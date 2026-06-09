@@ -61,6 +61,7 @@ function App() {
   const [searchResults, setSearchResults] = useState<RAGSearchResult[]>([]);
   const [retrievedChunks, setRetrievedChunks] = useState<RAGSearchResult[]>([]);
   const [useRag, setUseRag] = useState(false);
+  const [selectedRagDocumentId, setSelectedRagDocumentId] = useState("");
   const [lastIndexResult, setLastIndexResult] = useState<RAGIndexResult | null>(null);
   const [lastOcrResult, setLastOcrResult] = useState<OCRResult | null>(null);
   const [legacyPath, setLegacyPath] = useState("");
@@ -106,12 +107,22 @@ function App() {
   }, []);
 
   useEffect(() => {
+    setRetrievedChunks([]);
     if (!selectedSessionId) {
       setMessages([]);
       return;
     }
     void loadMessages(selectedSessionId);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (
+      selectedRagDocumentId &&
+      !documents.some((document) => document.id === selectedRagDocumentId && isRagReadyDocument(document))
+    ) {
+      setSelectedRagDocumentId("");
+    }
+  }, [documents, selectedRagDocumentId]);
 
   async function bootstrap() {
     setLoadState("loading");
@@ -396,12 +407,16 @@ function App() {
     setDraft("");
     setRetrievedChunks([]);
     try {
-      const result = await rpc<ChatResult>("chat.send", {
+      const params: Record<string, unknown> = {
         message,
         session_id: selectedSessionId,
         model: modelDraft.trim() || settings.default_model || "llama3.2",
         use_rag: useRag
-      });
+      };
+      if (useRag && selectedRagDocumentId) {
+        params.document_ids = [selectedRagDocumentId];
+      }
+      const result = await rpc<ChatResult>("chat.send", params);
       setSelectedSessionId(result.session.id);
       setMessages(result.messages);
       setRetrievedChunks(result.retrieved_chunks ?? []);
@@ -543,8 +558,10 @@ function App() {
             error={error}
             hasRuntime={hasRuntime}
             loadState={loadState}
+            documents={documents}
             messages={messages}
             retrievedChunks={retrievedChunks}
+            selectedRagDocumentId={selectedRagDocumentId}
             selectedSession={selectedSession}
             settings={settings}
             useRag={useRag}
@@ -552,6 +569,7 @@ function App() {
             onRetry={bootstrap}
             onSend={sendMessage}
             onSetDraft={setDraft}
+            onSetSelectedRagDocumentId={setSelectedRagDocumentId}
             onSetUseRag={setUseRag}
           />
         ) : (
@@ -593,8 +611,10 @@ function ChatWorkspace(props: {
   error: string | null;
   hasRuntime: boolean;
   loadState: LoadState;
+  documents: DocumentRecord[];
   messages: Message[];
   retrievedChunks: RAGSearchResult[];
+  selectedRagDocumentId: string;
   selectedSession: Session | null;
   settings: Settings;
   useRag: boolean;
@@ -602,8 +622,14 @@ function ChatWorkspace(props: {
   onRetry: () => void;
   onSend: (event: FormEvent) => void;
   onSetDraft: (value: string) => void;
+  onSetSelectedRagDocumentId: (value: string) => void;
   onSetUseRag: (value: boolean) => void;
 }) {
+  const indexedDocuments = props.documents.filter(isRagReadyDocument);
+  const latestAssistantMessageId = [...props.messages]
+    .reverse()
+    .find((message) => message.role === "assistant")?.id;
+
   return (
     <>
       <header className="flex h-16 shrink-0 items-center justify-between border-b border-ink/15 px-5">
@@ -616,6 +642,22 @@ function ChatWorkspace(props: {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          {props.useRag && (
+            <select
+              className="h-10 max-w-[240px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
+              disabled={props.busy || indexedDocuments.length === 0}
+              onChange={(event) => props.onSetSelectedRagDocumentId(event.target.value)}
+              title="Limit retrieval to one document"
+              value={props.selectedRagDocumentId}
+            >
+              <option value="">All indexed documents</option>
+              {indexedDocuments.map((document) => (
+                <option key={document.id} value={document.id}>
+                  {document.title || document.file_name}
+                </option>
+              ))}
+            </select>
+          )}
           <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
             <input
               checked={props.useRag}
@@ -667,11 +709,13 @@ function ChatWorkspace(props: {
               </div>
             ) : (
               <div className="mx-auto flex max-w-3xl flex-col gap-3">
-                {props.retrievedChunks.length > 0 && (
-                  <RetrievedSources chunks={props.retrievedChunks} />
-                )}
                 {props.messages.map((message) => (
-                  <MessageBubble key={message.id} message={message} />
+                  <div className="flex flex-col gap-2" key={message.id}>
+                    <MessageBubble message={message} />
+                    {message.id === latestAssistantMessageId && props.retrievedChunks.length > 0 && (
+                      <RetrievedSources chunks={props.retrievedChunks} detailed />
+                    )}
+                  </div>
                 ))}
               </div>
             )}
@@ -1172,10 +1216,10 @@ function RuntimeStatus({ status }: { status: OllamaStatus | null }) {
   );
 }
 
-function RetrievedSources({ chunks }: { chunks: RAGSearchResult[] }) {
+function RetrievedSources({ chunks, detailed = false }: { chunks: RAGSearchResult[]; detailed?: boolean }) {
   const sources = summarizeRetrievedSources(chunks);
   return (
-    <div className="rounded-md border border-tide/25 bg-[#eef8f8] px-3 py-2 text-xs text-tide">
+    <div className="max-w-[82%] rounded-md border border-tide/25 bg-[#eef8f8] px-3 py-2 text-xs text-tide">
       <div className="flex items-center gap-2 font-medium">
         <FileText size={14} aria-hidden="true" />
         <span>Retrieved {chunks.length} document chunk(s)</span>
@@ -1191,6 +1235,23 @@ function RetrievedSources({ chunks }: { chunks: RAGSearchResult[] }) {
           </span>
         ))}
       </div>
+      {detailed && (
+        <div className="mt-2 space-y-1.5">
+          {chunks.map((chunk, index) => (
+            <details
+              className="rounded-md border border-tide/15 bg-white px-2 py-1.5 text-ink/75"
+              key={chunk.chunk_id}
+            >
+              <summary className="cursor-pointer text-xs font-medium text-tide">
+                {formatRetrievedChunkLabel(chunk, index)}
+              </summary>
+              <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink/70">
+                {chunk.content}
+              </p>
+            </details>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1279,6 +1340,17 @@ function summarizeRetrievedSources(chunks: RAGSearchResult[]): string[] {
     }
   }
   return sources;
+}
+
+function formatRetrievedChunkLabel(chunk: RAGSearchResult, index: number): string {
+  const name = String(chunk.metadata.title ?? chunk.metadata.file_name ?? "Document");
+  const page = chunk.page_start ? `, p. ${chunk.page_start}` : "";
+  const chunkId = chunk.chunk_id ? `, chunk ${chunk.chunk_id.slice(0, 8)}` : `, chunk ${index + 1}`;
+  return `${name}${page}${chunkId}`;
+}
+
+function isRagReadyDocument(document: DocumentRecord): boolean {
+  return !document.is_deleted && (document.index_status === "indexed" || document.ocr_status === "indexed");
 }
 
 function formatLowTextOcrMessage(status: OCRStatus | null): string {

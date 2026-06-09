@@ -189,6 +189,7 @@ def test_extractable_pdf_imports_and_indexes(tmp_path: Path):
 class SpyVectorStore(VectorStore):
     def __init__(self):
         self.query_vectors: list[np.ndarray] = []
+        self.metadata_filters: list[dict | None] = []
 
     def upsert_chunks(self, _chunks):
         return []
@@ -198,6 +199,7 @@ class SpyVectorStore(VectorStore):
 
     def similarity_search(self, query_vector, *, limit=5, metadata_filter=None):
         self.query_vectors.append(query_vector)
+        self.metadata_filters.append(metadata_filter)
         return [
             SearchResult(
                 chunk_id="chunk-1",
@@ -221,6 +223,7 @@ class FixedResultVectorStore(VectorStore):
     def __init__(self, results: list[SearchResult]):
         self.results = results
         self.requested_limits: list[int] = []
+        self.metadata_filters: list[dict | None] = []
 
     def upsert_chunks(self, _chunks):
         return []
@@ -230,7 +233,13 @@ class FixedResultVectorStore(VectorStore):
 
     def similarity_search(self, _query_vector, *, limit=5, metadata_filter=None):
         self.requested_limits.append(limit)
-        return self.results[:limit]
+        self.metadata_filters.append(metadata_filter)
+        filtered = [
+            result
+            for result in self.results
+            if metadata_matches(result.metadata, metadata_filter)
+        ]
+        return filtered[:limit]
 
     def reindex_document(self, _document_id, _chunks):
         return []
@@ -384,6 +393,121 @@ def test_rag_chat_is_explicit_and_injects_retrieved_chunks(tmp_path: Path):
     assert result["retrieved_chunks"]
     assert models.calls[0]["messages"][0]["role"] == "system"
     assert "Retrieved document context" in models.calls[0]["messages"][0]["content"]
-    assert "Answer using only the retrieved document context" in models.calls[0]["messages"][0]["content"]
+    assert "Use only the retrieved chunks below for factual claims" in models.calls[0]["messages"][0]["content"]
     assert "rover batteries" in models.calls[0]["messages"][0]["content"]
     db.close()
+
+
+def test_rag_chat_preserves_grandfather_chronology_with_source_scope(tmp_path: Path):
+    frame = tmp_path / "Frame 10.txt"
+    frame.write_text(
+        "Tribute to my Grandfather. A soldier was fighting with his comrades to take control of a hill. "
+        "He got stuck in a hole and wrestled with whether to take a shot. "
+        "He eventually came out of the hole, enjoyed tea with comrades, and then told the story "
+        "for the next 60-70 years. "
+        "The broader section reflects on nostalgia, inherited memory, and how a war anecdote becomes "
+        "part of a family interpretation.",
+        encoding="utf-8",
+    )
+    water = tmp_path / "PublicWaterMassMailing.txt"
+    water.write_text(
+        "PublicWaterMassMailing explains public drinking water sample collection, testing, "
+        "and reporting requirements.",
+        encoding="utf-8",
+    )
+    db, documents, _embeddings, _vector_store, rag = build_rag(tmp_path / "profile")
+    settings = SettingsService(db)
+    sessions = SessionService(db)
+    models = GrandfatherGroundingModelService(db)
+    chat = ChatService(sessions, settings, models, rag=rag)
+
+    frame_doc = documents.import_document(str(frame))
+    water_doc = documents.import_document(str(water))
+    rag.index_document(frame_doc["id"])
+    rag.index_document(water_doc["id"])
+    result = chat.send(
+        "Tell me about the grandfather?",
+        use_rag=True,
+        document_ids=[frame_doc["id"]],
+    )
+
+    answer = result["assistant_message"]["content"]
+    system_prompt = models.calls[0]["messages"][0]["content"]
+    assert "Preserve chronology exactly" in system_prompt
+    assert "Never merge facts across unrelated documents" in system_prompt
+    assert "came out of the hole" in system_prompt
+    assert "told the story for the next 60-70 years" in system_prompt
+    assert "PublicWaterMassMailing" not in system_prompt
+    assert all(chunk["document_id"] == frame_doc["id"] for chunk in result["retrieved_chunks"])
+    assert "stayed in the hole for 60-70 years" not in answer
+    assert "eventually came out" in answer
+    assert "tea with comrades" in answer
+    assert "next 60-70 years" in answer
+    assert "war anecdote" in answer
+    assert "broader interpretation" in answer
+    db.close()
+
+
+def test_source_scoped_rag_context_does_not_cross_contaminate_documents(tmp_path: Path):
+    frame = tmp_path / "Frame 10.txt"
+    frame.write_text(
+        "Tribute to my Grandfather. He eventually came out of the hole and had tea with comrades.",
+        encoding="utf-8",
+    )
+    water = tmp_path / "PublicWaterMassMailing.txt"
+    water.write_text(
+        "PublicWaterMassMailing contains water testing and sample collection requirements.",
+        encoding="utf-8",
+    )
+    db, documents, _embeddings, _vector_store, rag = build_rag(tmp_path / "profile")
+
+    frame_doc = documents.import_document(str(frame))
+    water_doc = documents.import_document(str(water))
+    rag.index_document(frame_doc["id"])
+    rag.index_document(water_doc["id"])
+
+    frame_context, frame_chunks = rag.build_context(
+        "Tell me about the grandfather?",
+        document_ids=[frame_doc["id"]],
+    )
+    water_context, water_chunks = rag.build_context(
+        "What does the water PDF say about testing?",
+        document_ids=[water_doc["id"]],
+    )
+
+    assert frame_chunks
+    assert water_chunks
+    assert {chunk["document_id"] for chunk in frame_chunks} == {frame_doc["id"]}
+    assert {chunk["document_id"] for chunk in water_chunks} == {water_doc["id"]}
+    assert "PublicWaterMassMailing" not in frame_context
+    assert "water testing" not in frame_context
+    assert "Grandfather" not in water_context
+    assert "tea with comrades" not in water_context
+    db.close()
+
+
+class GrandfatherGroundingModelService(CapturingModelService):
+    def chat(self, model: str, messages: list[dict[str, str]]) -> str:
+        self.calls.append({"model": model, "messages": messages})
+        system_prompt = messages[0]["content"]
+        assert "the retrieved context does not say" in system_prompt
+        assert "Distinguish direct claims from inference" in system_prompt
+        return (
+            "The retrieved context directly says the grandfather was in a war anecdote, "
+            "eventually came out of the hole, and had tea with comrades. It also directly "
+            "says he told the story for the next 60-70 years. A broader interpretation "
+            "suggested by the text is that the anecdote became part of family memory."
+        )
+
+
+def metadata_matches(metadata: dict, metadata_filter: dict | None) -> bool:
+    if not metadata_filter:
+        return True
+    for key, expected in metadata_filter.items():
+        actual = metadata.get(key)
+        if isinstance(expected, (list, tuple, set)):
+            if actual not in expected:
+                return False
+        elif actual != expected:
+            return False
+    return True

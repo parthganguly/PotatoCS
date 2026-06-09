@@ -204,6 +204,10 @@ class SQLiteNumPyVectorStore(VectorStore):
         if not metadata_filter:
             return True
         for key, expected in metadata_filter.items():
-            if metadata.get(key) != expected:
+            actual = metadata.get(key)
+            if isinstance(expected, (list, tuple, set)):
+                if actual not in expected:
+                    return False
+            elif actual != expected:
                 return False
         return True

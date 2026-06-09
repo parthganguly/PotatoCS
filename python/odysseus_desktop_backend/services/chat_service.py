@@ -36,6 +36,7 @@ class ChatService:
         session_id: str | None = None,
         model: str | None = None,
         use_rag: bool = False,
+        document_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         content = (message or "").strip()
         if not content:
@@ -53,7 +54,10 @@ class ChatService:
         rag_context = ""
         retrieved_chunks: list[dict[str, Any]] = []
         if use_rag and self.rag is not None:
-            rag_context, retrieved_chunks = self.rag.build_context(content)
+            rag_context, retrieved_chunks = self.rag.build_context(
+                content,
+                document_ids=document_ids,
+            )
 
         ollama_messages = [
             {"role": item["role"], "content": item["content"]}
@@ -66,11 +70,21 @@ class ChatService:
                 {
                     "role": "system",
                     "content": (
-                        "Answer using only the retrieved document context below. "
-                        "Do not use unrelated prior conversation to override the retrieved context. "
-                        "Do not invent biographical details, motives, or personality traits that are not supported by the text. "
-                        "If the retrieved context is not enough, say what is missing. "
-                        "Mention the source title or page when useful.\n\n"
+                        "You are answering with retrieved document chunks.\n"
+                        "Rules:\n"
+                        "- Use only the retrieved chunks below for factual claims.\n"
+                        "- Keep different source titles, files, pages, and chunks separate. "
+                        "Never merge facts across unrelated documents.\n"
+                        "- Preserve chronology exactly. If the text says one event happened, "
+                        "then a story was told for 60-70 years, do not say the event lasted "
+                        "60-70 years.\n"
+                        "- Distinguish direct claims from inference. If you infer something, "
+                        "say it is suggested by the text.\n"
+                        "- Do not add unstated causes, motives, emotions, biographies, or "
+                        "causal links.\n"
+                        "- If the chunks do not answer something, say "
+                        "\"the retrieved context does not say.\"\n"
+                        "- Cite or name the source title/page when useful.\n\n"
                         f"Retrieved document context:\n{rag_context}"
                     ),
                 },

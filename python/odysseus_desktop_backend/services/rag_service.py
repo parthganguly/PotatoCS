@@ -155,16 +155,18 @@ class RAGService:
         *,
         limit: int = 5,
         metadata_filter: dict[str, Any] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         text = (query or "").strip()
         if not text:
             return []
         query_vector = self.embeddings.embed_query(text)
         candidate_limit = max(limit, RERANK_MIN_CANDIDATES, limit * 8)
+        effective_filter = self._source_scoped_filter(metadata_filter, document_ids)
         candidates = self.vector_store.similarity_search(
             query_vector,
             limit=candidate_limit,
-            metadata_filter=metadata_filter,
+            metadata_filter=effective_filter,
         )
         reranked = self._rerank(text, candidates)
         return [
@@ -175,8 +177,14 @@ class RAGService:
     def health(self) -> dict[str, Any]:
         return self.vector_store.health()
 
-    def build_context(self, query: str, *, limit: int = 4) -> tuple[str, list[dict[str, Any]]]:
-        results = self.search(query, limit=limit)
+    def build_context(
+        self,
+        query: str,
+        *,
+        limit: int = 4,
+        document_ids: list[str] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        results = self.search(query, limit=limit, document_ids=document_ids)
         if not results:
             return "", []
         results = self._expand_focused_document_results(query, results, limit=limit)
@@ -235,6 +243,37 @@ class RAGService:
     def _chunk_id(self, document_id: str, chunk_index: int, digest: str) -> str:
         seed = f"{document_id}:{chunk_index}:{digest}"
         return str(uuid.UUID(hashlib.md5(seed.encode("utf-8")).hexdigest()))
+
+    def _source_scoped_filter(
+        self,
+        metadata_filter: dict[str, Any] | None,
+        document_ids: list[str] | None,
+    ) -> dict[str, Any] | None:
+        clean_document_ids = [
+            document_id.strip()
+            for document_id in document_ids or []
+            if document_id.strip()
+        ]
+        if not metadata_filter and not clean_document_ids:
+            return None
+
+        effective: dict[str, Any] = dict(metadata_filter or {})
+        if clean_document_ids:
+            existing = effective.get("document_id")
+            if existing is None:
+                effective["document_id"] = clean_document_ids
+            else:
+                if isinstance(existing, (list, tuple, set)):
+                    existing_ids = {str(item) for item in existing}
+                else:
+                    existing_ids = {str(existing)}
+                allowed_ids = [
+                    document_id
+                    for document_id in clean_document_ids
+                    if document_id in existing_ids
+                ]
+                effective["document_id"] = allowed_ids
+        return effective
 
     def _rerank(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
         query_tokens = important_tokens(query)

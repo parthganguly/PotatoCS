@@ -136,6 +136,7 @@ class SidecarApp:
             session_id=optional_str(params, "session_id"),
             model=optional_str(params, "model"),
             use_rag=optional_bool(params, "use_rag", False),
+            document_ids=optional_str_list(params, "document_ids"),
         )
 
     def models_detect_ollama(self, _params: JsonDict) -> JsonDict:
@@ -185,6 +186,7 @@ class SidecarApp:
             require_str(params, "query"),
             limit=optional_int(params, "limit", 5),
             metadata_filter=metadata_filter,
+            document_ids=optional_str_list(params, "document_ids"),
         )
 
     def rag_health(self, _params: JsonDict) -> JsonDict:
@@ -223,6 +225,22 @@ def optional_bool(params: JsonDict, key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise RpcError(-32602, f"{key} must be a boolean")
     return value
+
+
+def optional_str_list(params: JsonDict, key: str) -> list[str] | None:
+    value = params.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise RpcError(-32602, f"{key} must be a list of strings")
+    clean: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise RpcError(-32602, f"{key} must be a list of strings")
+        item = item.strip()
+        if item:
+            clean.append(item)
+    return clean
 
 
 def make_response(request_id: Any, result: Any = None, error: RpcError | None = None) -> JsonDict:
