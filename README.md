@@ -3,12 +3,129 @@
 Windows-first desktop MVP for local Odysseus chat, documents, RAG, optional OCR,
 and non-destructive legacy import.
 
+Odysseus Desktop is a standalone product fork of the upstream Odysseus project.
+It keeps the spirit of a local AI workspace, but it deliberately changes the
+delivery model: this is a packaged desktop app, not a Docker/web app.
+
 This app is a Tauri desktop shell with a Rust supervisor, a bundled Python
 JSON-RPC sidecar over stdio, profile-local SQLite storage, React/TypeScript UI,
 and local model runtime detection for Ollama at `127.0.0.1:11434`.
 
 No Docker is required. No app-internal service binds to `0.0.0.0`. Localhost is
 used only for external local runtimes such as Ollama and the Vite dev server.
+
+## Why This Fork Exists
+
+The original Odysseus project is broad: it includes a web UI, Docker-oriented
+deployment, server routes, and a much larger assistant surface area. That is a
+good shape for the original project, but it is not the right shape for this
+fork's goal.
+
+This fork exists because the target product is a Windows-first local desktop
+app. A user should be able to install it, launch it from the Start Menu, keep
+their data in the normal Windows app-data folder, talk to a local model runtime,
+import documents, and quit/relaunch without needing Docker, a web server, or a
+manually managed Python environment.
+
+That requirement changes the architecture. The app boundary moves from
+browser-to-server into desktop-shell-to-sidecar:
+
+```text
+React UI
+   |
+   v
+Tauri / Rust desktop shell
+   |
+   +-- supervises bundled Python sidecar
+   +-- owns profile/app-data paths
+   +-- talks JSON-RPC over stdio
+   +-- detects local Ollama runtime
+   |
+   v
+Python services
+   |
+   +-- chat/session/settings
+   +-- document import
+   +-- RAG/chunking/embeddings
+   +-- optional OCR
+   +-- legacy import
+   |
+   v
+SQLite profile storage
+```
+
+## How It Is Different From Upstream
+
+This is not intended as a drop-in patch to upstream Odysseus. It is a focused
+desktop fork with a different product contract.
+
+Key differences:
+
+- Desktop-first instead of web-first.
+- Tauri/Rust process supervision instead of a long-running app web server.
+- JSON-RPC over stdio instead of app-internal HTTP.
+- Bundled embedded Python runtime for packaged Windows builds.
+- Profile-local SQLite data under `%APPDATA%`.
+- Ollama-first local model runtime detection.
+- SQLite + NumPy VectorStore MVP, with the VectorStore boundary preserved for
+  future sqlite-vec or LanceDB experiments.
+- Optional OCR by detecting local tools such as Tesseract and MuPDF/Poppler.
+- Non-destructive import from compatible legacy Odysseus data folders.
+
+Removed from the MVP on purpose:
+
+- Docker deployment
+- hidden HTTP services
+- tools and agents
+- email and calendar
+- shell execution surfaces
+- Cookbook
+- gallery/editor
+- full MCP
+- Chroma
+
+Those features may still make sense in upstream Odysseus. They are intentionally
+out of scope here because the first job of this fork is to prove a reliable
+local desktop foundation.
+
+## Philosophy
+
+Odysseus Desktop favors a small durable spine over broad feature parity.
+
+The architecture is intentionally boring in the parts that need to be reliable:
+
+- Rust owns the desktop shell, lifecycle, bundled resources, and process
+  supervision.
+- Python owns the AI orchestration and document intelligence.
+- SQLite owns local memory and restart persistence.
+- Ollama owns local model execution.
+- Optional native helpers can be added later only when they clearly earn their
+  complexity.
+
+The design principle is: prove the desktop foundation first, then add features
+only when they fit that foundation.
+
+That is why the MVP is narrow. It is not trying to rebuild every upstream module
+inside a desktop wrapper. It is trying to become a dependable local AI workspace
+that can be installed, inspected, repaired, and trusted on Windows.
+
+## Screenshots
+
+Screenshots are intentionally documented as part of the product surface. The
+current MVP should show these screens when captured from a packaged Windows
+build:
+
+- `docs/screenshots/chat-rag-sources.png` - chat with RAG enabled and retrieved
+  source chips visible.
+- `docs/screenshots/documents-import.png` - document import, indexed status,
+  OCR status, and test retrieval.
+- `docs/screenshots/legacy-import-report.png` - non-destructive legacy import
+  report with imported, skipped, incompatible, and failed entries.
+- `docs/screenshots/installer-start-menu.png` - installed app launched from the
+  Windows Start Menu.
+
+These screenshots are not committed yet because they should come from a clean
+packaged build capture, not a development or automation artifact.
 
 ## MVP Scope
 
