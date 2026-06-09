@@ -1,0 +1,29 @@
+{
+  "id": "water_no_grandfather_contamination",
+  "documents": [
+    {
+      "id": "frame_10",
+      "path": "../fixtures/documents/frame_10.md",
+      "title": "Frame 10"
+    },
+    {
+      "id": "public_water",
+      "path": "../fixtures/documents/public_water.md",
+      "title": "PublicWaterMassMailing"
+    }
+  ],
+  "required_source_document": "public_water",
+  "question": "What does the water document say about testing?",
+  "expected_facts": [
+    {
+      "label": "water testing requirements",
+      "any": ["water testing requirements", "testing requirements", "sample collection"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "grandfather story contamination",
+      "any": ["grandfather", "soldier in a hole", "tea with comrades", "nostalgia"]
+    }
+  ]
+}

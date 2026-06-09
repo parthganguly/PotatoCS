@@ -391,9 +391,10 @@ def test_rag_chat_is_explicit_and_injects_retrieved_chunks(tmp_path: Path):
     result = chat.send("What does mars mission planning require?", use_rag=True)
 
     assert result["retrieved_chunks"]
+    assert result["retrieved_snippets"]
     assert models.calls[0]["messages"][0]["role"] == "system"
-    assert "Retrieved document context" in models.calls[0]["messages"][0]["content"]
-    assert "Use only the retrieved chunks below for factual claims" in models.calls[0]["messages"][0]["content"]
+    assert "Retrieved evidence snippets" in models.calls[0]["messages"][0]["content"]
+    assert "Use only the evidence snippets below for factual claims" in models.calls[0]["messages"][0]["content"]
     assert "rover batteries" in models.calls[0]["messages"][0]["content"]
     db.close()
 

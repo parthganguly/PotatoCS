@@ -151,7 +151,7 @@ Excluded from the MVP:
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.1_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -214,6 +214,16 @@ Run backend tests:
 python -m pip install -r python\requirements.txt
 python -m pytest python/tests
 ```
+
+Run local RAG reliability evals against installed Ollama models:
+
+```powershell
+python scripts\run_rag_evals.py
+python scripts\run_rag_evals.py --models llama3.2 --verify
+```
+
+The eval fixtures live under `evals\`. They check required facts, forbidden
+claims, required source scoping, and latency without using cloud models.
 
 Run the frontend build:
 

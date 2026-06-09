@@ -30,9 +30,11 @@ import {
   OCRResult,
   OCRStatus,
   OllamaStatus,
+  RAGGroundingReport,
   RAGHealth,
   RAGIndexResult,
   RAGSearchResult,
+  RAGSnippet,
   Session,
   Settings,
   getAppStatus,
@@ -60,7 +62,10 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<RAGSearchResult[]>([]);
   const [retrievedChunks, setRetrievedChunks] = useState<RAGSearchResult[]>([]);
+  const [retrievedSnippets, setRetrievedSnippets] = useState<RAGSnippet[]>([]);
+  const [grounding, setGrounding] = useState<RAGGroundingReport | null>(null);
   const [useRag, setUseRag] = useState(false);
+  const [verifyRag, setVerifyRag] = useState(false);
   const [selectedRagDocumentId, setSelectedRagDocumentId] = useState("");
   const [lastIndexResult, setLastIndexResult] = useState<RAGIndexResult | null>(null);
   const [lastOcrResult, setLastOcrResult] = useState<OCRResult | null>(null);
@@ -108,6 +113,8 @@ function App() {
 
   useEffect(() => {
     setRetrievedChunks([]);
+    setRetrievedSnippets([]);
+    setGrounding(null);
     if (!selectedSessionId) {
       setMessages([]);
       return;
@@ -406,12 +413,15 @@ function App() {
     setError(null);
     setDraft("");
     setRetrievedChunks([]);
+    setRetrievedSnippets([]);
+    setGrounding(null);
     try {
       const params: Record<string, unknown> = {
         message,
         session_id: selectedSessionId,
         model: modelDraft.trim() || settings.default_model || "llama3.2",
-        use_rag: useRag
+        use_rag: useRag,
+        verify_rag: useRag && verifyRag
       };
       if (useRag && selectedRagDocumentId) {
         params.document_ids = [selectedRagDocumentId];
@@ -420,6 +430,8 @@ function App() {
       setSelectedSessionId(result.session.id);
       setMessages(result.messages);
       setRetrievedChunks(result.retrieved_chunks ?? []);
+      setRetrievedSnippets(result.retrieved_snippets ?? []);
+      setGrounding(result.grounding ?? null);
       setSessions(await rpc<Session[]>("sessions.list"));
     } catch (err) {
       setDraft(message);
@@ -561,16 +573,20 @@ function App() {
             documents={documents}
             messages={messages}
             retrievedChunks={retrievedChunks}
+            retrievedSnippets={retrievedSnippets}
+            grounding={grounding}
             selectedRagDocumentId={selectedRagDocumentId}
             selectedSession={selectedSession}
             settings={settings}
             useRag={useRag}
+            verifyRag={verifyRag}
             onDeleteSession={deleteSession}
             onRetry={bootstrap}
             onSend={sendMessage}
             onSetDraft={setDraft}
             onSetSelectedRagDocumentId={setSelectedRagDocumentId}
             onSetUseRag={setUseRag}
+            onSetVerifyRag={setVerifyRag}
           />
         ) : (
           <DocumentsWorkspace
@@ -614,16 +630,20 @@ function ChatWorkspace(props: {
   documents: DocumentRecord[];
   messages: Message[];
   retrievedChunks: RAGSearchResult[];
+  retrievedSnippets: RAGSnippet[];
+  grounding: RAGGroundingReport | null;
   selectedRagDocumentId: string;
   selectedSession: Session | null;
   settings: Settings;
   useRag: boolean;
+  verifyRag: boolean;
   onDeleteSession: (sessionId: string) => void;
   onRetry: () => void;
   onSend: (event: FormEvent) => void;
   onSetDraft: (value: string) => void;
   onSetSelectedRagDocumentId: (value: string) => void;
   onSetUseRag: (value: boolean) => void;
+  onSetVerifyRag: (value: boolean) => void;
 }) {
   const indexedDocuments = props.documents.filter(isRagReadyDocument);
   const latestAssistantMessageId = [...props.messages]
@@ -667,6 +687,17 @@ function ChatWorkspace(props: {
             />
             RAG
           </label>
+          {props.useRag && (
+            <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
+              <input
+                checked={props.verifyRag}
+                className="h-4 w-4 accent-tide"
+                onChange={(event) => props.onSetVerifyRag(event.target.checked)}
+                type="checkbox"
+              />
+              Verify
+            </label>
+          )}
           {props.selectedSession && (
             <IconButton
               className="text-clay"
@@ -713,7 +744,12 @@ function ChatWorkspace(props: {
                   <div className="flex flex-col gap-2" key={message.id}>
                     <MessageBubble message={message} />
                     {message.id === latestAssistantMessageId && props.retrievedChunks.length > 0 && (
-                      <RetrievedSources chunks={props.retrievedChunks} detailed />
+                      <RetrievedSources
+                        chunks={props.retrievedChunks}
+                        grounding={props.grounding}
+                        snippets={props.retrievedSnippets}
+                        detailed
+                      />
                     )}
                   </div>
                 ))}
@@ -1216,13 +1252,31 @@ function RuntimeStatus({ status }: { status: OllamaStatus | null }) {
   );
 }
 
-function RetrievedSources({ chunks, detailed = false }: { chunks: RAGSearchResult[]; detailed?: boolean }) {
+function RetrievedSources({
+  chunks,
+  detailed = false,
+  grounding,
+  snippets
+}: {
+  chunks: RAGSearchResult[];
+  detailed?: boolean;
+  grounding: RAGGroundingReport | null;
+  snippets: RAGSnippet[];
+}) {
   const sources = summarizeRetrievedSources(chunks);
+  const displayedSnippets = snippets.length > 0 ? snippets : chunks.map(chunkToSnippet);
+  const unsupportedClaims = grounding?.unsupported_claims ?? [];
+  const contradictedClaims = grounding?.contradicted_claims ?? [];
   return (
     <div className="max-w-[82%] rounded-md border border-tide/25 bg-[#eef8f8] px-3 py-2 text-xs text-tide">
-      <div className="flex items-center gap-2 font-medium">
-        <FileText size={14} aria-hidden="true" />
-        <span>Retrieved {chunks.length} document chunk(s)</span>
+      <div className="flex flex-wrap items-center gap-2 font-medium">
+        <div className="flex items-center gap-2">
+          <FileText size={14} aria-hidden="true" />
+          <span>
+            Retrieved {displayedSnippets.length} snippet(s) from {chunks.length} chunk(s)
+          </span>
+        </div>
+        <GroundingBadge grounding={grounding} />
       </div>
       <div className="mt-2 flex flex-wrap gap-1.5">
         {sources.map((source) => (
@@ -1235,24 +1289,60 @@ function RetrievedSources({ chunks, detailed = false }: { chunks: RAGSearchResul
           </span>
         ))}
       </div>
+      {(unsupportedClaims.length > 0 || contradictedClaims.length > 0) && (
+        <div className="mt-2 rounded-md border border-clay/20 bg-[#fff7f2] px-2 py-1.5 text-clay">
+          {contradictedClaims.length > 0 && (
+            <p>Contradicted: {contradictedClaims.join("; ")}</p>
+          )}
+          {unsupportedClaims.length > 0 && (
+            <p>Unsupported: {unsupportedClaims.join("; ")}</p>
+          )}
+        </div>
+      )}
       {detailed && (
         <div className="mt-2 space-y-1.5">
-          {chunks.map((chunk, index) => (
+          {displayedSnippets.map((snippet, index) => (
             <details
               className="rounded-md border border-tide/15 bg-white px-2 py-1.5 text-ink/75"
-              key={chunk.chunk_id}
+              key={`${snippet.snippet_id}-${snippet.chunk_id}`}
             >
               <summary className="cursor-pointer text-xs font-medium text-tide">
-                {formatRetrievedChunkLabel(chunk, index)}
+                {formatRetrievedSnippetLabel(snippet, index)}
               </summary>
               <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink/70">
-                {chunk.content}
+                {snippet.text}
               </p>
             </details>
           ))}
         </div>
       )}
     </div>
+  );
+}
+
+function GroundingBadge({ grounding }: { grounding: RAGGroundingReport | null }) {
+  if (!grounding) return null;
+  const verifier = grounding.verifier;
+  const label = verifier.enabled
+    ? verifier.status === "passed"
+      ? "grounding passed"
+      : verifier.status === "failed"
+        ? "grounding needs review"
+        : verifier.status === "error"
+          ? "grounding error"
+          : "grounding running"
+    : "verifier off";
+  const classes =
+    verifier.status === "passed"
+      ? "border-moss/20 bg-[#edf7ef] text-moss"
+      : verifier.status === "failed" || verifier.status === "error"
+        ? "border-clay/25 bg-[#fff3ee] text-clay"
+        : "border-tide/20 bg-white text-tide";
+  return (
+    <span className={`rounded-md border px-2 py-1 text-[11px] font-medium ${classes}`}>
+      {label}
+      {grounding.regenerated ? " after retry" : ""}
+    </span>
   );
 }
 
@@ -1342,11 +1432,25 @@ function summarizeRetrievedSources(chunks: RAGSearchResult[]): string[] {
   return sources;
 }
 
-function formatRetrievedChunkLabel(chunk: RAGSearchResult, index: number): string {
-  const name = String(chunk.metadata.title ?? chunk.metadata.file_name ?? "Document");
-  const page = chunk.page_start ? `, p. ${chunk.page_start}` : "";
-  const chunkId = chunk.chunk_id ? `, chunk ${chunk.chunk_id.slice(0, 8)}` : `, chunk ${index + 1}`;
-  return `${name}${page}${chunkId}`;
+function formatRetrievedSnippetLabel(snippet: RAGSnippet, index: number): string {
+  const name = snippet.source || String(snippet.metadata.title ?? snippet.metadata.file_name ?? "Document");
+  const page = snippet.page_start ? `, p. ${snippet.page_start}` : "";
+  const snippetId = snippet.snippet_id || `S${index + 1}`;
+  return `${snippetId}: ${name}${page}, chunk ${snippet.chunk_id.slice(0, 8)}`;
+}
+
+function chunkToSnippet(chunk: RAGSearchResult, index: number): RAGSnippet {
+  return {
+    snippet_id: `S${index + 1}`,
+    chunk_id: chunk.chunk_id,
+    document_id: chunk.document_id,
+    source: String(chunk.metadata.title ?? chunk.metadata.file_name ?? "Document"),
+    text: chunk.content,
+    score: chunk.score,
+    page_start: chunk.page_start,
+    page_end: chunk.page_end,
+    metadata: chunk.metadata
+  };
 }
 
 function isRagReadyDocument(document: DocumentRecord): boolean {

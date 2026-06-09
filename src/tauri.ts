@@ -46,6 +46,8 @@ export type ChatResult = {
   assistant_message: Message;
   messages: Message[];
   retrieved_chunks: RAGSearchResult[];
+  retrieved_snippets: RAGSnippet[];
+  grounding: RAGGroundingReport;
 };
 
 export type DocumentRecord = {
@@ -107,6 +109,50 @@ export type RAGSearchResult = {
   page_start: number | null;
   page_end: number | null;
   metadata: Record<string, unknown>;
+};
+
+export type RAGSnippet = {
+  snippet_id: string;
+  chunk_id: string;
+  document_id: string;
+  source: string;
+  text: string;
+  score: number;
+  page_start: number | null;
+  page_end: number | null;
+  metadata: Record<string, unknown>;
+};
+
+export type RAGGroundingSource = {
+  snippet_id: string;
+  document_id: string;
+  source: string;
+  page_start: number | null;
+  page_end: number | null;
+  chunk_id: string;
+};
+
+export type RAGGroundingClaim = {
+  text: string;
+  status: "supported" | "unsupported" | "contradicted";
+  reason: string;
+  source_ids: string[];
+};
+
+export type RAGGroundingReport = {
+  mode: "none" | "quote_first";
+  sources_used: RAGGroundingSource[];
+  verifier: {
+    enabled: boolean;
+    status: "not_run" | "no_evidence" | "passed" | "failed" | "error";
+    passed: boolean | null;
+    error: string;
+  };
+  claims: RAGGroundingClaim[];
+  unsupported_claims: string[];
+  contradicted_claims: string[];
+  regenerated: boolean;
+  draft_verifier?: RAGGroundingReport;
 };
 
 export type RAGHealth = {

@@ -1,0 +1,29 @@
+{
+  "id": "grandfather_no_water_contamination",
+  "documents": [
+    {
+      "id": "frame_10",
+      "path": "../fixtures/documents/frame_10.md",
+      "title": "Frame 10"
+    },
+    {
+      "id": "public_water",
+      "path": "../fixtures/documents/public_water.md",
+      "title": "PublicWaterMassMailing"
+    }
+  ],
+  "required_source_document": "frame_10",
+  "question": "What does the grandfather story say?",
+  "expected_facts": [
+    {
+      "label": "grandfather story is a war anecdote",
+      "any": ["war anecdote", "soldier", "comrades"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "water testing contamination",
+      "any": ["water testing", "PublicWaterMassMailing", "sample collection", "drinking water"]
+    }
+  ]
+}

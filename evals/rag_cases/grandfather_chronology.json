@@ -1,0 +1,41 @@
+{
+  "id": "grandfather_chronology",
+  "documents": [
+    {
+      "id": "frame_10",
+      "path": "../fixtures/documents/frame_10.md",
+      "title": "Frame 10"
+    },
+    {
+      "id": "public_water",
+      "path": "../fixtures/documents/public_water.md",
+      "title": "PublicWaterMassMailing"
+    }
+  ],
+  "required_source_document": "frame_10",
+  "question": "Tell me about the grandfather?",
+  "expected_facts": [
+    {
+      "label": "he eventually came out of the hole",
+      "any": ["eventually came out of the hole", "came out of the hole"]
+    },
+    {
+      "label": "he had tea with comrades",
+      "any": ["had tea with his comrades", "had tea with comrades", "tea with his comrades"]
+    },
+    {
+      "label": "he told the story for 60-70 years",
+      "any": ["told the story for the next 60-70 years", "told the story for 60-70 years"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "he stayed in the hole for 60-70 years",
+      "any": [
+        "stayed in the hole for 60-70 years",
+        "stuck in the hole for 60-70 years",
+        "remained in the hole for 60-70 years"
+      ]
+    }
+  ]
+}

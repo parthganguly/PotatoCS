@@ -15,7 +15,10 @@ from odysseus_desktop_backend.services.vector_store import SearchResult, VectorC
 MAX_CHUNK_CHARS = 900
 CHUNK_OVERLAP_CHARS = 120
 RERANK_MIN_CANDIDATES = 32
+MAX_EVIDENCE_SNIPPETS = 6
+MAX_EVIDENCE_SNIPPET_CHARS = 520
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 STOPWORDS = {
     "a",
     "about",
@@ -195,6 +198,134 @@ class RAGService:
             location = f", page {page}" if page else ""
             blocks.append(f"[{index}] {title}{location}\n{result['content']}")
         return "\n\n".join(blocks), results
+
+    def build_quote_context(
+        self,
+        query: str,
+        *,
+        limit: int = 4,
+        document_ids: list[str] | None = None,
+        max_snippets: int = MAX_EVIDENCE_SNIPPETS,
+    ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+        results = self.search(query, limit=limit, document_ids=document_ids)
+        if not results:
+            return "", [], []
+        results = self._expand_focused_document_results(query, results, limit=limit)
+        snippets = self.extract_evidence_snippets(
+            query,
+            results,
+            max_snippets=max_snippets,
+        )
+        blocks = []
+        query_tokens = important_tokens(query)
+        for snippet in snippets:
+            source = snippet["source"]
+            page = snippet["page_start"]
+            location = f", page {page}" if page else ""
+            heading_text = " ".join(
+                str(snippet["metadata"].get(key) or "")
+                for key in ("title", "file_name", "source_name")
+            )
+            first_sentence = split_sentences(snippet["text"])[:1]
+            framing_text = " ".join([heading_text, *first_sentence])
+            relevance_note = ""
+            if overlap_score(query_tokens, important_tokens(framing_text)) > 0:
+                relevance_note = (
+                    "Relevance note: this snippet heading or source matches the question; "
+                    "use the following quoted bullets from this same snippet as the relevant story/facts.\n"
+                )
+            quoted_sentences = "\n".join(
+                f"- \"{sentence}\""
+                for sentence in split_sentences(snippet["text"])
+            )
+            blocks.append(
+                f"[{snippet['snippet_id']}] {source}{location}, chunk {snippet['chunk_id']}\n"
+                f"{relevance_note}"
+                f"{quoted_sentences}"
+            )
+        return "\n\n".join(blocks), results, snippets
+
+    def extract_evidence_snippets(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        *,
+        max_snippets: int = MAX_EVIDENCE_SNIPPETS,
+        max_chars: int = MAX_EVIDENCE_SNIPPET_CHARS,
+    ) -> list[dict[str, Any]]:
+        query_tokens = important_tokens(query)
+        scored_snippets: list[tuple[float, float, int, dict[str, Any]]] = []
+        seen_text: set[str] = set()
+
+        for result_index, result in enumerate(results):
+            title = result["metadata"].get("title") or result["metadata"].get("file_name") or "Document"
+            metadata_text = " ".join(
+                str(result["metadata"].get(key) or "")
+                for key in ("title", "file_name", "source_name")
+            )
+            metadata_score = overlap_score(query_tokens, important_tokens(metadata_text)) * 1.75
+            sentences = split_sentences(result["content"])
+            if not sentences:
+                continue
+
+            best_score = -1.0
+            best_text = ""
+            for sentence_index, _sentence in enumerate(sentences):
+                window = " ".join(sentences[sentence_index : sentence_index + 5]).strip()
+                if not window:
+                    continue
+                if len(window) > max_chars:
+                    window = trim_to_sentence_boundary(window, max_chars)
+                content_score = overlap_score(query_tokens, important_tokens(window))
+                score = (
+                    content_score * 2.0
+                    + metadata_score
+                    + float(result["score"]) * 0.1
+                )
+                if score > best_score:
+                    best_score = score
+                    best_text = window
+
+            if not best_text:
+                continue
+            normalized = normalized_text(best_text)
+            if normalized in seen_text:
+                continue
+            seen_text.add(normalized)
+            scored_snippets.append(
+                (
+                    best_score,
+                    overlap_score(query_tokens, important_tokens(best_text)),
+                    result_index,
+                    {
+                        "snippet_id": f"S{len(scored_snippets) + 1}",
+                        "chunk_id": result["chunk_id"],
+                        "document_id": result["document_id"],
+                        "source": str(title),
+                        "text": best_text,
+                        "score": result["score"],
+                        "page_start": result["page_start"],
+                        "page_end": result["page_end"],
+                        "metadata": result["metadata"],
+                    },
+                )
+            )
+
+        if any(content_score > 0 for _score, content_score, _index, _snippet in scored_snippets):
+            scored_snippets = [
+                item
+                for item in scored_snippets
+                if item[1] > 0
+            ]
+
+        scored_snippets.sort(key=lambda item: (-item[0], item[2]))
+        selected = [
+            snippet
+            for _score, _content_score, _index, snippet in scored_snippets[: max(0, max_snippets)]
+        ]
+        for index, snippet in enumerate(selected, start=1):
+            snippet["snippet_id"] = f"S{index}"
+        return selected
 
     def _chunk_pages(self, document: dict[str, Any], pages: list[dict[str, Any]]) -> list[ChunkDraft]:
         drafts: list[ChunkDraft] = []
@@ -395,3 +526,24 @@ def overlap_score(query_tokens: set[str], candidate_tokens: set[str]) -> float:
     if not query_tokens or not candidate_tokens:
         return 0.0
     return len(query_tokens & candidate_tokens) / len(query_tokens)
+
+
+def split_sentences(text: str) -> list[str]:
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
+        return []
+    sentences = [part.strip() for part in SENTENCE_SPLIT_RE.split(collapsed) if part.strip()]
+    return sentences or [collapsed]
+
+
+def trim_to_sentence_boundary(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rstrip()
+    boundary = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
+    if boundary >= max_chars // 2:
+        return clipped[: boundary + 1]
+    word_boundary = clipped.rfind(" ")
+    if word_boundary >= max_chars // 2:
+        return clipped[:word_boundary].rstrip() + "..."
+    return clipped + "..."

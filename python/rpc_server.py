@@ -137,6 +137,7 @@ class SidecarApp:
             model=optional_str(params, "model"),
             use_rag=optional_bool(params, "use_rag", False),
             document_ids=optional_str_list(params, "document_ids"),
+            verify_rag=optional_bool(params, "verify_rag", False),
         )
 
     def models_detect_ollama(self, _params: JsonDict) -> JsonDict:
