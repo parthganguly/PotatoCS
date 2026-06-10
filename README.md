@@ -135,6 +135,8 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
+- v0.1.1 RAG reliability improvements: quote-first answers, source-scoped
+  retrieval, optional verifier pass, retrieved snippets, and local evals.
 - Embedding cache by chunk/content hash.
 - Optional OCR for scanned/low-text PDFs when Tesseract plus `pdftoppm` or
   `mutool` are locally installed.
@@ -145,6 +147,36 @@ Excluded from the MVP:
 
 - Tools, agents, email, calendar, shell, Cookbook, gallery/editor, full MCP,
   Chroma, Docker, and hidden HTTP.
+
+## RAG Reliability
+
+v0.1.1 focuses on making RAG more dependable with weak local models such as
+`llama3.2`. It does not require cloud models or a larger default model.
+
+The RAG path now uses quote-first grounding:
+
+- Retrieval still uses the existing VectorStore-backed search path.
+- The answer prompt receives short evidence snippets extracted from retrieved
+  chunks, not the full noisy chunk text.
+- Each snippet keeps source document, page, chunk, and snippet metadata.
+- The chat UI shows retrieved snippets under the answer so the user can inspect
+  exactly what the model saw.
+
+RAG chat also supports source-scoped retrieval. When RAG is enabled, the chat
+header can limit retrieval to one indexed document. This reduces cross-document
+contamination, such as mixing a personal Frame 10 essay with an unrelated water
+testing PDF.
+
+The optional verifier pass can be enabled from the chat UI. It asks the local
+model to classify factual claims as supported, unsupported, or contradicted
+against the retrieved snippets. If a contradicted claim is found, the app
+regenerates once with the correction. The verifier is local-only and optional
+because it costs extra tokens.
+
+The local eval harness lives under `evals\` and `scripts\run_rag_evals.py`.
+Fixtures include grandfather chronology and cross-document contamination cases.
+Each case records the source document, question, expected facts, forbidden
+claims, and required source document.
 
 ## User Setup
 
@@ -224,6 +256,54 @@ python scripts\run_rag_evals.py --models llama3.2 --verify
 
 The eval fixtures live under `evals\`. They check required facts, forbidden
 claims, required source scoping, and latency without using cloud models.
+
+## Benchmark Guide
+
+Run all RAG eval cases against every installed Ollama model:
+
+```powershell
+python scripts\run_rag_evals.py
+```
+
+Run the same evals with the optional verifier pass enabled:
+
+```powershell
+python scripts\run_rag_evals.py --verify
+```
+
+Run selected models only:
+
+```powershell
+python scripts\run_rag_evals.py --models llama3.2 qwen2.5:3b qwen2.5:7b mistral:7b
+```
+
+Print answers while debugging a failure:
+
+```powershell
+python scripts\run_rag_evals.py --models llama3.2 --show-answers
+```
+
+The runner defaults eval generations to `--temperature 0.0` to reduce local
+sampling noise. Use `--temperature` to compare a different setting.
+
+Interpretation:
+
+- `PASS` means the answer included all expected facts, avoided forbidden claims,
+  and retrieved only from the required source document.
+- `FAIL` lists the missing expected facts, forbidden claims, or source-scope
+  issue that caused the failure.
+- `latency_ms` is wall-clock time for that case and model on the current
+  machine, including retrieval and generation.
+- `expected`, `forbidden`, and `source` show which part of the case passed.
+
+Sample benchmark table placeholder:
+
+| Model | Verify | Cases Passed | Median Latency | Notes |
+| --- | --- | --- | --- | --- |
+| llama3.2 | off | TBD | TBD | Weak-model baseline |
+| qwen2.5:3b | off | TBD | TBD | Candidate small local model |
+| qwen2.5:7b | off | TBD | TBD | Candidate stronger local model |
+| mistral:7b | off | TBD | TBD | Candidate general local model |
 
 Run the frontend build:
 

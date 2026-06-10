@@ -15,3 +15,39 @@ python-runtime/*
 !python-runtime/.gitkeep
 work/
 outputs/
+logs/
+*.log
+
+# Generated installers and release bundles should be attached intentionally,
+# not committed from local build output.
+*.msi
+*.msix
+*.appinstaller
+*_x64-setup.exe
+
+# Local model/runtime artifacts.
+models/
+ollama-models/
+*.gguf
+*.safetensors
+
+# Local benchmark and eval output.
+evals/results/
+benchmark-results/
+benchmarks/results/
+*.benchmark.json
+*.benchmark.md
+rag-eval-*.json
+rag-eval-*.md
+
+# Local app data/profile experiments.
+app-data/
+profiles/
+dev.odysseus.desktop/
+.odysseus/
+
+# Local test documents that should not become fixtures by accident.
+local-test-docs/
+test-data/local/
+*.local.pdf
+*.sample.pdf
