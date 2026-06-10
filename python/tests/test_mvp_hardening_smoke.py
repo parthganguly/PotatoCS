@@ -99,12 +99,28 @@ def test_ollama_missing_and_reachable_detection_smoke(tmp_path: Path, monkeypatc
     monkeypatch.setattr(
         service,
         "_get_json",
-        lambda url, timeout: {"models": [{"name": "llama3.2"}]} if url.endswith("/api/tags") else {"version": "test"},
+        lambda url, timeout: {
+            "models": [
+                {
+                    "name": "llama3.2",
+                    "size": 2_000_000_000,
+                    "modified_at": "2026-06-10T00:00:00Z",
+                    "digest": "abc123",
+                    "details": {
+                        "family": "llama",
+                        "parameter_size": "3.2B",
+                        "quantization_level": "Q4_K_M",
+                    },
+                }
+            ]
+        } if url.endswith("/api/tags") else {"version": "test"},
     )
     reachable = service.detect_ollama()
     assert reachable["installed"] is True
     assert reachable["reachable"] is True
     assert reachable["models"] == ["llama3.2"]
+    assert reachable["model_details"][0]["parameter_size"] == "3.2B"
+    assert reachable["model_details"][0]["quantization_level"] == "Q4_K_M"
     db.close()
 
 

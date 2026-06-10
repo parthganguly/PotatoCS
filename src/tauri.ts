@@ -36,8 +36,20 @@ export type OllamaStatus = {
   endpoint: string;
   version: string;
   models: string[];
+  model_details?: OllamaModelInfo[];
   error: string;
   updated_at: number;
+};
+
+export type OllamaModelInfo = {
+  name: string;
+  modified_at: string;
+  size: number;
+  digest: string;
+  format: string;
+  family: string;
+  parameter_size: string;
+  quantization_level: string;
 };
 
 export type ChatResult = {

@@ -23,17 +23,18 @@ class ModelService:
         installed = shutil.which("ollama") is not None
         reachable = self._tcp_reachable("127.0.0.1", 11434)
         models: list[str] = []
+        model_details: list[dict[str, Any]] = []
         version = ""
         error = ""
 
         if reachable:
             try:
                 tags = self._get_json(f"{OLLAMA_ENDPOINT}/api/tags", timeout=3)
-                models = [
-                    item.get("name", "")
-                    for item in tags.get("models", [])
-                    if isinstance(item, dict) and item.get("name")
-                ]
+                for item in tags.get("models", []):
+                    if not isinstance(item, dict) or not item.get("name"):
+                        continue
+                    models.append(str(item["name"]))
+                    model_details.append(self._model_info(item))
             except Exception as exc:  # noqa: BLE001 - surfaced in runtime status
                 error = str(exc)
             try:
@@ -49,6 +50,7 @@ class ModelService:
             "endpoint": OLLAMA_ENDPOINT,
             "version": version,
             "models": models,
+            "model_details": model_details,
             "error": error,
             "updated_at": utc_ms(),
         }
@@ -62,6 +64,19 @@ class ModelService:
             error,
         )
         return status
+
+    def _model_info(self, item: dict[str, Any]) -> dict[str, Any]:
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        return {
+            "name": str(item.get("name") or ""),
+            "modified_at": str(item.get("modified_at") or ""),
+            "size": int(item.get("size") or 0),
+            "digest": str(item.get("digest") or ""),
+            "format": str(details.get("format") or ""),
+            "family": str(details.get("family") or ""),
+            "parameter_size": str(details.get("parameter_size") or ""),
+            "quantization_level": str(details.get("quantization_level") or ""),
+        }
 
     def chat(self, model: str, messages: list[dict[str, str]]) -> str:
         if not model:

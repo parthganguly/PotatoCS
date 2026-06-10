@@ -197,11 +197,12 @@ claims, and required source document.
 
 The Diagnostics tab exposes the same local eval suite inside the app. It shows
 the app version, profile path, backend/database/log paths, Ollama reachability,
-installed Ollama models, OCR dependency status, and VectorStore health. The
-Model Benchmark panel can run the eval suite against one installed Ollama model
-with verifier on or off, then saves pass/fail, latency, and per-case check
-results in the profile-local SQLite database. It does not auto-download models
-and does not use cloud services.
+installed Ollama models with basic size/parameter/quantization stats, OCR
+dependency status, and VectorStore health. The Model Benchmark panel can run
+the eval suite against one installed Ollama model with verifier on or off, then
+saves pass/fail, latency, and per-case check results in the profile-local
+SQLite database. It does not auto-download models and does not use cloud
+services.
 
 ## User Setup
 
@@ -295,6 +296,12 @@ In the app:
 
 Models must already be installed in Ollama. Odysseus Desktop will list local
 models but will not pull or download them.
+
+The `Documents` tab is your user-imported library for normal RAG chat. The
+benchmark eval fixtures are separate bundled documents used for repeatable
+model testing. Benchmark runs create temporary/internal eval documents while
+they run, so benchmark results can exist even when the user document count is
+0, and those eval documents will not appear in `Documents`.
 
 Run all RAG eval cases against every installed Ollama model:
 

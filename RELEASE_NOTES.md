@@ -20,6 +20,9 @@ Highlights:
 - Reused the shared eval service from both the app and
   `scripts\run_rag_evals.py`.
 - Bundled the `evals\` fixtures into the Windows installer resources.
+- Clarified that benchmarks use bundled temporary eval fixtures, not the user's
+  imported Documents library.
+- Showed basic Ollama model stats where Ollama reports them.
 - Kept evals as regression examples only; runtime behavior is not
   special-cased for any named fixture, document, or query.
 

@@ -16,7 +16,12 @@ from odysseus_desktop_backend.storage import Database
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run local RAG evals against installed Ollama models.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run local RAG evals against installed Ollama models. "
+            "These evals use bundled fixture documents, not the user's imported Documents library."
+        )
+    )
     parser.add_argument("--cases", type=Path, default=ROOT / "evals" / "rag_cases")
     parser.add_argument("--models", nargs="*", help="Specific Ollama model names. Defaults to all installed models.")
     parser.add_argument("--verify", action="store_true", help="Enable the optional verifier pass during evals.")

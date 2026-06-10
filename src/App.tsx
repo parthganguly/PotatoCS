@@ -101,6 +101,10 @@ function App() {
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
     [sessions, selectedSessionId]
   );
+  const modelChoices = useMemo(
+    () => dedupeStrings([modelDraft, ...(ollama?.models ?? [])]),
+    [modelDraft, ollama]
+  );
 
   useEffect(() => {
     void bootstrap();
@@ -201,7 +205,9 @@ function App() {
   async function refreshOllama() {
     setError(null);
     try {
-      setOllama(await rpc<OllamaStatus>("models.detect_ollama"));
+      const nextOllama = await rpc<OllamaStatus>("models.detect_ollama");
+      setOllama(nextOllama);
+      setModelDraft((current) => current || nextOllama.models[0] || "");
     } catch (err) {
       setError(readError(err));
     }
@@ -624,16 +630,33 @@ function App() {
             Settings
           </div>
           <div className="flex gap-2">
-            <input
-              className="min-w-0 flex-1 rounded-md border border-ink/20 bg-white px-3 py-2 text-sm outline-none focus:border-tide"
-              value={modelDraft}
-              onChange={(event) => setModelDraft(event.target.value)}
-              placeholder="llama3.2"
-            />
+            {ollama?.models.length ? (
+              <select
+                className="min-w-0 flex-1 rounded-md border border-ink/20 bg-white px-3 py-2 text-sm outline-none focus:border-tide"
+                onChange={(event) => setModelDraft(event.target.value)}
+                title="Model for new chats"
+                value={modelDraft}
+              >
+                {modelChoices.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                className="min-w-0 flex-1 rounded-md border border-ink/20 bg-white px-3 py-2 text-sm outline-none focus:border-tide"
+                value={modelDraft}
+                onChange={(event) => setModelDraft(event.target.value)}
+                placeholder="llama3.2"
+                title="Model for new chats"
+              />
+            )}
             <IconButton className="bg-tide text-white hover:bg-[#2e5c66]" disabled={busy} onClick={saveSettings} title="Save settings">
               <Save size={17} aria-hidden="true" />
             </IconButton>
           </div>
+          <p className="mt-2 text-xs text-ink/55">Used when you start a new chat.</p>
         </section>
 
         <section className="flex min-h-0 flex-1 flex-col">
@@ -1170,6 +1193,7 @@ function DiagnosticsWorkspace(props: {
   onSetBenchmarkVerify: (value: boolean) => void;
 }) {
   const models = props.diagnostics?.ollama.models ?? [];
+  const modelDetails = props.diagnostics?.ollama.model_details ?? [];
   const canRun = Boolean(props.diagnostics?.ollama.reachable && props.benchmarkModel.trim());
   return (
     <>
@@ -1225,6 +1249,7 @@ function DiagnosticsWorkspace(props: {
                   ))}
                 </div>
               )}
+              {modelDetails.length > 0 && <ModelStatsTable details={modelDetails} />}
             </div>
 
             <OCRDebugStatus
@@ -1240,6 +1265,9 @@ function DiagnosticsWorkspace(props: {
                 <BarChart3 size={17} aria-hidden="true" />
                 Model Benchmark
               </div>
+              <p className="mb-2 text-xs text-ink/55">
+                Benchmarks use bundled local eval fixtures, not your imported Documents library.
+              </p>
               <div className="grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-3">
                 <select
                   className="h-10 min-w-0 rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
@@ -1292,6 +1320,9 @@ function DiagnosticsWorkspace(props: {
                 <Metric label="Cases" value={props.evalSuite?.case_count ?? 0} />
                 <Metric label="History" value={props.evalHistory.length} />
               </div>
+              <p className="mt-2 text-xs text-ink/55">
+                Eval documents are temporary/internal to the benchmark and will not appear in Documents.
+              </p>
               {!props.diagnostics?.ollama.reachable && (
                 <p className="mt-3 text-xs text-clay">Ollama is not reachable at 127.0.0.1:11434.</p>
               )}
@@ -1402,6 +1433,37 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+function ModelStatsTable({ details }: { details: NonNullable<OllamaStatus["model_details"]> }) {
+  return (
+    <div className="mt-3 overflow-auto rounded-md border border-ink/10">
+      <table className="w-full min-w-[520px] text-left text-xs">
+        <thead className="bg-[#faf9f3] text-ink/55">
+          <tr>
+            <th className="px-3 py-2 font-medium">Model</th>
+            <th className="px-3 py-2 font-medium">Params</th>
+            <th className="px-3 py-2 font-medium">Quant</th>
+            <th className="px-3 py-2 font-medium">Size</th>
+            <th className="px-3 py-2 font-medium">Updated</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-ink/10">
+          {details.map((model) => (
+            <tr key={model.name}>
+              <td className="max-w-[190px] truncate px-3 py-2 font-medium" title={model.name}>
+                {model.name}
+              </td>
+              <td className="px-3 py-2">{model.parameter_size || model.family || "unknown"}</td>
+              <td className="px-3 py-2">{model.quantization_level || "unknown"}</td>
+              <td className="px-3 py-2">{model.size ? formatBytes(model.size) : "unknown"}</td>
+              <td className="px-3 py-2">{formatModelModified(model.modified_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -1845,6 +1907,13 @@ function formatTimestamp(ms: number): string {
   return new Date(ms).toLocaleString();
 }
 
+function formatModelModified(value: string): string {
+  if (!value) return "unknown";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  return date.toLocaleDateString();
+}
+
 function formatAnswerStyle(style: AnswerStyle): string {
   const found = ANSWER_STYLE_OPTIONS.find((option) => option.value === style);
   return found?.label ?? style;
@@ -1870,6 +1939,18 @@ function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
     );
   }
   return lines.join("\n");
+}
+
+function dedupeStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const clean = value.trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    result.push(clean);
+  }
+  return result;
 }
 
 function summarizeRetrievedSources(chunks: RAGSearchResult[]): string[] {
