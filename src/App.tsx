@@ -1323,6 +1323,9 @@ function DiagnosticsWorkspace(props: {
               <p className="mt-2 text-xs text-ink/55">
                 Eval documents are temporary/internal to the benchmark and will not appear in Documents.
               </p>
+              <p className="mt-1 text-xs text-ink/55">
+                Verifier uses the selected local model to check grounding. Very small models may not verify themselves reliably.
+              </p>
               {!props.diagnostics?.ollama.reachable && (
                 <p className="mt-3 text-xs text-clay">Ollama is not reachable at 127.0.0.1:11434.</p>
               )}

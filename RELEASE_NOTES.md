@@ -25,6 +25,10 @@ Highlights:
 - Bundled the `evals\` fixtures into the Windows installer resources.
 - Clarified that benchmarks use bundled temporary eval fixtures, not the user's
   imported Documents library.
+- Clarified benchmark model guidance: 1B-class models are a survival baseline,
+  `llama3.2:3b` / `llama3.2:latest` is the currently validated everyman
+  baseline, and verifier mode is slower and not a magic fix for very small
+  models.
 - Showed basic Ollama model stats where Ollama reports them.
 - Kept evals as regression examples only; runtime behavior is not
   special-cased for any named fixture, document, or query.

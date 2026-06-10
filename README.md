@@ -311,6 +311,25 @@ In the app:
 Models must already be installed in Ollama. Odysseus Desktop will list local
 models but will not pull or download them.
 
+Model guidance:
+
+- Survival baseline: `llama3.2:1b`. It runs on weak hardware and can be useful
+  for `Extract only`, simple Q&A, and retrieval inspection. It is not
+  recommended for reliable RAG reasoning.
+- Recommended everyman baseline: `llama3.2:3b` / `llama3.2:latest`. This is
+  the lowest currently validated reliable baseline in the local eval suite.
+- Comfortable local models: larger 7B-ish models. They can improve reliability
+  on stronger machines, but benchmark them before relying on them.
+
+Verifier guidance:
+
+- `Verify` can improve grounding for some models.
+- `Verify` increases latency because the selected local model performs an
+  extra checking pass.
+- `Verify` may not help 1B-class models much; very small models may not verify
+  their own answers reliably.
+- Let benchmark results decide the recommendation, not model size or vibes.
+
 The `Documents` tab is your user-imported library for normal RAG chat. The
 benchmark eval fixtures are separate bundled documents used for repeatable
 model testing. Benchmark runs create temporary/internal eval documents while
@@ -358,10 +377,10 @@ Sample benchmark table placeholder:
 
 | Model | Verify | Passed | Failed | Avg latency | Notes |
 | --- | --- | ---: | ---: | ---: | --- |
-| llama3.2 | off | TBD | TBD | TBD | Weak-model baseline |
-| qwen2.5:3b | off | TBD | TBD | TBD | Candidate small local model |
-| qwen2.5:7b | off | TBD | TBD | TBD | Candidate stronger local model |
-| mistral:7b | off | TBD | TBD | TBD | Candidate general local model |
+| llama3.2:1b | off | TBD | TBD | TBD | Survival baseline; inspect retrieval, avoid relying on RAG reasoning |
+| llama3.2:3b / llama3.2:latest | off | TBD | TBD | TBD | Recommended everyman baseline |
+| qwen2.5:7b | off | TBD | TBD | TBD | Comfortable local candidate |
+| mistral:7b | off | TBD | TBD | TBD | Comfortable local candidate |
 
 Run the frontend build:
 
