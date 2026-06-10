@@ -48,7 +48,10 @@ export type ChatResult = {
   retrieved_chunks: RAGSearchResult[];
   retrieved_snippets: RAGSnippet[];
   grounding: RAGGroundingReport;
+  answer_style: AnswerStyle;
 };
+
+export type AnswerStyle = "precise" | "layman" | "detailed" | "extract_only";
 
 export type DocumentRecord = {
   id: string;

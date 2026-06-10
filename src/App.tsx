@@ -21,6 +21,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AppStatus,
+  AnswerStyle,
   ChatResult,
   DocumentImportResult,
   DocumentRecord,
@@ -44,6 +45,12 @@ import {
 type LoadState = "idle" | "loading" | "error";
 type ActiveView = "chat" | "documents";
 const SUPPORTED_DOCUMENT_EXTENSIONS = [".txt", ".md", ".pdf"];
+const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
+  { value: "precise", label: "Precise" },
+  { value: "layman", label: "Layman" },
+  { value: "detailed", label: "Detailed" },
+  { value: "extract_only", label: "Extract only" }
+];
 
 function App() {
   const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
@@ -66,6 +73,7 @@ function App() {
   const [grounding, setGrounding] = useState<RAGGroundingReport | null>(null);
   const [useRag, setUseRag] = useState(false);
   const [verifyRag, setVerifyRag] = useState(false);
+  const [answerStyle, setAnswerStyle] = useState<AnswerStyle>("precise");
   const [selectedRagDocumentId, setSelectedRagDocumentId] = useState("");
   const [lastIndexResult, setLastIndexResult] = useState<RAGIndexResult | null>(null);
   const [lastOcrResult, setLastOcrResult] = useState<OCRResult | null>(null);
@@ -421,7 +429,8 @@ function App() {
         session_id: selectedSessionId,
         model: modelDraft.trim() || settings.default_model || "llama3.2",
         use_rag: useRag,
-        verify_rag: useRag && verifyRag
+        verify_rag: useRag && verifyRag,
+        answer_style: answerStyle
       };
       if (useRag && selectedRagDocumentId) {
         params.document_ids = [selectedRagDocumentId];
@@ -578,12 +587,14 @@ function App() {
             selectedRagDocumentId={selectedRagDocumentId}
             selectedSession={selectedSession}
             settings={settings}
+            answerStyle={answerStyle}
             useRag={useRag}
             verifyRag={verifyRag}
             onDeleteSession={deleteSession}
             onRetry={bootstrap}
             onSend={sendMessage}
             onSetDraft={setDraft}
+            onSetAnswerStyle={setAnswerStyle}
             onSetSelectedRagDocumentId={setSelectedRagDocumentId}
             onSetUseRag={setUseRag}
             onSetVerifyRag={setVerifyRag}
@@ -635,11 +646,13 @@ function ChatWorkspace(props: {
   selectedRagDocumentId: string;
   selectedSession: Session | null;
   settings: Settings;
+  answerStyle: AnswerStyle;
   useRag: boolean;
   verifyRag: boolean;
   onDeleteSession: (sessionId: string) => void;
   onRetry: () => void;
   onSend: (event: FormEvent) => void;
+  onSetAnswerStyle: (value: AnswerStyle) => void;
   onSetDraft: (value: string) => void;
   onSetSelectedRagDocumentId: (value: string) => void;
   onSetUseRag: (value: boolean) => void;
@@ -674,6 +687,21 @@ function ChatWorkspace(props: {
               {indexedDocuments.map((document) => (
                 <option key={document.id} value={document.id}>
                   {document.title || document.file_name}
+                </option>
+              ))}
+            </select>
+          )}
+          {props.useRag && (
+            <select
+              className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
+              disabled={props.busy}
+              onChange={(event) => props.onSetAnswerStyle(event.target.value as AnswerStyle)}
+              title="Answer style"
+              value={props.answerStyle}
+            >
+              {ANSWER_STYLE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
                 </option>
               ))}
             </select>
@@ -1292,10 +1320,10 @@ function RetrievedSources({
       {(unsupportedClaims.length > 0 || contradictedClaims.length > 0) && (
         <div className="mt-2 rounded-md border border-clay/20 bg-[#fff7f2] px-2 py-1.5 text-clay">
           {contradictedClaims.length > 0 && (
-            <p>Contradicted: {contradictedClaims.join("; ")}</p>
+            <p>Possible contradiction detected: {contradictedClaims.join("; ")}</p>
           )}
           {unsupportedClaims.length > 0 && (
-            <p>Unsupported: {unsupportedClaims.join("; ")}</p>
+            <p>Unsupported claim detected: {unsupportedClaims.join("; ")}</p>
           )}
         </div>
       )}
@@ -1325,12 +1353,12 @@ function GroundingBadge({ grounding }: { grounding: RAGGroundingReport | null })
   const verifier = grounding.verifier;
   const label = verifier.enabled
     ? verifier.status === "passed"
-      ? "grounding passed"
+      ? "grounding looks okay"
       : verifier.status === "failed"
         ? "grounding needs review"
         : verifier.status === "error"
-          ? "grounding error"
-          : "grounding running"
+          ? "grounding check error"
+          : "grounding not checked"
     : "verifier off";
   const classes =
     verifier.status === "passed"

@@ -31,6 +31,7 @@ def main() -> int:
     parser.add_argument("--verify", action="store_true", help="Enable the optional verifier pass during evals.")
     parser.add_argument("--show-answers", action="store_true", help="Print model answers for debugging failures.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Ollama generation temperature for eval runs.")
+    parser.add_argument("--style", help="Override answer_style for every eval case.")
     args = parser.parse_args()
 
     cases = load_cases(args.cases)
@@ -52,6 +53,7 @@ def main() -> int:
             verify=args.verify,
             show_answers=args.show_answers,
             temperature=args.temperature,
+            answer_style_override=args.style,
         )
         failures += model_failures
     return 1 if failures else 0
@@ -85,6 +87,7 @@ def run_model_cases(
     verify: bool,
     show_answers: bool,
     temperature: float,
+    answer_style_override: str | None,
 ) -> int:
     failures = 0
     with tempfile.TemporaryDirectory(prefix=f"odysseus-rag-eval-{safe_name(model)}-") as temp:
@@ -104,12 +107,14 @@ def run_model_cases(
             for case in cases:
                 started = time.perf_counter()
                 required_source = str(case["required_source_document"])
+                answer_style = str(answer_style_override or case.get("answer_style") or "precise")
                 result = chat.send(
                     str(case["question"]),
                     model=model,
                     use_rag=True,
                     document_ids=[document_ids[required_source]],
                     verify_rag=verify,
+                    answer_style=answer_style,
                 )
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 outcome = evaluate_case(case, result, document_ids[required_source])
@@ -117,7 +122,7 @@ def run_model_cases(
                     failures += 1
                 status = "PASS" if outcome["passed"] else "FAIL"
                 print(
-                    f"  {status} {case['id']} latency_ms={elapsed_ms} "
+                    f"  {status} {case['id']} style={answer_style} latency_ms={elapsed_ms} "
                     f"expected={outcome['expected_passed']} forbidden={outcome['forbidden_passed']} "
                     f"source={outcome['source_passed']}"
                 )
@@ -207,7 +212,9 @@ def evaluate_case(case: dict[str, Any], result: dict[str, Any], required_documen
 
 
 def normalize(text: str) -> str:
-    return " ".join((text or "").lower().replace("–", "-").split())
+    return " ".join(
+        (text or "").lower().replace("\u2013", "-").replace("\u00e2\u20ac\u201c", "-").split()
+    )
 
 
 def safe_name(value: str) -> str:

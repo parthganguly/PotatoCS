@@ -135,7 +135,7 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.1 RAG reliability improvements: quote-first answers, source-scoped
+- v0.1.2 RAG answer-quality improvements: quote-first answers, source-scoped
   retrieval, optional verifier pass, retrieved snippets, and local evals.
 - Embedding cache by chunk/content hash.
 - Optional OCR for scanned/low-text PDFs when Tesseract plus `pdftoppm` or
@@ -150,8 +150,9 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.1 focuses on making RAG more dependable with weak local models such as
-`llama3.2`. It does not require cloud models or a larger default model.
+v0.1.2 focuses on making RAG answers more useful and disciplined with weak
+local models such as `llama3.2`. It does not require cloud models or a larger
+default model.
 
 The RAG path now uses quote-first grounding:
 
@@ -164,8 +165,20 @@ The RAG path now uses quote-first grounding:
 
 RAG chat also supports source-scoped retrieval. When RAG is enabled, the chat
 header can limit retrieval to one indexed document. This reduces cross-document
-contamination, such as mixing a personal Frame 10 essay with an unrelated water
-testing PDF.
+contamination by keeping a document-specific conversation inside that selected
+source unless the user searches across all indexed documents.
+
+RAG answers support four general styles:
+
+- `Precise` - default. Best for factual questions where the answer should stay
+  close to the retrieved evidence and preserve chronology.
+- `Layman` - best when a document is procedural, bureaucratic, legal,
+  technical, medical, or institutional and the user wants practical meaning in
+  plain English. It still states what the context does not prove.
+- `Detailed` - best when the user wants a fuller answer with organization,
+  caveats, and clear source separation.
+- `Extract only` - best when the user wants only directly stated facts and no
+  interpretation or speculation.
 
 The optional verifier pass can be enabled from the chat UI. It asks the local
 model to classify factual claims as supported, unsupported, or contradicted
@@ -174,8 +187,11 @@ regenerates once with the correction. The verifier is local-only and optional
 because it costs extra tokens.
 
 The local eval harness lives under `evals\` and `scripts\run_rag_evals.py`.
-Fixtures include grandfather chronology and cross-document contamination cases.
-Each case records the source document, question, expected facts, forbidden
+Fixtures include chronology preservation, cross-document contamination,
+procedural-document interpretation, layman explanation, and extract-only cases.
+They are regression examples that expose general RAG weaknesses; the app does
+not hard-code behavior for any fixture, document name, or query. Each case
+records the source document, question, answer style, expected facts, forbidden
 claims, and required source document.
 
 ## User Setup
@@ -183,7 +199,7 @@ claims, and required source document.
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.1_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.2_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -252,6 +268,7 @@ Run local RAG reliability evals against installed Ollama models:
 ```powershell
 python scripts\run_rag_evals.py
 python scripts\run_rag_evals.py --models llama3.2 --verify
+python scripts\run_rag_evals.py --models llama3.2 --style layman
 ```
 
 The eval fixtures live under `evals\`. They check required facts, forbidden
@@ -275,6 +292,12 @@ Run selected models only:
 
 ```powershell
 python scripts\run_rag_evals.py --models llama3.2 qwen2.5:3b qwen2.5:7b mistral:7b
+```
+
+Override the answer style for all cases:
+
+```powershell
+python scripts\run_rag_evals.py --models llama3.2 --style extract_only
 ```
 
 Print answers while debugging a failure:

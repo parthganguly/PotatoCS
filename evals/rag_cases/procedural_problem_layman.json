@@ -1,0 +1,42 @@
+{
+  "id": "procedural_problem_layman",
+  "answer_style": "layman",
+  "documents": [
+    {
+      "id": "sample_kit_instructions",
+      "path": "../fixtures/documents/sample_kit_instructions.md",
+      "title": "Sample Kit Instructions"
+    },
+    {
+      "id": "building_notice",
+      "path": "../fixtures/documents/building_notice.md",
+      "title": "Building Notice"
+    }
+  ],
+  "required_source_document": "sample_kit_instructions",
+  "question": "Explain the problem in this document like I am not technical.",
+  "expected_facts": [
+    {
+      "label": "procedural sample handling concern",
+      "any": ["sample", "bottle", "laboratory", "mailing", "instructions"]
+    },
+    {
+      "label": "plain-language limitation",
+      "any": ["does not report", "does not prove", "does not establish", "does not say"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "invented crisis",
+      "any": [
+        "there is an outbreak",
+        "there is an emergency",
+        "confirms an outbreak",
+        "confirms an emergency",
+        "people are sick",
+        "diagnosis of",
+        "there is confirmed harm"
+      ]
+    }
+  ]
+}

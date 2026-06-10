@@ -1,0 +1,38 @@
+{
+  "id": "extract_only_direct_facts",
+  "answer_style": "extract_only",
+  "documents": [
+    {
+      "id": "building_notice",
+      "path": "../fixtures/documents/building_notice.md",
+      "title": "Building Notice"
+    },
+    {
+      "id": "sample_kit_instructions",
+      "path": "../fixtures/documents/sample_kit_instructions.md",
+      "title": "Sample Kit Instructions"
+    }
+  ],
+  "required_source_document": "building_notice",
+  "question": "Extract only the directly stated facts.",
+  "expected_facts": [
+    {
+      "label": "inspection date",
+      "any": ["june 20", "north entrance"]
+    },
+    {
+      "label": "building remains open",
+      "any": ["building remains open", "remains open"]
+    },
+    {
+      "label": "south entrance timing",
+      "any": ["south entrance", "8:00 am", "12:00 pm"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "interpretation or speculation",
+      "any": ["probably", "likely", "suggests", "means that", "practical meaning", "because"]
+    }
+  ]
+}

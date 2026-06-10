@@ -13,6 +13,15 @@ if TYPE_CHECKING:
     from odysseus_desktop_backend.services.rag_service import RAGService
 
 
+ANSWER_STYLES = {
+    "precise": "Precise",
+    "layman": "Layman",
+    "detailed": "Detailed",
+    "extract_only": "Extract only",
+}
+DEFAULT_ANSWER_STYLE = "precise"
+
+
 class ChatService:
     """Chat service.
 
@@ -40,10 +49,16 @@ class ChatService:
         use_rag: bool = False,
         document_ids: list[str] | None = None,
         verify_rag: bool = False,
+        answer_style: str | None = None,
     ) -> dict[str, Any]:
         content = (message or "").strip()
         if not content:
             raise ValueError("message is required")
+        selected_answer_style = (
+            normalize_answer_style(answer_style)
+            if use_rag
+            else DEFAULT_ANSWER_STYLE
+        )
 
         current_settings = self.settings.get()
         selected_model = (model or current_settings.get("default_model") or "llama3.2").strip()
@@ -73,10 +88,18 @@ class ChatService:
                 0,
                 {
                     "role": "system",
-                    "content": self._rag_system_prompt(rag_context, content),
+                    "content": self._rag_system_prompt(
+                        rag_context,
+                        content,
+                        selected_answer_style,
+                    ),
                 },
             )
-            self._augment_latest_user_message_for_rag(ollama_messages, content)
+            self._augment_latest_user_message_for_rag(
+                ollama_messages,
+                content,
+                selected_answer_style,
+            )
 
         reply = self.models.chat(selected_model, ollama_messages)
         grounding = self._grounding_report(
@@ -90,6 +113,7 @@ class ChatService:
                 messages=ollama_messages,
                 draft_answer=reply,
                 snippets=retrieved_snippets,
+                answer_style=selected_answer_style,
             )
         assistant_message = self.sessions.add_message(session["id"], "assistant", reply)
 
@@ -104,6 +128,7 @@ class ChatService:
             "retrieved_chunks": retrieved_chunks,
             "retrieved_snippets": retrieved_snippets,
             "grounding": grounding,
+            "answer_style": selected_answer_style,
         }
 
     def _derive_title(self, content: str) -> str:
@@ -112,10 +137,17 @@ class ChatService:
             title = title[:45].rstrip() + "..."
         return title or "New chat"
 
-    def _rag_system_prompt(self, rag_context: str, question: str) -> str:
+    def _rag_system_prompt(
+        self,
+        rag_context: str,
+        question: str,
+        answer_style: str,
+    ) -> str:
         return (
             "You are answering with short retrieved evidence snippets.\n"
             f"Latest user question: {question}\n\n"
+            f"Answer style: {ANSWER_STYLES[answer_style]}.\n"
+            f"{self._answer_style_instructions(answer_style)}\n\n"
             "First answer with directly supported facts from the quoted evidence. "
             "If any quoted bullet gives an event or fact relevant to the question, "
             "use it before discussing missing details.\n\n"
@@ -123,9 +155,9 @@ class ChatService:
             "- Use only the evidence snippets below for factual claims.\n"
             "- Keep different source titles, files, pages, and snippets separate. "
             "Never merge facts across unrelated documents.\n"
-            "- Preserve chronology exactly. If the text says one event happened, "
-            "then a story was told for 60-70 years, do not say the event lasted "
-            "60-70 years.\n"
+            "- Preserve chronology exactly. Do not move a duration, cause, action, "
+            "or outcome from one event or person to another.\n"
+            "- Avoid changing who did what, when, where, or for how long.\n"
             "- For broad questions like \"tell me about\", first summarize the "
             "directly supported events or facts in chronological order. Mention "
             "missing identity/background details only after those facts.\n"
@@ -137,8 +169,11 @@ class ChatService:
             "- If a source heading or title names the user's subject, use the "
             "following same-snippet story as relevant to that subject. Do not say "
             "there is no information merely because later sentences use a role "
-            "like soldier instead of repeating the subject name.\n"
+            "or description instead of repeating the subject name.\n"
             "- Do not add unstated causes, motives, emotions, biographies, or causal links.\n"
+            "- Never treat a document's existence as proof of a real-world crisis, "
+            "diagnosis, cause, motive, event, or conclusion unless the snippets "
+            "directly state it.\n"
             "- Answer with this shape when there is relevant evidence: "
             "\"The retrieved context says ...\" followed by supported facts. "
             "Then, only if useful, add \"The retrieved context does not say ...\" "
@@ -153,16 +188,58 @@ class ChatService:
         self,
         messages: list[dict[str, str]],
         content: str,
+        answer_style: str,
     ) -> None:
         for message in reversed(messages):
             if message["role"] == "user":
                 message["content"] = (
                     f"{content}\n\n"
-                    "Use the retrieved evidence snippets above. Start with the directly "
-                    "supported facts or events in chronological order. Do not answer only "
-                    "with missing background details when quoted evidence gives relevant facts."
+                    f"Use the retrieved evidence snippets above in {ANSWER_STYLES[answer_style]} style. "
+                    "Start with the directly supported facts or events in chronological order. "
+                    "Do not answer only with missing background details when quoted evidence "
+                    "gives relevant facts."
                 )
                 return
+
+    def _answer_style_instructions(self, answer_style: str) -> str:
+        if answer_style == "layman":
+            return (
+                "Layman style:\n"
+                "- Explain what the retrieved document or context is about in plain English.\n"
+                "- Translate procedural, bureaucratic, legal, technical, medical, or "
+                "institutional language into practical meaning.\n"
+                "- Clearly separate what the snippets directly state, what that practically "
+                "means, and what the snippets do not prove.\n"
+                "- Do not invent a concrete crisis, diagnosis, cause, motive, event, or "
+                "conclusion when the snippets only contain forms, procedures, notices, or "
+                "instructions.\n"
+                "- Do not put internal chunk IDs in the final answer prose."
+            )
+        if answer_style == "detailed":
+            return (
+                "Detailed style:\n"
+                "- Give a fuller answer while staying grounded in retrieved evidence.\n"
+                "- Organize the answer clearly.\n"
+                "- Include caveats and what is not established.\n"
+                "- Do not merge unrelated documents or sources."
+            )
+        if answer_style == "extract_only":
+            return (
+                "Extract only style:\n"
+                "- Return only facts directly stated in retrieved snippets.\n"
+                "- Do not interpret, speculate, infer practical meaning, or explain what "
+                "something probably means.\n"
+                "- If the requested answer is not directly present, say that the retrieved "
+                "context does not say."
+            )
+        return (
+            "Precise style:\n"
+            "- Stay close to the retrieved evidence.\n"
+            "- Preserve chronology.\n"
+            "- Do not add broad interpretation unless the user asks.\n"
+            "- Separate directly stated facts from uncertainty.\n"
+            "- Say the retrieved context does not say when evidence is missing."
+        )
 
     def _verify_and_correct(
         self,
@@ -171,6 +248,7 @@ class ChatService:
         messages: list[dict[str, str]],
         draft_answer: str,
         snippets: list[dict[str, Any]],
+        answer_style: str,
     ) -> tuple[str, dict[str, Any]]:
         first_report = self._verify_answer(model, draft_answer, snippets)
         contradicted = first_report.get("contradicted_claims") or []
@@ -183,7 +261,8 @@ class ChatService:
                 "role": "user",
                 "content": (
                     "Revise the answer once. Remove or correct every contradicted claim below. "
-                    "Use only the retrieved evidence snippets and preserve chronology.\n\n"
+                    f"Use only the retrieved evidence snippets, preserve chronology, and keep "
+                    f"{ANSWER_STYLES[answer_style]} style.\n\n"
                     f"Contradicted claims:\n{json.dumps(contradicted, ensure_ascii=False)}"
                 ),
             },
@@ -201,6 +280,7 @@ class ChatService:
         snippets: list[dict[str, Any]],
     ) -> dict[str, Any]:
         prompt = (
+            "Use this as a lightweight warning pass, not as a perfect judge. "
             "Check the answer only against the retrieved evidence snippets. "
             "Extract factual claims from the answer. Mark each claim as supported, "
             "unsupported, or contradicted. A claim is supported only if the snippets say it. "
@@ -362,3 +442,15 @@ def dedupe_strings(values: list[str]) -> list[str]:
         seen.add(key)
         deduped.append(str(value))
     return deduped
+
+
+def normalize_answer_style(value: str | None) -> str:
+    if value is None:
+        return DEFAULT_ANSWER_STYLE
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized == "extract":
+        normalized = "extract_only"
+    if normalized not in ANSWER_STYLES:
+        allowed = ", ".join(sorted(ANSWER_STYLES))
+        raise ValueError(f"answer_style must be one of: {allowed}")
+    return normalized
