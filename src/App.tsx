@@ -1,10 +1,14 @@
 import {
   AlertTriangle,
+  BarChart3,
   Bot,
   CheckCircle2,
   CircleAlert,
+  Clipboard,
+  Cpu,
   Database,
   FileText,
+  History,
   MessageSquarePlus,
   Power,
   RefreshCw,
@@ -23,8 +27,11 @@ import {
   AppStatus,
   AnswerStyle,
   ChatResult,
+  DiagnosticsStatus,
   DocumentImportResult,
   DocumentRecord,
+  EvalRun,
+  EvalSuite,
   LegacyImportReport,
   Message,
   OCRDependencyName,
@@ -43,7 +50,7 @@ import {
 } from "./tauri";
 
 type LoadState = "idle" | "loading" | "error";
-type ActiveView = "chat" | "documents";
+type ActiveView = "chat" | "documents" | "diagnostics";
 const SUPPORTED_DOCUMENT_EXTENSIONS = [".txt", ".md", ".pdf"];
 const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
   { value: "precise", label: "Precise" },
@@ -79,6 +86,13 @@ function App() {
   const [lastOcrResult, setLastOcrResult] = useState<OCRResult | null>(null);
   const [legacyPath, setLegacyPath] = useState("");
   const [legacyReport, setLegacyReport] = useState<LegacyImportReport | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsStatus | null>(null);
+  const [evalSuite, setEvalSuite] = useState<EvalSuite | null>(null);
+  const [evalHistory, setEvalHistory] = useState<EvalRun[]>([]);
+  const [benchmarkResult, setBenchmarkResult] = useState<EvalRun | null>(null);
+  const [benchmarkModel, setBenchmarkModel] = useState("");
+  const [benchmarkVerify, setBenchmarkVerify] = useState(false);
+  const [copyStatus, setCopyStatus] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -139,6 +153,12 @@ function App() {
     }
   }, [documents, selectedRagDocumentId]);
 
+  useEffect(() => {
+    if (activeView === "diagnostics" && !diagnostics) {
+      void refreshDiagnostics();
+    }
+  }, [activeView, diagnostics]);
+
   async function bootstrap() {
     setLoadState("loading");
     setError(null);
@@ -193,6 +213,80 @@ function App() {
       setOcrStatus(await rpc<OCRStatus>("ocr.status"));
     } catch (err) {
       setError(readError(err));
+    }
+  }
+
+  async function refreshDiagnostics() {
+    setBusy(true);
+    setError(null);
+    try {
+      const [nextDiagnostics, nextSuite, nextHistory] = await Promise.all([
+        rpc<DiagnosticsStatus>("diagnostics.get"),
+        rpc<EvalSuite>("evals.list"),
+        rpc<EvalRun[]>("evals.history", { limit: 20 })
+      ]);
+      setDiagnostics(nextDiagnostics);
+      setEvalSuite(nextSuite);
+      setEvalHistory(nextHistory);
+      setOllama(nextDiagnostics.ollama);
+      setOcrStatus(nextDiagnostics.ocr);
+      setRagHealth(nextDiagnostics.rag);
+      setBenchmarkModel((current) =>
+        nextDiagnostics.ollama.models.includes(current)
+          ? current
+          : nextDiagnostics.ollama.models[0] || ""
+      );
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runBenchmark() {
+    const model = benchmarkModel.trim();
+    if (!model) return;
+    setBusy(true);
+    setError(null);
+    setCopyStatus("");
+    try {
+      const run = await rpc<EvalRun>("evals.run", {
+        model,
+        verify: benchmarkVerify
+      });
+      setBenchmarkResult(run);
+      setEvalHistory(await rpc<EvalRun[]>("evals.history", { limit: 20 }));
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyBenchmarkSummary() {
+    const summary = benchmarkSummaryMarkdown(benchmarkResult ? [benchmarkResult] : evalHistory);
+    if (!summary.trim()) return;
+    setError(null);
+    try {
+      await navigator.clipboard.writeText(summary);
+      setCopyStatus("Copied benchmark summary.");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function clearBenchmarkHistory() {
+    setBusy(true);
+    setError(null);
+    setCopyStatus("");
+    try {
+      await rpc("evals.clear_history");
+      setBenchmarkResult(null);
+      setEvalHistory([]);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -470,7 +564,7 @@ function App() {
           </div>
         </div>
 
-        <nav className="grid grid-cols-2 gap-2 border-b border-ink/15 px-4 py-3">
+        <nav className="grid grid-cols-3 gap-2 border-b border-ink/15 px-4 py-3">
           <button
             className={`rounded-md px-3 py-2 text-sm font-medium ${
               activeView === "chat" ? "bg-moss text-white" : "bg-white hover:bg-[#faf9f3]"
@@ -488,6 +582,15 @@ function App() {
             type="button"
           >
             Documents
+          </button>
+          <button
+            className={`rounded-md px-2 py-2 text-sm font-medium ${
+              activeView === "diagnostics" ? "bg-moss text-white" : "bg-white hover:bg-[#faf9f3]"
+            }`}
+            onClick={() => setActiveView("diagnostics")}
+            type="button"
+          >
+            Diagnostics
           </button>
         </nav>
 
@@ -599,7 +702,7 @@ function App() {
             onSetUseRag={setUseRag}
             onSetVerifyRag={setVerifyRag}
           />
-        ) : (
+        ) : activeView === "documents" ? (
           <DocumentsWorkspace
             busy={busy}
             documents={documents}
@@ -625,6 +728,24 @@ function App() {
             onSetImportPath={setImportPath}
             onSetLegacyPath={setLegacyPath}
             onSetSearchQuery={setSearchQuery}
+          />
+        ) : (
+          <DiagnosticsWorkspace
+            benchmarkModel={benchmarkModel}
+            benchmarkResult={benchmarkResult}
+            benchmarkVerify={benchmarkVerify}
+            busy={busy}
+            copyStatus={copyStatus}
+            diagnostics={diagnostics}
+            error={error}
+            evalHistory={evalHistory}
+            evalSuite={evalSuite}
+            onClearHistory={clearBenchmarkHistory}
+            onCopySummary={copyBenchmarkSummary}
+            onRefresh={refreshDiagnostics}
+            onRunBenchmark={runBenchmark}
+            onSetBenchmarkModel={setBenchmarkModel}
+            onSetBenchmarkVerify={setBenchmarkVerify}
           />
         )}
       </section>
@@ -1028,6 +1149,280 @@ function DocumentsWorkspace(props: {
         </div>
       </div>
     </>
+  );
+}
+
+function DiagnosticsWorkspace(props: {
+  benchmarkModel: string;
+  benchmarkResult: EvalRun | null;
+  benchmarkVerify: boolean;
+  busy: boolean;
+  copyStatus: string;
+  diagnostics: DiagnosticsStatus | null;
+  error: string | null;
+  evalHistory: EvalRun[];
+  evalSuite: EvalSuite | null;
+  onClearHistory: () => void;
+  onCopySummary: () => void;
+  onRefresh: () => void;
+  onRunBenchmark: () => void;
+  onSetBenchmarkModel: (value: string) => void;
+  onSetBenchmarkVerify: (value: boolean) => void;
+}) {
+  const models = props.diagnostics?.ollama.models ?? [];
+  const canRun = Boolean(props.diagnostics?.ollama.reachable && props.benchmarkModel.trim());
+  return (
+    <>
+      <header className="flex h-16 shrink-0 items-center justify-between border-b border-ink/15 px-5">
+        <div>
+          <h2 className="text-lg font-semibold">Diagnostics</h2>
+          <p className="text-xs text-ink/55">
+            {props.evalSuite
+              ? `${props.evalSuite.case_count} eval case(s), ${props.evalHistory.length} saved run(s)`
+              : "Benchmark status unavailable"}
+          </p>
+        </div>
+        <IconButton disabled={props.busy} onClick={props.onRefresh} title="Refresh diagnostics">
+          <RefreshCw size={15} aria-hidden="true" />
+        </IconButton>
+      </header>
+
+      <ErrorBanner error={props.error} />
+
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto px-5 py-5">
+        <div className="grid grid-cols-[minmax(280px,380px)_minmax(0,1fr)] gap-5">
+          <section className="space-y-4">
+            <div className="rounded-md border border-ink/15 bg-white p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <Cpu size={17} aria-hidden="true" />
+                Runtime
+              </div>
+              <div className="space-y-3 text-sm">
+                <DiagnosticRow label="App version" value={props.diagnostics?.app_version ?? "checking"} />
+                <DiagnosticRow
+                  label="Backend"
+                  value={props.diagnostics?.backend_ready ? "ready" : "starting"}
+                />
+                <DiagnosticRow label="Current model" value={props.diagnostics?.current_model ?? ""} />
+                <PathRow label="Profile" value={props.diagnostics?.profile_dir ?? ""} />
+                <PathRow label="Database" value={props.diagnostics?.db_path ?? ""} />
+                <PathRow label="Backend log" value={props.diagnostics?.backend_log_path ?? ""} />
+              </div>
+            </div>
+
+            <div className="rounded-md border border-ink/15 bg-white p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <Power size={17} aria-hidden="true" />
+                Ollama Models
+              </div>
+              <RuntimeStatus status={props.diagnostics?.ollama ?? null} />
+              {models.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {models.map((model) => (
+                    <span className="rounded-md border border-tide/20 bg-[#eef8f8] px-2 py-1 text-xs text-tide" key={model}>
+                      {model}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <OCRDebugStatus
+              busy={props.busy}
+              onRefresh={props.onRefresh}
+              status={props.diagnostics?.ocr ?? null}
+            />
+          </section>
+
+          <section className="min-w-0 space-y-4">
+            <div className="rounded-md border border-ink/15 bg-white p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <BarChart3 size={17} aria-hidden="true" />
+                Model Benchmark
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-3">
+                <select
+                  className="h-10 min-w-0 rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
+                  disabled={props.busy || models.length === 0}
+                  onChange={(event) => props.onSetBenchmarkModel(event.target.value)}
+                  value={props.benchmarkModel}
+                >
+                  {models.length === 0 ? (
+                    <option value="">No installed Ollama models</option>
+                  ) : (
+                    models.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <label className="flex h-10 items-center gap-2 rounded-md border border-ink/15 bg-white px-3 text-sm">
+                  <input
+                    checked={props.benchmarkVerify}
+                    className="h-4 w-4 accent-tide"
+                    disabled={props.busy}
+                    onChange={(event) => props.onSetBenchmarkVerify(event.target.checked)}
+                    type="checkbox"
+                  />
+                  Verify
+                </label>
+                <button
+                  className="flex h-10 items-center justify-center gap-2 rounded-md bg-moss px-3 text-sm font-medium text-white hover:bg-[#35543d]"
+                  disabled={props.busy || !canRun}
+                  onClick={props.onRunBenchmark}
+                  type="button"
+                >
+                  <BarChart3 size={16} aria-hidden="true" />
+                  Run
+                </button>
+                <button
+                  className="flex h-10 items-center justify-center gap-2 rounded-md border border-ink/15 bg-white px-3 text-sm font-medium hover:bg-[#faf9f3]"
+                  disabled={props.busy || (!props.benchmarkResult && props.evalHistory.length === 0)}
+                  onClick={props.onCopySummary}
+                  type="button"
+                >
+                  <Clipboard size={16} aria-hidden="true" />
+                  Copy
+                </button>
+              </div>
+              <div className="mt-3 grid grid-cols-4 gap-2 text-xs text-ink/65">
+                <Metric label="Suite" value={props.evalSuite?.suite_name ?? "local-rag"} />
+                <Metric label="Version" value={props.evalSuite?.suite_version ?? "checking"} />
+                <Metric label="Cases" value={props.evalSuite?.case_count ?? 0} />
+                <Metric label="History" value={props.evalHistory.length} />
+              </div>
+              {!props.diagnostics?.ollama.reachable && (
+                <p className="mt-3 text-xs text-clay">Ollama is not reachable at 127.0.0.1:11434.</p>
+              )}
+              {props.copyStatus && <p className="mt-3 text-xs text-moss">{props.copyStatus}</p>}
+            </div>
+
+            {props.benchmarkResult && <BenchmarkRunCard run={props.benchmarkResult} title="Latest Result" />}
+
+            <div className="rounded-md border border-ink/15 bg-white">
+              <div className="flex items-center justify-between border-b border-ink/10 px-4 py-3">
+                <div className="flex items-center gap-2 text-sm font-semibold">
+                  <History size={17} aria-hidden="true" />
+                  Benchmark History
+                </div>
+                <button
+                  className="rounded-md border border-ink/15 bg-white px-3 py-1.5 text-xs font-medium hover:bg-[#faf9f3]"
+                  disabled={props.busy || props.evalHistory.length === 0}
+                  onClick={props.onClearHistory}
+                  type="button"
+                >
+                  Clear
+                </button>
+              </div>
+              {props.evalHistory.length === 0 ? (
+                <p className="px-4 py-6 text-sm text-ink/55">No benchmark runs yet.</p>
+              ) : (
+                <div className="divide-y divide-ink/10">
+                  {props.evalHistory.map((run) => (
+                    <div className="px-4 py-3" key={run.id}>
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{run.model}</p>
+                          <p className="text-xs text-ink/55">
+                            {formatTimestamp(run.created_at)} - verifier {run.verify ? "on" : "off"}
+                          </p>
+                        </div>
+                        <div className="text-right text-xs">
+                          <p className={run.total_failed === 0 ? "text-moss" : "text-clay"}>
+                            {run.total_passed} passed, {run.total_failed} failed
+                          </p>
+                          <p className="text-ink/55">{run.average_latency_ms} ms avg</p>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
+  return (
+    <div className="rounded-md border border-ink/15 bg-white">
+      <div className="flex items-center justify-between gap-3 border-b border-ink/10 px-4 py-3">
+        <div>
+          <p className="text-sm font-semibold">{title}</p>
+          <p className="text-xs text-ink/55">
+            {run.model} - verifier {run.verify ? "on" : "off"} - {formatTimestamp(run.created_at)}
+          </p>
+        </div>
+        <span
+          className={`rounded-md border px-2 py-1 text-xs font-medium ${
+            run.total_failed === 0
+              ? "border-moss/20 bg-[#edf7ef] text-moss"
+              : "border-clay/25 bg-[#fff3ee] text-clay"
+          }`}
+        >
+          {run.total_passed} passed, {run.total_failed} failed
+        </span>
+      </div>
+      <div className="grid grid-cols-3 gap-2 px-4 py-3 text-xs text-ink/65">
+        <Metric label="Average latency" value={`${run.average_latency_ms} ms`} />
+        <Metric label="Total runtime" value={`${run.total_runtime_ms} ms`} />
+        <Metric label="Suite" value={run.suite_version} />
+      </div>
+      <div className="overflow-auto">
+        <table className="w-full min-w-[720px] border-t border-ink/10 text-left text-xs">
+          <thead className="bg-[#faf9f3] text-ink/60">
+            <tr>
+              <th className="px-4 py-2 font-medium">Case</th>
+              <th className="px-4 py-2 font-medium">Style</th>
+              <th className="px-4 py-2 font-medium">Latency</th>
+              <th className="px-4 py-2 font-medium">Expected</th>
+              <th className="px-4 py-2 font-medium">Forbidden</th>
+              <th className="px-4 py-2 font-medium">Source</th>
+              <th className="px-4 py-2 font-medium">Notes</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-ink/10">
+            {run.cases.map((result) => (
+              <tr key={result.id}>
+                <td className="px-4 py-2 font-medium">{result.case_id}</td>
+                <td className="px-4 py-2">{formatAnswerStyle(result.answer_style)}</td>
+                <td className="px-4 py-2">{result.latency_ms} ms</td>
+                <td className="px-4 py-2">{formatPass(result.expected_passed)}</td>
+                <td className="px-4 py-2">{formatPass(result.forbidden_passed)}</td>
+                <td className="px-4 py-2">{formatPass(result.source_passed)}</td>
+                <td className="px-4 py-2 text-ink/65">
+                  {result.reasons.length > 0 ? result.reasons.join("; ") : "ok"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DiagnosticRow({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div>
+      <p className="text-xs font-medium uppercase text-ink/45">{label}</p>
+      <p className="mt-0.5 text-sm">{value || "unavailable"}</p>
+    </div>
+  );
+}
+
+function PathRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs font-medium uppercase text-ink/45">{label}</p>
+      <p className="mt-0.5 truncate text-sm text-ink/70" title={value}>
+        {value || "unavailable"}
+      </p>
+    </div>
   );
 }
 
@@ -1443,6 +1838,38 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatTimestamp(ms: number): string {
+  if (!ms) return "unknown time";
+  return new Date(ms).toLocaleString();
+}
+
+function formatAnswerStyle(style: AnswerStyle): string {
+  const found = ANSWER_STYLE_OPTIONS.find((option) => option.value === style);
+  return found?.label ?? style;
+}
+
+function formatPass(value: boolean): string {
+  return value ? "pass" : "fail";
+}
+
+function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
+  if (runs.length === 0) return "";
+  const lines = [
+    "| Model | Verify | Passed | Failed | Avg latency | Notes |",
+    "| --- | --- | ---: | ---: | ---: | --- |"
+  ];
+  for (const run of runs) {
+    const failedCases = run.cases
+      .filter((result) => !result.passed)
+      .map((result) => result.case_id);
+    const notes = failedCases.length > 0 ? `failed: ${failedCases.join(", ")}` : "ok";
+    lines.push(
+      `| ${run.model} | ${run.verify ? "on" : "off"} | ${run.total_passed} | ${run.total_failed} | ${run.average_latency_ms} ms | ${notes} |`
+    );
+  }
+  return lines.join("\n");
 }
 
 function summarizeRetrievedSources(chunks: RAGSearchResult[]): string[] {

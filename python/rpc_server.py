@@ -14,6 +14,7 @@ from odysseus_desktop_backend.logging_config import get_logger, setup_logging
 from odysseus_desktop_backend.services.chat_service import ChatService
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
+from odysseus_desktop_backend.services.eval_service import EvalService
 from odysseus_desktop_backend.services.legacy_import_service import LegacyImportService
 from odysseus_desktop_backend.services.model_service import ModelService
 from odysseus_desktop_backend.services.ocr_service import OCRService
@@ -51,9 +52,11 @@ class SidecarApp:
         self.ocr = OCRService(self.documents, self.rag)
         self.legacy_import = LegacyImportService(self.documents, self.rag, self.sessions, self.settings)
         self.chat = ChatService(self.sessions, self.settings, self.models, rag=self.rag)
+        self.evals = EvalService(self.db)
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
             "health.ping": self.health_ping,
+            "diagnostics.get": self.diagnostics_get,
             "settings.get": self.settings_get,
             "settings.set": self.settings_set,
             "sessions.list": self.sessions_list,
@@ -63,6 +66,7 @@ class SidecarApp:
             "sessions.messages": self.sessions_messages,
             "chat.send": self.chat_send,
             "models.detect_ollama": self.models_detect_ollama,
+            "models.list": self.models_list,
             "documents.list": self.documents_list,
             "documents.import": self.documents_import,
             "documents.delete": self.documents_delete,
@@ -74,6 +78,10 @@ class SidecarApp:
             "legacy.import": self.legacy_import_folder,
             "rag.search": self.rag_search,
             "rag.health": self.rag_health,
+            "evals.list": self.evals_list,
+            "evals.run": self.evals_run,
+            "evals.history": self.evals_history,
+            "evals.clear_history": self.evals_clear_history,
             "app.shutdown": self.app_shutdown,
         }
 
@@ -97,6 +105,21 @@ class SidecarApp:
             "version": __version__,
             "profile_dir": str(self.profile_dir),
             "db_path": str(self.db.path),
+        }
+
+    def diagnostics_get(self, _params: JsonDict) -> JsonDict:
+        settings = self.settings.get()
+        return {
+            "app_version": __version__,
+            "profile_dir": str(self.profile_dir),
+            "backend_ready": True,
+            "db_path": str(self.db.path),
+            "backend_log_path": str(self.profile_dir / "logs" / "backend.log"),
+            "current_model": str(settings.get("default_model") or "llama3.2"),
+            "settings": settings,
+            "ollama": self.models.detect_ollama(),
+            "ocr": self.ocr.status(),
+            "rag": self.rag.health(),
         }
 
     def settings_get(self, _params: JsonDict) -> JsonDict:
@@ -142,6 +165,9 @@ class SidecarApp:
         )
 
     def models_detect_ollama(self, _params: JsonDict) -> JsonDict:
+        return self.models.detect_ollama()
+
+    def models_list(self, _params: JsonDict) -> JsonDict:
         return self.models.detect_ollama()
 
     def documents_list(self, _params: JsonDict) -> list[JsonDict]:
@@ -193,6 +219,22 @@ class SidecarApp:
 
     def rag_health(self, _params: JsonDict) -> JsonDict:
         return self.rag.health()
+
+    def evals_list(self, _params: JsonDict) -> JsonDict:
+        return self.evals.list_cases()
+
+    def evals_run(self, params: JsonDict) -> JsonDict:
+        return self.evals.run(
+            model=require_str(params, "model"),
+            verify=optional_bool(params, "verify", False),
+            answer_style_override=optional_str(params, "answer_style"),
+        )
+
+    def evals_history(self, params: JsonDict) -> list[JsonDict]:
+        return self.evals.history(limit=optional_int(params, "limit", 20))
+
+    def evals_clear_history(self, _params: JsonDict) -> JsonDict:
+        return self.evals.clear_history()
 
     def app_shutdown(self, _params: JsonDict) -> JsonDict:
         self.shutdown_requested = True

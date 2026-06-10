@@ -135,8 +135,9 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.2 RAG answer-quality improvements: quote-first answers, source-scoped
-  retrieval, optional verifier pass, retrieved snippets, and local evals.
+- v0.1.3 RAG diagnostics: quote-first answers, source-scoped retrieval,
+  answer styles, optional verifier pass, retrieved snippets, and local
+  benchmark runs.
 - Embedding cache by chunk/content hash.
 - Optional OCR for scanned/low-text PDFs when Tesseract plus `pdftoppm` or
   `mutool` are locally installed.
@@ -150,9 +151,9 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.2 focuses on making RAG answers more useful and disciplined with weak
-local models such as `llama3.2`. It does not require cloud models or a larger
-default model.
+v0.1.3 focuses on making RAG answers more useful, disciplined, and measurable
+with weak local models such as `llama3.2`. It does not require cloud models or
+a larger default model.
 
 The RAG path now uses quote-first grounding:
 
@@ -194,12 +195,20 @@ not hard-code behavior for any fixture, document name, or query. Each case
 records the source document, question, answer style, expected facts, forbidden
 claims, and required source document.
 
+The Diagnostics tab exposes the same local eval suite inside the app. It shows
+the app version, profile path, backend/database/log paths, Ollama reachability,
+installed Ollama models, OCR dependency status, and VectorStore health. The
+Model Benchmark panel can run the eval suite against one installed Ollama model
+with verifier on or off, then saves pass/fail, latency, and per-case check
+results in the profile-local SQLite database. It does not auto-download models
+and does not use cloud services.
+
 ## User Setup
 
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.2_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.3_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -232,7 +241,7 @@ User data is stored in the app-data profile folder:
 
 Important files:
 
-- `app.db` - profile-local SQLite database.
+- `app.db` - profile-local SQLite database, including benchmark history.
 - `files\documents` - profile-local copies of imported documents.
 - `logs\backend.log` - Python sidecar startup, JSON-RPC errors, Ollama detection,
   document import, OCR, and legacy import logs.
@@ -276,6 +285,17 @@ claims, required source scoping, and latency without using cloud models.
 
 ## Benchmark Guide
 
+In the app:
+
+- Open `Diagnostics`.
+- Select an installed Ollama model.
+- Toggle `Verify` when you want the slower, more careful verifier pass.
+- Click `Run`.
+- Use `Copy` to copy a Markdown benchmark summary table.
+
+Models must already be installed in Ollama. Odysseus Desktop will list local
+models but will not pull or download them.
+
 Run all RAG eval cases against every installed Ollama model:
 
 ```powershell
@@ -300,12 +320,6 @@ Override the answer style for all cases:
 python scripts\run_rag_evals.py --models llama3.2 --style extract_only
 ```
 
-Print answers while debugging a failure:
-
-```powershell
-python scripts\run_rag_evals.py --models llama3.2 --show-answers
-```
-
 The runner defaults eval generations to `--temperature 0.0` to reduce local
 sampling noise. Use `--temperature` to compare a different setting.
 
@@ -321,12 +335,12 @@ Interpretation:
 
 Sample benchmark table placeholder:
 
-| Model | Verify | Cases Passed | Median Latency | Notes |
-| --- | --- | --- | --- | --- |
-| llama3.2 | off | TBD | TBD | Weak-model baseline |
-| qwen2.5:3b | off | TBD | TBD | Candidate small local model |
-| qwen2.5:7b | off | TBD | TBD | Candidate stronger local model |
-| mistral:7b | off | TBD | TBD | Candidate general local model |
+| Model | Verify | Passed | Failed | Avg latency | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| llama3.2 | off | TBD | TBD | TBD | Weak-model baseline |
+| qwen2.5:3b | off | TBD | TBD | TBD | Candidate small local model |
+| qwen2.5:7b | off | TBD | TBD | TBD | Candidate stronger local model |
+| mistral:7b | off | TBD | TBD | TBD | Candidate general local model |
 
 Run the frontend build:
 

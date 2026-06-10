@@ -12,11 +12,12 @@ if (-not $RuntimeDir) {
 $pythonExe = Join-Path $RuntimeDir "python.exe"
 $backendScript = Join-Path $repoRoot "python\rpc_server.py"
 $backendPackage = Join-Path $repoRoot "python\odysseus_desktop_backend"
+$evalCases = Join-Path $repoRoot "evals\rag_cases"
 $icon = Join-Path $repoRoot "src-tauri\icons\icon.ico"
 $license = Join-Path $repoRoot "LICENSE"
 $notices = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 
-foreach ($path in @($pythonExe, $backendScript, $backendPackage, $icon, $license, $notices)) {
+foreach ($path in @($pythonExe, $backendScript, $backendPackage, $evalCases, $icon, $license, $notices)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required packaging path is missing: $path"
     }

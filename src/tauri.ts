@@ -227,6 +227,68 @@ export type LegacyImportReport = {
   failed: LegacyImportReportItem[];
 };
 
+export type DiagnosticsStatus = {
+  app_version: string;
+  profile_dir: string;
+  backend_ready: boolean;
+  db_path: string;
+  backend_log_path: string;
+  current_model: string;
+  settings: Settings;
+  ollama: OllamaStatus;
+  ocr: OCRStatus;
+  rag: RAGHealth;
+};
+
+export type EvalCaseSummary = {
+  id: string;
+  question: string;
+  answer_style: AnswerStyle;
+  required_source_document: string;
+  expected_fact_count: number;
+  forbidden_claim_count: number;
+};
+
+export type EvalSuite = {
+  suite_name: string;
+  suite_version: string;
+  cases_dir: string;
+  case_count: number;
+  cases: EvalCaseSummary[];
+};
+
+export type EvalCaseResult = {
+  id: string;
+  run_id: string;
+  case_id: string;
+  question: string;
+  answer_style: AnswerStyle;
+  required_source_document: string;
+  passed: boolean;
+  expected_passed: boolean;
+  forbidden_passed: boolean;
+  source_passed: boolean;
+  latency_ms: number;
+  reasons: string[];
+  created_at: number;
+};
+
+export type EvalRun = {
+  id: string;
+  model: string;
+  verify: boolean;
+  suite_name: string;
+  suite_version: string;
+  total_passed: number;
+  total_failed: number;
+  average_latency_ms: number;
+  total_runtime_ms: number;
+  notes: string;
+  created_at: number;
+  cases: EvalCaseResult[];
+  summary_markdown: string;
+};
+
 export async function getAppStatus(): Promise<AppStatus> {
   return invoke<AppStatus>("app_status");
 }

@@ -160,12 +160,49 @@ class Database:
                 last_used_at INTEGER NOT NULL,
                 PRIMARY KEY (content_hash, embedding_model)
             );
+
+            CREATE TABLE IF NOT EXISTS benchmark_runs (
+                id TEXT PRIMARY KEY,
+                model TEXT NOT NULL,
+                verify INTEGER NOT NULL DEFAULT 0,
+                suite_name TEXT NOT NULL,
+                suite_version TEXT NOT NULL,
+                total_passed INTEGER NOT NULL,
+                total_failed INTEGER NOT NULL,
+                average_latency_ms INTEGER NOT NULL,
+                total_runtime_ms INTEGER NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_benchmark_runs_created
+                ON benchmark_runs(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS benchmark_case_results (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                answer_style TEXT NOT NULL,
+                required_source_document TEXT NOT NULL,
+                passed INTEGER NOT NULL,
+                expected_passed INTEGER NOT NULL,
+                forbidden_passed INTEGER NOT NULL,
+                source_passed INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES benchmark_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_benchmark_case_results_run
+                ON benchmark_case_results(run_id, case_id);
             """
         )
         self.ensure_column("documents", "ocr_status", "TEXT NOT NULL DEFAULT 'not_needed'")
         self.ensure_column("documents", "ocr_engine", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "ocr_error", "TEXT NOT NULL DEFAULT ''")
-        self.set_meta_default("schema_version", "3")
+        self.set_meta_default("schema_version", "4")
         self.set_setting_default("default_model", "llama3.2")
         self.set_setting_default("ollama_endpoint", "http://127.0.0.1:11434")
         self.set_setting_default("embedding_model", "local-hash-v1")
