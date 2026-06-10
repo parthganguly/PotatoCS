@@ -3,8 +3,11 @@
 ## v0.1.3 - Diagnostics and Model Benchmark
 
 v0.1.3 turns the local RAG eval harness into an in-app Diagnostics / Model
-Benchmark area without adding agents, autonomous tools, shell access, cloud
-sync, Chroma, Docker, or hidden HTTP.
+Benchmark area. This supports the broader Odysseus Desktop thesis: helping
+small local models become more useful on limited hardware with retrieval,
+source scoping, OCR, answer styles, verification, search, and benchmarks while
+remaining private and local-first. It does not add agents, autonomous tools,
+shell access, cloud sync, Chroma, Docker, or hidden HTTP.
 
 Highlights:
 
@@ -53,8 +56,9 @@ npm run tauri:build
 
 ## v0.1.2 - RAG Answer Quality
 
-v0.1.2 improves general RAG answer quality for weak local models without adding
-agents, tools, shell access, cloud sync, Chroma, Docker, or hidden HTTP.
+v0.1.2 improves general RAG answer quality for small local models without
+claiming frontier-model correctness and without adding agents, tools, shell
+access, cloud sync, Chroma, Docker, or hidden HTTP.
 
 Highlights:
 

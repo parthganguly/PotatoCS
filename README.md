@@ -1,11 +1,17 @@
 # Odysseus Desktop
 
-Windows-first desktop MVP for local Odysseus chat, documents, RAG, optional OCR,
-and non-destructive legacy import.
+Windows-first local AI workspace for small models on limited hardware.
 
 Odysseus Desktop is a standalone product fork of the upstream Odysseus project.
-It keeps the spirit of a local AI workspace, but it deliberately changes the
-delivery model: this is a packaged desktop app, not a Docker/web app.
+It keeps the spirit of a local AI workspace, but it deliberately changes both
+the product thesis and delivery model: this is a packaged desktop app for
+making modest local models more useful, not a Docker/web app or a general
+model runner.
+
+Odysseus Desktop is designed to help small Ollama models work better on modest
+hardware. Instead of relying only on model size, it adds local support around
+the model: document RAG, OCR, source-scoped retrieval, answer styles,
+verification, snippets, search, and benchmarks.
 
 This app is a Tauri desktop shell with a Rust supervisor, a bundled Python
 JSON-RPC sidecar over stdio, profile-local SQLite storage, React/TypeScript UI,
@@ -71,6 +77,9 @@ Key differences:
   future sqlite-vec or LanceDB experiments.
 - Optional OCR by detecting local tools such as Tesseract and MuPDF/Poppler.
 - Non-destructive import from compatible legacy Odysseus data folders.
+- Grounding, search, verification, and benchmark surfaces that help modest
+  local models punch above their weight without claiming frontier-model
+  correctness.
 
 Removed from the MVP on purpose:
 
@@ -90,7 +99,10 @@ local desktop foundation.
 
 ## Philosophy
 
-Odysseus Desktop favors a small durable spine over broad feature parity.
+Odysseus Desktop favors a small durable spine over broad feature parity. It is
+not just a local model runner; it is a local AI workspace for limited hardware.
+The goal is to make modest private models more useful by surrounding them with
+retrieval, document search, OCR, grounding, verification, and benchmarks.
 
 The architecture is intentionally boring in the parts that need to be reliable:
 
@@ -106,8 +118,10 @@ The design principle is: prove the desktop foundation first, then add features
 only when they fit that foundation.
 
 That is why the MVP is narrow. It is not trying to rebuild every upstream module
-inside a desktop wrapper. It is trying to become a dependable local AI workspace
-that can be installed, inspected, repaired, and trusted on Windows.
+inside a desktop wrapper, and it does not claim that small models become as
+capable as frontier cloud systems. It is trying to become a dependable local AI
+workspace that helps local models work better, improves reliability where it
+can, and stays installable, inspectable, repairable, and private on Windows.
 
 ## Screenshots
 
@@ -152,8 +166,8 @@ Excluded from the MVP:
 ## RAG Reliability
 
 v0.1.3 focuses on making RAG answers more useful, disciplined, and measurable
-with weak local models such as `llama3.2`. It does not require cloud models or
-a larger default model.
+with small local models such as `llama3.2` on limited hardware. It does not
+require cloud models or a larger default model.
 
 The RAG path now uses quote-first grounding:
 

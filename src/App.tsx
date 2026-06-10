@@ -565,7 +565,7 @@ function App() {
             </div>
             <div className="min-w-0">
               <h1 className="truncate text-base font-semibold">Odysseus Desktop</h1>
-              <p className="truncate text-xs text-ink/60">Local AI workspace MVP</p>
+              <p className="truncate text-xs text-ink/60">Local AI workspace for small models</p>
             </div>
           </div>
         </div>
