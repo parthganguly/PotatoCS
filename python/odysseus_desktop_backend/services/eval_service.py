@@ -219,7 +219,7 @@ class EvalService:
 
     def comparison(self, *, limit: int = 100) -> dict[str, Any]:
         runs = self.history(limit=limit)
-        return benchmark_comparison(runs)
+        return benchmark_comparison(runs, current_suite_version=EVAL_SUITE_VERSION)
 
     def clear_history(self) -> dict[str, Any]:
         self.db.conn.execute("DELETE FROM benchmark_runs")
@@ -509,9 +509,26 @@ def format_benchmark_summary(runs: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def benchmark_comparison(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    grouped_runs: dict[tuple[str, str, str, bool, float], list[dict[str, Any]]] = {}
+def benchmark_comparison(
+    runs: list[dict[str, Any]],
+    *,
+    current_suite_version: str = EVAL_SUITE_VERSION,
+) -> dict[str, Any]:
+    comparable_runs = []
+    excluded_runs = []
     for run in runs:
+        if str(run.get("suite_version") or "") == current_suite_version:
+            comparable_runs.append(run)
+        else:
+            excluded_runs.append(run)
+    excluded_suite_versions = sorted(
+        {
+            str(run.get("suite_version") or "unknown")
+            for run in excluded_runs
+        }
+    )
+    grouped_runs: dict[tuple[str, str, str, bool, float], list[dict[str, Any]]] = {}
+    for run in comparable_runs:
         grouped_runs.setdefault(comparison_key(run), []).append(run)
 
     groups_by_key: dict[tuple[str, str, str, bool, float], dict[str, Any]] = {}
@@ -600,8 +617,16 @@ def benchmark_comparison(runs: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "groups": groups,
         "recommended": recommended,
-        "recommendation_reason": recommendation_reason(recommended),
-        "case_difficulty": case_difficulty_summary(runs),
+        "recommendation_reason": recommendation_reason(
+            recommended,
+            current_suite_version=current_suite_version,
+            excluded_count=len(excluded_runs),
+        ),
+        "case_difficulty": case_difficulty_summary(comparable_runs),
+        "comparison_suite_version": current_suite_version,
+        "included_run_count": len(comparable_runs),
+        "excluded_run_count": len(excluded_runs),
+        "excluded_suite_versions": excluded_suite_versions,
     }
 
 
@@ -714,14 +739,30 @@ def recommendation_score(group: dict[str, Any]) -> float:
     return float(group.get("latest_run_pass_rate") or 0.0)
 
 
-def recommendation_reason(group: dict[str, Any] | None) -> str:
+def recommendation_reason(
+    group: dict[str, Any] | None,
+    *,
+    current_suite_version: str = EVAL_SUITE_VERSION,
+    excluded_count: int = 0,
+) -> str:
     if not group:
+        if excluded_count:
+            return (
+                f"No comparable {current_suite_version} benchmark runs yet. "
+                f"{excluded_count} older/incompatible run(s) are excluded from recommendation."
+            )
         return "No benchmark runs are available yet."
     verifier = "verifier on" if group.get("verify") else "verifier off"
+    excluded_note = (
+        f" {excluded_count} older/incompatible run(s) are excluded."
+        if excluded_count
+        else ""
+    )
     return (
-        f"Recommended by latest/mean pass rate with lower latency as tie-breaker: "
+        f"Recommended among {current_suite_version} runs by latest/mean pass rate with lower latency as tie-breaker: "
         f"{group.get('model')} using {group.get('embedding_backend')}/{group.get('embedding_model')}, "
         f"{verifier}, temperature {float(group.get('temperature') or 0):.2f}."
+        f"{excluded_note}"
     )
 
 

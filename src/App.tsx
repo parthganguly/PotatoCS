@@ -1554,9 +1554,17 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
           Benchmark Comparison
         </div>
         <p className="mt-1 text-xs text-ink/55">{comparison.recommendation_reason}</p>
+        <p className="mt-1 text-xs text-ink/55">
+          Comparing {comparison.included_run_count} current-suite {comparison.comparison_suite_version} run(s).
+          {comparison.excluded_run_count > 0
+            ? ` ${comparison.excluded_run_count} older/incompatible run(s) excluded: ${comparison.excluded_suite_versions.join(", ")}.`
+            : ""}
+        </p>
       </div>
       {comparison.groups.length === 0 ? (
-        <p className="px-4 py-6 text-sm text-ink/55">No saved benchmark runs to compare.</p>
+        <p className="px-4 py-6 text-sm text-ink/55">
+          No comparable current-suite benchmark runs to compare. Older runs remain in history, but they are excluded from recommendation.
+        </p>
       ) : (
         <div className="overflow-auto">
           <table className="w-full min-w-[1080px] text-left text-xs">

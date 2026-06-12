@@ -115,6 +115,67 @@ def test_benchmark_comparison_prefers_faster_model_when_scores_match():
     assert "Fastest usable config" in recommended["guidance_labels"]
 
 
+def test_benchmark_comparison_excludes_older_eval_suites_from_recommendation():
+    comparison = benchmark_comparison(
+        [
+            run_fixture(
+                "llama3.2:latest",
+                verify=False,
+                passed=5,
+                total=5,
+                latency=3966,
+                suite_version="v0.1.3",
+                embedding_backend="",
+                embedding_model="",
+                created_at=1,
+            ),
+            run_fixture(
+                "llama3.2:latest",
+                verify=False,
+                passed=3,
+                total=7,
+                latency=2316,
+                suite_version="v0.1.5",
+                created_at=2,
+            ),
+        ]
+    )
+
+    recommended = comparison["recommended"]
+
+    assert comparison["comparison_suite_version"] == "v0.1.5"
+    assert comparison["included_run_count"] == 1
+    assert comparison["excluded_run_count"] == 1
+    assert comparison["excluded_suite_versions"] == ["v0.1.3"]
+    assert len(comparison["groups"]) == 1
+    assert recommended["latest_run_passed"] == 3
+    assert recommended["latest_run_total"] == 7
+    assert recommended["embedding_backend"] == "semantic"
+
+
+def test_benchmark_comparison_shows_no_groups_when_only_old_suites_exist():
+    comparison = benchmark_comparison(
+        [
+            run_fixture(
+                "llama3.2:latest",
+                verify=False,
+                passed=5,
+                total=5,
+                latency=3966,
+                suite_version="v0.1.3",
+                embedding_backend="",
+                embedding_model="",
+            )
+        ]
+    )
+
+    assert comparison["groups"] == []
+    assert comparison["recommended"] is None
+    assert comparison["included_run_count"] == 0
+    assert comparison["excluded_run_count"] == 1
+    assert "older/incompatible" in comparison["recommendation_reason"]
+
+
 def test_verifier_improvement_can_be_rejected_when_latency_is_too_high():
     comparison = benchmark_comparison(
         [
@@ -269,6 +330,7 @@ def run_fixture(
     embedding_backend: str = "semantic",
     embedding_model: str = "nomic-embed-text",
     temperature: float = 0.0,
+    suite_version: str = "v0.1.5",
     expected_failures: int = 0,
     forbidden_failures: int = 0,
     source_failures: int = 0,
@@ -298,7 +360,7 @@ def run_fixture(
         "model": model,
         "verify": verify,
         "suite_name": "local-rag",
-        "suite_version": "v0.1.5",
+        "suite_version": suite_version,
         "total_passed": passed,
         "total_failed": total - passed,
         "average_latency_ms": latency,

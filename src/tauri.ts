@@ -397,6 +397,10 @@ export type BenchmarkComparison = {
   recommended: BenchmarkComparisonGroup | null;
   recommendation_reason: string;
   case_difficulty: BenchmarkCaseDifficulty;
+  comparison_suite_version: string;
+  included_run_count: number;
+  excluded_run_count: number;
+  excluded_suite_versions: string[];
 };
 
 export async function getAppStatus(): Promise<AppStatus> {

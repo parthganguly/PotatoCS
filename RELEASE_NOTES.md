@@ -1,5 +1,21 @@
 # Release Notes
 
+## v0.1.7 - Current-Suite Benchmark Comparison
+
+v0.1.7 fixes a follow-up Benchmark Comparison issue found in installed builds:
+old 5-case `v0.1.3` benchmark runs with missing embedding metadata could still
+appear above current 7-case `v0.1.5` runs and win the recommendation.
+
+Highlights:
+
+- Benchmark Comparison now compares and recommends only current eval suite
+  runs.
+- Older/incompatible benchmark suites remain in Benchmark History, but are
+  excluded from comparison ranking.
+- The comparison header now shows how many current-suite runs are included and
+  which older suite versions were excluded.
+- Eval suite remains `v0.1.5`; this patch changes comparison filtering only.
+
 ## v0.1.6 - Benchmark Comparison Fix
 
 v0.1.6 fixes the Benchmark Comparison section so repeated benchmark runs do not

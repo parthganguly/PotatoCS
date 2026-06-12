@@ -153,7 +153,7 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.6 RAG diagnostics: semantic Ollama embeddings where available, honest
+- v0.1.7 RAG diagnostics: semantic Ollama embeddings where available, honest
   lexical fallback, quote-first answers, source-scoped retrieval,
   answer styles, optional verifier pass, retrieved snippets, local benchmark
   runs, comparison summaries, deterministic model guidance, Potato Mode, and
@@ -171,7 +171,7 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.6 focuses on making retrieval, diagnostics, and evaluation more useful for small local
+v0.1.7 focuses on making retrieval, diagnostics, and evaluation more useful for small local
 models such as `llama3.2` on limited hardware. It does not require cloud
 models, does not auto-download models, and does not require a larger default
 chat model.
@@ -237,8 +237,9 @@ IDs, retrieved chunk IDs, active embedding backend/model, answer style,
 verifier state, and temperature. Expected-fact grading is paraphrase-tolerant
 instead of pure exact substring matching, while forbidden claims remain
 phrase-aware checks.
-v0.1.6 keeps the eval suite at `v0.1.5` and only changes how saved benchmark
-history is compared and recommended.
+v0.1.7 keeps the eval suite at `v0.1.5` and only changes how saved benchmark
+history is compared and recommended. Older benchmark suites remain visible in
+history, but they are excluded from the current recommendation.
 
 The Diagnostics tab exposes the same local eval suite inside the app. It shows
 the app version, profile path, backend/database/log paths, Ollama reachability,
@@ -259,7 +260,7 @@ services.
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.6_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.7_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -382,6 +383,9 @@ Recommendation guidance:
 
 - The comparison table groups saved runs by chat model, embedding backend/model,
   verifier on/off, and temperature.
+- It compares only the active eval suite. Older or incompatible benchmark
+  suites stay in history, but they are excluded from the recommendation and
+  listed in the comparison header.
 - It shows latest run score, best run score, average pass/run, run count,
   median average latency, verifier state, and deterministic guidance labels.
 - Cumulative pass totals are kept only as informational data and are not the
