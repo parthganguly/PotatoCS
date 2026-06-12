@@ -1,0 +1,32 @@
+{
+  "id": "grandfather_unscoped_no_water",
+  "answer_style": "precise",
+  "retrieval_scope": "all",
+  "source_policy": "top_retrieved",
+  "documents": [
+    {
+      "id": "frame_10",
+      "path": "../fixtures/documents/frame_10.md",
+      "title": "Frame 10"
+    },
+    {
+      "id": "public_water",
+      "path": "../fixtures/documents/public_water.md",
+      "title": "PublicWaterMassMailing"
+    }
+  ],
+  "required_source_document": "frame_10",
+  "question": "Tell me about the grandfather story and what happened after the hole.",
+  "expected_facts": [
+    {
+      "label": "he came out and had tea",
+      "any": ["came out of the hole", "had tea with his comrades"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "water contamination",
+      "any": ["water testing", "sample collection", "drinking water", "PublicWaterMassMailing"]
+    }
+  ]
+}

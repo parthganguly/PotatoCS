@@ -28,7 +28,7 @@ from odysseus_desktop_backend.storage import Database
 def build_rag(profile_dir: Path, provider: LocalHashEmbeddingProvider | None = None):
     db = Database(profile_dir)
     documents = DocumentService(db)
-    embeddings = EmbeddingService(db, provider=provider)
+    embeddings = EmbeddingService(db, provider=provider or LocalHashEmbeddingProvider())
     vector_store = SQLiteNumPyVectorStore(db)
     rag = RAGService(documents, embeddings, vector_store)
     return db, documents, embeddings, vector_store, rag
@@ -197,7 +197,7 @@ class SpyVectorStore(VectorStore):
     def delete_by_document(self, _document_id):
         return 0
 
-    def similarity_search(self, query_vector, *, limit=5, metadata_filter=None):
+    def similarity_search(self, query_vector, *, limit=5, embedding_model=None, metadata_filter=None):
         self.query_vectors.append(query_vector)
         self.metadata_filters.append(metadata_filter)
         return [
@@ -231,7 +231,7 @@ class FixedResultVectorStore(VectorStore):
     def delete_by_document(self, _document_id):
         return 0
 
-    def similarity_search(self, _query_vector, *, limit=5, metadata_filter=None):
+    def similarity_search(self, _query_vector, *, limit=5, embedding_model=None, metadata_filter=None):
         self.requested_limits.append(limit)
         self.metadata_filters.append(metadata_filter)
         filtered = [
@@ -251,7 +251,7 @@ class FixedResultVectorStore(VectorStore):
 def test_rag_search_depends_on_vector_store_interface(tmp_path: Path):
     db = Database(tmp_path / "profile")
     documents = DocumentService(db)
-    embeddings = EmbeddingService(db)
+    embeddings = EmbeddingService(db, provider=LocalHashEmbeddingProvider())
     spy = SpyVectorStore()
     rag = RAGService(documents, embeddings, spy)
 
@@ -265,7 +265,7 @@ def test_rag_search_depends_on_vector_store_interface(tmp_path: Path):
 def test_rag_reranks_distinctive_content_match_above_vector_noise(tmp_path: Path):
     db = Database(tmp_path / "profile")
     documents = DocumentService(db)
-    embeddings = EmbeddingService(db)
+    embeddings = EmbeddingService(db, provider=LocalHashEmbeddingProvider())
     noisy_results = [
         SearchResult(
             chunk_id="water-1",
@@ -302,7 +302,7 @@ def test_rag_reranks_distinctive_content_match_above_vector_noise(tmp_path: Path
 def test_rag_reranks_title_and_file_name_match(tmp_path: Path):
     db = Database(tmp_path / "profile")
     documents = DocumentService(db)
-    embeddings = EmbeddingService(db)
+    embeddings = EmbeddingService(db, provider=LocalHashEmbeddingProvider())
     noisy_results = [
         SearchResult(
             chunk_id="water-1",

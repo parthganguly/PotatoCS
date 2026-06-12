@@ -1,0 +1,40 @@
+{
+  "id": "semantic_grandfather_unscoped",
+  "answer_style": "precise",
+  "retrieval_scope": "all",
+  "source_policy": "top_retrieved",
+  "documents": [
+    {
+      "id": "semantic_grandfather_story",
+      "path": "../fixtures/documents/semantic_grandfather_story.md",
+      "title": "Hill Story"
+    },
+    {
+      "id": "lexical_trench_decoy",
+      "path": "../fixtures/documents/lexical_trench_decoy.md",
+      "title": "Excavation Note"
+    }
+  ],
+  "required_source_document": "semantic_grandfather_story",
+  "question": "What happened after the ancestor left the trench?",
+  "expected_facts": [
+    {
+      "label": "he came out of the hole",
+      "any": ["came out of the hole", "left the hole"]
+    },
+    {
+      "label": "he had tea with comrades",
+      "any": ["had tea with his comrades", "tea with comrades"]
+    },
+    {
+      "label": "he told the story for 60-70 years",
+      "any": ["told that story for the next 60-70 years", "told the story for 60-70 years"]
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "label": "excavation decoy",
+      "any": ["garden excavation", "survey markers", "misplaced tea cup"]
+    }
+  ]
+}

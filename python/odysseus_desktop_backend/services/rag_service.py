@@ -133,7 +133,13 @@ class RAGService:
             )
 
         self.vector_store.reindex_document(document_id, chunks)
-        self.documents.mark_indexed(document_id)
+        indexed_model = embedding_results[0].model if embedding_results else ""
+        indexed_backend = embedding_results[0].backend if embedding_results else ""
+        self.documents.mark_indexed(
+            document_id,
+            embedding_model=indexed_model,
+            embedding_backend=indexed_backend,
+        )
         self.documents.link_ocr_chunks(document_id)
         return {
             "document": self.documents.get(document_id),
@@ -163,22 +169,68 @@ class RAGService:
         text = (query or "").strip()
         if not text:
             return []
-        query_vector = self.embeddings.embed_query(text)
+        query_embedding = self.embeddings.embed_query(text)
         candidate_limit = max(limit, RERANK_MIN_CANDIDATES, limit * 8)
         effective_filter = self._source_scoped_filter(metadata_filter, document_ids)
         candidates = self.vector_store.similarity_search(
-            query_vector,
+            query_embedding.vector,
             limit=candidate_limit,
+            embedding_model=query_embedding.model,
             metadata_filter=effective_filter,
         )
-        reranked = self._rerank(text, candidates)
+        reranked = self._rerank(text, candidates, embedding_backend=query_embedding.backend)
         return [
             self._result_dict(result)
             for result in reranked[: max(0, limit)]
         ]
 
     def health(self) -> dict[str, Any]:
-        return self.vector_store.health()
+        health = self.vector_store.health()
+        embedding = self.embeddings.status()
+        health["embedding"] = embedding
+        active_counts = self.document_embedding_counts(str(embedding.get("cache_key") or ""))
+        health["documents_needing_reindex"] = active_counts["documents_needing_reindex"]
+        health["indexed_documents"] = active_counts["indexed_documents"]
+        health["documents_indexed_with_active_backend"] = active_counts[
+            "documents_indexed_with_active_backend"
+        ]
+        health["user_documents_indexed_with_active_backend"] = (
+            active_counts["indexed_documents"] > 0
+            and active_counts["documents_needing_reindex"] == 0
+        )
+        return health
+
+    def documents_needing_reindex(self) -> int:
+        current_key = str(self.embeddings.status().get("cache_key") or "")
+        return self.document_embedding_counts(current_key)["documents_needing_reindex"]
+
+    def document_embedding_counts(self, current_key: str) -> dict[str, int]:
+        if not current_key:
+            return {
+                "indexed_documents": 0,
+                "documents_indexed_with_active_backend": 0,
+                "documents_needing_reindex": 0,
+            }
+        row = self.documents.db.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS indexed_documents,
+                SUM(
+                    CASE WHEN COALESCE(indexed_embedding_model, '') = ? THEN 1 ELSE 0 END
+                ) AS active_documents
+            FROM documents
+            WHERE is_deleted = 0
+              AND index_status = 'indexed'
+            """,
+            (current_key,),
+        ).fetchone()
+        indexed = int(row["indexed_documents"] if row else 0)
+        active = int(row["active_documents"] or 0) if row else 0
+        return {
+            "indexed_documents": indexed,
+            "documents_indexed_with_active_backend": active,
+            "documents_needing_reindex": max(0, indexed - active),
+        }
 
     def build_context(
         self,
@@ -406,10 +458,17 @@ class RAGService:
                 effective["document_id"] = allowed_ids
         return effective
 
-    def _rerank(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
+    def _rerank(
+        self,
+        query: str,
+        results: list[SearchResult],
+        *,
+        embedding_backend: str = "lexical",
+    ) -> list[SearchResult]:
         query_tokens = important_tokens(query)
         query_phrase = normalized_text(query)
         scored: list[tuple[float, SearchResult]] = []
+        vector_weight = 2.0 if embedding_backend == "semantic" else 1.0
 
         for result in results:
             content_tokens = important_tokens(result.content)
@@ -429,7 +488,7 @@ class RAGService:
             if query_phrase and query_phrase in metadata_phrase:
                 metadata_score += 2.5
 
-            combined_score = result.score + lexical_score + metadata_score
+            combined_score = result.score * vector_weight + lexical_score + metadata_score
             scored.append((combined_score, replace(result, score=combined_score)))
 
         scored.sort(key=lambda item: item[0], reverse=True)

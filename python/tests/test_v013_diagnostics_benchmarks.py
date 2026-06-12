@@ -90,6 +90,7 @@ def test_evals_json_rpc_methods_delegate_to_service(tmp_path: Path):
 def test_eval_runner_persists_history_and_summary(tmp_path: Path):
     cases_dir = write_eval_fixture(tmp_path)
     db = Database(tmp_path / "profile")
+    db.set_setting("embedding_backend", "local")
     service = EvalService(
         db,
         cases_dir=cases_dir,
@@ -110,7 +111,7 @@ def test_eval_runner_persists_history_and_summary(tmp_path: Path):
     assert run["cases"][0]["expected_passed"] is True
     assert run["cases"][0]["forbidden_passed"] is True
     assert run["cases"][0]["source_passed"] is True
-    assert "| fake:latest | off | 1 | 0 |" in run["summary_markdown"]
+    assert "| fake:latest | lexical/local-hash-v1 | 0.00 | off | 1 | 0 |" in run["summary_markdown"]
 
     history = service.history()
     assert len(history) == 1
@@ -130,6 +131,7 @@ def test_eval_runner_persists_history_and_summary(tmp_path: Path):
 def test_eval_runner_verifier_on_result_shape(tmp_path: Path):
     cases_dir = write_eval_fixture(tmp_path)
     db = Database(tmp_path / "profile")
+    db.set_setting("embedding_backend", "local")
     try:
         service = EvalService(
             db,
@@ -149,6 +151,7 @@ def test_eval_runner_verifier_on_result_shape(tmp_path: Path):
 def test_clear_history_and_summary_format(tmp_path: Path):
     cases_dir = write_eval_fixture(tmp_path)
     db = Database(tmp_path / "profile")
+    db.set_setting("embedding_backend", "local")
     try:
         service = EvalService(
             db,
@@ -158,7 +161,7 @@ def test_clear_history_and_summary_format(tmp_path: Path):
         run = service.run(model="fake:latest", verify=False)
         summary = format_benchmark_summary([run])
 
-        assert "Model | Verify | Passed | Failed | Avg latency | Notes" in summary
+        assert "Model | Embeddings | Temp | Verify | Passed | Failed | Avg latency | Notes" in summary
         assert "fake:latest" in summary
         assert service.clear_history()["cleared"] is True
         assert service.history() == []

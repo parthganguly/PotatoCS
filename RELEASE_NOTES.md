@@ -1,5 +1,115 @@
 # Release Notes
 
+## v0.1.5 - Benchmark Hardening and Weak-Model Guidance
+
+v0.1.5 hardens Diagnostics and Model Benchmark so Odysseus Desktop can evaluate
+weak local models for RAG use more safely. It does not add agents, MCP, shell
+tools, browser tools, cloud sync, email/calendar, Chroma, Docker, hidden HTTP,
+or new architecture.
+
+Highlights:
+
+- Split Diagnostics retrieval status into App Document Retrieval and Benchmark
+  Retrieval so the current user document library is not confused with the
+  latest temporary benchmark fixture run.
+- App Document Retrieval now shows backend, model, semantic active yes/no,
+  documents needing reindex, and how many indexed user documents match the
+  active backend.
+- Benchmark Retrieval now shows the backend/model used by the latest benchmark
+  run, whether semantic retrieval was used, and the eval suite version.
+- Added an explicit warning when a benchmark used semantic retrieval while the
+  user's document library is lexical or not reindexed.
+- Added benchmark comparison summaries grouped by chat model, embedding
+  backend/model, verifier on/off, and temperature.
+- Comparison rows show passed/total, expected failures, forbidden failures,
+  source failures, average latency, total runtime, and deterministic guidance
+  labels.
+- Added deterministic recommendation rules: highest pass count wins, lower
+  latency breaks ties, and verifier is recommended only when it improves pass
+  count enough to justify latency.
+- Added deterministic model guidance labels such as `Good for direct
+  extraction`, `Weak at chronology`, `Source contamination risk`, `Verifier not
+  useful here`, `Recommended for Potato Mode`, and `Not recommended for
+  evidence-sensitive answers`.
+- Added Potato Mode as an explicit RAG preset for weak models: quote-first,
+  short, fewer chunks, strict no-answer behavior, verifier off, temperature
+  `0.0`, Evidence Only formatting, and no speculative synthesis.
+- Added Evidence Only answer style with `Answer:`, `Evidence:`, and
+  `Not found / cannot confirm:` sections.
+- Bumped the eval suite to `v0.1.5` because benchmark comparison behavior and
+  result interpretation changed.
+
+Validation commands for v0.1.5:
+
+```powershell
+python -m pytest python\tests
+npm run build
+```
+
+## v0.1.4 - Real Retrieval and Honest Evaluation
+
+v0.1.4 makes RAG retrieval and local benchmarks more honest for weak local
+models on limited hardware. It keeps the privacy-first desktop architecture:
+React/TypeScript UI, Tauri/Rust shell, Python JSON-RPC sidecar over stdio,
+profile-local SQLite, and Ollama at `127.0.0.1:11434`. It does not add agents,
+tools, shell access, cloud sync, Chroma, Docker, hidden HTTP, or model
+auto-downloads.
+
+Highlights:
+
+- Added an Ollama semantic embedding provider using the local `/api/embed`
+  endpoint, with `nomic-embed-text` as the default configured candidate.
+- Kept `local-hash-v1` as an automatic deterministic lexical fallback when
+  Ollama is unavailable, the embedding model is missing, or embedding calls
+  fail.
+- Made diagnostics report the active embedding backend/model honestly:
+  semantic Ollama embeddings versus lexical fallback.
+- Preserved content-hash embedding caching while separating cache keys by
+  embedding backend/model.
+- Added document indexed-embedding metadata and diagnostics for documents that
+  need reindex after an embedding model change.
+- Skipped old vector rows with incompatible dimensions instead of mixing them
+  into current retrieval.
+- Reduced lexical fallback noise with normalized tokenization and stopword
+  stripping.
+- Weighted semantic vector matches more strongly during reranking so surface
+  word decoys do not drown out the semantic hit.
+- Bumped the eval suite to `v0.1.4` because old benchmark results are not
+  directly comparable.
+- Replaced exact-substring-only expected fact checks with paraphrase-tolerant
+  fact coverage while keeping phrase-aware forbidden-claim checks.
+- Added unscoped retrieval and semantic-vs-lexical decoy eval fixtures.
+- Stored retrieved document IDs, retrieved chunk IDs, embedding backend/model,
+  answer style, verifier state, and temperature for benchmark cases.
+- Passed explicit generation temperature through production chat and eval
+  paths, defaulting to `0.0` for parity.
+- Updated the Diagnostics benchmark UI and copyable benchmark summary to show
+  embedding backend/model and temperature.
+
+Scope intentionally unchanged:
+
+- No agents.
+- No tools.
+- No shell execution module.
+- No email or calendar modules.
+- No MCP.
+- No Cookbook.
+- No gallery/editor.
+- No Chroma.
+- No Docker.
+- No hidden HTTP service.
+- No model auto-download.
+- No cloud-model dependency.
+
+Validation commands for v0.1.4:
+
+```powershell
+python -m pytest python\tests
+npm run build
+python scripts\run_rag_evals.py --models llama3.2:latest
+python scripts\run_rag_evals.py --models llama3.2:latest --verify
+```
+
 ## v0.1.3 - Diagnostics and Model Benchmark
 
 v0.1.3 turns the local RAG eval harness into an in-app Diagnostics / Model
@@ -26,9 +136,9 @@ Highlights:
 - Clarified that benchmarks use bundled temporary eval fixtures, not the user's
   imported Documents library.
 - Clarified benchmark model guidance: 1B-class models are a survival baseline,
-  `llama3.2:3b` / `llama3.2:latest` is the currently validated everyman
-  baseline, and verifier mode is slower and not a magic fix for very small
-  models.
+  `llama3.2:3b` / `llama3.2:latest` is the intended everyman candidate to
+  benchmark first, and verifier mode is slower and not a magic fix for very
+  small models.
 - Showed basic Ollama model stats where Ollama reports them.
 - Kept evals as regression examples only; runtime behavior is not
   special-cased for any named fixture, document, or query.

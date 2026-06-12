@@ -78,7 +78,13 @@ class ModelService:
             "quantization_level": str(details.get("quantization_level") or ""),
         }
 
-    def chat(self, model: str, messages: list[dict[str, str]]) -> str:
+    def chat(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> str:
         if not model:
             raise ValueError("model is required")
         payload = {
@@ -86,6 +92,8 @@ class ModelService:
             "messages": messages,
             "stream": False,
         }
+        if options:
+            payload["options"] = options
         data = self._post_json(f"{OLLAMA_ENDPOINT}/api/chat", payload, timeout=120)
         message = data.get("message") if isinstance(data, dict) else None
         if isinstance(message, dict):

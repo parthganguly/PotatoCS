@@ -26,11 +26,15 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AppStatus,
   AnswerStyle,
+  BenchmarkComparison,
+  BenchmarkComparisonGroup,
   ChatResult,
   DiagnosticsStatus,
   DocumentImportResult,
   DocumentRecord,
+  EmbeddingStatus,
   EvalRun,
+  EvalCaseResult,
   EvalSuite,
   LegacyImportReport,
   Message,
@@ -43,6 +47,7 @@ import {
   RAGIndexResult,
   RAGSearchResult,
   RAGSnippet,
+  RagPreset,
   Session,
   Settings,
   getAppStatus,
@@ -56,7 +61,8 @@ const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
   { value: "precise", label: "Precise" },
   { value: "layman", label: "Layman" },
   { value: "detailed", label: "Detailed" },
-  { value: "extract_only", label: "Extract only" }
+  { value: "extract_only", label: "Extract only" },
+  { value: "evidence_only", label: "Evidence only" }
 ];
 
 function App() {
@@ -81,6 +87,7 @@ function App() {
   const [useRag, setUseRag] = useState(false);
   const [verifyRag, setVerifyRag] = useState(false);
   const [answerStyle, setAnswerStyle] = useState<AnswerStyle>("precise");
+  const [ragPreset, setRagPreset] = useState<RagPreset>("standard");
   const [selectedRagDocumentId, setSelectedRagDocumentId] = useState("");
   const [lastIndexResult, setLastIndexResult] = useState<RAGIndexResult | null>(null);
   const [lastOcrResult, setLastOcrResult] = useState<OCRResult | null>(null);
@@ -89,6 +96,7 @@ function App() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsStatus | null>(null);
   const [evalSuite, setEvalSuite] = useState<EvalSuite | null>(null);
   const [evalHistory, setEvalHistory] = useState<EvalRun[]>([]);
+  const [benchmarkComparison, setBenchmarkComparison] = useState<BenchmarkComparison | null>(null);
   const [benchmarkResult, setBenchmarkResult] = useState<EvalRun | null>(null);
   const [benchmarkModel, setBenchmarkModel] = useState("");
   const [benchmarkVerify, setBenchmarkVerify] = useState(false);
@@ -226,14 +234,16 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const [nextDiagnostics, nextSuite, nextHistory] = await Promise.all([
+      const [nextDiagnostics, nextSuite, nextHistory, nextComparison] = await Promise.all([
         rpc<DiagnosticsStatus>("diagnostics.get"),
         rpc<EvalSuite>("evals.list"),
-        rpc<EvalRun[]>("evals.history", { limit: 20 })
+        rpc<EvalRun[]>("evals.history", { limit: 20 }),
+        rpc<BenchmarkComparison>("evals.comparison", { limit: 100 })
       ]);
       setDiagnostics(nextDiagnostics);
       setEvalSuite(nextSuite);
       setEvalHistory(nextHistory);
+      setBenchmarkComparison(nextComparison);
       setOllama(nextDiagnostics.ollama);
       setOcrStatus(nextDiagnostics.ocr);
       setRagHealth(nextDiagnostics.rag);
@@ -261,7 +271,12 @@ function App() {
         verify: benchmarkVerify
       });
       setBenchmarkResult(run);
-      setEvalHistory(await rpc<EvalRun[]>("evals.history", { limit: 20 }));
+      const [nextHistory, nextComparison] = await Promise.all([
+        rpc<EvalRun[]>("evals.history", { limit: 20 }),
+        rpc<BenchmarkComparison>("evals.comparison", { limit: 100 })
+      ]);
+      setEvalHistory(nextHistory);
+      setBenchmarkComparison(nextComparison);
     } catch (err) {
       setError(readError(err));
     } finally {
@@ -289,6 +304,7 @@ function App() {
       await rpc("evals.clear_history");
       setBenchmarkResult(null);
       setEvalHistory([]);
+      setBenchmarkComparison(null);
     } catch (err) {
       setError(readError(err));
     } finally {
@@ -529,8 +545,9 @@ function App() {
         session_id: selectedSessionId,
         model: modelDraft.trim() || settings.default_model || "llama3.2",
         use_rag: useRag,
-        verify_rag: useRag && verifyRag,
-        answer_style: answerStyle
+        verify_rag: useRag && ragPreset !== "potato" && verifyRag,
+        answer_style: answerStyle,
+        rag_preset: ragPreset
       };
       if (useRag && selectedRagDocumentId) {
         params.document_ids = [selectedRagDocumentId];
@@ -714,6 +731,7 @@ function App() {
             selectedSession={selectedSession}
             settings={settings}
             answerStyle={answerStyle}
+            ragPreset={ragPreset}
             useRag={useRag}
             verifyRag={verifyRag}
             onDeleteSession={deleteSession}
@@ -722,6 +740,14 @@ function App() {
             onSetDraft={setDraft}
             onSetAnswerStyle={setAnswerStyle}
             onSetSelectedRagDocumentId={setSelectedRagDocumentId}
+            onSetRagPreset={(value) => {
+              setRagPreset(value);
+              if (value === "potato") {
+                setUseRag(true);
+                setVerifyRag(false);
+                setAnswerStyle("evidence_only");
+              }
+            }}
             onSetUseRag={setUseRag}
             onSetVerifyRag={setVerifyRag}
           />
@@ -759,6 +785,7 @@ function App() {
             benchmarkVerify={benchmarkVerify}
             busy={busy}
             copyStatus={copyStatus}
+            comparison={benchmarkComparison}
             diagnostics={diagnostics}
             error={error}
             evalHistory={evalHistory}
@@ -791,6 +818,7 @@ function ChatWorkspace(props: {
   selectedSession: Session | null;
   settings: Settings;
   answerStyle: AnswerStyle;
+  ragPreset: RagPreset;
   useRag: boolean;
   verifyRag: boolean;
   onDeleteSession: (sessionId: string) => void;
@@ -798,6 +826,7 @@ function ChatWorkspace(props: {
   onSend: (event: FormEvent) => void;
   onSetAnswerStyle: (value: AnswerStyle) => void;
   onSetDraft: (value: string) => void;
+  onSetRagPreset: (value: RagPreset) => void;
   onSetSelectedRagDocumentId: (value: string) => void;
   onSetUseRag: (value: boolean) => void;
   onSetVerifyRag: (value: boolean) => void;
@@ -839,9 +868,21 @@ function ChatWorkspace(props: {
             <select
               className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
               disabled={props.busy}
+              onChange={(event) => props.onSetRagPreset(event.target.value as RagPreset)}
+              title="RAG preset"
+              value={props.ragPreset}
+            >
+              <option value="standard">Standard</option>
+              <option value="potato">Potato Mode</option>
+            </select>
+          )}
+          {props.useRag && (
+            <select
+              className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
+              disabled={props.busy || props.ragPreset === "potato"}
               onChange={(event) => props.onSetAnswerStyle(event.target.value as AnswerStyle)}
               title="Answer style"
-              value={props.answerStyle}
+              value={props.ragPreset === "potato" ? "evidence_only" : props.answerStyle}
             >
               {ANSWER_STYLE_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -862,8 +903,9 @@ function ChatWorkspace(props: {
           {props.useRag && (
             <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
               <input
-                checked={props.verifyRag}
+                checked={props.ragPreset !== "potato" && props.verifyRag}
                 className="h-4 w-4 accent-tide"
+                disabled={props.ragPreset === "potato"}
                 onChange={(event) => props.onSetVerifyRag(event.target.checked)}
                 type="checkbox"
               />
@@ -1180,6 +1222,7 @@ function DiagnosticsWorkspace(props: {
   benchmarkResult: EvalRun | null;
   benchmarkVerify: boolean;
   busy: boolean;
+  comparison: BenchmarkComparison | null;
   copyStatus: string;
   diagnostics: DiagnosticsStatus | null;
   error: string | null;
@@ -1195,6 +1238,8 @@ function DiagnosticsWorkspace(props: {
   const models = props.diagnostics?.ollama.models ?? [];
   const modelDetails = props.diagnostics?.ollama.model_details ?? [];
   const canRun = Boolean(props.diagnostics?.ollama.reachable && props.benchmarkModel.trim());
+  const latestBenchmarkRun = props.benchmarkResult ?? props.evalHistory[0] ?? null;
+  const retrievalMismatch = benchmarkRetrievalMismatch(props.diagnostics?.rag ?? null, latestBenchmarkRun);
   return (
     <>
       <header className="flex h-16 shrink-0 items-center justify-between border-b border-ink/15 px-5">
@@ -1232,6 +1277,56 @@ function DiagnosticsWorkspace(props: {
                 <PathRow label="Database" value={props.diagnostics?.db_path ?? ""} />
                 <PathRow label="Backend log" value={props.diagnostics?.backend_log_path ?? ""} />
               </div>
+            </div>
+
+            <div className="rounded-md border border-ink/15 bg-white p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <Search size={17} aria-hidden="true" />
+                App Document Retrieval
+              </div>
+              <div className="space-y-3 text-sm">
+                <DiagnosticRow label="Backend" value={props.diagnostics?.rag.embedding.backend ?? ""} />
+                <DiagnosticRow label="Model" value={props.diagnostics?.rag.embedding.model ?? ""} />
+                <DiagnosticRow
+                  label="Semantic active"
+                  value={props.diagnostics?.rag.embedding.semantic ? "yes" : "no"}
+                />
+                <DiagnosticRow
+                  label="Indexed with active backend"
+                  value={formatIndexedWithActiveBackend(props.diagnostics?.rag ?? null)}
+                />
+                <DiagnosticRow
+                  label="Needs reindex"
+                  value={props.diagnostics?.rag.documents_needing_reindex ?? 0}
+                />
+              </div>
+              {props.diagnostics?.rag.embedding.message && (
+                <p className="mt-3 text-xs text-ink/55">{props.diagnostics.rag.embedding.message}</p>
+              )}
+            </div>
+
+            <div className="rounded-md border border-ink/15 bg-white p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <BarChart3 size={17} aria-hidden="true" />
+                Benchmark Retrieval
+              </div>
+              <div className="space-y-3 text-sm">
+                <DiagnosticRow label="Backend used" value={latestBenchmarkRun?.embedding_backend ?? "no runs"} />
+                <DiagnosticRow label="Embedding model" value={latestBenchmarkRun?.embedding_model ?? "no runs"} />
+                <DiagnosticRow
+                  label="Semantic used"
+                  value={latestBenchmarkRun ? (latestBenchmarkRun.embedding_backend === "semantic" ? "yes" : "no") : "no runs"}
+                />
+                <DiagnosticRow
+                  label="Eval suite"
+                  value={latestBenchmarkRun?.suite_version ?? props.evalSuite?.suite_version ?? "checking"}
+                />
+              </div>
+              {retrievalMismatch && (
+                <p className="mt-3 rounded-md border border-gold/30 bg-[#fff8e8] px-3 py-2 text-xs text-[#7a561d]">
+                  Benchmark used semantic retrieval, but your document library is currently lexical/not reindexed.
+                </p>
+              )}
             </div>
 
             <div className="rounded-md border border-ink/15 bg-white p-4">
@@ -1314,11 +1409,12 @@ function DiagnosticsWorkspace(props: {
                   Copy
                 </button>
               </div>
-              <div className="mt-3 grid grid-cols-4 gap-2 text-xs text-ink/65">
+              <div className="mt-3 grid grid-cols-5 gap-2 text-xs text-ink/65">
                 <Metric label="Suite" value={props.evalSuite?.suite_name ?? "local-rag"} />
                 <Metric label="Version" value={props.evalSuite?.suite_version ?? "checking"} />
                 <Metric label="Cases" value={props.evalSuite?.case_count ?? 0} />
                 <Metric label="History" value={props.evalHistory.length} />
+                <Metric label="Latest run embeddings" value={latestBenchmarkRun ? formatRunEmbedding(latestBenchmarkRun) : "none"} />
               </div>
               <p className="mt-2 text-xs text-ink/55">
                 Eval documents are temporary/internal to the benchmark and will not appear in Documents.
@@ -1333,6 +1429,8 @@ function DiagnosticsWorkspace(props: {
             </div>
 
             {props.benchmarkResult && <BenchmarkRunCard run={props.benchmarkResult} title="Latest Result" />}
+
+            {props.comparison && <BenchmarkComparisonCard comparison={props.comparison} />}
 
             <div className="rounded-md border border-ink/15 bg-white">
               <div className="flex items-center justify-between border-b border-ink/10 px-4 py-3">
@@ -1359,7 +1457,7 @@ function DiagnosticsWorkspace(props: {
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium">{run.model}</p>
                           <p className="text-xs text-ink/55">
-                            {formatTimestamp(run.created_at)} - verifier {run.verify ? "on" : "off"}
+                            {formatTimestamp(run.created_at)} - {formatRunEmbedding(run)} - verifier {run.verify ? "on" : "off"}
                           </p>
                         </div>
                         <div className="text-right text-xs">
@@ -1388,7 +1486,7 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
         <div>
           <p className="text-sm font-semibold">{title}</p>
           <p className="text-xs text-ink/55">
-            {run.model} - verifier {run.verify ? "on" : "off"} - {formatTimestamp(run.created_at)}
+            {run.model} - {formatRunEmbedding(run)} - temp {run.temperature.toFixed(2)} - verifier {run.verify ? "on" : "off"} - {formatTimestamp(run.created_at)}
           </p>
         </div>
         <span
@@ -1401,17 +1499,21 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
           {run.total_passed} passed, {run.total_failed} failed
         </span>
       </div>
-      <div className="grid grid-cols-3 gap-2 px-4 py-3 text-xs text-ink/65">
+      <div className="grid grid-cols-5 gap-2 px-4 py-3 text-xs text-ink/65">
         <Metric label="Average latency" value={`${run.average_latency_ms} ms`} />
         <Metric label="Total runtime" value={`${run.total_runtime_ms} ms`} />
         <Metric label="Suite" value={run.suite_version} />
+        <Metric label="Embeddings" value={formatRunEmbedding(run)} />
+        <Metric label="Temperature" value={run.temperature.toFixed(2)} />
       </div>
       <div className="overflow-auto">
-        <table className="w-full min-w-[720px] border-t border-ink/10 text-left text-xs">
+        <table className="w-full min-w-[860px] border-t border-ink/10 text-left text-xs">
           <thead className="bg-[#faf9f3] text-ink/60">
             <tr>
               <th className="px-4 py-2 font-medium">Case</th>
               <th className="px-4 py-2 font-medium">Style</th>
+              <th className="px-4 py-2 font-medium">Embeddings</th>
+              <th className="px-4 py-2 font-medium">Temp</th>
               <th className="px-4 py-2 font-medium">Latency</th>
               <th className="px-4 py-2 font-medium">Expected</th>
               <th className="px-4 py-2 font-medium">Forbidden</th>
@@ -1424,6 +1526,8 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
               <tr key={result.id}>
                 <td className="px-4 py-2 font-medium">{result.case_id}</td>
                 <td className="px-4 py-2">{formatAnswerStyle(result.answer_style)}</td>
+                <td className="px-4 py-2">{formatCaseEmbedding(result)}</td>
+                <td className="px-4 py-2">{result.temperature.toFixed(2)}</td>
                 <td className="px-4 py-2">{result.latency_ms} ms</td>
                 <td className="px-4 py-2">{formatPass(result.expected_passed)}</td>
                 <td className="px-4 py-2">{formatPass(result.forbidden_passed)}</td>
@@ -1436,6 +1540,72 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparison }) {
+  return (
+    <div className="rounded-md border border-ink/15 bg-white">
+      <div className="border-b border-ink/10 px-4 py-3">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <BarChart3 size={17} aria-hidden="true" />
+          Benchmark Comparison
+        </div>
+        <p className="mt-1 text-xs text-ink/55">{comparison.recommendation_reason}</p>
+      </div>
+      {comparison.groups.length === 0 ? (
+        <p className="px-4 py-6 text-sm text-ink/55">No saved benchmark runs to compare.</p>
+      ) : (
+        <div className="overflow-auto">
+          <table className="w-full min-w-[980px] text-left text-xs">
+            <thead className="bg-[#faf9f3] text-ink/60">
+              <tr>
+                <th className="px-4 py-2 font-medium">Config</th>
+                <th className="px-4 py-2 font-medium">Passed</th>
+                <th className="px-4 py-2 font-medium">Expected fail</th>
+                <th className="px-4 py-2 font-medium">Forbidden fail</th>
+                <th className="px-4 py-2 font-medium">Source fail</th>
+                <th className="px-4 py-2 font-medium">Avg latency</th>
+                <th className="px-4 py-2 font-medium">Runtime</th>
+                <th className="px-4 py-2 font-medium">Guidance</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ink/10">
+              {comparison.groups.map((group) => (
+                <tr className={group.recommended ? "bg-[#edf7ef]" : ""} key={group.key}>
+                  <td className="px-4 py-2">
+                    <p className="font-medium">{group.model}</p>
+                    <p className="text-ink/55">
+                      {formatGroupEmbedding(group)} · verifier {group.verify ? "on" : "off"} · temp {group.temperature.toFixed(2)}
+                    </p>
+                    {group.recommended && <p className="mt-1 text-moss">Recommended</p>}
+                  </td>
+                  <td className="px-4 py-2">{group.passed}/{group.total}</td>
+                  <td className="px-4 py-2">{group.expected_failures}</td>
+                  <td className="px-4 py-2">{group.forbidden_failures}</td>
+                  <td className="px-4 py-2">{group.source_failures}</td>
+                  <td className="px-4 py-2">{group.average_latency_ms} ms</td>
+                  <td className="px-4 py-2">{group.total_runtime_ms} ms</td>
+                  <td className="px-4 py-2">
+                    <div className="flex max-w-[280px] flex-wrap gap-1.5">
+                      {group.guidance_labels.length === 0 ? (
+                        <span className="text-ink/55">No label</span>
+                      ) : (
+                        group.guidance_labels.map((label) => (
+                          <span className="rounded-md border border-ink/10 bg-white px-2 py-1" key={label}>
+                            {label}
+                          </span>
+                        ))
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -1929,8 +2099,8 @@ function formatPass(value: boolean): string {
 function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
   if (runs.length === 0) return "";
   const lines = [
-    "| Model | Verify | Passed | Failed | Avg latency | Notes |",
-    "| --- | --- | ---: | ---: | ---: | --- |"
+    "| Model | Embeddings | Temp | Verify | Passed | Failed | Avg latency | Notes |",
+    "| --- | --- | ---: | --- | ---: | ---: | ---: | --- |"
   ];
   for (const run of runs) {
     const failedCases = run.cases
@@ -1938,10 +2108,49 @@ function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
       .map((result) => result.case_id);
     const notes = failedCases.length > 0 ? `failed: ${failedCases.join(", ")}` : "ok";
     lines.push(
-      `| ${run.model} | ${run.verify ? "on" : "off"} | ${run.total_passed} | ${run.total_failed} | ${run.average_latency_ms} ms | ${notes} |`
+      `| ${run.model} | ${formatRunEmbedding(run)} | ${run.temperature.toFixed(2)} | ${run.verify ? "on" : "off"} | ${run.total_passed} | ${run.total_failed} | ${run.average_latency_ms} ms | ${notes} |`
     );
   }
   return lines.join("\n");
+}
+
+function formatEmbeddingStatus(status?: EmbeddingStatus): string {
+  if (!status) return "unknown";
+  return status.semantic ? `semantic/${status.model}` : status.model || "lexical";
+}
+
+function formatRunEmbedding(run: EvalRun): string {
+  if (run.embedding_backend && run.embedding_model) {
+    return `${run.embedding_backend}/${run.embedding_model}`;
+  }
+  return run.embedding_model || run.embedding_backend || "unknown";
+}
+
+function formatCaseEmbedding(result: EvalCaseResult): string {
+  if (result.embedding_backend && result.embedding_model) {
+    return `${result.embedding_backend}/${result.embedding_model}`;
+  }
+  return result.embedding_model || result.embedding_backend || "unknown";
+}
+
+function formatGroupEmbedding(group: BenchmarkComparisonGroup): string {
+  if (group.embedding_backend && group.embedding_model) {
+    return `${group.embedding_backend}/${group.embedding_model}`;
+  }
+  return group.embedding_model || group.embedding_backend || "unknown";
+}
+
+function formatIndexedWithActiveBackend(health: RAGHealth | null): string {
+  if (!health) return "unknown";
+  if (health.indexed_documents === 0) return "no indexed documents";
+  return `${health.documents_indexed_with_active_backend}/${health.indexed_documents}`;
+}
+
+function benchmarkRetrievalMismatch(health: RAGHealth | null, run: EvalRun | null): boolean {
+  if (!health || !run) return false;
+  const benchmarkSemantic = run.embedding_backend === "semantic";
+  if (!benchmarkSemantic) return false;
+  return !health.embedding.semantic || !health.user_documents_indexed_with_active_backend;
 }
 
 function dedupeStrings(values: string[]): string[] {

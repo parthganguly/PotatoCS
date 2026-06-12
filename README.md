@@ -10,8 +10,9 @@ model runner.
 
 Odysseus Desktop is designed to help small Ollama models work better on modest
 hardware. Instead of relying only on model size, it adds local support around
-the model: document RAG, OCR, source-scoped retrieval, answer styles,
-verification, snippets, search, and benchmarks.
+the model: semantic retrieval when a local embedding model is installed,
+lexical fallback when it is not, document RAG, OCR, source-scoped retrieval,
+answer styles, verification, snippets, search, and benchmarks.
 
 This app is a Tauri desktop shell with a Rust supervisor, a bundled Python
 JSON-RPC sidecar over stdio, profile-local SQLite storage, React/TypeScript UI,
@@ -75,6 +76,9 @@ Key differences:
 - Ollama-first local model runtime detection.
 - SQLite + NumPy VectorStore MVP, with the VectorStore boundary preserved for
   future sqlite-vec or LanceDB experiments.
+- Ollama semantic embeddings when a local embedding model such as
+  `nomic-embed-text` is installed, with an honest lexical fallback when it is
+  not.
 - Optional OCR by detecting local tools such as Tesseract and MuPDF/Poppler.
 - Non-destructive import from compatible legacy Odysseus data folders.
 - Grounding, search, verification, and benchmark surfaces that help modest
@@ -149,9 +153,11 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.3 RAG diagnostics: quote-first answers, source-scoped retrieval,
-  answer styles, optional verifier pass, retrieved snippets, and local
-  benchmark runs.
+- v0.1.5 RAG diagnostics: semantic Ollama embeddings where available, honest
+  lexical fallback, quote-first answers, source-scoped retrieval,
+  answer styles, optional verifier pass, retrieved snippets, local benchmark
+  runs, comparison summaries, deterministic model guidance, Potato Mode, and
+  Evidence Only style.
 - Embedding cache by chunk/content hash.
 - Optional OCR for scanned/low-text PDFs when Tesseract plus `pdftoppm` or
   `mutool` are locally installed.
@@ -165,13 +171,23 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.3 focuses on making RAG answers more useful, disciplined, and measurable
-with small local models such as `llama3.2` on limited hardware. It does not
-require cloud models or a larger default model.
+v0.1.5 focuses on making retrieval, diagnostics, and evaluation more useful for small local
+models such as `llama3.2` on limited hardware. It does not require cloud
+models, does not auto-download models, and does not require a larger default
+chat model.
 
 The RAG path now uses quote-first grounding:
 
 - Retrieval still uses the existing VectorStore-backed search path.
+- If a local Ollama embedding model such as `nomic-embed-text` is installed,
+  retrieval can use semantic embeddings through Ollama's local `/api/embed`
+  endpoint.
+- If Ollama is unavailable, the embedding model is missing, or embedding calls
+  fail, retrieval falls back to `local-hash-v1`, a deterministic lexical
+  fallback. The app reports this as lexical fallback, not semantic retrieval.
+- Embeddings are cached by content hash and embedding model/cache key. If the
+  active embedding model changes, diagnostics report documents needing reindex,
+  and old vector dimensions are skipped safely instead of being mixed.
 - The answer prompt receives short evidence snippets extracted from retrieved
   chunks, not the full noisy chunk text.
 - Each snippet keeps source document, page, chunk, and snippet metadata.
@@ -183,7 +199,7 @@ header can limit retrieval to one indexed document. This reduces cross-document
 contamination by keeping a document-specific conversation inside that selected
 source unless the user searches across all indexed documents.
 
-RAG answers support four general styles:
+RAG answers support five general styles:
 
 - `Precise` - default. Best for factual questions where the answer should stay
   close to the retrieved evidence and preserve chronology.
@@ -194,12 +210,21 @@ RAG answers support four general styles:
   caveats, and clear source separation.
 - `Extract only` - best when the user wants only directly stated facts and no
   interpretation or speculation.
+- `Evidence only` - best for weak local models and evidence-sensitive answers.
+  It asks the model to use this shape: `Answer:`, `Evidence:`, and
+  `Not found / cannot confirm:`.
 
-The optional verifier pass can be enabled from the chat UI. It asks the local
-model to classify factual claims as supported, unsupported, or contradicted
-against the retrieved snippets. If a contradicted claim is found, the app
-regenerates once with the correction. The verifier is local-only and optional
-because it costs extra tokens.
+Potato Mode is an optional RAG preset for weak models and limited hardware. It
+is not the global default. It uses quote-first evidence, fewer retrieved chunks,
+temperature `0.0`, verifier off, Evidence Only formatting, strict no-answer
+behavior, and no speculative synthesis.
+
+The optional verifier pass can be enabled from the chat UI. It asks the selected
+local model to classify factual claims as supported, unsupported, or
+contradicted against the retrieved snippets. If a contradicted claim is found,
+the app regenerates once with the correction. The verifier is local-only,
+best-effort, and optional because it costs extra tokens. It is not a rescue
+mechanism for 1B/1.5B-class models.
 
 The local eval harness lives under `evals\` and `scripts\run_rag_evals.py`.
 Fixtures include chronology preservation, cross-document contamination,
@@ -207,15 +232,24 @@ procedural-document interpretation, layman explanation, and extract-only cases.
 They are regression examples that expose general RAG weaknesses; the app does
 not hard-code behavior for any fixture, document name, or query. Each case
 records the source document, question, answer style, expected facts, forbidden
-claims, and required source document.
+claims, and required source document. v0.1.5 also records retrieved document
+IDs, retrieved chunk IDs, active embedding backend/model, answer style,
+verifier state, and temperature. Expected-fact grading is paraphrase-tolerant
+instead of pure exact substring matching, while forbidden claims remain
+phrase-aware checks.
 
 The Diagnostics tab exposes the same local eval suite inside the app. It shows
 the app version, profile path, backend/database/log paths, Ollama reachability,
 installed Ollama models with basic size/parameter/quantization stats, OCR
-dependency status, and VectorStore health. The Model Benchmark panel can run
-the eval suite against one installed Ollama model with verifier on or off, then
-saves pass/fail, latency, and per-case check results in the profile-local
-SQLite database. It does not auto-download models and does not use cloud
+dependency status, VectorStore health, active embedding backend/model, whether
+semantic retrieval is active, and documents needing reindex. It separates App
+Document Retrieval from Benchmark Retrieval so a semantic benchmark run is not
+confused with a lexical or not-reindexed document library. The Model Benchmark
+panel can run the eval suite against one installed Ollama model with verifier on
+or off, then saves pass/fail, latency, embedding backend/model, and per-case
+check results in the profile-local SQLite database. It also shows a compact
+comparison table grouped by chat model, embedding backend/model, verifier
+state, and temperature. It does not auto-download models and does not use cloud
 services.
 
 ## User Setup
@@ -223,7 +257,7 @@ services.
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.3_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.5_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -236,6 +270,17 @@ For local chat, install and run Ollama separately:
 ollama serve
 ollama pull llama3.2
 ```
+
+Semantic retrieval is optional and also local. To enable it, install an Ollama
+embedding model yourself:
+
+```powershell
+ollama pull nomic-embed-text
+```
+
+If no embedding model is installed, Odysseus Desktop still works with the
+`local-hash-v1` lexical fallback and clearly reports that semantic retrieval is
+not active.
 
 OCR is optional. To OCR scanned PDFs, install Tesseract and at least one PDF
 renderer:
@@ -308,16 +353,17 @@ In the app:
 - Click `Run`.
 - Use `Copy` to copy a Markdown benchmark summary table.
 
-Models must already be installed in Ollama. Odysseus Desktop will list local
-models but will not pull or download them.
+Chat and embedding models must already be installed in Ollama. Odysseus Desktop
+will list local models but will not pull or download them.
 
 Model guidance:
 
 - Survival baseline: `llama3.2:1b`. It runs on weak hardware and can be useful
   for `Extract only`, simple Q&A, and retrieval inspection. It is not
   recommended for reliable RAG reasoning.
-- Recommended everyman baseline: `llama3.2:3b` / `llama3.2:latest`. This is
-  the lowest currently validated reliable baseline in the local eval suite.
+- Practical everyman candidate: `llama3.2:3b` / `llama3.2:latest`. It is the
+  intended weak-model baseline to benchmark first, but recommendations should
+  come from your local eval results, not from the model name alone.
 - Comfortable local models: larger 7B-ish models. They can improve reliability
   on stronger machines, but benchmark them before relying on them.
 
@@ -330,11 +376,32 @@ Verifier guidance:
   their own answers reliably.
 - Let benchmark results decide the recommendation, not model size or vibes.
 
+Recommendation guidance:
+
+- The comparison table groups saved runs by chat model, embedding backend/model,
+  verifier on/off, and temperature.
+- It shows passed/total, expected-fact failures, forbidden-claim failures,
+  source failures, average latency, total runtime, and deterministic guidance
+  labels.
+- The recommended configuration is selected by highest pass count, then lower
+  latency. Verifier-on runs are recommended only when they improve pass count
+  enough to justify their latency cost.
+- Guidance labels are deterministic examples such as `Good for direct
+  extraction`, `Weak at chronology`, `Source contamination risk`, `Verifier not
+  useful here`, `Recommended for Potato Mode`, and `Not recommended for
+  evidence-sensitive answers`.
+
 The `Documents` tab is your user-imported library for normal RAG chat. The
 benchmark eval fixtures are separate bundled documents used for repeatable
 model testing. Benchmark runs create temporary/internal eval documents while
 they run, so benchmark results can exist even when the user document count is
 0, and those eval documents will not appear in `Documents`.
+
+Benchmark results also report the embedding backend/model. `semantic/<model>`
+means the eval used a local Ollama embedding model. `lexical/local-hash-v1`
+means it used the deterministic lexical fallback. Lexical fallback is useful
+for inspection and basic matching, but semantic retrieval is expected to do
+better on synonym/paraphrase cases such as `ancestor` versus `grandfather`.
 
 Run all RAG eval cases against every installed Ollama model:
 
@@ -366,7 +433,7 @@ sampling noise. Use `--temperature` to compare a different setting.
 Interpretation:
 
 - `PASS` means the answer included all expected facts, avoided forbidden claims,
-  and retrieved only from the required source document.
+  and satisfied the source policy for the case.
 - `FAIL` lists the missing expected facts, forbidden claims, or source-scope
   issue that caused the failure.
 - `latency_ms` is wall-clock time for that case and model on the current
@@ -375,12 +442,12 @@ Interpretation:
 
 Sample benchmark table placeholder:
 
-| Model | Verify | Passed | Failed | Avg latency | Notes |
-| --- | --- | ---: | ---: | ---: | --- |
-| llama3.2:1b | off | TBD | TBD | TBD | Survival baseline; inspect retrieval, avoid relying on RAG reasoning |
-| llama3.2:3b / llama3.2:latest | off | TBD | TBD | TBD | Recommended everyman baseline |
-| qwen2.5:7b | off | TBD | TBD | TBD | Comfortable local candidate |
-| mistral:7b | off | TBD | TBD | TBD | Comfortable local candidate |
+| Model | Embeddings | Temp | Verify | Passed | Failed | Avg latency | Notes |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- |
+| llama3.2:1b | lexical/local-hash-v1 or semantic/nomic-embed-text | 0.00 | off | TBD | TBD | TBD | Survival baseline; inspect retrieval, avoid relying on RAG reasoning |
+| llama3.2:3b / llama3.2:latest | semantic/nomic-embed-text | 0.00 | off | TBD | TBD | TBD | Practical everyman candidate; benchmark locally |
+| qwen2.5:7b | semantic/nomic-embed-text | 0.00 | off | TBD | TBD | TBD | Comfortable local candidate |
+| mistral:7b | semantic/nomic-embed-text | 0.00 | off | TBD | TBD | TBD | Comfortable local candidate |
 
 Run the frontend build:
 

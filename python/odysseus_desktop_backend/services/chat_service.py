@@ -18,8 +18,13 @@ ANSWER_STYLES = {
     "layman": "Layman",
     "detailed": "Detailed",
     "extract_only": "Extract only",
+    "evidence_only": "Evidence only",
 }
 DEFAULT_ANSWER_STYLE = "precise"
+DEFAULT_TEMPERATURE = 0.0
+RAG_PRESETS = {"standard", "potato"}
+DEFAULT_RAG_PRESET = "standard"
+POTATO_RETRIEVAL_LIMIT = 2
 
 
 class ChatService:
@@ -50,15 +55,22 @@ class ChatService:
         document_ids: list[str] | None = None,
         verify_rag: bool = False,
         answer_style: str | None = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        rag_preset: str | None = None,
     ) -> dict[str, Any]:
         content = (message or "").strip()
         if not content:
             raise ValueError("message is required")
+        selected_rag_preset = normalize_rag_preset(rag_preset) if use_rag else DEFAULT_RAG_PRESET
+        potato_mode = use_rag and selected_rag_preset == "potato"
         selected_answer_style = (
-            normalize_answer_style(answer_style)
+            "evidence_only" if potato_mode else normalize_answer_style(answer_style)
             if use_rag
             else DEFAULT_ANSWER_STYLE
         )
+        if potato_mode:
+            verify_rag = False
+            temperature = DEFAULT_TEMPERATURE
 
         current_settings = self.settings.get()
         selected_model = (model or current_settings.get("default_model") or "llama3.2").strip()
@@ -76,6 +88,7 @@ class ChatService:
             rag_context, retrieved_chunks, retrieved_snippets = self.rag.build_quote_context(
                 content,
                 document_ids=document_ids,
+                limit=POTATO_RETRIEVAL_LIMIT if potato_mode else 4,
             )
 
         ollama_messages = [
@@ -92,6 +105,7 @@ class ChatService:
                         rag_context,
                         content,
                         selected_answer_style,
+                        selected_rag_preset,
                     ),
                 },
             )
@@ -99,9 +113,11 @@ class ChatService:
                 ollama_messages,
                 content,
                 selected_answer_style,
+                selected_rag_preset,
             )
 
-        reply = self.models.chat(selected_model, ollama_messages)
+        generation_options = {"temperature": float(temperature)}
+        reply = self._chat_model(selected_model, ollama_messages, generation_options)
         grounding = self._grounding_report(
             retrieved_snippets,
             enabled=verify_rag,
@@ -114,6 +130,7 @@ class ChatService:
                 draft_answer=reply,
                 snippets=retrieved_snippets,
                 answer_style=selected_answer_style,
+                options=generation_options,
             )
         assistant_message = self.sessions.add_message(session["id"], "assistant", reply)
 
@@ -129,7 +146,20 @@ class ChatService:
             "retrieved_snippets": retrieved_snippets,
             "grounding": grounding,
             "answer_style": selected_answer_style,
+            "temperature": float(temperature),
+            "rag_preset": selected_rag_preset,
         }
+
+    def _chat_model(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        options: dict[str, Any],
+    ) -> str:
+        try:
+            return self.models.chat(model, messages, options=options)
+        except TypeError:
+            return self.models.chat(model, messages)
 
     def _derive_title(self, content: str) -> str:
         title = " ".join(content.split())
@@ -142,12 +172,14 @@ class ChatService:
         rag_context: str,
         question: str,
         answer_style: str,
+        rag_preset: str,
     ) -> str:
         return (
             "You are answering with short retrieved evidence snippets.\n"
             f"Latest user question: {question}\n\n"
             f"Answer style: {ANSWER_STYLES[answer_style]}.\n"
             f"{self._answer_style_instructions(answer_style)}\n\n"
+            f"{self._rag_preset_instructions(rag_preset)}\n\n"
             "First answer with directly supported facts from the quoted evidence. "
             "If any quoted bullet gives an event or fact relevant to the question, "
             "use it before discussing missing details.\n\n"
@@ -189,12 +221,19 @@ class ChatService:
         messages: list[dict[str, str]],
         content: str,
         answer_style: str,
+        rag_preset: str,
     ) -> None:
         for message in reversed(messages):
             if message["role"] == "user":
+                preset_note = (
+                    "Potato Mode is active: keep the answer short, quote-first, "
+                    "and say what cannot be confirmed."
+                    if rag_preset == "potato"
+                    else "Use the retrieved evidence snippets above"
+                )
                 message["content"] = (
                     f"{content}\n\n"
-                    f"Use the retrieved evidence snippets above in {ANSWER_STYLES[answer_style]} style. "
+                    f"{preset_note} in {ANSWER_STYLES[answer_style]} style. "
                     "Start with the directly supported facts or events in chronological order. "
                     "Do not answer only with missing background details when quoted evidence "
                     "gives relevant facts."
@@ -232,6 +271,20 @@ class ChatService:
                 "- If the requested answer is not directly present, say that the retrieved "
                 "context does not say."
             )
+        if answer_style == "evidence_only":
+            return (
+                "Evidence only style:\n"
+                "- Use exactly these section headings in this order:\n"
+                "  Answer:\n"
+                "  Evidence:\n"
+                "  Not found / cannot confirm:\n"
+                "- In Answer, give only one or two short directly supported claims.\n"
+                "- In Evidence, list the short quoted evidence snippets or source/page labels "
+                "that support the answer.\n"
+                "- In Not found / cannot confirm, list any requested details that are absent. "
+                "If nothing is missing, write \"None\".\n"
+                "- Do not synthesize, speculate, infer motives, or fill gaps."
+            )
         return (
             "Precise style:\n"
             "- Stay close to the retrieved evidence.\n"
@@ -241,6 +294,20 @@ class ChatService:
             "- Say the retrieved context does not say when evidence is missing."
         )
 
+    def _rag_preset_instructions(self, rag_preset: str) -> str:
+        if rag_preset == "potato":
+            return (
+                "Potato Mode preset:\n"
+                "- This mode is for weak local models and limited hardware.\n"
+                "- Use quote-first evidence only.\n"
+                "- Keep the answer short.\n"
+                "- Be strict: if the snippets do not directly answer a detail, put it under "
+                "\"Not found / cannot confirm\".\n"
+                "- Do not speculate or produce broad synthesis.\n"
+                "- Prefer saying what is missing over guessing."
+            )
+        return "Standard RAG preset."
+
     def _verify_and_correct(
         self,
         *,
@@ -249,6 +316,7 @@ class ChatService:
         draft_answer: str,
         snippets: list[dict[str, Any]],
         answer_style: str,
+        options: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
         first_report = self._verify_answer(model, draft_answer, snippets)
         contradicted = first_report.get("contradicted_claims") or []
@@ -267,7 +335,7 @@ class ChatService:
                 ),
             },
         ]
-        corrected = self.models.chat(model, correction_messages)
+        corrected = self._chat_model(model, correction_messages, options)
         final_report = self._verify_answer(model, corrected, snippets)
         final_report["regenerated"] = True
         final_report["draft_verifier"] = first_report
@@ -294,12 +362,13 @@ class ChatService:
             f"Answer:\n{answer}"
         )
         try:
-            raw = self.models.chat(
+            raw = self._chat_model(
                 model,
                 [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": payload},
                 ],
+                {"temperature": DEFAULT_TEMPERATURE},
             )
             data = parse_json_object(raw)
             return self._normalize_verification_report(snippets, data)
@@ -450,7 +519,21 @@ def normalize_answer_style(value: str | None) -> str:
     normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
     if normalized == "extract":
         normalized = "extract_only"
+    if normalized == "evidence":
+        normalized = "evidence_only"
     if normalized not in ANSWER_STYLES:
         allowed = ", ".join(sorted(ANSWER_STYLES))
         raise ValueError(f"answer_style must be one of: {allowed}")
+    return normalized
+
+
+def normalize_rag_preset(value: str | None) -> str:
+    if value is None:
+        return DEFAULT_RAG_PRESET
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"potato_mode", "potato"}:
+        return "potato"
+    if normalized not in RAG_PRESETS:
+        allowed = ", ".join(sorted(RAG_PRESETS))
+        raise ValueError(f"rag_preset must be one of: {allowed}")
     return normalized

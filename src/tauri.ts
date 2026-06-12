@@ -9,6 +9,8 @@ export type AppStatus = {
 export type Settings = {
   default_model?: string;
   ollama_endpoint?: string;
+  embedding_backend?: string;
+  embedding_model?: string;
   [key: string]: unknown;
 };
 
@@ -61,9 +63,11 @@ export type ChatResult = {
   retrieved_snippets: RAGSnippet[];
   grounding: RAGGroundingReport;
   answer_style: AnswerStyle;
+  rag_preset: RagPreset;
 };
 
-export type AnswerStyle = "precise" | "layman" | "detailed" | "extract_only";
+export type AnswerStyle = "precise" | "layman" | "detailed" | "extract_only" | "evidence_only";
+export type RagPreset = "standard" | "potato";
 
 export type DocumentRecord = {
   id: string;
@@ -82,6 +86,8 @@ export type DocumentRecord = {
   created_at: number;
   updated_at: number;
   indexed_at: number | null;
+  indexed_embedding_model: string;
+  indexed_embedding_backend: string;
   ocr_status: string;
   ocr_engine: string;
   ocr_error: string;
@@ -176,6 +182,21 @@ export type RAGHealth = {
   documents: number;
   chunks: number;
   cached_embeddings: number;
+  documents_needing_reindex: number;
+  indexed_documents: number;
+  documents_indexed_with_active_backend: number;
+  user_documents_indexed_with_active_backend: boolean;
+  embedding: EmbeddingStatus;
+};
+
+export type EmbeddingStatus = {
+  backend: string;
+  provider: string;
+  model: string;
+  cache_key: string;
+  semantic: boolean;
+  dimensions: number | null;
+  message: string;
 };
 
 export type OCRDependencyName = "tesseract" | "pdftoppm" | "mutool";
@@ -282,6 +303,11 @@ export type EvalCaseResult = {
   source_passed: boolean;
   latency_ms: number;
   reasons: string[];
+  retrieved_document_ids: string[];
+  retrieved_chunk_ids: string[];
+  embedding_backend: string;
+  embedding_model: string;
+  temperature: number;
   created_at: number;
 };
 
@@ -295,10 +321,41 @@ export type EvalRun = {
   total_failed: number;
   average_latency_ms: number;
   total_runtime_ms: number;
+  embedding_backend: string;
+  embedding_model: string;
+  temperature: number;
   notes: string;
   created_at: number;
   cases: EvalCaseResult[];
   summary_markdown: string;
+};
+
+export type BenchmarkComparisonGroup = {
+  key: string;
+  model: string;
+  embedding_backend: string;
+  embedding_model: string;
+  verify: boolean;
+  temperature: number;
+  suite_version: string;
+  run_count: number;
+  passed: number;
+  total: number;
+  expected_failures: number;
+  forbidden_failures: number;
+  source_failures: number;
+  average_latency_ms: number;
+  total_runtime_ms: number;
+  pass_rate: number;
+  guidance_labels: string[];
+  verifier_recommended: boolean;
+  recommended?: boolean;
+};
+
+export type BenchmarkComparison = {
+  groups: BenchmarkComparisonGroup[];
+  recommended: BenchmarkComparisonGroup | null;
+  recommendation_reason: string;
 };
 
 export async function getAppStatus(): Promise<AppStatus> {

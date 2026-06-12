@@ -81,6 +81,7 @@ class SidecarApp:
             "evals.list": self.evals_list,
             "evals.run": self.evals_run,
             "evals.history": self.evals_history,
+            "evals.comparison": self.evals_comparison,
             "evals.clear_history": self.evals_clear_history,
             "app.shutdown": self.app_shutdown,
         }
@@ -162,6 +163,8 @@ class SidecarApp:
             document_ids=optional_str_list(params, "document_ids"),
             verify_rag=optional_bool(params, "verify_rag", False),
             answer_style=optional_str(params, "answer_style"),
+            temperature=optional_float(params, "temperature", 0.0),
+            rag_preset=optional_str(params, "rag_preset"),
         )
 
     def models_detect_ollama(self, _params: JsonDict) -> JsonDict:
@@ -228,10 +231,14 @@ class SidecarApp:
             model=require_str(params, "model"),
             verify=optional_bool(params, "verify", False),
             answer_style_override=optional_str(params, "answer_style"),
+            temperature=optional_float(params, "temperature", 0.0),
         )
 
     def evals_history(self, params: JsonDict) -> list[JsonDict]:
         return self.evals.history(limit=optional_int(params, "limit", 20))
+
+    def evals_comparison(self, params: JsonDict) -> JsonDict:
+        return self.evals.comparison(limit=optional_int(params, "limit", 100))
 
     def evals_clear_history(self, _params: JsonDict) -> JsonDict:
         return self.evals.clear_history()
@@ -269,6 +276,13 @@ def optional_bool(params: JsonDict, key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise RpcError(-32602, f"{key} must be a boolean")
     return value
+
+
+def optional_float(params: JsonDict, key: str, default: float) -> float:
+    value = params.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RpcError(-32602, f"{key} must be a number")
+    return float(value)
 
 
 def optional_str_list(params: JsonDict, key: str) -> list[str] | None:

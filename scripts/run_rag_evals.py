@@ -19,7 +19,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run local RAG evals against installed Ollama models. "
-            "These evals use bundled fixture documents, not the user's imported Documents library."
+            "These evals use bundled fixture documents, not the user's imported Documents library. "
+            "Results report whether retrieval used semantic Ollama embeddings or the lexical fallback."
         )
     )
     parser.add_argument("--cases", type=Path, default=ROOT / "evals" / "rag_cases")
@@ -57,10 +58,18 @@ def main() -> int:
                 runs.append(run)
                 failures += run["total_failed"]
                 print(f"\nmodel={model}")
+                print(
+                    "  embeddings={backend}/{model_name} temperature={temperature:.2f}".format(
+                        backend=run.get("embedding_backend") or "unknown",
+                        model_name=run.get("embedding_model") or "unknown",
+                        temperature=float(run.get("temperature") or 0),
+                    )
+                )
                 for case in run["cases"]:
                     status = "PASS" if case["passed"] else "FAIL"
                     print(
                         f"  {status} {case['case_id']} style={case['answer_style']} "
+                        f"embeddings={case.get('embedding_backend')}/{case.get('embedding_model')} "
                         f"latency_ms={case['latency_ms']} "
                         f"expected={case['expected_passed']} forbidden={case['forbidden_passed']} "
                         f"source={case['source_passed']}"

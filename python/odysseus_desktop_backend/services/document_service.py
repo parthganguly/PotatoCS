@@ -289,16 +289,23 @@ class DocumentService:
     def mark_indexing(self, document_id: str) -> None:
         self._update_status(document_id, index_status="indexing", status="imported", error="")
 
-    def mark_indexed(self, document_id: str) -> None:
+    def mark_indexed(
+        self,
+        document_id: str,
+        *,
+        embedding_model: str = "",
+        embedding_backend: str = "",
+    ) -> None:
         now = utc_ms()
         self.db.conn.execute(
             """
             UPDATE documents
             SET index_status = 'indexed', status = 'indexed', error = '',
+                indexed_embedding_model = ?, indexed_embedding_backend = ?,
                 updated_at = ?, indexed_at = ?
             WHERE id = ?
             """,
-            (now, now, document_id),
+            (embedding_model, embedding_backend, now, now, document_id),
         )
         self.db.conn.commit()
 
@@ -426,6 +433,8 @@ class DocumentService:
             "ocr_status",
             "ocr_engine",
             "ocr_error",
+            "indexed_embedding_model",
+            "indexed_embedding_backend",
         }
         fields = {key: value for key, value in values.items() if key in allowed}
         if not fields:

@@ -51,6 +51,7 @@ class VectorStore(ABC):
         query_vector: np.ndarray,
         *,
         limit: int = 5,
+        embedding_model: str | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[SearchResult]:
         raise NotImplementedError
@@ -130,10 +131,12 @@ class SQLiteNumPyVectorStore(VectorStore):
         query_vector: np.ndarray,
         *,
         limit: int = 5,
+        embedding_model: str | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[SearchResult]:
+        model_filter = "AND c.embedding_model = ?" if embedding_model else ""
         rows = self.db.conn.execute(
-            """
+            f"""
             SELECT
                 c.id, c.document_id, c.content, c.page_start, c.page_end,
                 c.metadata_json, e.vector_blob, e.dimensions
@@ -143,7 +146,9 @@ class SQLiteNumPyVectorStore(VectorStore):
                 ON e.content_hash = c.embedding_hash
                 AND e.embedding_model = c.embedding_model
             WHERE c.is_deleted = 0 AND d.is_deleted = 0 AND d.index_status = 'indexed'
-            """
+            {model_filter}
+            """,
+            ([embedding_model] if embedding_model else []),
         ).fetchall()
 
         query = query_vector.astype(np.float32)
@@ -158,6 +163,8 @@ class SQLiteNumPyVectorStore(VectorStore):
                 continue
             vector = np.frombuffer(row["vector_blob"], dtype=np.float32)
             if vector.shape[0] != row["dimensions"]:
+                continue
+            if vector.shape[0] != query.shape[0]:
                 continue
             denom = float(np.linalg.norm(vector)) * query_norm
             score = 0.0 if denom == 0 else float(np.dot(query, vector) / denom)
