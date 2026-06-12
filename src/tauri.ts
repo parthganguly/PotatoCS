@@ -339,6 +339,25 @@ export type BenchmarkComparisonGroup = {
   temperature: number;
   suite_version: string;
   run_count: number;
+  latest_run_passed: number;
+  latest_run_total: number;
+  latest_run_pass_rate: number;
+  latest_run_avg_latency_ms: number;
+  latest_expected_failures: number;
+  latest_forbidden_failures: number;
+  latest_source_failures: number;
+  latest_created_at: number;
+  best_run_passed: number;
+  best_run_total: number;
+  best_run_pass_rate: number;
+  best_run_avg_latency_ms: number;
+  best_created_at: number;
+  mean_passed_per_run: number;
+  mean_pass_rate: number;
+  median_avg_latency_ms: number;
+  mean_avg_latency_ms: number;
+  cumulative_passed: number;
+  cumulative_total: number;
   passed: number;
   total: number;
   expected_failures: number;
@@ -352,10 +371,32 @@ export type BenchmarkComparisonGroup = {
   recommended?: boolean;
 };
 
+export type BenchmarkCaseDifficultyItem = {
+  case_id: string;
+  question: string;
+  required_source_document: string;
+  attempts: number;
+  passes: number;
+  failures: number;
+  pass_rate: number;
+  source_failures: number;
+  source_failure_rate: number;
+  forbidden_failures: number;
+  forbidden_failure_rate: number;
+};
+
+export type BenchmarkCaseDifficulty = {
+  usually_pass: BenchmarkCaseDifficultyItem[];
+  usually_fail: BenchmarkCaseDifficultyItem[];
+  frequent_source_failures: BenchmarkCaseDifficultyItem[];
+  frequent_forbidden_failures: BenchmarkCaseDifficultyItem[];
+};
+
 export type BenchmarkComparison = {
   groups: BenchmarkComparisonGroup[];
   recommended: BenchmarkComparisonGroup | null;
   recommendation_reason: string;
+  case_difficulty: BenchmarkCaseDifficulty;
 };
 
 export async function getAppStatus(): Promise<AppStatus> {

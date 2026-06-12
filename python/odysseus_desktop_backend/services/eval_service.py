@@ -5,6 +5,7 @@ import tempfile
 import time
 import uuid
 import math
+import statistics
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -509,56 +510,85 @@ def format_benchmark_summary(runs: list[dict[str, Any]]) -> str:
 
 
 def benchmark_comparison(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    groups_by_key: dict[tuple[str, str, str, bool, float], dict[str, Any]] = {}
+    grouped_runs: dict[tuple[str, str, str, bool, float], list[dict[str, Any]]] = {}
     for run in runs:
-        key = comparison_key(run)
-        group = groups_by_key.setdefault(
-            key,
-            {
-                "key": "|".join(str(item) for item in key),
-                "model": str(run.get("model") or ""),
-                "embedding_backend": str(run.get("embedding_backend") or ""),
-                "embedding_model": str(run.get("embedding_model") or ""),
-                "verify": bool(run.get("verify")),
-                "temperature": float(run.get("temperature") or 0),
-                "suite_version": str(run.get("suite_version") or ""),
-                "run_count": 0,
-                "passed": 0,
-                "total": 0,
-                "expected_failures": 0,
-                "forbidden_failures": 0,
-                "source_failures": 0,
-                "latency_total": 0,
-                "total_runtime_ms": 0,
-            },
-        )
-        cases = run.get("cases") or []
-        group["run_count"] += 1
-        group["passed"] += int(run.get("total_passed") or 0)
-        group["total"] += len(cases)
-        group["expected_failures"] += sum(1 for case in cases if not case.get("expected_passed"))
-        group["forbidden_failures"] += sum(1 for case in cases if not case.get("forbidden_passed"))
-        group["source_failures"] += sum(1 for case in cases if not case.get("source_passed"))
-        group["latency_total"] += sum(int(case.get("latency_ms") or 0) for case in cases)
-        group["total_runtime_ms"] += int(run.get("total_runtime_ms") or 0)
+        grouped_runs.setdefault(comparison_key(run), []).append(run)
 
-    for group in groups_by_key.values():
-        total = int(group["total"])
-        average_latency_ms = int(group["latency_total"] / total) if total else 0
-        group.pop("latency_total", None)
-        group["average_latency_ms"] = average_latency_ms
-        group["pass_rate"] = (float(group["passed"]) / total) if total else 0.0
+    groups_by_key: dict[tuple[str, str, str, bool, float], dict[str, Any]] = {}
+    for key, config_runs in grouped_runs.items():
+        sorted_runs = sorted(config_runs, key=run_created_at, reverse=True)
+        latest_run = sorted_runs[0]
+        best_run = sorted(
+            sorted_runs,
+            key=lambda run: (-run_passed_count(run), run_average_latency_ms(run), -run_created_at(run)),
+        )[0]
+        latest_cases = run_cases(latest_run)
+        latest_expected_failures, latest_forbidden_failures, latest_source_failures = case_failure_counts(latest_cases)
+        run_passed_values = [run_passed_count(run) for run in sorted_runs]
+        run_pass_rates = [run_pass_rate(run) for run in sorted_runs]
+        run_latencies = [run_average_latency_ms(run) for run in sorted_runs]
+        run_count = len(sorted_runs)
+        total_runtime_ms = sum(int(run.get("total_runtime_ms") or 0) for run in sorted_runs)
+        latest_total = run_total_count(latest_run)
+        best_total = run_total_count(best_run)
+
+        group = {
+            "key": "|".join(str(item) for item in key),
+            "model": str(latest_run.get("model") or ""),
+            "embedding_backend": str(latest_run.get("embedding_backend") or ""),
+            "embedding_model": str(latest_run.get("embedding_model") or ""),
+            "verify": bool(latest_run.get("verify")),
+            "temperature": float(latest_run.get("temperature") or 0),
+            "suite_version": str(latest_run.get("suite_version") or ""),
+            "run_count": run_count,
+            "latest_run_passed": run_passed_count(latest_run),
+            "latest_run_total": latest_total,
+            "latest_run_pass_rate": run_pass_rate(latest_run),
+            "latest_run_avg_latency_ms": run_average_latency_ms(latest_run),
+            "latest_expected_failures": latest_expected_failures,
+            "latest_forbidden_failures": latest_forbidden_failures,
+            "latest_source_failures": latest_source_failures,
+            "latest_created_at": run_created_at(latest_run),
+            "best_run_passed": run_passed_count(best_run),
+            "best_run_total": best_total,
+            "best_run_pass_rate": run_pass_rate(best_run),
+            "best_run_avg_latency_ms": run_average_latency_ms(best_run),
+            "best_created_at": run_created_at(best_run),
+            "mean_passed_per_run": sum(run_passed_values) / run_count if run_count else 0.0,
+            "mean_pass_rate": sum(run_pass_rates) / run_count if run_count else 0.0,
+            "median_avg_latency_ms": int(statistics.median(run_latencies)) if run_latencies else 0,
+            "mean_avg_latency_ms": int(statistics.mean(run_latencies)) if run_latencies else 0,
+            "total_runtime_ms": total_runtime_ms,
+            "cumulative_passed": sum(run_passed_values),
+            "cumulative_total": sum(run_total_count(run) for run in sorted_runs),
+        }
+
+        # Backward-compatible aliases for older callers; these now represent the
+        # latest run or median latency, not cumulative benchmark quality.
+        group.update(
+            {
+                "passed": group["latest_run_passed"],
+                "total": group["latest_run_total"],
+                "expected_failures": group["latest_expected_failures"],
+                "forbidden_failures": group["latest_forbidden_failures"],
+                "source_failures": group["latest_source_failures"],
+                "average_latency_ms": group["median_avg_latency_ms"],
+                "pass_rate": group["latest_run_pass_rate"],
+            }
+        )
+        groups_by_key[key] = group
 
     groups = []
     for group in groups_by_key.values():
         group["guidance_labels"] = guidance_labels_for_group(group, groups_by_key)
         group["verifier_recommended"] = verifier_is_worthwhile(group, groups_by_key)
         groups.append(group)
+    add_fastest_usable_label(groups)
 
     groups.sort(
         key=lambda group: (
-            -int(group["passed"]),
-            int(group["average_latency_ms"]),
+            -recommendation_score(group),
+            int(group["latest_run_avg_latency_ms"] or group["median_avg_latency_ms"]),
             bool(group["verify"]),
             str(group["model"]),
         )
@@ -571,7 +601,50 @@ def benchmark_comparison(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "groups": groups,
         "recommended": recommended,
         "recommendation_reason": recommendation_reason(recommended),
+        "case_difficulty": case_difficulty_summary(runs),
     }
+
+
+def run_cases(run: dict[str, Any]) -> list[dict[str, Any]]:
+    cases = run.get("cases")
+    return cases if isinstance(cases, list) else []
+
+
+def run_passed_count(run: dict[str, Any]) -> int:
+    return int(run.get("total_passed") or 0)
+
+
+def run_total_count(run: dict[str, Any]) -> int:
+    cases = run_cases(run)
+    if cases:
+        return len(cases)
+    return run_passed_count(run) + int(run.get("total_failed") or 0)
+
+
+def run_pass_rate(run: dict[str, Any]) -> float:
+    total = run_total_count(run)
+    return float(run_passed_count(run)) / total if total else 0.0
+
+
+def run_average_latency_ms(run: dict[str, Any]) -> int:
+    latency = run.get("average_latency_ms")
+    if latency is not None:
+        return int(latency or 0)
+    cases = run_cases(run)
+    if not cases:
+        return 0
+    return int(sum(int(case.get("latency_ms") or 0) for case in cases) / len(cases))
+
+
+def run_created_at(run: dict[str, Any]) -> int:
+    return int(run.get("created_at") or 0)
+
+
+def case_failure_counts(cases: list[dict[str, Any]]) -> tuple[int, int, int]:
+    expected_failures = sum(1 for case in cases if not case.get("expected_passed"))
+    forbidden_failures = sum(1 for case in cases if not case.get("forbidden_passed"))
+    source_failures = sum(1 for case in cases if not case.get("source_passed"))
+    return expected_failures, forbidden_failures, source_failures
 
 
 def comparison_key(run: dict[str, Any]) -> tuple[str, str, str, bool, float]:
@@ -603,14 +676,14 @@ def verifier_is_worthwhile(
     counterpart = groups_by_key.get(no_verifier_key(group))
     if counterpart is None:
         return True
-    total = max(int(group.get("total") or 0), int(counterpart.get("total") or 0), 1)
-    pass_delta = int(group.get("passed") or 0) - int(counterpart.get("passed") or 0)
+    total = max(int(group.get("latest_run_total") or 0), int(counterpart.get("latest_run_total") or 0), 1)
+    pass_delta = int(group.get("latest_run_passed") or 0) - int(counterpart.get("latest_run_passed") or 0)
     meaningful_delta = max(1, math.ceil(total * 0.15))
     if pass_delta < meaningful_delta:
         return False
-    verifier_latency = int(group.get("average_latency_ms") or 0)
-    base_latency = max(int(counterpart.get("average_latency_ms") or 0), 1)
-    return verifier_latency <= base_latency * 2 or pass_delta >= meaningful_delta + 1
+    verifier_latency = int(group.get("latest_run_avg_latency_ms") or group.get("median_avg_latency_ms") or 0)
+    base_latency = max(int(counterpart.get("latest_run_avg_latency_ms") or counterpart.get("median_avg_latency_ms") or 0), 1)
+    return verifier_latency <= base_latency * 2
 
 
 def choose_recommended_group(
@@ -627,12 +700,18 @@ def choose_recommended_group(
     return sorted(
         eligible,
         key=lambda group: (
-            -int(group.get("passed") or 0),
-            int(group.get("average_latency_ms") or 0),
+            -recommendation_score(group),
+            int(group.get("latest_run_avg_latency_ms") or group.get("median_avg_latency_ms") or 0),
             bool(group.get("verify")),
             str(group.get("model") or ""),
         ),
     )[0]
+
+
+def recommendation_score(group: dict[str, Any]) -> float:
+    if int(group.get("run_count") or 0) > 1:
+        return float(group.get("mean_pass_rate") or 0.0)
+    return float(group.get("latest_run_pass_rate") or 0.0)
 
 
 def recommendation_reason(group: dict[str, Any] | None) -> str:
@@ -640,7 +719,7 @@ def recommendation_reason(group: dict[str, Any] | None) -> str:
         return "No benchmark runs are available yet."
     verifier = "verifier on" if group.get("verify") else "verifier off"
     return (
-        f"Recommended by highest pass count with lower latency as tie-breaker: "
+        f"Recommended by latest/mean pass rate with lower latency as tie-breaker: "
         f"{group.get('model')} using {group.get('embedding_backend')}/{group.get('embedding_model')}, "
         f"{verifier}, temperature {float(group.get('temperature') or 0):.2f}."
     )
@@ -651,29 +730,117 @@ def guidance_labels_for_group(
     groups_by_key: dict[tuple[str, str, str, bool, float], dict[str, Any]],
 ) -> list[str]:
     labels: list[str] = []
-    total = max(int(group.get("total") or 0), 1)
-    passed = int(group.get("passed") or 0)
-    pass_rate = passed / total
-    expected_failures = int(group.get("expected_failures") or 0)
-    forbidden_failures = int(group.get("forbidden_failures") or 0)
-    source_failures = int(group.get("source_failures") or 0)
+    pass_rate = float(group.get("mean_pass_rate") or group.get("latest_run_pass_rate") or 0.0)
+    expected_failures = int(group.get("latest_expected_failures") or 0)
+    forbidden_failures = int(group.get("latest_forbidden_failures") or 0)
+    source_failures = int(group.get("latest_source_failures") or 0)
 
     if pass_rate >= 0.85 and source_failures == 0 and forbidden_failures == 0:
         labels.append("Recommended for Potato Mode")
-    if pass_rate >= 0.65 and forbidden_failures == 0:
-        labels.append("Good for direct extraction")
+    if pass_rate >= 0.4 and forbidden_failures == 0:
+        labels.append("Good extraction baseline")
     if expected_failures > 0:
         labels.append("Weak at chronology")
     if source_failures > 0:
         labels.append("Source contamination risk")
     if forbidden_failures > 0 or pass_rate < 0.5:
-        labels.append("Not recommended for evidence-sensitive answers")
+        labels.append("Not evidence-safe")
     if group.get("verify"):
+        counterpart = groups_by_key.get(no_verifier_key(group))
+        improved = counterpart is None or int(group.get("latest_run_passed") or 0) > int(counterpart.get("latest_run_passed") or 0)
         if verifier_is_worthwhile(group, groups_by_key):
-            labels.append("Verifier helped grounding")
+            labels.append("Verifier improved score")
+        elif improved:
+            labels.append("Verifier improved score but high latency")
         else:
-            labels.append("Verifier not useful here")
+            labels.append("Verifier not worth latency")
     return dedupe_labels(labels)
+
+
+def add_fastest_usable_label(groups: list[dict[str, Any]]) -> None:
+    usable = [group for group in groups if int(group.get("latest_run_passed") or 0) > 0]
+    if not usable:
+        return
+    best_passed = max(int(group.get("latest_run_passed") or 0) for group in usable)
+    fastest = sorted(
+        (group for group in usable if int(group.get("latest_run_passed") or 0) == best_passed),
+        key=lambda group: (
+            int(group.get("latest_run_avg_latency_ms") or group.get("median_avg_latency_ms") or 0),
+            bool(group.get("verify")),
+            str(group.get("model") or ""),
+        ),
+    )[0]
+    fastest["guidance_labels"] = dedupe_labels(["Fastest usable config", *fastest.get("guidance_labels", [])])
+
+
+def case_difficulty_summary(runs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    stats: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        for case in run_cases(run):
+            case_id = str(case.get("case_id") or "unknown")
+            entry = stats.setdefault(
+                case_id,
+                {
+                    "case_id": case_id,
+                    "question": str(case.get("question") or ""),
+                    "required_source_document": str(case.get("required_source_document") or ""),
+                    "attempts": 0,
+                    "passes": 0,
+                    "source_failures": 0,
+                    "forbidden_failures": 0,
+                },
+            )
+            entry["attempts"] += 1
+            if case.get("passed"):
+                entry["passes"] += 1
+            if not case.get("source_passed"):
+                entry["source_failures"] += 1
+            if not case.get("forbidden_passed"):
+                entry["forbidden_failures"] += 1
+
+    items = [case_difficulty_item(entry) for entry in stats.values()]
+    usually_pass = sorted(
+        [item for item in items if item["pass_rate"] >= 0.75],
+        key=lambda item: (-float(item["pass_rate"]), -int(item["attempts"]), str(item["case_id"])),
+    )
+    usually_fail = sorted(
+        [item for item in items if item["pass_rate"] <= 0.4],
+        key=lambda item: (float(item["pass_rate"]), -int(item["attempts"]), str(item["case_id"])),
+    )
+    frequent_source_failures = sorted(
+        [item for item in items if item["source_failure_rate"] >= 0.4 and int(item["source_failures"]) > 0],
+        key=lambda item: (-float(item["source_failure_rate"]), -int(item["attempts"]), str(item["case_id"])),
+    )
+    frequent_forbidden_failures = sorted(
+        [item for item in items if item["forbidden_failure_rate"] >= 0.4 and int(item["forbidden_failures"]) > 0],
+        key=lambda item: (-float(item["forbidden_failure_rate"]), -int(item["attempts"]), str(item["case_id"])),
+    )
+    return {
+        "usually_pass": usually_pass,
+        "usually_fail": usually_fail,
+        "frequent_source_failures": frequent_source_failures,
+        "frequent_forbidden_failures": frequent_forbidden_failures,
+    }
+
+
+def case_difficulty_item(entry: dict[str, Any]) -> dict[str, Any]:
+    attempts = max(int(entry.get("attempts") or 0), 1)
+    passes = int(entry.get("passes") or 0)
+    source_failures = int(entry.get("source_failures") or 0)
+    forbidden_failures = int(entry.get("forbidden_failures") or 0)
+    return {
+        "case_id": str(entry.get("case_id") or ""),
+        "question": str(entry.get("question") or ""),
+        "required_source_document": str(entry.get("required_source_document") or ""),
+        "attempts": attempts,
+        "passes": passes,
+        "failures": attempts - passes,
+        "pass_rate": passes / attempts,
+        "source_failures": source_failures,
+        "source_failure_rate": source_failures / attempts,
+        "forbidden_failures": forbidden_failures,
+        "forbidden_failure_rate": forbidden_failures / attempts,
+    }
 
 
 def dedupe_labels(labels: list[str]) -> list[str]:

@@ -153,7 +153,7 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.5 RAG diagnostics: semantic Ollama embeddings where available, honest
+- v0.1.6 RAG diagnostics: semantic Ollama embeddings where available, honest
   lexical fallback, quote-first answers, source-scoped retrieval,
   answer styles, optional verifier pass, retrieved snippets, local benchmark
   runs, comparison summaries, deterministic model guidance, Potato Mode, and
@@ -171,7 +171,7 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.5 focuses on making retrieval, diagnostics, and evaluation more useful for small local
+v0.1.6 focuses on making retrieval, diagnostics, and evaluation more useful for small local
 models such as `llama3.2` on limited hardware. It does not require cloud
 models, does not auto-download models, and does not require a larger default
 chat model.
@@ -237,6 +237,8 @@ IDs, retrieved chunk IDs, active embedding backend/model, answer style,
 verifier state, and temperature. Expected-fact grading is paraphrase-tolerant
 instead of pure exact substring matching, while forbidden claims remain
 phrase-aware checks.
+v0.1.6 keeps the eval suite at `v0.1.5` and only changes how saved benchmark
+history is compared and recommended.
 
 The Diagnostics tab exposes the same local eval suite inside the app. It shows
 the app version, profile path, backend/database/log paths, Ollama reachability,
@@ -257,7 +259,7 @@ services.
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.5_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.6_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -380,16 +382,20 @@ Recommendation guidance:
 
 - The comparison table groups saved runs by chat model, embedding backend/model,
   verifier on/off, and temperature.
-- It shows passed/total, expected-fact failures, forbidden-claim failures,
-  source failures, average latency, total runtime, and deterministic guidance
-  labels.
-- The recommended configuration is selected by highest pass count, then lower
-  latency. Verifier-on runs are recommended only when they improve pass count
-  enough to justify their latency cost.
-- Guidance labels are deterministic examples such as `Good for direct
-  extraction`, `Weak at chronology`, `Source contamination risk`, `Verifier not
-  useful here`, `Recommended for Potato Mode`, and `Not recommended for
-  evidence-sensitive answers`.
+- It shows latest run score, best run score, average pass/run, run count,
+  median average latency, verifier state, and deterministic guidance labels.
+- Cumulative pass totals are kept only as informational data and are not the
+  main score, because repeated runs of the same config should not look better
+  merely because they were run more often.
+- The recommended configuration is selected from latest/mean pass rate, then
+  lower latency. Verifier-off wins ties, and verifier-on runs are recommended
+  only when they materially improve pass score enough to justify latency.
+- The Case Difficulty summary identifies cases that usually pass, usually
+  fail, often fail source scoping, or often produce forbidden-claim failures.
+- Guidance labels are deterministic examples such as `Fastest usable config`,
+  `Good extraction baseline`, `Weak at chronology`, `Source contamination
+  risk`, `Verifier not worth latency`, `Verifier improved score but high
+  latency`, `Recommended for Potato Mode`, and `Not evidence-safe`.
 
 The `Documents` tab is your user-imported library for normal RAG chat. The
 benchmark eval fixtures are separate bundled documents used for repeatable

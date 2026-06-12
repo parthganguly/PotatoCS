@@ -1,5 +1,36 @@
 # Release Notes
 
+## v0.1.6 - Benchmark Comparison Fix
+
+v0.1.6 fixes the Benchmark Comparison section so repeated benchmark runs do not
+inflate a configuration's apparent quality. It does not change the eval case
+definitions or scoring rules, so the eval suite remains `v0.1.5`.
+
+Highlights:
+
+- Comparison rows now show latest run score, best run score, average pass/run,
+  run count, median average latency, verifier state, and deterministic guidance
+  labels.
+- Cumulative totals are no longer used as the primary score or recommendation
+  driver.
+- Recommendation now prefers latest/mean pass rate, then lower latency, with
+  verifier-off winning ties.
+- Verifier-on configurations are recommended only when they materially improve
+  pass score enough to justify latency.
+- Added a deterministic Case Difficulty summary for usually passing cases,
+  usually failing cases, frequent source failures, and frequent forbidden-claim
+  failures.
+- Guidance labels now use latest/average behavior instead of cumulative raw
+  totals.
+
+Validation commands for v0.1.6:
+
+```powershell
+python -m pytest python\tests
+npm run build
+git diff --check
+```
+
 ## v0.1.5 - Benchmark Hardening and Weak-Model Guidance
 
 v0.1.5 hardens Diagnostics and Model Benchmark so Odysseus Desktop can evaluate

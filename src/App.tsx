@@ -26,6 +26,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AppStatus,
   AnswerStyle,
+  BenchmarkCaseDifficulty,
   BenchmarkComparison,
   BenchmarkComparisonGroup,
   ChatResult,
@@ -1558,16 +1559,16 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
         <p className="px-4 py-6 text-sm text-ink/55">No saved benchmark runs to compare.</p>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[980px] text-left text-xs">
+          <table className="w-full min-w-[1080px] text-left text-xs">
             <thead className="bg-[#faf9f3] text-ink/60">
               <tr>
                 <th className="px-4 py-2 font-medium">Config</th>
-                <th className="px-4 py-2 font-medium">Passed</th>
-                <th className="px-4 py-2 font-medium">Expected fail</th>
-                <th className="px-4 py-2 font-medium">Forbidden fail</th>
-                <th className="px-4 py-2 font-medium">Source fail</th>
+                <th className="px-4 py-2 font-medium">Latest</th>
+                <th className="px-4 py-2 font-medium">Best</th>
+                <th className="px-4 py-2 font-medium">Avg pass/run</th>
+                <th className="px-4 py-2 font-medium">Runs</th>
                 <th className="px-4 py-2 font-medium">Avg latency</th>
-                <th className="px-4 py-2 font-medium">Runtime</th>
+                <th className="px-4 py-2 font-medium">Verifier</th>
                 <th className="px-4 py-2 font-medium">Guidance</th>
               </tr>
             </thead>
@@ -1577,16 +1578,34 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
                   <td className="px-4 py-2">
                     <p className="font-medium">{group.model}</p>
                     <p className="text-ink/55">
-                      {formatGroupEmbedding(group)} · verifier {group.verify ? "on" : "off"} · temp {group.temperature.toFixed(2)}
+                      {formatGroupEmbedding(group)} - temp {group.temperature.toFixed(2)}
                     </p>
                     {group.recommended && <p className="mt-1 text-moss">Recommended</p>}
                   </td>
-                  <td className="px-4 py-2">{group.passed}/{group.total}</td>
-                  <td className="px-4 py-2">{group.expected_failures}</td>
-                  <td className="px-4 py-2">{group.forbidden_failures}</td>
-                  <td className="px-4 py-2">{group.source_failures}</td>
-                  <td className="px-4 py-2">{group.average_latency_ms} ms</td>
-                  <td className="px-4 py-2">{group.total_runtime_ms} ms</td>
+                  <td className="px-4 py-2">
+                    <p>{group.latest_run_passed}/{group.latest_run_total}</p>
+                    <p className="text-ink/55">{formatPercent(group.latest_run_pass_rate)}</p>
+                  </td>
+                  <td className="px-4 py-2">
+                    <p>{group.best_run_passed}/{group.best_run_total}</p>
+                    <p className="text-ink/55">{formatMs(group.best_run_avg_latency_ms)}</p>
+                  </td>
+                  <td className="px-4 py-2">
+                    <p>{group.mean_passed_per_run.toFixed(1)}</p>
+                    <p className="text-ink/55">{formatPercent(group.mean_pass_rate)}</p>
+                  </td>
+                  <td className="px-4 py-2">
+                    <p>{group.run_count}</p>
+                    <p className="text-ink/55">runtime {formatMs(group.total_runtime_ms)}</p>
+                  </td>
+                  <td className="px-4 py-2">
+                    <p>{formatMs(group.median_avg_latency_ms)}</p>
+                    <p className="text-ink/55">latest {formatMs(group.latest_run_avg_latency_ms)}</p>
+                  </td>
+                  <td className="px-4 py-2">
+                    <p>{group.verify ? "on" : "off"}</p>
+                    <p className="text-ink/55">{group.verify ? (group.verifier_recommended ? "worth it" : "not worth latency") : "baseline"}</p>
+                  </td>
                   <td className="px-4 py-2">
                     <div className="flex max-w-[280px] flex-wrap gap-1.5">
                       {group.guidance_labels.length === 0 ? (
@@ -1604,6 +1623,56 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
               ))}
             </tbody>
           </table>
+          <CaseDifficultySummary summary={comparison.case_difficulty} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CaseDifficultySummary({ summary }: { summary: BenchmarkCaseDifficulty }) {
+  const hasItems =
+    summary.usually_pass.length > 0 ||
+    summary.usually_fail.length > 0 ||
+    summary.frequent_source_failures.length > 0 ||
+    summary.frequent_forbidden_failures.length > 0;
+  if (!hasItems) return null;
+  return (
+    <div className="border-t border-ink/10 px-4 py-3">
+      <p className="text-sm font-semibold">Case Difficulty</p>
+      <p className="mt-1 text-xs text-ink/55">Deterministic summary across saved benchmark runs.</p>
+      <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <CaseDifficultyList items={summary.usually_pass} title="Usually pass" />
+        <CaseDifficultyList items={summary.usually_fail} title="Usually fail" />
+        <CaseDifficultyList items={summary.frequent_source_failures} title="Frequent source failures" />
+        <CaseDifficultyList items={summary.frequent_forbidden_failures} title="Frequent forbidden-claim failures" />
+      </div>
+    </div>
+  );
+}
+
+function CaseDifficultyList({
+  items,
+  title,
+}: {
+  items: BenchmarkCaseDifficulty["usually_pass"];
+  title: string;
+}) {
+  return (
+    <div>
+      <p className="text-xs font-semibold text-ink/70">{title}</p>
+      {items.length === 0 ? (
+        <p className="mt-1 text-xs text-ink/45">No cases yet.</p>
+      ) : (
+        <div className="mt-1 space-y-1.5">
+          {items.slice(0, 4).map((item) => (
+            <div className="rounded-md border border-ink/10 bg-[#faf9f3] px-2 py-1.5 text-xs" key={item.case_id}>
+              <p className="font-medium">{item.case_id}</p>
+              <p className="text-ink/55">
+                {item.passes}/{item.attempts} passed - source failures {item.source_failures} - forbidden failures {item.forbidden_failures}
+              </p>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -2073,6 +2142,14 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatMs(ms: number): string {
+  return `${Math.round(ms)} ms`;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
 }
 
 function formatTimestamp(ms: number): string {

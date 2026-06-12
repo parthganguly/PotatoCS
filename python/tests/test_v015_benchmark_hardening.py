@@ -23,9 +23,9 @@ def test_benchmark_comparison_prefers_verifier_off_when_pass_equal_and_faster():
     recommended = comparison["recommended"]
 
     assert recommended["verify"] is False
-    assert recommended["passed"] == 4
+    assert recommended["latest_run_passed"] == 4
     verifier_group = next(group for group in comparison["groups"] if group["verify"])
-    assert "Verifier not useful here" in verifier_group["guidance_labels"]
+    assert "Verifier not worth latency" in verifier_group["guidance_labels"]
 
 
 def test_benchmark_comparison_recommends_verifier_only_when_it_meaningfully_improves_passes():
@@ -39,8 +39,44 @@ def test_benchmark_comparison_recommends_verifier_only_when_it_meaningfully_impr
     recommended = comparison["recommended"]
 
     assert recommended["verify"] is True
-    assert recommended["passed"] == 5
-    assert "Verifier helped grounding" in recommended["guidance_labels"]
+    assert recommended["latest_run_passed"] == 5
+    assert "Verifier improved score" in recommended["guidance_labels"]
+
+
+def test_repeated_runs_do_not_win_by_cumulative_pass_count():
+    comparison = benchmark_comparison(
+        [
+            run_fixture("repeated:latest", verify=False, passed=2, latency=700, created_at=1),
+            run_fixture("repeated:latest", verify=False, passed=2, latency=700, created_at=2),
+            run_fixture("repeated:latest", verify=False, passed=2, latency=700, created_at=3),
+            run_fixture("single:latest", verify=False, passed=3, latency=900, created_at=4),
+        ]
+    )
+
+    recommended = comparison["recommended"]
+    repeated = next(group for group in comparison["groups"] if group["model"] == "repeated:latest")
+
+    assert repeated["cumulative_passed"] == 6
+    assert repeated["latest_run_passed"] == 2
+    assert repeated["mean_passed_per_run"] == 2
+    assert recommended["model"] == "single:latest"
+
+
+def test_latest_run_score_is_separate_from_average_score():
+    comparison = benchmark_comparison(
+        [
+            run_fixture("steady:latest", verify=False, passed=2, latency=1000, created_at=1),
+            run_fixture("steady:latest", verify=False, passed=4, latency=1200, created_at=2),
+        ]
+    )
+
+    group = comparison["groups"][0]
+
+    assert group["run_count"] == 2
+    assert group["latest_run_passed"] == 4
+    assert group["best_run_passed"] == 4
+    assert group["mean_passed_per_run"] == 3
+    assert group["cumulative_passed"] == 6
 
 
 def test_guidance_labels_are_deterministic_from_failure_categories():
@@ -60,11 +96,73 @@ def test_guidance_labels_are_deterministic_from_failure_categories():
 
     labels = comparison["groups"][0]["guidance_labels"]
 
-    assert labels == [
-        "Weak at chronology",
-        "Source contamination risk",
-        "Not recommended for evidence-sensitive answers",
-    ]
+    assert "Weak at chronology" in labels
+    assert "Source contamination risk" in labels
+    assert "Not evidence-safe" in labels
+
+
+def test_benchmark_comparison_prefers_faster_model_when_scores_match():
+    comparison = benchmark_comparison(
+        [
+            run_fixture("llama3.2:latest", verify=False, passed=3, latency=2316),
+            run_fixture("openhermes:v2.5", verify=False, passed=3, latency=16384),
+        ]
+    )
+
+    recommended = comparison["recommended"]
+
+    assert recommended["model"] == "llama3.2:latest"
+    assert "Fastest usable config" in recommended["guidance_labels"]
+
+
+def test_verifier_improvement_can_be_rejected_when_latency_is_too_high():
+    comparison = benchmark_comparison(
+        [
+            run_fixture("llama3.2:1b", verify=False, passed=1, latency=1558),
+            run_fixture("llama3.2:1b", verify=True, passed=3, latency=6846),
+            run_fixture("llama3.2:latest", verify=False, passed=3, latency=2316),
+        ]
+    )
+
+    recommended = comparison["recommended"]
+    verifier_group = next(group for group in comparison["groups"] if group["model"] == "llama3.2:1b" and group["verify"])
+
+    assert recommended["model"] == "llama3.2:latest"
+    assert recommended["verify"] is False
+    assert "Verifier improved score but high latency" in verifier_group["guidance_labels"]
+
+
+def test_case_difficulty_summary_identifies_frequent_failures():
+    comparison = benchmark_comparison(
+        [
+            run_fixture(
+                "llama3.2",
+                verify=False,
+                passed=1,
+                latency=500,
+                created_at=1,
+                case_ids=["easy", "chronology", "source-risk", "forbidden-risk"],
+                source_failures_by_case={"source-risk"},
+                forbidden_failures_by_case={"forbidden-risk"},
+            ),
+            run_fixture(
+                "llama3.2",
+                verify=True,
+                passed=2,
+                latency=900,
+                created_at=2,
+                case_ids=["easy", "chronology", "source-risk", "forbidden-risk"],
+                source_failures_by_case={"source-risk"},
+                forbidden_failures_by_case={"forbidden-risk"},
+            ),
+        ]
+    )
+
+    difficulty = comparison["case_difficulty"]
+
+    assert [item["case_id"] for item in difficulty["usually_pass"]] == ["easy"]
+    assert "source-risk" in [item["case_id"] for item in difficulty["frequent_source_failures"]]
+    assert "forbidden-risk" in [item["case_id"] for item in difficulty["frequent_forbidden_failures"]]
 
 
 def test_app_retrieval_and_benchmark_retrieval_can_differ_without_backend_confusion(tmp_path: Path):
@@ -90,8 +188,10 @@ def test_app_retrieval_and_benchmark_retrieval_can_differ_without_backend_confus
 
         assert diagnostics["rag"]["embedding"]["backend"] == "lexical"
         assert diagnostics["rag"]["embedding"]["semantic"] is False
+        assert comparison["groups"]
         assert comparison["groups"][0]["embedding_backend"] == "semantic"
         assert comparison["groups"][0]["embedding_model"] == "nomic-embed-text"
+        assert comparison["groups"][0]["latest_run_passed"] == 1
     finally:
         app.close()
 
@@ -164,26 +264,37 @@ def run_fixture(
     verify: bool,
     passed: int,
     latency: int,
+    total: int = 7,
+    created_at: int = 1,
+    embedding_backend: str = "semantic",
+    embedding_model: str = "nomic-embed-text",
+    temperature: float = 0.0,
     expected_failures: int = 0,
     forbidden_failures: int = 0,
     source_failures: int = 0,
+    case_ids: list[str] | None = None,
+    source_failures_by_case: set[str] | None = None,
+    forbidden_failures_by_case: set[str] | None = None,
 ) -> dict[str, Any]:
-    total = 5
+    ids = case_ids or [f"case-{index}" for index in range(total)]
+    total = len(ids)
+    source_failures_by_case = source_failures_by_case or set()
+    forbidden_failures_by_case = forbidden_failures_by_case or set()
     cases = []
-    for index in range(total):
+    for index, case_id in enumerate(ids):
         case_passed = index < passed
         cases.append(
             {
-                "case_id": f"case-{index}",
+                "case_id": case_id,
                 "passed": case_passed,
                 "expected_passed": index >= expected_failures,
-                "forbidden_passed": index >= forbidden_failures,
-                "source_passed": index >= source_failures,
+                "forbidden_passed": index >= forbidden_failures and case_id not in forbidden_failures_by_case,
+                "source_passed": index >= source_failures and case_id not in source_failures_by_case,
                 "latency_ms": latency,
             }
         )
     return {
-        "id": f"{model}-{verify}",
+        "id": f"{model}-{verify}-{created_at}",
         "model": model,
         "verify": verify,
         "suite_name": "local-rag",
@@ -192,10 +303,10 @@ def run_fixture(
         "total_failed": total - passed,
         "average_latency_ms": latency,
         "total_runtime_ms": latency * total,
-        "embedding_backend": "semantic",
-        "embedding_model": "nomic-embed-text",
-        "temperature": 0.0,
-        "created_at": 1,
+        "embedding_backend": embedding_backend,
+        "embedding_model": embedding_model,
+        "temperature": temperature,
+        "created_at": created_at,
         "cases": cases,
     }
 
