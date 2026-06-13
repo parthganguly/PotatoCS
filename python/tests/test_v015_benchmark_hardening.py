@@ -135,7 +135,7 @@ def test_benchmark_comparison_excludes_older_eval_suites_from_recommendation():
                 passed=3,
                 total=7,
                 latency=2316,
-                suite_version="v0.1.5",
+                suite_version="v0.1.8",
                 created_at=2,
             ),
         ]
@@ -143,7 +143,7 @@ def test_benchmark_comparison_excludes_older_eval_suites_from_recommendation():
 
     recommended = comparison["recommended"]
 
-    assert comparison["comparison_suite_version"] == "v0.1.5"
+    assert comparison["comparison_suite_version"] == "v0.1.8"
     assert comparison["included_run_count"] == 1
     assert comparison["excluded_run_count"] == 1
     assert comparison["excluded_suite_versions"] == ["v0.1.3"]
@@ -162,7 +162,7 @@ def test_benchmark_comparison_shows_no_groups_when_only_old_suites_exist():
                 passed=5,
                 total=5,
                 latency=3966,
-                suite_version="v0.1.3",
+                suite_version="v0.1.5",
                 embedding_backend="",
                 embedding_model="",
             )
@@ -330,7 +330,7 @@ def run_fixture(
     embedding_backend: str = "semantic",
     embedding_model: str = "nomic-embed-text",
     temperature: float = 0.0,
-    suite_version: str = "v0.1.5",
+    suite_version: str = "v0.1.8",
     expected_failures: int = 0,
     forbidden_failures: int = 0,
     source_failures: int = 0,

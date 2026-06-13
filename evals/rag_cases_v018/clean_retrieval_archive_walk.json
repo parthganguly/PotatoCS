@@ -1,0 +1,25 @@
+{
+  "id": "clean_retrieval_archive_walk",
+  "suite_version": "v0.1.8",
+  "category": "clean_retrieval",
+  "difficulty": "easy",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "museum_event", "path": "../fixtures_v018/documents/museum_event_notice.md"},
+    {"id": "museum_cafe", "path": "../fixtures_v018/documents/museum_cafe_decoy.md"}
+  ],
+  "required_source_document": "museum_event",
+  "gold_chunk_text": "archive walk begins at 9:30 a.m. in the north lobby",
+  "question": "What time does the Saturday records tour start, and where do visitors meet?",
+  "answer_style": "precise",
+  "expected_facts": [
+    {"label": "start time", "any": ["9:30 a.m.", "9:30"]},
+    {"label": "meeting place", "any": ["north lobby"]}
+  ],
+  "forbidden_claims": [{"label": "cafe start", "any": ["10:00 a.m."]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Records tour paraphrases archive walk; cafe decoy shares Saturday/north lobby."
+}

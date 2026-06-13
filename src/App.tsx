@@ -22,10 +22,11 @@ import {
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AppStatus,
   AnswerStyle,
+  BenchmarkMode,
   BenchmarkCaseDifficulty,
   BenchmarkComparison,
   BenchmarkComparisonGroup,
@@ -51,6 +52,7 @@ import {
   RagPreset,
   Session,
   Settings,
+  ThinkingMode,
   getAppStatus,
   rpc
 } from "./tauri";
@@ -64,6 +66,16 @@ const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
   { value: "detailed", label: "Detailed" },
   { value: "extract_only", label: "Extract only" },
   { value: "evidence_only", label: "Evidence only" }
+];
+const BENCHMARK_MODE_OPTIONS: Array<{ value: BenchmarkMode; label: string }> = [
+  { value: "retrieval_only", label: "Retrieval only" },
+  { value: "oracle_generation", label: "Oracle generation" },
+  { value: "end_to_end", label: "End-to-end" }
+];
+const THINKING_MODE_OPTIONS: Array<{ value: Exclude<ThinkingMode, "legacy/unrecorded">; label: string }> = [
+  { value: "off", label: "Off" },
+  { value: "on", label: "On" },
+  { value: "auto", label: "Auto" }
 ];
 
 function App() {
@@ -100,7 +112,10 @@ function App() {
   const [benchmarkComparison, setBenchmarkComparison] = useState<BenchmarkComparison | null>(null);
   const [benchmarkResult, setBenchmarkResult] = useState<EvalRun | null>(null);
   const [benchmarkModel, setBenchmarkModel] = useState("");
+  const [benchmarkMode, setBenchmarkMode] = useState<BenchmarkMode>("end_to_end");
+  const [benchmarkThinking, setBenchmarkThinking] = useState<Exclude<ThinkingMode, "legacy/unrecorded">>("off");
   const [benchmarkVerify, setBenchmarkVerify] = useState(false);
+  const [benchmarkRepeats, setBenchmarkRepeats] = useState<1 | 3>(1);
   const [copyStatus, setCopyStatus] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [busy, setBusy] = useState(false);
@@ -269,7 +284,10 @@ function App() {
     try {
       const run = await rpc<EvalRun>("evals.run", {
         model,
-        verify: benchmarkVerify
+        benchmark_mode: benchmarkMode,
+        thinking_mode: benchmarkThinking,
+        verify: benchmarkMode === "end_to_end" ? benchmarkVerify : false,
+        repeats: benchmarkRepeats
       });
       setBenchmarkResult(run);
       const [nextHistory, nextComparison] = await Promise.all([
@@ -791,11 +809,17 @@ function App() {
             error={error}
             evalHistory={evalHistory}
             evalSuite={evalSuite}
+            benchmarkMode={benchmarkMode}
+            benchmarkRepeats={benchmarkRepeats}
+            benchmarkThinking={benchmarkThinking}
             onClearHistory={clearBenchmarkHistory}
             onCopySummary={copyBenchmarkSummary}
             onRefresh={refreshDiagnostics}
             onRunBenchmark={runBenchmark}
+            onSetBenchmarkMode={setBenchmarkMode}
             onSetBenchmarkModel={setBenchmarkModel}
+            onSetBenchmarkRepeats={setBenchmarkRepeats}
+            onSetBenchmarkThinking={setBenchmarkThinking}
             onSetBenchmarkVerify={setBenchmarkVerify}
           />
         )}
@@ -1220,7 +1244,10 @@ function DocumentsWorkspace(props: {
 
 function DiagnosticsWorkspace(props: {
   benchmarkModel: string;
+  benchmarkMode: BenchmarkMode;
   benchmarkResult: EvalRun | null;
+  benchmarkRepeats: 1 | 3;
+  benchmarkThinking: Exclude<ThinkingMode, "legacy/unrecorded">;
   benchmarkVerify: boolean;
   busy: boolean;
   comparison: BenchmarkComparison | null;
@@ -1233,12 +1260,16 @@ function DiagnosticsWorkspace(props: {
   onCopySummary: () => void;
   onRefresh: () => void;
   onRunBenchmark: () => void;
+  onSetBenchmarkMode: (value: BenchmarkMode) => void;
   onSetBenchmarkModel: (value: string) => void;
+  onSetBenchmarkRepeats: (value: 1 | 3) => void;
+  onSetBenchmarkThinking: (value: Exclude<ThinkingMode, "legacy/unrecorded">) => void;
   onSetBenchmarkVerify: (value: boolean) => void;
 }) {
   const models = props.diagnostics?.ollama.models ?? [];
   const modelDetails = props.diagnostics?.ollama.model_details ?? [];
   const canRun = Boolean(props.diagnostics?.ollama.reachable && props.benchmarkModel.trim());
+  const verifierEnabled = props.benchmarkMode === "end_to_end";
   const latestBenchmarkRun = props.benchmarkResult ?? props.evalHistory[0] ?? null;
   const retrievalMismatch = benchmarkRetrievalMismatch(props.diagnostics?.rag ?? null, latestBenchmarkRun);
   return (
@@ -1364,7 +1395,7 @@ function DiagnosticsWorkspace(props: {
               <p className="mb-2 text-xs text-ink/55">
                 Benchmarks use bundled local eval fixtures, not your imported Documents library.
               </p>
-              <div className="grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-3">
+              <div className="grid grid-cols-[minmax(160px,1fr)_150px_130px_90px] items-center gap-3">
                 <select
                   className="h-10 min-w-0 rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
                   disabled={props.busy || models.length === 0}
@@ -1381,11 +1412,46 @@ function DiagnosticsWorkspace(props: {
                     ))
                   )}
                 </select>
+                <select
+                  className="h-10 rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
+                  disabled={props.busy}
+                  onChange={(event) => props.onSetBenchmarkMode(event.target.value as BenchmarkMode)}
+                  value={props.benchmarkMode}
+                >
+                  {BENCHMARK_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="h-10 rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
+                  disabled={props.busy || props.benchmarkMode === "retrieval_only"}
+                  onChange={(event) => props.onSetBenchmarkThinking(event.target.value as Exclude<ThinkingMode, "legacy/unrecorded">)}
+                  value={props.benchmarkThinking}
+                >
+                  {THINKING_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      Thinking {option.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="h-10 rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
+                  disabled={props.busy}
+                  onChange={(event) => props.onSetBenchmarkRepeats(Number(event.target.value) === 3 ? 3 : 1)}
+                  value={props.benchmarkRepeats}
+                >
+                  <option value={1}>1 run</option>
+                  <option value={3}>3 runs</option>
+                </select>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-3">
                 <label className="flex h-10 items-center gap-2 rounded-md border border-ink/15 bg-white px-3 text-sm">
                   <input
-                    checked={props.benchmarkVerify}
+                    checked={verifierEnabled && props.benchmarkVerify}
                     className="h-4 w-4 accent-tide"
-                    disabled={props.busy}
+                    disabled={props.busy || !verifierEnabled}
                     onChange={(event) => props.onSetBenchmarkVerify(event.target.checked)}
                     type="checkbox"
                   />
@@ -1415,13 +1481,13 @@ function DiagnosticsWorkspace(props: {
                 <Metric label="Version" value={props.evalSuite?.suite_version ?? "checking"} />
                 <Metric label="Cases" value={props.evalSuite?.case_count ?? 0} />
                 <Metric label="History" value={props.evalHistory.length} />
-                <Metric label="Latest run embeddings" value={latestBenchmarkRun ? formatRunEmbedding(latestBenchmarkRun) : "none"} />
+                <Metric label="Latest run" value={latestBenchmarkRun ? formatBenchmarkRunLabel(latestBenchmarkRun) : "none"} />
               </div>
               <p className="mt-2 text-xs text-ink/55">
                 Eval documents are temporary/internal to the benchmark and will not appear in Documents.
               </p>
               <p className="mt-1 text-xs text-ink/55">
-                Verifier uses the selected local model to check grounding. Very small models may not verify themselves reliably.
+                Retrieval-only measures ranking without a chat model. Oracle generation bypasses retrieval. Verifier applies only to end-to-end runs.
               </p>
               {!props.diagnostics?.ollama.reachable && (
                 <p className="mt-3 text-xs text-clay">Ollama is not reachable at 127.0.0.1:11434.</p>
@@ -1458,7 +1524,7 @@ function DiagnosticsWorkspace(props: {
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium">{run.model}</p>
                           <p className="text-xs text-ink/55">
-                            {formatTimestamp(run.created_at)} - {formatRunEmbedding(run)} - verifier {run.verify ? "on" : "off"}
+                            {formatTimestamp(run.created_at)} - {formatBenchmarkRunLabel(run)}
                           </p>
                         </div>
                         <div className="text-right text-xs">
@@ -1487,7 +1553,7 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
         <div>
           <p className="text-sm font-semibold">{title}</p>
           <p className="text-xs text-ink/55">
-            {run.model} - {formatRunEmbedding(run)} - temp {run.temperature.toFixed(2)} - verifier {run.verify ? "on" : "off"} - {formatTimestamp(run.created_at)}
+            {run.model} - {formatBenchmarkRunLabel(run)} - temp {run.temperature.toFixed(2)} - {formatTimestamp(run.created_at)}
           </p>
         </div>
         <span
@@ -1500,12 +1566,15 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
           {run.total_passed} passed, {run.total_failed} failed
         </span>
       </div>
-      <div className="grid grid-cols-5 gap-2 px-4 py-3 text-xs text-ink/65">
+      <div className="grid grid-cols-8 gap-2 px-4 py-3 text-xs text-ink/65">
         <Metric label="Average latency" value={`${run.average_latency_ms} ms`} />
         <Metric label="Total runtime" value={`${run.total_runtime_ms} ms`} />
         <Metric label="Suite" value={run.suite_version} />
-        <Metric label="Embeddings" value={formatRunEmbedding(run)} />
-        <Metric label="Temperature" value={run.temperature.toFixed(2)} />
+        <Metric label="Mode" value={formatBenchmarkMode(run.benchmark_mode)} />
+        <Metric label="Thinking" value={formatThinkingMode(run.thinking_mode)} />
+        <Metric label="Status" value={run.status} />
+        <Metric label="Practical" value={formatScoreSummary(run.practical_score)} />
+        <Metric label="Adversarial" value={formatScoreSummary(run.adversarial_score)} />
       </div>
       <div className="overflow-auto">
         <table className="w-full min-w-[860px] border-t border-ink/10 text-left text-xs">
@@ -1516,6 +1585,7 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
               <th className="px-4 py-2 font-medium">Embeddings</th>
               <th className="px-4 py-2 font-medium">Temp</th>
               <th className="px-4 py-2 font-medium">Latency</th>
+              <th className="px-4 py-2 font-medium">Status</th>
               <th className="px-4 py-2 font-medium">Expected</th>
               <th className="px-4 py-2 font-medium">Forbidden</th>
               <th className="px-4 py-2 font-medium">Source</th>
@@ -1524,19 +1594,44 @@ function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
           </thead>
           <tbody className="divide-y divide-ink/10">
             {run.cases.map((result) => (
-              <tr key={result.id}>
-                <td className="px-4 py-2 font-medium">{result.case_id}</td>
-                <td className="px-4 py-2">{formatAnswerStyle(result.answer_style)}</td>
-                <td className="px-4 py-2">{formatCaseEmbedding(result)}</td>
-                <td className="px-4 py-2">{result.temperature.toFixed(2)}</td>
-                <td className="px-4 py-2">{result.latency_ms} ms</td>
-                <td className="px-4 py-2">{formatPass(result.expected_passed)}</td>
-                <td className="px-4 py-2">{formatPass(result.forbidden_passed)}</td>
-                <td className="px-4 py-2">{formatPass(result.source_passed)}</td>
-                <td className="px-4 py-2 text-ink/65">
-                  {result.reasons.length > 0 ? result.reasons.join("; ") : "ok"}
-                </td>
-              </tr>
+              <Fragment key={result.id}>
+                <tr>
+                  <td className="px-4 py-2 font-medium">{result.case_id}</td>
+                  <td className="px-4 py-2">{formatAnswerStyle(result.answer_style)}</td>
+                  <td className="px-4 py-2">{formatCaseEmbedding(result)}</td>
+                  <td className="px-4 py-2">{result.temperature.toFixed(2)}</td>
+                  <td className="px-4 py-2">{result.latency_ms} ms</td>
+                  <td className="px-4 py-2">{result.status}</td>
+                  <td className="px-4 py-2">{formatPass(result.expected_passed)}</td>
+                  <td className="px-4 py-2">{formatPass(result.forbidden_passed)}</td>
+                  <td className="px-4 py-2">{formatPass(result.source_passed)}</td>
+                  <td className="px-4 py-2 text-ink/65">
+                    {result.reasons.length > 0 ? result.reasons.join("; ") : "ok"}
+                  </td>
+                </tr>
+                <tr className="bg-[#fcfbf7]">
+                  <td className="px-4 pb-3 pt-0" colSpan={10}>
+                    <details className="rounded-md border border-ink/10 bg-white px-3 py-2">
+                      <summary className="cursor-pointer text-xs font-medium text-ink/70">
+                        Audit details - {result.pipeline_diagnosis || "no diagnosis"}
+                      </summary>
+                      <div className="mt-3 grid gap-3 text-xs text-ink/70">
+                        <AuditBlock label="Question" value={result.question} />
+                        <AuditBlock label="Gold source" value={result.required_source_document} />
+                        <AuditBlock label="Prompt" value={result.prompt_text} />
+                        <AuditBlock label="Raw answer" value={result.answer_content} />
+                        {result.corrected_answer && <AuditBlock label="Corrected answer" value={result.corrected_answer} />}
+                        {result.thinking_text && <AuditBlock label="Thinking output" value={result.thinking_text} />}
+                        <AuditBlock label="Supplied evidence" value={formatJson(result.supplied_evidence)} />
+                        <AuditBlock label="Retrieved candidates" value={formatJson(result.retrieval_candidates)} />
+                        <AuditBlock label="Retrieval metrics" value={formatJson(result.retrieval_metrics)} />
+                        <AuditBlock label="Grader matches" value={formatJson(result.grader_matches)} />
+                        <AuditBlock label="Timings" value={formatJson(result.timings)} />
+                      </div>
+                    </details>
+                  </td>
+                </tr>
+              </Fragment>
             ))}
           </tbody>
         </table>
@@ -1559,6 +1654,7 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
           {comparison.excluded_run_count > 0
             ? ` ${comparison.excluded_run_count} older/incompatible run(s) excluded: ${comparison.excluded_suite_versions.join(", ")}.`
             : ""}
+          {comparison.incomplete_run_count > 0 ? ` ${comparison.incomplete_run_count} partial/incomplete run(s) excluded.` : ""}
         </p>
       </div>
       {comparison.groups.length === 0 ? (
@@ -1586,7 +1682,10 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
                   <td className="px-4 py-2">
                     <p className="font-medium">{group.model}</p>
                     <p className="text-ink/55">
-                      {formatGroupEmbedding(group)} - temp {group.temperature.toFixed(2)}
+                      {formatBenchmarkMode(group.benchmark_mode)} - thinking {formatThinkingMode(group.thinking_mode)}
+                    </p>
+                    <p className="text-ink/55">
+                      {formatGroupEmbedding(group)} - temp {group.temperature.toFixed(2)} - {group.prompt_version || "legacy prompt"}
                     </p>
                     {group.recommended && <p className="mt-1 text-moss">Recommended</p>}
                   </td>
@@ -1604,7 +1703,7 @@ function BenchmarkComparisonCard({ comparison }: { comparison: BenchmarkComparis
                   </td>
                   <td className="px-4 py-2">
                     <p>{group.run_count}</p>
-                    <p className="text-ink/55">runtime {formatMs(group.total_runtime_ms)}</p>
+                    <p className="text-ink/55">{group.repeatability_label}</p>
                   </td>
                   <td className="px-4 py-2">
                     <p>{formatMs(group.median_avg_latency_ms)}</p>
@@ -1836,6 +1935,18 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="rounded-md bg-white/70 px-2 py-2">
       <p className="font-medium text-ink">{value}</p>
       <p className="mt-0.5 text-ink/55">{label}</p>
+    </div>
+  );
+}
+
+function AuditBlock({ label, value }: { label: string; value: string }) {
+  if (!value.trim()) return null;
+  return (
+    <div>
+      <p className="mb-1 font-medium text-ink">{label}</p>
+      <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-[#faf9f3] p-2 font-mono text-[11px] leading-5 text-ink/75">
+        {value}
+      </pre>
     </div>
   );
 }
@@ -2184,8 +2295,8 @@ function formatPass(value: boolean): string {
 function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
   if (runs.length === 0) return "";
   const lines = [
-    "| Model | Embeddings | Temp | Verify | Passed | Failed | Avg latency | Notes |",
-    "| --- | --- | ---: | --- | ---: | ---: | ---: | --- |"
+    "| Model | Mode | Thinking | Embeddings | Temp | Verify | Status | Passed | Failed | Avg latency | Notes |",
+    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | --- |"
   ];
   for (const run of runs) {
     const failedCases = run.cases
@@ -2193,7 +2304,7 @@ function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
       .map((result) => result.case_id);
     const notes = failedCases.length > 0 ? `failed: ${failedCases.join(", ")}` : "ok";
     lines.push(
-      `| ${run.model} | ${formatRunEmbedding(run)} | ${run.temperature.toFixed(2)} | ${run.verify ? "on" : "off"} | ${run.total_passed} | ${run.total_failed} | ${run.average_latency_ms} ms | ${notes} |`
+      `| ${run.model} | ${formatBenchmarkMode(run.benchmark_mode)} | ${formatThinkingMode(run.thinking_mode)} | ${formatRunEmbedding(run)} | ${run.temperature.toFixed(2)} | ${run.verify ? "on" : "off"} | ${run.status} | ${run.total_passed} | ${run.total_failed} | ${run.average_latency_ms} ms | ${notes} |`
     );
   }
   return lines.join("\n");
@@ -2209,6 +2320,42 @@ function formatRunEmbedding(run: EvalRun): string {
     return `${run.embedding_backend}/${run.embedding_model}`;
   }
   return run.embedding_model || run.embedding_backend || "unknown";
+}
+
+function formatBenchmarkMode(mode: BenchmarkMode): string {
+  if (mode === "retrieval_only") return "Retrieval only";
+  if (mode === "oracle_generation") return "Oracle generation";
+  return "End-to-end";
+}
+
+function formatThinkingMode(mode: ThinkingMode): string {
+  if (mode === "legacy/unrecorded") return "legacy/unrecorded";
+  return mode;
+}
+
+function formatBenchmarkRunLabel(run: EvalRun): string {
+  return [
+    formatBenchmarkMode(run.benchmark_mode),
+    `thinking ${formatThinkingMode(run.thinking_mode)}`,
+    `verifier ${run.verify ? "on" : "off"}`,
+    formatRunEmbedding(run),
+    run.status
+  ].join(" - ");
+}
+
+function formatScoreSummary(score: Record<string, unknown>): string {
+  const passed = Number(score.passed ?? 0);
+  const total = Number(score.total ?? 0);
+  if (!total) return "n/a";
+  return `${passed}/${total}`;
+}
+
+function formatJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value ?? "");
+  }
 }
 
 function formatCaseEmbedding(result: EvalCaseResult): string {

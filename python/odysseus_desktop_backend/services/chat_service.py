@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import TYPE_CHECKING
 from typing import Any
 
-from odysseus_desktop_backend.services.model_service import ModelService
+from odysseus_desktop_backend.services.model_service import (
+    CORRECTION_NUM_PREDICT,
+    CORRECTION_TIMEOUT_SECONDS,
+    INTERACTIVE_CHAT_TIMEOUT_SECONDS,
+    VERIFIER_NUM_PREDICT,
+    VERIFIER_TIMEOUT_SECONDS,
+    ModelService,
+    ModelTimeoutError,
+    normalize_thinking_mode,
+)
 from odysseus_desktop_backend.services.session_service import SessionService
 from odysseus_desktop_backend.services.settings_service import SettingsService
 
@@ -57,6 +67,8 @@ class ChatService:
         answer_style: str | None = None,
         temperature: float = DEFAULT_TEMPERATURE,
         rag_preset: str | None = None,
+        thinking_mode: str = "auto",
+        timeout: float = INTERACTIVE_CHAT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         content = (message or "").strip()
         if not content:
@@ -71,6 +83,7 @@ class ChatService:
         if potato_mode:
             verify_rag = False
             temperature = DEFAULT_TEMPERATURE
+        selected_thinking_mode = normalize_thinking_mode(thinking_mode)
 
         current_settings = self.settings.get()
         selected_model = (model or current_settings.get("default_model") or "llama3.2").strip()
@@ -117,7 +130,14 @@ class ChatService:
             )
 
         generation_options = {"temperature": float(temperature)}
-        reply = self._chat_model(selected_model, ollama_messages, generation_options)
+        reply_response = self._chat_model_detailed(
+            selected_model,
+            ollama_messages,
+            generation_options,
+            thinking=selected_thinking_mode,
+            timeout=timeout,
+        )
+        reply = str(reply_response.get("content") or "")
         grounding = self._grounding_report(
             retrieved_snippets,
             enabled=verify_rag,
@@ -148,6 +168,14 @@ class ChatService:
             "answer_style": selected_answer_style,
             "temperature": float(temperature),
             "rag_preset": selected_rag_preset,
+            "thinking_mode": selected_thinking_mode,
+            "model_response": reply_response,
+            "timings": {
+                "answer_latency_ms": int(reply_response.get("elapsed_ms") or 0),
+                "verifier_latency_ms": int(grounding.get("verifier_latency_ms") or 0),
+                "correction_latency_ms": int(grounding.get("correction_latency_ms") or 0),
+                "final_verification_latency_ms": int(grounding.get("final_verification_latency_ms") or 0),
+            },
         }
 
     def _chat_model(
@@ -156,10 +184,64 @@ class ChatService:
         messages: list[dict[str, str]],
         options: dict[str, Any],
     ) -> str:
+        return str(
+            self._chat_model_detailed(
+                model,
+                messages,
+                options,
+                thinking="auto",
+                timeout=INTERACTIVE_CHAT_TIMEOUT_SECONDS,
+            ).get("content")
+            or ""
+        )
+
+    def _chat_model_detailed(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        options: dict[str, Any],
+        *,
+        thinking: str,
+        timeout: float,
+        response_format: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        detailed_impl = getattr(type(self.models), "chat_detailed", None)
+        if type(self.models) is ModelService or detailed_impl is not ModelService.chat_detailed:
+            try:
+                return self.models.chat_detailed(
+                    model,
+                    messages,
+                    options=options,
+                    thinking=thinking,
+                    timeout=timeout,
+                    response_format=response_format,
+                )
+            except AttributeError:
+                pass
+            except TypeError:
+                pass
+
         try:
-            return self.models.chat(model, messages, options=options)
+            content = self.models.chat(model, messages, options=options)
         except TypeError:
-            return self.models.chat(model, messages)
+            content = self.models.chat(model, messages)
+        return {
+            "model": model,
+            "content": content,
+            "thinking": "",
+            "done_reason": "",
+            "total_duration_ns": 0,
+            "load_duration_ns": 0,
+            "prompt_eval_count": 0,
+            "prompt_eval_duration_ns": 0,
+            "eval_count": 0,
+            "eval_duration_ns": 0,
+            "prompt_tokens_per_second": None,
+            "generation_tokens_per_second": None,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "raw": {},
+        }
 
     def _derive_title(self, content: str) -> str:
         title = " ".join(content.split())
@@ -335,10 +417,32 @@ class ChatService:
                 ),
             },
         ]
-        corrected = self._chat_model(model, correction_messages, options)
-        final_report = self._verify_answer(model, corrected, snippets)
+        correction_options = dict(options)
+        correction_options.setdefault("temperature", DEFAULT_TEMPERATURE)
+        correction_options.setdefault("num_predict", CORRECTION_NUM_PREDICT)
+        try:
+            correction_response = self._chat_model_detailed(
+                model,
+                correction_messages,
+                correction_options,
+                thinking="off",
+                timeout=CORRECTION_TIMEOUT_SECONDS,
+            )
+        except ModelTimeoutError as exc:
+            first_report["correction_status"] = "timeout"
+            first_report["correction_error"] = str(exc)
+            return draft_answer, first_report
+        except Exception as exc:  # noqa: BLE001 - correction is optional
+            first_report["correction_status"] = "error"
+            first_report["correction_error"] = str(exc)
+            return draft_answer, first_report
+
+        corrected = str(correction_response.get("content") or "")
+        final_report = self._verify_answer(model, corrected, snippets, stage="final_verification")
         final_report["regenerated"] = True
         final_report["draft_verifier"] = first_report
+        final_report["correction_status"] = "completed"
+        final_report["correction_latency_ms"] = int(correction_response.get("elapsed_ms") or 0)
         return corrected, final_report
 
     def _verify_answer(
@@ -346,6 +450,8 @@ class ChatService:
         model: str,
         answer: str,
         snippets: list[dict[str, Any]],
+        *,
+        stage: str = "verifier",
     ) -> dict[str, Any]:
         prompt = (
             "Use this as a lightweight warning pass, not as a perfect judge. "
@@ -362,16 +468,30 @@ class ChatService:
             f"Answer:\n{answer}"
         )
         try:
-            raw = self._chat_model(
+            response = self._chat_model_detailed(
                 model,
                 [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": payload},
                 ],
-                {"temperature": DEFAULT_TEMPERATURE},
+                {"temperature": DEFAULT_TEMPERATURE, "num_predict": VERIFIER_NUM_PREDICT},
+                thinking="off",
+                timeout=VERIFIER_TIMEOUT_SECONDS,
+                response_format="json",
             )
+            raw = str(response.get("content") or "")
             data = parse_json_object(raw)
-            return self._normalize_verification_report(snippets, data)
+            report = self._normalize_verification_report(snippets, data)
+            report[f"{stage}_latency_ms"] = int(response.get("elapsed_ms") or 0)
+            report["verifier_latency_ms"] = int(response.get("elapsed_ms") or 0)
+            return report
+        except ModelTimeoutError as exc:
+            return self._grounding_report(
+                snippets,
+                enabled=True,
+                status="timeout",
+                error=str(exc),
+            )
         except Exception as exc:  # noqa: BLE001 - verifier is optional and must not break chat
             return self._grounding_report(
                 snippets,

@@ -1,0 +1,22 @@
+{
+  "id": "negation_no_emergency",
+  "suite_version": "v0.1.8",
+  "category": "negation_adversarial",
+  "difficulty": "hard",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": false,
+  "documents": [
+    {"id": "building_notice", "path": "../fixtures_v018/documents/building_notice_no_outbreak.md"},
+    {"id": "building_newsletter", "path": "../fixtures_v018/documents/building_notice_decoy.md"}
+  ],
+  "required_source_document": "building_notice",
+  "gold_chunk_text": "There is no emergency",
+  "question": "Does the building notice confirm an emergency?",
+  "answer_style": "precise",
+  "expected_facts": [{"label": "no emergency", "any": ["no emergency", "does not confirm an emergency"]}],
+  "forbidden_claims": [{"label": "emergency", "any": ["There is an emergency", "confirms an emergency"]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Negated copy of tempting forbidden claim; reported outside primary recommendation."
+}

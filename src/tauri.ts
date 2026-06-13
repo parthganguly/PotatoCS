@@ -54,6 +54,24 @@ export type OllamaModelInfo = {
   quantization_level: string;
 };
 
+export type OllamaPsStatus = {
+  models: Array<{
+    name: string;
+    model: string;
+    size: number;
+    size_vram: number;
+    parameter_size: string;
+    quantization_level: string;
+    context_length: number;
+    estimated_gpu_loaded_fraction: number | null;
+    estimated_cpu_loaded_fraction: number | null;
+    partially_cpu_offloaded: boolean;
+    warning?: string;
+  }>;
+  reachable: boolean;
+  error: string;
+};
+
 export type ChatResult = {
   session: Session;
   user_message: Message;
@@ -269,18 +287,26 @@ export type DiagnosticsStatus = {
   current_model: string;
   settings: Settings;
   ollama: OllamaStatus;
+  ollama_ps?: OllamaPsStatus;
   ocr: OCRStatus;
   rag: RAGHealth;
 };
 
 export type EvalCaseSummary = {
   id: string;
+  category: string;
+  difficulty: string;
+  benchmark_modes: BenchmarkMode[];
+  counts_toward_primary_recommendation: boolean;
   question: string;
   answer_style: AnswerStyle;
   required_source_document: string;
   expected_fact_count: number;
   forbidden_claim_count: number;
 };
+
+export type BenchmarkMode = "retrieval_only" | "oracle_generation" | "end_to_end";
+export type ThinkingMode = "off" | "on" | "auto" | "legacy/unrecorded";
 
 export type EvalSuite = {
   suite_name: string;
@@ -309,6 +335,29 @@ export type EvalCaseResult = {
   embedding_model: string;
   temperature: number;
   created_at: number;
+  case_category: string;
+  case_difficulty: string;
+  benchmark_mode: BenchmarkMode;
+  thinking_mode: ThinkingMode;
+  repeat_index: number;
+  status: string;
+  stage: string;
+  pipeline_diagnosis: string;
+  counts_toward_primary: boolean;
+  grader_review_required: boolean;
+  answer_content: string;
+  thinking_text: string;
+  thinking_returned: boolean;
+  thinking_char_count: number;
+  prompt_text: string;
+  corrected_answer: string;
+  model_response: Record<string, unknown>;
+  retrieval_metrics: Record<string, unknown>;
+  retrieval_candidates: Array<Record<string, unknown>>;
+  supplied_evidence: Array<Record<string, unknown>>;
+  grader_matches: Array<Record<string, unknown>>;
+  timings: Record<string, unknown>;
+  error_message: string;
 };
 
 export type EvalRun = {
@@ -326,6 +375,25 @@ export type EvalRun = {
   temperature: number;
   notes: string;
   created_at: number;
+  app_version: string;
+  prompt_version: string;
+  benchmark_mode: BenchmarkMode;
+  thinking_mode: ThinkingMode;
+  answer_style: string;
+  status: string;
+  repeat_count: number;
+  num_predict: number;
+  timeout_policy: Record<string, unknown>;
+  model_info: Record<string, unknown>;
+  retrieval_score: Record<string, unknown>;
+  oracle_score: Record<string, unknown>;
+  end_to_end_score: Record<string, unknown>;
+  practical_score: Record<string, unknown>;
+  adversarial_score: Record<string, unknown>;
+  timeout_count: number;
+  runtime_error_count: number;
+  grader_review_count: number;
+  completed_at: number | null;
   cases: EvalCaseResult[];
   summary_markdown: string;
 };
@@ -335,10 +403,17 @@ export type BenchmarkComparisonGroup = {
   model: string;
   embedding_backend: string;
   embedding_model: string;
+  benchmark_mode: BenchmarkMode;
+  thinking_mode: ThinkingMode;
+  prompt_version: string;
+  answer_style: string;
+  num_predict: number;
+  status: string;
   verify: boolean;
   temperature: number;
   suite_version: string;
   run_count: number;
+  repeatability_label: string;
   latest_run_passed: number;
   latest_run_total: number;
   latest_run_pass_rate: number;
@@ -354,6 +429,11 @@ export type BenchmarkComparisonGroup = {
   best_created_at: number;
   mean_passed_per_run: number;
   mean_pass_rate: number;
+  mean_practical_pass_rate: number;
+  worst_run_practical_pass_rate: number;
+  mean_adversarial_pass_rate: number;
+  timeout_rate: number;
+  recommendation_eligible: boolean;
   median_avg_latency_ms: number;
   mean_avg_latency_ms: number;
   cumulative_passed: number;
@@ -400,6 +480,7 @@ export type BenchmarkComparison = {
   comparison_suite_version: string;
   included_run_count: number;
   excluded_run_count: number;
+  incomplete_run_count: number;
   excluded_suite_versions: string[];
 };
 

@@ -1,0 +1,25 @@
+{
+  "id": "direct_extraction_shipping",
+  "suite_version": "v0.1.8",
+  "category": "direct_extraction",
+  "difficulty": "easy",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "harbor_shipping", "path": "../fixtures_v018/documents/shipping_memo_pallets.md"},
+    {"id": "inland_shipping", "path": "../fixtures_v018/documents/shipping_decoy_crates.md"}
+  ],
+  "required_source_document": "harbor_shipping",
+  "gold_chunk_text": "18 blue ceramic filters packed on three pallets",
+  "question": "How many blue ceramic filters are in shipment HB-204, and how many pallets are they on?",
+  "answer_style": "extract_only",
+  "expected_facts": [
+    {"label": "filter count", "any": ["18 blue ceramic filters", "18 filters"]},
+    {"label": "pallet count", "any": ["three pallets", "3 pallets"]}
+  ],
+  "forbidden_claims": [{"label": "wrong code", "any": ["MAPLE-4"]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Exact quantity extraction with an unrelated shipping decoy."
+}

@@ -1,0 +1,26 @@
+{
+  "id": "chronology_kolkata_duration",
+  "suite_version": "v0.1.8",
+  "category": "chronology_comprehension",
+  "difficulty": "medium",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "train_story", "path": "../fixtures_v018/documents/family_train_story.md"},
+    {"id": "winter_story", "path": "../fixtures_v018/documents/family_winter_story_decoy.md"}
+  ],
+  "required_source_document": "train_story",
+  "gold_chunk_text": "In 1972, her brother Arun lived in Kolkata for six months while studying music",
+  "question": "In the family story, who lived in Kolkata for six months, and why?",
+  "answer_style": "precise",
+  "expected_facts": [
+    {"label": "person", "any": ["Arun"]},
+    {"label": "duration", "any": ["six months"]},
+    {"label": "reason", "any": ["studying music"]}
+  ],
+  "forbidden_claims": [{"label": "wrong duration", "any": ["two hours in Kolkata", "Leela lived in Kolkata"]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Prevents moving Leela's two-hour station wait onto Arun's Kolkata stay."
+}

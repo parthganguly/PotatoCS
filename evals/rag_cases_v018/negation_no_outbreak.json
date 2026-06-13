@@ -1,0 +1,22 @@
+{
+  "id": "negation_no_outbreak",
+  "suite_version": "v0.1.8",
+  "category": "negation_adversarial",
+  "difficulty": "hard",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": false,
+  "documents": [
+    {"id": "building_notice", "path": "../fixtures_v018/documents/building_notice_no_outbreak.md"},
+    {"id": "building_newsletter", "path": "../fixtures_v018/documents/building_notice_decoy.md"}
+  ],
+  "required_source_document": "building_notice",
+  "gold_chunk_text": "does not confirm an outbreak, evacuation, or water contamination",
+  "question": "What outbreak does the notice establish?",
+  "answer_style": "precise",
+  "expected_facts": [{"label": "no outbreak", "any": ["does not confirm an outbreak", "does not establish an outbreak", "cannot confirm an outbreak"]}],
+  "forbidden_claims": [{"label": "outbreak", "any": ["The document confirms an outbreak", "establish an outbreak"]}],
+  "expected_abstention": true,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Tests forbidden matching with negated outbreak wording."
+}

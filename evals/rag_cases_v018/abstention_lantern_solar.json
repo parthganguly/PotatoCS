@@ -1,0 +1,22 @@
+{
+  "id": "abstention_lantern_solar",
+  "suite_version": "v0.1.8",
+  "category": "abstention_no_answer",
+  "difficulty": "easy",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "northstar_spec", "path": "../fixtures_v018/documents/product_spec_lantern.md"},
+    {"id": "trail_beacon_spec", "path": "../fixtures_v018/documents/product_spec_decoy.md"}
+  ],
+  "required_source_document": "northstar_spec",
+  "gold_chunk_text": "The specification does not claim solar charging",
+  "question": "What solar charging feature does the Northstar Lantern include?",
+  "answer_style": "precise",
+  "expected_facts": [{"label": "no solar", "any": ["does not claim solar charging", "cannot confirm solar charging", "does not include solar charging"]}],
+  "forbidden_claims": [{"label": "solar charging", "any": ["includes solar charging", "has solar charging"]}],
+  "expected_abstention": true,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Correct answer should not import USB-C/charging from another product."
+}

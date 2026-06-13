@@ -1,0 +1,25 @@
+{
+  "id": "chronology_train_wait",
+  "suite_version": "v0.1.8",
+  "category": "chronology_comprehension",
+  "difficulty": "medium",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "train_story", "path": "../fixtures_v018/documents/family_train_story.md"},
+    {"id": "winter_story", "path": "../fixtures_v018/documents/family_winter_story_decoy.md"}
+  ],
+  "required_source_document": "train_story",
+  "gold_chunk_text": "Leela missed the morning train and waited at the station for two hours",
+  "question": "Who waited two hours at the station, and what caused the wait?",
+  "answer_style": "precise",
+  "expected_facts": [
+    {"label": "person", "any": ["Leela"]},
+    {"label": "cause", "any": ["missed the morning train", "missed train"]}
+  ],
+  "forbidden_claims": [{"label": "wrong person", "any": ["Arun waited two hours", "Arun waited at the station"]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Preserve which person and event received the two-hour duration."
+}

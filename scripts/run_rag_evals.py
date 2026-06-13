@@ -23,12 +23,20 @@ def main() -> int:
             "Results report whether retrieval used semantic Ollama embeddings or the lexical fallback."
         )
     )
-    parser.add_argument("--cases", type=Path, default=ROOT / "evals" / "rag_cases")
+    parser.add_argument("--cases", type=Path, default=ROOT / "evals" / "rag_cases_v018")
     parser.add_argument("--models", nargs="*", help="Specific Ollama model names. Defaults to all installed models.")
     parser.add_argument("--verify", action="store_true", help="Enable the optional verifier pass during evals.")
     parser.add_argument("--show-answers", action="store_true", help="Accepted for compatibility; answers are not stored.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Ollama generation temperature for eval runs.")
     parser.add_argument("--style", help="Override answer_style for every eval case.")
+    parser.add_argument(
+        "--mode",
+        choices=["retrieval_only", "oracle_generation", "end_to_end"],
+        default="end_to_end",
+        help="Benchmark mode.",
+    )
+    parser.add_argument("--thinking", choices=["off", "on", "auto"], default="off")
+    parser.add_argument("--repeats", type=int, choices=[1, 3], default=1)
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="odysseus-rag-eval-cli-") as temp:
@@ -54,6 +62,9 @@ def main() -> int:
                     verify=args.verify,
                     answer_style_override=args.style,
                     temperature=args.temperature,
+                    benchmark_mode=args.mode,
+                    thinking_mode=args.thinking,
+                    repeats=args.repeats,
                 )
                 runs.append(run)
                 failures += run["total_failed"]

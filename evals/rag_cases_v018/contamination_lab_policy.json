@@ -1,0 +1,25 @@
+{
+  "id": "contamination_lab_policy",
+  "suite_version": "v0.1.8",
+  "category": "cross_document_contamination",
+  "difficulty": "medium",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "lab_sample_policy", "path": "../fixtures_v018/documents/lab_policy_samples.md"},
+    {"id": "lab_visitor_policy", "path": "../fixtures_v018/documents/lab_policy_decoy.md"}
+  ],
+  "required_source_document": "lab_sample_policy",
+  "gold_chunk_text": "write the sample ID by hand and log the printer outage before refrigeration",
+  "question": "If the lab label printer is offline, what should intake staff do before refrigeration?",
+  "answer_style": "layman",
+  "expected_facts": [
+    {"label": "hand label", "any": ["write the sample ID by hand"]},
+    {"label": "log outage", "any": ["log the printer outage"]}
+  ],
+  "forbidden_claims": [{"label": "visitor badge", "any": ["yellow badge"]}, {"label": "discard", "any": ["discarding unlabeled samples"]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Correct policy and unrelated visitor policy coexist."
+}

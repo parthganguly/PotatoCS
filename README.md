@@ -153,11 +153,13 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.7 RAG diagnostics: semantic Ollama embeddings where available, honest
+- v0.1.8 RAG diagnostics: semantic Ollama embeddings where available, honest
   lexical fallback, quote-first answers, source-scoped retrieval,
   answer styles, optional verifier pass, retrieved snippets, local benchmark
-  runs, comparison summaries, deterministic model guidance, Potato Mode, and
-  Evidence Only style.
+  runs, structured Ollama metadata, thinking-mode benchmark support, timeout
+  safety, separate retrieval/oracle/end-to-end benchmark modes, comparison
+  summaries, deterministic model guidance, Potato Mode, and Evidence Only
+  style.
 - Embedding cache by chunk/content hash.
 - Optional OCR for scanned/low-text PDFs when Tesseract plus `pdftoppm` or
   `mutool` are locally installed.
@@ -171,7 +173,7 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.7 focuses on making retrieval, diagnostics, and evaluation more useful for small local
+v0.1.8 focuses on making retrieval, diagnostics, and evaluation more useful for small local
 models such as `llama3.2` on limited hardware. It does not require cloud
 models, does not auto-download models, and does not require a larger default
 chat model.
@@ -227,19 +229,30 @@ best-effort, and optional because it costs extra tokens. It is not a rescue
 mechanism for 1B/1.5B-class models.
 
 The local eval harness lives under `evals\` and `scripts\run_rag_evals.py`.
-Fixtures include chronology preservation, cross-document contamination,
-procedural-document interpretation, layman explanation, and extract-only cases.
-They are regression examples that expose general RAG weaknesses; the app does
-not hard-code behavior for any fixture, document name, or query. Each case
-records the source document, question, answer style, expected facts, forbidden
-claims, and required source document. v0.1.5 also records retrieved document
-IDs, retrieved chunk IDs, active embedding backend/model, answer style,
-verifier state, and temperature. Expected-fact grading is paraphrase-tolerant
-instead of pure exact substring matching, while forbidden claims remain
-phrase-aware checks.
-v0.1.7 keeps the eval suite at `v0.1.5` and only changes how saved benchmark
-history is compared and recommended. Older benchmark suites remain visible in
-history, but they are excluded from the current recommendation.
+The active suite is `v0.1.8` under `evals\rag_cases_v018`; older suites remain
+on disk for legacy history and regression context. The v0.1.8 fixtures cover
+clean retrieval, direct extraction, chronology/comprehension, cross-document
+contamination, abstention/no-answer, and negation-adversarial cases across
+technical instructions, event notices, logistics memos, family narrative,
+policy/procedure, and product/spec domains. The app does not hard-code behavior
+for any fixture, document name, question, or model.
+
+Benchmarks now run in three separate modes: Retrieval only, Oracle generation,
+and End-to-end RAG. Comparison never combines different modes. End-to-end runs
+record retrieved candidate document IDs separately from evidence snippets
+actually supplied to the model, so a wrong rank-4 candidate is reported as
+candidate contamination without automatically failing source grounding if it
+was not supplied. The deterministic grader records expected/forbidden match
+details, answer windows, token overlap, nearby negation, and review-required
+decisions; negated forbidden claims such as "there is no emergency" are not
+treated as affirmative forbidden claims.
+
+Benchmark runs store structured Ollama response metadata, requested thinking
+mode (`off`, `on`, or `auto`), whether thinking text was returned, token counts,
+durations, prompts, raw answers, supplied evidence, timings, timeout/error
+status, and model/offload diagnostics from local `/api/ps` when available.
+Older benchmark suites remain visible in history, but only completed current
+suite runs are eligible for current recommendations.
 
 The Diagnostics tab exposes the same local eval suite inside the app. It shows
 the app version, profile path, backend/database/log paths, Ollama reachability,
@@ -248,19 +261,20 @@ dependency status, VectorStore health, active embedding backend/model, whether
 semantic retrieval is active, and documents needing reindex. It separates App
 Document Retrieval from Benchmark Retrieval so a semantic benchmark run is not
 confused with a lexical or not-reindexed document library. The Model Benchmark
-panel can run the eval suite against one installed Ollama model with verifier on
-or off, then saves pass/fail, latency, embedding backend/model, and per-case
-check results in the profile-local SQLite database. It also shows a compact
-comparison table grouped by chat model, embedding backend/model, verifier
-state, and temperature. It does not auto-download models and does not use cloud
-services.
+panel can run Retrieval only, Oracle generation, or End-to-end RAG with
+thinking off/on/auto, verifier on/off where valid, and one or three repeats.
+It saves progress incrementally so completed cases remain auditable if a later
+case times out. It also shows a compact comparison table grouped by suite,
+mode, prompt version, chat model, thinking mode, embedding backend/model,
+verifier state, temperature, and generation limits. It does not auto-download
+models and does not use cloud services.
 
 ## User Setup
 
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.7_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.8_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded
@@ -352,7 +366,12 @@ In the app:
 
 - Open `Diagnostics`.
 - Select an installed Ollama model.
-- Toggle `Verify` when you want the slower, more careful verifier pass.
+- Pick a mode: `Retrieval only`, `Oracle generation`, or `End-to-end`.
+- Pick thinking mode: `Off`, `On`, or `Auto`. The benchmark default is `Off`
+  for bounded weak-hardware comparison.
+- Toggle `Verify` only for End-to-end runs when you want the slower, more
+  careful verifier pass.
+- Pick one or three repeats.
 - Click `Run`.
 - Use `Copy` to copy a Markdown benchmark summary table.
 
@@ -381,19 +400,23 @@ Verifier guidance:
 
 Recommendation guidance:
 
-- The comparison table groups saved runs by chat model, embedding backend/model,
-  verifier on/off, and temperature.
-- It compares only the active eval suite. Older or incompatible benchmark
-  suites stay in history, but they are excluded from the recommendation and
-  listed in the comparison header.
-- It shows latest run score, best run score, average pass/run, run count,
-  median average latency, verifier state, and deterministic guidance labels.
+- The comparison table groups saved runs by suite, benchmark mode, prompt
+  version, chat model, thinking mode, embedding backend/model, verifier on/off,
+  temperature, and generation limits.
+- It compares only completed current-suite runs. Older, incompatible, partial,
+  or still-running benchmark suites stay in history, but they are excluded from
+  the recommendation and listed in the comparison header.
+- It shows latest run score, best run score, average pass/run, practical score,
+  adversarial score, run count, timeout rate, median average latency, verifier
+  state, thinking state, and deterministic guidance labels.
 - Cumulative pass totals are kept only as informational data and are not the
   main score, because repeated runs of the same config should not look better
   merely because they were run more often.
-- The recommended configuration is selected from latest/mean pass rate, then
-  lower latency. Verifier-off wins ties, and verifier-on runs are recommended
-  only when they materially improve pass score enough to justify latency.
+- The recommended configuration is selected from completed current-suite
+  end-to-end core cases using mean practical pass rate, worst-run practical
+  pass rate, retrieval quality, and lower latency. Verifier-off and thinking-off
+  win ties, and verifier/thinking-on runs are recommended only when they
+  materially improve quality enough to justify latency.
 - The Case Difficulty summary identifies cases that usually pass, usually
   fail, often fail source scoping, or often produce forbidden-claim failures.
 - Guidance labels are deterministic examples such as `Fastest usable config`,

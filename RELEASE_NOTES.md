@@ -1,5 +1,64 @@
 # Release Notes
 
+## v0.1.8 - RAG Benchmark Validity, Thinking, and Timeout Safety
+
+v0.1.8 redesigns the local benchmark path so weak-model evaluation can separate
+retrieval quality, model comprehension with known-good evidence, and full
+end-to-end RAG behavior. It keeps the local-first architecture and does not add
+agents, shell tools, MCP, cloud services, Chroma, LanceDB, Docker, hidden HTTP,
+or model auto-downloads.
+
+Highlights:
+
+- Added structured Ollama chat responses with content, thinking text, done
+  reason, token counts, durations, derived token rates, and model name while
+  preserving the existing string-returning `chat()` compatibility wrapper.
+- Added explicit benchmark thinking modes: `off`, `on`, and `auto`; the Ollama
+  `think` field is sent top-level, never inside `options`.
+- Bumped the active eval suite to `v0.1.8` and added a diverse synthetic suite
+  for clean retrieval, direct extraction, chronology/comprehension,
+  cross-document contamination, abstention/no-answer, and negation-adversarial
+  cases.
+- Added separate benchmark modes for Retrieval only, Oracle generation, and
+  End-to-end RAG. Comparison groups never combine different modes.
+- Added additive benchmark storage fields for run status, prompt version,
+  benchmark mode, thinking mode, answer style, repeat count, timeout policy,
+  model/offload diagnostics, raw prompts, raw answers, thinking text, supplied
+  evidence, retrieval candidates, grader matches, timings, and per-case
+  diagnosis.
+- Persisted benchmark runs incrementally: a run row is created at start and
+  each case is stored as it finishes. A case timeout or runtime error is stored
+  and the run continues.
+- Bounded verifier and correction requests with thinking off, temperature `0.0`,
+  JSON-format request where supported, and output-token limits. Verifier or
+  correction failure preserves the original/last completed answer.
+- Added request-specific timeout constants for interactive chat, benchmark
+  answer generation, verifier JSON, and correction generation.
+- Added local `/api/ps` diagnostics for loaded model size, VRAM size,
+  parameter/quantization details, estimated CPU/GPU loaded fraction, and
+  partial CPU-offload warning text.
+- Added retrieval audit score components: original vector score/rank, lexical
+  contribution, metadata contribution, phrase bonus, final score, and final
+  rerank.
+- Separated retrieved candidate contamination from supplied-evidence
+  contamination for source grading.
+- Added deterministic negation-aware grading with match spans/windows, token
+  overlap, negation detection, final decision, and grader-review status.
+- Updated benchmark UI controls for model, mode, thinking, verifier, repeats,
+  and richer result/comparison metadata.
+
+Validation commands for v0.1.8:
+
+```powershell
+python -m pytest python\tests
+npm run build
+python -m py_compile python\odysseus_desktop_backend\services\model_service.py python\odysseus_desktop_backend\services\eval_service.py python\odysseus_desktop_backend\services\rag_service.py python\odysseus_desktop_backend\services\chat_service.py python\rpc_server.py
+git diff --check
+```
+
+Packaging note: do not claim benchmark quality is validated until a package
+build is installed and real post-package benchmark runs are performed.
+
 ## v0.1.7 - Current-Suite Benchmark Comparison
 
 v0.1.7 fixes a follow-up Benchmark Comparison issue found in installed builds:

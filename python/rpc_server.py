@@ -119,6 +119,7 @@ class SidecarApp:
             "current_model": str(settings.get("default_model") or "llama3.2"),
             "settings": settings,
             "ollama": self.models.detect_ollama(),
+            "ollama_ps": self.models.ps(),
             "ocr": self.ocr.status(),
             "rag": self.rag.health(),
         }
@@ -232,6 +233,10 @@ class SidecarApp:
             verify=optional_bool(params, "verify", False),
             answer_style_override=optional_str(params, "answer_style"),
             temperature=optional_float(params, "temperature", 0.0),
+            benchmark_mode=optional_str(params, "benchmark_mode") or "end_to_end",
+            thinking_mode=optional_str(params, "thinking_mode") or "off",
+            repeats=optional_int(params, "repeats", 1),
+            num_predict=optional_int(params, "num_predict", 0),
         )
 
     def evals_history(self, params: JsonDict) -> list[JsonDict]:

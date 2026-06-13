@@ -1,0 +1,26 @@
+{
+  "id": "direct_extraction_product",
+  "suite_version": "v0.1.8",
+  "category": "direct_extraction",
+  "difficulty": "easy",
+  "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
+  "counts_toward_primary_recommendation": true,
+  "documents": [
+    {"id": "northstar_spec", "path": "../fixtures_v018/documents/product_spec_lantern.md"},
+    {"id": "trail_beacon_spec", "path": "../fixtures_v018/documents/product_spec_decoy.md"}
+  ],
+  "required_source_document": "northstar_spec",
+  "gold_chunk_text": "weighs 1.4 kg, uses two D-cell batteries, and provides 320 lumens",
+  "question": "What are the Northstar Lantern's weight, battery type, and high-setting brightness?",
+  "answer_style": "extract_only",
+  "expected_facts": [
+    {"label": "weight", "any": ["1.4 kg"]},
+    {"label": "battery type", "any": ["two D-cell batteries", "D-cell batteries"]},
+    {"label": "brightness", "any": ["320 lumens"]}
+  ],
+  "forbidden_claims": [{"label": "solar", "any": ["solar charging"]}],
+  "expected_abstention": false,
+  "source_policy": "all_retrieved",
+  "retrieval_scope": "all",
+  "notes": "Product/specification domain with quantity extraction."
+}

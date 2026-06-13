@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from dataclasses import replace
@@ -169,6 +170,36 @@ class RAGService:
         text = (query or "").strip()
         if not text:
             return []
+        audit = self.search_with_audit(
+            text,
+            limit=limit,
+            metadata_filter=metadata_filter,
+            document_ids=document_ids,
+        )
+        reranked = audit["results"]
+        return [
+            self._result_dict(result)
+            for result in reranked
+        ]
+
+    def search_with_audit(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        metadata_filter: dict[str, Any] | None = None,
+        document_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        text = (query or "").strip()
+        started = time.perf_counter()
+        if not text:
+            return {
+                "results": [],
+                "candidates": [],
+                "embedding_backend": "",
+                "embedding_model": "",
+                "retrieval_latency_ms": 0,
+            }
         query_embedding = self.embeddings.embed_query(text)
         candidate_limit = max(limit, RERANK_MIN_CANDIDATES, limit * 8)
         effective_filter = self._source_scoped_filter(metadata_filter, document_ids)
@@ -178,11 +209,18 @@ class RAGService:
             embedding_model=query_embedding.model,
             metadata_filter=effective_filter,
         )
-        reranked = self._rerank(text, candidates, embedding_backend=query_embedding.backend)
-        return [
-            self._result_dict(result)
-            for result in reranked[: max(0, limit)]
-        ]
+        reranked, diagnostics = self._rerank_with_details(
+            text,
+            candidates,
+            embedding_backend=query_embedding.backend,
+        )
+        return {
+            "results": reranked[: max(0, limit)],
+            "candidates": diagnostics,
+            "embedding_backend": query_embedding.backend,
+            "embedding_model": query_embedding.model,
+            "retrieval_latency_ms": int((time.perf_counter() - started) * 1000),
+        }
 
     def health(self) -> dict[str, Any]:
         health = self.vector_store.health()
@@ -465,12 +503,26 @@ class RAGService:
         *,
         embedding_backend: str = "lexical",
     ) -> list[SearchResult]:
+        reranked, _diagnostics = self._rerank_with_details(
+            query,
+            results,
+            embedding_backend=embedding_backend,
+        )
+        return reranked
+
+    def _rerank_with_details(
+        self,
+        query: str,
+        results: list[SearchResult],
+        *,
+        embedding_backend: str = "lexical",
+    ) -> tuple[list[SearchResult], list[dict[str, Any]]]:
         query_tokens = important_tokens(query)
         query_phrase = normalized_text(query)
-        scored: list[tuple[float, SearchResult]] = []
+        scored: list[tuple[float, int, SearchResult, dict[str, Any]]] = []
         vector_weight = 2.0 if embedding_backend == "semantic" else 1.0
 
-        for result in results:
+        for original_rank, result in enumerate(results, start=1):
             content_tokens = important_tokens(result.content)
             metadata_text = " ".join(
                 str(result.metadata.get(key) or "")
@@ -480,19 +532,48 @@ class RAGService:
 
             lexical_score = overlap_score(query_tokens, content_tokens) * 1.25
             metadata_score = overlap_score(query_tokens, metadata_tokens) * 2.0
+            phrase_bonus = 0.0
 
             content_phrase = normalized_text(result.content)
             metadata_phrase = normalized_text(metadata_text)
             if query_phrase and query_phrase in content_phrase:
-                lexical_score += 0.75
+                phrase_bonus += 0.75
             if query_phrase and query_phrase in metadata_phrase:
-                metadata_score += 2.5
+                phrase_bonus += 2.5
 
-            combined_score = result.score * vector_weight + lexical_score + metadata_score
-            scored.append((combined_score, replace(result, score=combined_score)))
+            combined_score = result.score * vector_weight + lexical_score + metadata_score + phrase_bonus
+            reranked = replace(result, score=combined_score)
+            scored.append(
+                (
+                    combined_score,
+                    original_rank,
+                    reranked,
+                    {
+                        "chunk_id": result.chunk_id,
+                        "document_id": result.document_id,
+                        "content": result.content,
+                        "original_vector_score": result.score,
+                        "lexical_overlap_contribution": lexical_score,
+                        "metadata_contribution": metadata_score,
+                        "phrase_bonus": phrase_bonus,
+                        "final_combined_score": combined_score,
+                        "original_vector_rank": original_rank,
+                        "final_reranked_rank": 0,
+                        "page_start": result.page_start,
+                        "page_end": result.page_end,
+                        "metadata": result.metadata,
+                    },
+                )
+            )
 
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [result for _score, result in scored]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        diagnostics: list[dict[str, Any]] = []
+        reranked_results: list[SearchResult] = []
+        for final_rank, (_score, _original_rank, result, diagnostic) in enumerate(scored, start=1):
+            diagnostic["final_reranked_rank"] = final_rank
+            diagnostics.append(diagnostic)
+            reranked_results.append(result)
+        return reranked_results, diagnostics
 
     def _result_dict(self, result: SearchResult) -> dict[str, Any]:
         return {
