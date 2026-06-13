@@ -1,6 +1,6 @@
 [package]
 name = "odysseus-desktop"
-version = "0.1.8"
+version = "0.1.9"
 description = "Local AI workspace for small models on limited hardware"
 authors = ["Odysseus Desktop Contributors"]
 edition = "2021"

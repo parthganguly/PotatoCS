@@ -196,66 +196,109 @@ class EvalService:
             repeat_count,
         )
 
-        with tempfile.TemporaryDirectory(prefix=f"odysseus-rag-eval-{safe_name(model_name)}-") as temp:
-            temp_db = Database(Path(temp))
-            try:
-                copy_embedding_settings(self.db, temp_db)
-                documents = DocumentService(temp_db)
-                embeddings = EmbeddingService(temp_db)
-                vector_store = SQLiteNumPyVectorStore(temp_db)
-                rag = RAGService(documents, embeddings, vector_store)
-                settings = SettingsService(temp_db)
-                sessions = SessionService(temp_db)
-                models = self.model_service_factory(temp_db, temperature)
-                chat = ChatService(sessions, settings, models, rag=rag)
-                document_ids = index_case_documents(cases, documents, rag)
-                for repeat_index in range(1, repeat_count + 1):
-                    for case in cases:
-                        try:
-                            case_result = self._run_case(
-                                case,
-                                mode=mode,
-                                model_name=model_name,
-                                verify=verify,
-                                answer_style_override=answer_style_override,
-                                temperature=temperature,
-                                thinking_mode=selected_thinking_mode,
-                                num_predict=num_predict,
-                                repeat_index=repeat_index,
-                                document_ids=document_ids,
-                                rag=rag,
-                                chat=chat,
-                                models=models,
-                            )
-                        except ModelTimeoutError as exc:
-                            case_result = timeout_case_result(
-                                case,
-                                mode=mode,
-                                thinking_mode=selected_thinking_mode,
-                                repeat_index=repeat_index,
-                                temperature=temperature,
-                                stage="answer",
-                                error=str(exc),
-                            )
-                        except Exception as exc:  # noqa: BLE001 - one case must not abort the run
-                            logger.warning(
-                                "benchmark case failed run_id=%s case_id=%s error=%s",
-                                run["id"],
-                                case.get("id"),
-                                exc,
-                            )
-                            case_result = error_case_result(
-                                case,
-                                mode=mode,
-                                thinking_mode=selected_thinking_mode,
-                                repeat_index=repeat_index,
-                                temperature=temperature,
-                                stage="runtime",
-                                error=str(exc),
-                            )
-                        self._store_case_result(run["id"], case_result)
-            finally:
-                temp_db.close()
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"odysseus-rag-eval-{safe_name(model_name)}-") as temp:
+                temp_db = Database(Path(temp))
+                try:
+                    copy_embedding_settings(self.db, temp_db)
+                    documents = DocumentService(temp_db)
+                    embeddings = EmbeddingService(temp_db)
+                    vector_store = SQLiteNumPyVectorStore(temp_db)
+                    rag = RAGService(documents, embeddings, vector_store)
+                    settings = SettingsService(temp_db)
+                    sessions = SessionService(temp_db)
+                    models = self.model_service_factory(temp_db, temperature)
+                    chat = ChatService(sessions, settings, models, rag=rag)
+                    document_ids = index_case_documents(cases, documents, rag)
+                    for repeat_index in range(1, repeat_count + 1):
+                        for case in cases:
+                            missing_documents = missing_case_document_ids(case, document_ids)
+                            if missing_documents:
+                                case_result = error_case_result(
+                                    case,
+                                    mode=mode,
+                                    thinking_mode=selected_thinking_mode,
+                                    repeat_index=repeat_index,
+                                    temperature=temperature,
+                                    stage="indexing",
+                                    error=(
+                                        "required benchmark fixture(s) were not indexed: "
+                                        + ", ".join(missing_documents)
+                                    ),
+                                )
+                                self._store_case_result(run["id"], case_result)
+                                continue
+                            try:
+                                case_result = self._run_case(
+                                    case,
+                                    mode=mode,
+                                    model_name=model_name,
+                                    verify=verify,
+                                    answer_style_override=answer_style_override,
+                                    temperature=temperature,
+                                    thinking_mode=selected_thinking_mode,
+                                    num_predict=num_predict,
+                                    repeat_index=repeat_index,
+                                    document_ids=document_ids,
+                                    rag=rag,
+                                    chat=chat,
+                                    models=models,
+                                )
+                            except ModelTimeoutError as exc:
+                                case_result = timeout_case_result(
+                                    case,
+                                    mode=mode,
+                                    thinking_mode=selected_thinking_mode,
+                                    repeat_index=repeat_index,
+                                    temperature=temperature,
+                                    stage="answer",
+                                    error=str(exc),
+                                )
+                            except Exception as exc:  # noqa: BLE001 - one case must not abort the run
+                                logger.warning(
+                                    "benchmark case failed run_id=%s case_id=%s error=%s",
+                                    run["id"],
+                                    case.get("id"),
+                                    exc,
+                                )
+                                case_result = error_case_result(
+                                    case,
+                                    mode=mode,
+                                    thinking_mode=selected_thinking_mode,
+                                    repeat_index=repeat_index,
+                                    temperature=temperature,
+                                    stage="runtime",
+                                    error=str(exc),
+                                )
+                            self._store_case_result(run["id"], case_result)
+                finally:
+                    temp_db.close()
+        except Exception as exc:  # noqa: BLE001 - preserve benchmark history for setup failures
+            logger.exception("benchmark run aborted run_id=%s error=%s", run["id"], exc)
+            self._store_unattempted_case_errors(
+                run["id"],
+                cases,
+                mode=mode,
+                thinking_mode=selected_thinking_mode,
+                repeat_count=repeat_count,
+                temperature=temperature,
+                stage="setup",
+                error=str(exc),
+            )
+            total_runtime_ms = int((time.perf_counter() - started) * 1000)
+            run = self._finalize_run(
+                run["id"],
+                total_runtime_ms=total_runtime_ms,
+                status="error",
+                notes=f"Benchmark aborted before completion: {exc}",
+            )
+            logger.info(
+                "benchmark run aborted run_id=%s model=%s runtime_ms=%s",
+                run["id"],
+                model_name,
+                total_runtime_ms,
+            )
+            return run
 
         total_runtime_ms = int((time.perf_counter() - started) * 1000)
         run = self._finalize_run(run["id"], total_runtime_ms=total_runtime_ms)
@@ -618,7 +661,56 @@ class EvalService:
         )
         self.db.conn.commit()
 
-    def _finalize_run(self, run_id: str, *, total_runtime_ms: int) -> dict[str, Any]:
+    def _store_unattempted_case_errors(
+        self,
+        run_id: str,
+        cases: list[dict[str, Any]],
+        *,
+        mode: str,
+        thinking_mode: str,
+        repeat_count: int,
+        temperature: float,
+        stage: str,
+        error: str,
+    ) -> None:
+        rows = self.db.conn.execute(
+            """
+            SELECT case_id, repeat_index
+            FROM benchmark_case_results
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchall()
+        existing = {
+            (str(row["case_id"]), int(row["repeat_index"] or 1))
+            for row in rows
+        }
+        for repeat_index in range(1, repeat_count + 1):
+            for case in cases:
+                case_id = str(case.get("id") or "")
+                if (case_id, repeat_index) in existing:
+                    continue
+                self._store_case_result(
+                    run_id,
+                    error_case_result(
+                        case,
+                        mode=mode,
+                        thinking_mode=thinking_mode,
+                        repeat_index=repeat_index,
+                        temperature=temperature,
+                        stage=stage,
+                        error=error,
+                    ),
+                )
+
+    def _finalize_run(
+        self,
+        run_id: str,
+        *,
+        total_runtime_ms: int,
+        status: str = "completed",
+        notes: str | None = None,
+    ) -> dict[str, Any]:
         rows = self.db.conn.execute(
             "SELECT * FROM benchmark_case_results WHERE run_id = ?",
             (run_id,),
@@ -643,7 +735,8 @@ class EvalService:
                 total_runtime_ms = ?,
                 embedding_backend = ?,
                 embedding_model = ?,
-                status = 'completed',
+                notes = COALESCE(?, notes),
+                status = ?,
                 timeout_count = ?,
                 runtime_error_count = ?,
                 grader_review_count = ?,
@@ -662,6 +755,8 @@ class EvalService:
                 total_runtime_ms,
                 embedding_backend,
                 embedding_model,
+                notes,
+                status,
                 timeout_count,
                 runtime_error_count,
                 grader_review_count,
@@ -679,6 +774,39 @@ class EvalService:
         if row is None:
             raise RuntimeError("benchmark run was not finalized")
         return self._run_with_cases(row)
+
+    def recover_interrupted_runs(self, *, reason: str) -> int:
+        rows = self.db.conn.execute(
+            """
+            SELECT id, created_at, total_runtime_ms, notes
+            FROM benchmark_runs
+            WHERE status = 'running'
+            """
+        ).fetchall()
+        if not rows:
+            return 0
+        now = utc_ms()
+        for row in rows:
+            elapsed_ms = max(int(row["total_runtime_ms"] or 0), now - int(row["created_at"] or now))
+            existing_notes = str(row["notes"] or "").strip()
+            note = f"{existing_notes}\n{reason}".strip() if existing_notes else reason
+            self.db.conn.execute(
+                """
+                UPDATE benchmark_runs
+                SET status = 'interrupted',
+                    notes = ?,
+                    total_runtime_ms = ?,
+                    runtime_error_count = CASE
+                        WHEN runtime_error_count > 0 THEN runtime_error_count
+                        ELSE 1
+                    END,
+                    completed_at = ?
+                WHERE id = ?
+                """,
+                (note, elapsed_ms, now, row["id"]),
+            )
+        self.db.conn.commit()
+        return len(rows)
 
     def _model_preflight(self, model_name: str) -> dict[str, Any]:
         try:
@@ -851,10 +979,41 @@ def index_case_documents(
             if fixture_id in indexed:
                 continue
             path = (case_path.parent / str(document["path"])).resolve()
-            imported = documents.import_document(str(path))
-            rag.index_document(imported["id"])
-            indexed[fixture_id] = imported["id"]
+            try:
+                logger.info(
+                    "benchmark indexing fixture fixture_id=%s path=%s",
+                    fixture_id,
+                    path,
+                )
+                imported = documents.import_document(str(path))
+                result = rag.index_document(imported["id"])
+                indexed[fixture_id] = imported["id"]
+                logger.info(
+                    "benchmark indexed fixture fixture_id=%s document_id=%s chunks=%s embedded=%s cached=%s",
+                    fixture_id,
+                    imported["id"],
+                    len(result.get("chunks") or []),
+                    result.get("embedded"),
+                    result.get("cached"),
+                )
+            except Exception as exc:  # noqa: BLE001 - record the affected cases instead of aborting the suite
+                logger.warning(
+                    "benchmark fixture indexing failed fixture_id=%s path=%s error=%s",
+                    fixture_id,
+                    path,
+                    exc,
+                )
     return indexed
+
+
+def missing_case_document_ids(case: dict[str, Any], document_ids: dict[str, str]) -> list[str]:
+    required_ids = {
+        str(document.get("id") or "")
+        for document in case.get("documents", [])
+        if isinstance(document, dict)
+    }
+    required_ids.add(str(case.get("required_source_document") or ""))
+    return sorted(fixture_id for fixture_id in required_ids if fixture_id and fixture_id not in document_ids)
 
 
 def normalize_benchmark_mode(value: str | None) -> str:

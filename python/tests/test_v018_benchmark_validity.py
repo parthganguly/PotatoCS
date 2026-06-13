@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from odysseus_desktop_backend.services import eval_service as eval_module
 from odysseus_desktop_backend.services.chat_service import ChatService
 from odysseus_desktop_backend.services.eval_service import EvalService, benchmark_comparison, evaluate_answer
 from odysseus_desktop_backend.services.model_service import ModelService, ModelTimeoutError
@@ -115,6 +116,89 @@ def test_retrieval_only_mode_never_calls_chat_model(tmp_path: Path):
 
         assert run["benchmark_mode"] == "retrieval_only"
         assert len(run["cases"]) == 2
+    finally:
+        db.close()
+
+
+def test_indexing_failure_is_stored_as_case_error(tmp_path: Path):
+    cases = tmp_path / "rag_cases"
+    cases.mkdir()
+    payload = {
+        "id": "missing_fixture",
+        "category": "direct_extraction",
+        "difficulty": "easy",
+        "benchmark_modes": ["retrieval_only"],
+        "documents": [{"id": "missing_doc", "path": "../fixtures/documents/missing.md"}],
+        "required_source_document": "missing_doc",
+        "question": "What is missing?",
+        "expected_facts": [{"label": "missing", "any": ["missing"]}],
+        "forbidden_claims": [],
+    }
+    (cases / "missing_fixture.json").write_text(json.dumps(payload), encoding="utf-8")
+    db = Database(tmp_path / "profile")
+    try:
+        service = EvalService(db, cases_dir=cases)
+
+        run = service.run(model="fake", benchmark_mode="retrieval_only")
+
+        assert run["status"] == "completed"
+        assert run["runtime_error_count"] == 1
+        assert len(run["cases"]) == 1
+        assert run["cases"][0]["status"] == "error"
+        assert run["cases"][0]["stage"] == "indexing"
+    finally:
+        db.close()
+
+
+def test_setup_failure_finalizes_run_with_error_cases(tmp_path: Path, monkeypatch):
+    cases_dir = write_two_case_fixture(tmp_path)
+    db = Database(tmp_path / "profile")
+
+    def fail_copy_settings(_source_db, _target_db):
+        raise RuntimeError("settings copy failed")
+
+    monkeypatch.setattr(eval_module, "copy_embedding_settings", fail_copy_settings)
+    try:
+        service = EvalService(
+            db,
+            cases_dir=cases_dir,
+            model_service_factory=lambda temp_db, temperature: ExplodingModel(temp_db),
+        )
+
+        run = service.run(model="fake", benchmark_mode="retrieval_only")
+
+        assert run["status"] == "error"
+        assert "settings copy failed" in run["notes"]
+        assert run["runtime_error_count"] == 2
+        assert [case["stage"] for case in run["cases"]] == ["setup", "setup"]
+    finally:
+        db.close()
+
+
+def test_running_benchmark_runs_are_marked_interrupted(tmp_path: Path):
+    db = Database(tmp_path / "profile")
+    try:
+        service = EvalService(db, cases_dir=write_two_case_fixture(tmp_path))
+        run = service._start_run(
+            model="fake",
+            verify=False,
+            temperature=0.0,
+            benchmark_mode="end_to_end",
+            thinking_mode="off",
+            answer_style="",
+            repeat_count=1,
+            num_predict=0,
+        )
+
+        recovered = service.recover_interrupted_runs(reason="sidecar restarted")
+        history = service.history(limit=1)
+
+        assert recovered == 1
+        assert history[0]["id"] == run["id"]
+        assert history[0]["status"] == "interrupted"
+        assert "sidecar restarted" in history[0]["notes"]
+        assert history[0]["runtime_error_count"] == 1
+        assert history[0]["completed_at"] is not None
     finally:
         db.close()
 

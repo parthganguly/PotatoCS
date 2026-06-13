@@ -153,7 +153,7 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.8 RAG diagnostics: semantic Ollama embeddings where available, honest
+- v0.1.9 RAG diagnostics: semantic Ollama embeddings where available, honest
   lexical fallback, quote-first answers, source-scoped retrieval,
   answer styles, optional verifier pass, retrieved snippets, local benchmark
   runs, structured Ollama metadata, thinking-mode benchmark support, timeout
@@ -173,7 +173,7 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.8 focuses on making retrieval, diagnostics, and evaluation more useful for small local
+v0.1.9 focuses on making retrieval, diagnostics, and evaluation more useful for small local
 models such as `llama3.2` on limited hardware. It does not require cloud
 models, does not auto-download models, and does not require a larger default
 chat model.
@@ -264,7 +264,9 @@ confused with a lexical or not-reindexed document library. The Model Benchmark
 panel can run Retrieval only, Oracle generation, or End-to-end RAG with
 thinking off/on/auto, verifier on/off where valid, and one or three repeats.
 It saves progress incrementally so completed cases remain auditable if a later
-case times out. It also shows a compact comparison table grouped by suite,
+case times out, marks interrupted sidecar runs in history, and retries lost
+benchmark RPC responses after restarting the sidecar. It also shows a compact
+comparison table grouped by suite,
 mode, prompt version, chat model, thinking mode, embedding backend/model,
 verifier state, temperature, and generation limits. It does not auto-download
 models and does not use cloud services.
@@ -274,7 +276,7 @@ models and does not use cloud services.
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.8_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.9_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded

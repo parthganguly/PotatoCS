@@ -190,9 +190,11 @@ impl BackendClient {
 
             if read == 0 {
                 self.is_shutdown = true;
-                return Err(BackendCallError::final_error(format!(
-                    "Python sidecar exited before responding to {method}"
-                )));
+                let message = format!("Python sidecar exited before responding to {method}");
+                if can_retry_after_lost_response(method) {
+                    return Err(BackendCallError::restartable(message));
+                }
+                return Err(BackendCallError::final_error(message));
             }
 
             let response: Value = serde_json::from_str(line.trim()).map_err(|err| {
@@ -262,6 +264,21 @@ impl BackendClient {
         self.child.kill().map_err(|err| err.to_string())?;
         Ok(())
     }
+}
+
+fn can_retry_after_lost_response(method: &str) -> bool {
+    matches!(
+        method,
+        "diagnostics.get"
+            | "models.detect_ollama"
+            | "models.list"
+            | "ocr.status"
+            | "rag.health"
+            | "evals.list"
+            | "evals.history"
+            | "evals.comparison"
+            | "evals.run"
+    )
 }
 
 #[tauri::command]

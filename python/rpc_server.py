@@ -53,6 +53,11 @@ class SidecarApp:
         self.legacy_import = LegacyImportService(self.documents, self.rag, self.sessions, self.settings)
         self.chat = ChatService(self.sessions, self.settings, self.models, rag=self.rag)
         self.evals = EvalService(self.db)
+        recovered_runs = self.evals.recover_interrupted_runs(
+            reason="Benchmark was interrupted because the Python sidecar stopped before returning a result."
+        )
+        if recovered_runs:
+            logger.warning("recovered interrupted benchmark runs count=%s", recovered_runs)
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
             "health.ping": self.health_ping,
