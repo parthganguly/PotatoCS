@@ -1,6 +1,6 @@
 {
   "id": "chronology_train_wait",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "chronology_comprehension",
   "difficulty": "medium",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -14,12 +14,30 @@
   "question": "Who waited two hours at the station, and what caused the wait?",
   "answer_style": "precise",
   "expected_facts": [
-    {"label": "person", "any": ["Leela"]},
-    {"label": "cause", "any": ["missed the morning train", "missed train"]}
+    {
+      "label": "Leela wait",
+      "type": "relation",
+      "subject_aliases": ["Leela"],
+      "predicate_aliases": ["waited", "wait"],
+      "object_aliases": ["station"],
+      "value_aliases": ["two hours"],
+      "scope": "same_clause"
+    },
+    {"label": "cause", "type": "positive_fact", "any": ["missed the morning train", "missed train"]}
   ],
-  "forbidden_claims": [{"label": "wrong person", "any": ["Arun waited two hours", "Arun waited at the station"]}],
+  "forbidden_claims": [
+    {
+      "label": "wrong person",
+      "type": "relation",
+      "subject_aliases": ["Arun"],
+      "predicate_aliases": ["waited", "wait"],
+      "object_aliases": ["station"],
+      "value_aliases": ["two hours"],
+      "scope": "same_clause"
+    }
+  ],
   "expected_abstention": false,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Preserve which person and event received the two-hour duration."
 }

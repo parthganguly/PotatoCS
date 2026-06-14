@@ -1,6 +1,6 @@
 {
   "id": "abstention_archive_budget",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "abstention_no_answer",
   "difficulty": "medium",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -13,10 +13,17 @@
   "gold_chunk_text": "does not list who approved the budget and does not include any budget amount",
   "question": "Who approved the budget in Box A17?",
   "answer_style": "precise",
-  "expected_facts": [{"label": "no approver", "any": ["cannot confirm", "does not list who approved", "does not identify an approver"]}],
-  "forbidden_claims": [{"label": "invented approver", "any": ["Mara Chen approved", "Leela approved", "Arun approved"]}],
+  "expected_facts": [
+    {
+      "label": "no approver",
+      "type": "absence_or_abstention",
+      "target_aliases": ["approver", "approved the budget", "who approved"],
+      "any": ["cannot confirm", "does not list who approved", "does not identify an approver"]
+    }
+  ],
+  "forbidden_claims": [{"label": "invented approver", "type": "positive_fact", "any": ["Mara Chen approved", "Leela approved", "Arun approved"]}],
   "expected_abstention": true,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Requested fact is absent; correct answer should abstain."
 }

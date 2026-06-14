@@ -1,6 +1,6 @@
 {
   "id": "direct_extraction_product",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "direct_extraction",
   "difficulty": "easy",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -14,13 +14,13 @@
   "question": "What are the Northstar Lantern's weight, battery type, and high-setting brightness?",
   "answer_style": "extract_only",
   "expected_facts": [
-    {"label": "weight", "any": ["1.4 kg"]},
-    {"label": "battery type", "any": ["two D-cell batteries", "D-cell batteries"]},
-    {"label": "brightness", "any": ["320 lumens"]}
+    {"label": "weight", "type": "quantity", "any": ["1.4 kg"]},
+    {"label": "battery type", "type": "quantity", "any": ["two D-cell batteries", "D-cell batteries"]},
+    {"label": "brightness", "type": "quantity", "any": ["320 lumens"]}
   ],
   "forbidden_claims": [{"label": "solar", "any": ["solar charging"]}],
   "expected_abstention": false,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Product/specification domain with quantity extraction."
 }

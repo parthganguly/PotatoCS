@@ -197,6 +197,79 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_benchmark_case_results_run
                 ON benchmark_case_results(run_id, case_id);
+
+            CREATE TABLE IF NOT EXISTS benchmark_campaigns (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                preset TEXT NOT NULL,
+                app_version TEXT NOT NULL,
+                suite_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                selected_models_json TEXT NOT NULL DEFAULT '[]',
+                selected_modes_json TEXT NOT NULL DEFAULT '[]',
+                selected_thinking_modes_json TEXT NOT NULL DEFAULT '[]',
+                verifier_settings_json TEXT NOT NULL DEFAULT '[]',
+                repeat_count INTEGER NOT NULL DEFAULT 1,
+                embedding_backend TEXT NOT NULL DEFAULT '',
+                embedding_model TEXT NOT NULL DEFAULT '',
+                temperature REAL NOT NULL DEFAULT 0,
+                num_predict INTEGER NOT NULL DEFAULT 0,
+                timeout_policy_json TEXT NOT NULL DEFAULT '{}',
+                planned_job_count INTEGER NOT NULL DEFAULT 0,
+                completed_job_count INTEGER NOT NULL DEFAULT 0,
+                failed_job_count INTEGER NOT NULL DEFAULT 0,
+                timed_out_job_count INTEGER NOT NULL DEFAULT 0,
+                skipped_job_count INTEGER NOT NULL DEFAULT 0,
+                estimated_runtime_ms INTEGER NOT NULL DEFAULT 0,
+                estimated_min_runtime_ms INTEGER NOT NULL DEFAULT 0,
+                actual_runtime_ms INTEGER NOT NULL DEFAULT 0,
+                auto_generate_report INTEGER NOT NULL DEFAULT 1,
+                report_status TEXT NOT NULL DEFAULT 'not_started',
+                report_paths_json TEXT NOT NULL DEFAULT '{}',
+                report_warnings_json TEXT NOT NULL DEFAULT '[]',
+                report_schema_version TEXT NOT NULL DEFAULT '',
+                output_folder TEXT NOT NULL DEFAULT '',
+                include_detailed_audit INTEGER NOT NULL DEFAULT 0,
+                requested_action TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_benchmark_campaigns_created
+                ON benchmark_campaigns(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS benchmark_campaign_jobs (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                benchmark_mode TEXT NOT NULL,
+                thinking_mode TEXT NOT NULL,
+                verify INTEGER NOT NULL DEFAULT 0,
+                repeat_count INTEGER NOT NULL DEFAULT 1,
+                temperature REAL NOT NULL DEFAULT 0,
+                num_predict INTEGER NOT NULL DEFAULT 0,
+                timeout_policy_json TEXT NOT NULL DEFAULT '{}',
+                benchmark_run_ids_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'queued',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                estimated_runtime_ms INTEGER NOT NULL DEFAULT 0,
+                estimated_min_runtime_ms INTEGER NOT NULL DEFAULT 0,
+                model_info_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                FOREIGN KEY (campaign_id) REFERENCES benchmark_campaigns(id) ON DELETE CASCADE
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_benchmark_campaign_jobs_sequence
+                ON benchmark_campaign_jobs(campaign_id, sequence);
+
+            CREATE INDEX IF NOT EXISTS idx_benchmark_campaign_jobs_status
+                ON benchmark_campaign_jobs(campaign_id, status, sequence);
             """
         )
         self.ensure_column("documents", "ocr_status", "TEXT NOT NULL DEFAULT 'not_needed'")
@@ -254,6 +327,13 @@ class Database:
         self.ensure_column("benchmark_case_results", "grader_matches_json", "TEXT NOT NULL DEFAULT '[]'")
         self.ensure_column("benchmark_case_results", "timings_json", "TEXT NOT NULL DEFAULT '{}'")
         self.ensure_column("benchmark_case_results", "error_message", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("benchmark_campaigns", "report_warnings_json", "TEXT NOT NULL DEFAULT '[]'")
+        self.ensure_column("benchmark_campaigns", "report_schema_version", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("benchmark_campaigns", "output_folder", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("benchmark_campaigns", "include_detailed_audit", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("benchmark_campaigns", "requested_action", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("benchmark_campaign_jobs", "estimated_min_runtime_ms", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("benchmark_campaign_jobs", "model_info_json", "TEXT NOT NULL DEFAULT '{}'")
         old_embedding_model = self.get_setting("embedding_model", None)
         old_embedding_backend = self.get_setting("embedding_backend", None)
         if old_embedding_model == "local-hash-v1" and old_embedding_backend is None:

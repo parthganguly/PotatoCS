@@ -1,5 +1,176 @@
 # Release Notes
 
+## v0.1.12 - Benchmark Trustworthiness and Report Finalization
+
+v0.1.12 fixes remaining benchmark-grading and campaign-report finalization
+defects found in a real installed v0.1.11 Quick campaign. It does not add
+agents, MCP, cloud services, telemetry, model downloads, new model providers,
+or new benchmark models.
+
+Important versioning note:
+
+- App version is `0.1.12`.
+- Eval suite version is `v0.1.12`.
+- Prompt version is `rag-benchmark-v0.1.12`.
+- The fixture corpus still lives under `evals\rag_cases_v018`, but grader and
+  scoring semantics changed comparability, so current recommendations exclude
+  v0.1.11 and older runs.
+
+Highlights:
+
+- Replaced broad phrase-overlap grading with typed deterministic assertions for
+  positive facts, negative facts, absence/abstention, exact identifiers,
+  quantities, date/time values, codes, and relation bindings.
+- Added a general absence evaluator that recognizes target-scoped forms such
+  as "does not identify an approver", "does not list who approved", "cannot
+  determine", and "the context is silent on" without requiring a stock refusal
+  phrase.
+- Added clause-local relation binding so Arun/Kolkata/six-month facts are not
+  contaminated by Leela's unrelated two-hour train wait.
+- Kept exact identifiers, codes, quantities, and times exact across confusing
+  pairs such as slot A/B, MAPLE-4/7, HB-204/240, 9:30/10:00, and six
+  months/two hours.
+- Distinguished answer conclusions from quoted evidence and recorded which
+  segment caused each match.
+- Changed scorer semantics so `grader_review` is neither a pass nor a
+  confirmed model failure. Reports now include attempted, passed, failed,
+  grader-review, timeout, runtime-error, adjudicated pass rate, and coverage.
+- Recommendation eligibility now requires sufficient grading coverage; a
+  relative winner is not described as deployment-ready merely because it beat a
+  weak comparison set.
+- Added one canonical report view model consumed by JSON, HTML, PDF, fallback
+  screenshots, and the DOM screenshot view.
+- Replaced ambiguous report `running` state with explicit report-generation
+  states including `awaiting_capture`, `capturing`, `generating`,
+  `completed`, `completed_with_warnings`, and `error`.
+- Fixed automatic campaign report handoff so the backend waits for frontend DOM
+  screenshots instead of racing directly to backend fallback snapshots.
+- Made backend fallback screenshots explicit, content-fitted, and warning
+  backed.
+- Improved PDF summary terminology, table wrapping, and visual appendix density
+  so screenshots are supplementary rather than mostly empty pages.
+- Improved ETA metadata with compatible-history confidence and fallback-source
+  wording.
+
+Validation commands for v0.1.12:
+
+```powershell
+python -m pytest python\tests
+npm run build
+cargo check --manifest-path src-tauri\Cargo.toml
+python -m py_compile python\odysseus_desktop_backend\services\eval_service.py python\odysseus_desktop_backend\services\campaign_service.py python\odysseus_desktop_backend\services\report_service.py python\rpc_server.py
+git diff --check
+npm run tauri:build
+```
+
+## v0.1.11 - Benchmark Correctness and Report Integrity
+
+v0.1.11 fixes scorer and report-integrity bugs found in real v0.1.10 campaign
+reports. It does not add agents, MCP, cloud services, model downloads, or new
+benchmark fixtures.
+
+Important versioning note:
+
+- App version is `0.1.11`.
+- Eval suite version is `v0.1.11`.
+- The fixture corpus still lives under `evals\rag_cases_v018`, but grader
+  semantics changed comparability, so current recommendations exclude older
+  `v0.1.8` runs.
+
+Highlights:
+
+- Added typed expected-fact matching for positive, negative, abstention,
+  exact identifier, quantity/date, and code-like facts.
+- Fixed negative expected facts such as "no emergency" and abstention facts
+  such as "no approver" so they are not rejected merely because the expected
+  claim itself is negated.
+- Restricted negation handling to the matched sentence/clause and predicate,
+  so unrelated later negative sentences do not negate quantity facts.
+- Required exact normalized matching for short identifiers, alphanumeric
+  codes, times, dates, and quantities.
+- Added explicit source-policy handling for required-source presence,
+  exclusive-source cases, no-conflicting-evidence cases, and abstention source
+  cases.
+- Normalized pipeline diagnosis to one disjoint taxonomy:
+  `retrieval_only`, `generation_only`, `both`, `grader_review`, `timeout`,
+  `runtime_error`, and `passed`.
+- Fixed report terminology to distinguish job execution errors, benchmark
+  assertion failures, grader-review cases, and timeouts.
+- Fixed not-run report metrics so quick campaigns display `N/A` / `Not run`
+  instead of `0%` / `0/0`.
+- Fixed recommendation reporting so equal-quality configurations produce a
+  quality tie while speed and balanced recommendations remain separate.
+- Fixed case-difficulty labels for small observation counts and source/
+  forbidden-failure panels.
+- Fixed report finalization so successful reports end as `completed` or
+  `completed_with_warnings`, not `running`.
+- Improved DOM screenshot handoff timing and kept backend fallback snapshots as
+  a warning-path safety net.
+- Added hardware context for Python/Ollama/model metadata and observed
+  CPU/GPU offload when available.
+- Improved PDF layout by reducing forced page breaks, shortening wide-table
+  headers, and scaling report snapshots larger.
+
+Validation commands for v0.1.11:
+
+```powershell
+python -m pytest python\tests
+npm run build
+cargo check --manifest-path src-tauri\Cargo.toml
+python -m py_compile python\odysseus_desktop_backend\services\campaign_service.py python\odysseus_desktop_backend\services\report_service.py python\odysseus_desktop_backend\services\eval_service.py python\rpc_server.py
+git diff --check
+npm run tauri:build
+```
+
+## v0.1.10 - Automated Benchmark Campaigns and Local Reports
+
+v0.1.10 adds profile-local benchmark campaigns and completely local report
+export while keeping the active eval suite at `v0.1.8`. It does not add agents,
+cloud services, telemetry, hidden HTTP, model auto-downloads, or new benchmark
+fixtures.
+
+Highlights:
+
+- Added persistent benchmark campaign and campaign job tables with additive
+  SQLite migrations. Existing benchmark history remains intact.
+- Added Quick comparison, Standard diagnostic, and Thorough comparison campaign
+  presets with deterministic job planning, ETA estimates, long-run warnings,
+  and explicit user Start action.
+- Standard campaigns deduplicate retrieval-only work for a shared embedding
+  configuration instead of rerunning it for every chat model.
+- Installed-model selection now classifies chat, embedding-only, and unknown
+  Ollama models where possible, and excludes embedding-only models from
+  automatic chat benchmark selection.
+- Campaign execution runs one benchmark job at a time, preserves completed
+  results when later jobs fail or time out, and supports pause, cancel, retry,
+  and interrupted-campaign resume.
+- Added campaign setup, active progress, and campaign history UI to Diagnostics
+  without starting benchmarks automatically on launch.
+- Added local report export through a Python `ReportService`: searchable PDF
+  via ReportLab, self-contained offline HTML, raw JSON schema version `1`, and
+  Odysseus-generated visual snapshots.
+- Added React report snapshot rendering with `html2canvas`, plus backend
+  fallback snapshots when DOM capture is unavailable.
+- Default reports redact full private filesystem paths and omit raw prompts,
+  thinking traces, and large raw answers unless detailed audit export is
+  enabled.
+- Added ReportLab runtime preparation/verification and campaign/report tests.
+
+Validation commands for v0.1.10:
+
+```powershell
+python -m pytest python\tests
+npm run build
+cargo check --manifest-path src-tauri\Cargo.toml
+python -m py_compile python\odysseus_desktop_backend\services\campaign_service.py python\odysseus_desktop_backend\services\report_service.py python\odysseus_desktop_backend\services\eval_service.py python\rpc_server.py
+git diff --check
+npm run tauri:build
+```
+
+Packaging note: this release is ready for manual campaign testing only after
+the package build succeeds. Do not claim fully release-ready until a real
+installed-app campaign generates and opens a valid report.
+
 ## v0.1.8 - RAG Benchmark Validity, Thinking, and Timeout Safety
 
 v0.1.8 redesigns the local benchmark path so weak-model evaluation can separate

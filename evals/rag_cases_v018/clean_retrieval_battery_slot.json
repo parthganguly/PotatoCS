@@ -1,6 +1,6 @@
 {
   "id": "clean_retrieval_battery_slot",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "clean_retrieval",
   "difficulty": "medium",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -13,10 +13,10 @@
   "gold_chunk_text": "place the battery pack in slot B before attaching the antenna lead",
   "question": "For the Delta-4 reader, where does the power pack go before the antenna is connected?",
   "answer_style": "precise",
-  "expected_facts": [{"label": "slot B", "any": ["slot B", "battery pack in slot B"]}],
+  "expected_facts": [{"label": "slot B", "type": "exact_identifier", "any": ["slot B", "battery pack in slot B"]}],
   "forbidden_claims": [{"label": "slot absent", "any": ["does not say which slot", "slot A"]}],
   "expected_abstention": false,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Synonym query uses power pack while the source says battery pack; antenna decoy shares topic words."
 }

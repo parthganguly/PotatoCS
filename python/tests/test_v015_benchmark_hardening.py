@@ -87,6 +87,7 @@ def test_guidance_labels_are_deterministic_from_failure_categories():
                 verify=False,
                 passed=1,
                 latency=300,
+                case_ids=["chronology-a", "chronology-b", "direct"],
                 expected_failures=2,
                 forbidden_failures=1,
                 source_failures=1,
@@ -135,7 +136,7 @@ def test_benchmark_comparison_excludes_older_eval_suites_from_recommendation():
                 passed=3,
                 total=7,
                 latency=2316,
-                suite_version="v0.1.8",
+                suite_version="v0.1.12",
                 created_at=2,
             ),
         ]
@@ -143,7 +144,7 @@ def test_benchmark_comparison_excludes_older_eval_suites_from_recommendation():
 
     recommended = comparison["recommended"]
 
-    assert comparison["comparison_suite_version"] == "v0.1.8"
+    assert comparison["comparison_suite_version"] == "v0.1.12"
     assert comparison["included_run_count"] == 1
     assert comparison["excluded_run_count"] == 1
     assert comparison["excluded_suite_versions"] == ["v0.1.3"]
@@ -330,7 +331,7 @@ def run_fixture(
     embedding_backend: str = "semantic",
     embedding_model: str = "nomic-embed-text",
     temperature: float = 0.0,
-    suite_version: str = "v0.1.8",
+    suite_version: str = "v0.1.12",
     expected_failures: int = 0,
     forbidden_failures: int = 0,
     source_failures: int = 0,
@@ -352,6 +353,9 @@ def run_fixture(
                 "expected_passed": index >= expected_failures,
                 "forbidden_passed": index >= forbidden_failures and case_id not in forbidden_failures_by_case,
                 "source_passed": index >= source_failures and case_id not in source_failures_by_case,
+                "case_category": "chronology_comprehension" if str(case_id).startswith("chronology") else "direct_extraction",
+                "benchmark_mode": "end_to_end",
+                "counts_toward_primary": True,
                 "latency_ms": latency,
             }
         )

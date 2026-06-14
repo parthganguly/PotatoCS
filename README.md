@@ -153,13 +153,13 @@ Included:
 - Sessions, settings, default profile, and restart persistence.
 - `.txt`, `.md`, and extractable `.pdf` document import.
 - SQLite + NumPy VectorStore-backed RAG.
-- v0.1.9 RAG diagnostics: semantic Ollama embeddings where available, honest
+- v0.1.12 RAG diagnostics: semantic Ollama embeddings where available, honest
   lexical fallback, quote-first answers, source-scoped retrieval,
   answer styles, optional verifier pass, retrieved snippets, local benchmark
   runs, structured Ollama metadata, thinking-mode benchmark support, timeout
   safety, separate retrieval/oracle/end-to-end benchmark modes, comparison
-  summaries, deterministic model guidance, Potato Mode, and Evidence Only
-  style.
+  summaries, deterministic model guidance, persistent benchmark campaigns,
+  local PDF/HTML/JSON report export, Potato Mode, and Evidence Only style.
 - Embedding cache by chunk/content hash.
 - Optional OCR for scanned/low-text PDFs when Tesseract plus `pdftoppm` or
   `mutool` are locally installed.
@@ -173,7 +173,7 @@ Excluded from the MVP:
 
 ## RAG Reliability
 
-v0.1.9 focuses on making retrieval, diagnostics, and evaluation more useful for small local
+v0.1.12 focuses on making retrieval, diagnostics, and evaluation more trustworthy for small local
 models such as `llama3.2` on limited hardware. It does not require cloud
 models, does not auto-download models, and does not require a larger default
 chat model.
@@ -229,8 +229,12 @@ best-effort, and optional because it costs extra tokens. It is not a rescue
 mechanism for 1B/1.5B-class models.
 
 The local eval harness lives under `evals\` and `scripts\run_rag_evals.py`.
-The active suite is `v0.1.8` under `evals\rag_cases_v018`; older suites remain
-on disk for legacy history and regression context. The v0.1.8 fixtures cover
+The active suite is `v0.1.12` under `evals\rag_cases_v018`; older suites remain
+on disk for legacy history and regression context. v0.1.12 uses the same
+fixture corpus but changes grader semantics for absence/abstention, relation
+binding, exact values, grader-review scoring, source policies, and report
+finalization, so old v0.1.11 and earlier benchmark runs are not compared as
+current-suite results. The fixtures cover
 clean retrieval, direct extraction, chronology/comprehension, cross-document
 contamination, abstention/no-answer, and negation-adversarial cases across
 technical instructions, event notices, logistics memos, family narrative,
@@ -242,8 +246,9 @@ and End-to-end RAG. Comparison never combines different modes. End-to-end runs
 record retrieved candidate document IDs separately from evidence snippets
 actually supplied to the model, so a wrong rank-4 candidate is reported as
 candidate contamination without automatically failing source grounding if it
-was not supplied. The deterministic grader records expected/forbidden match
-details, answer windows, token overlap, nearby negation, and review-required
+was not supplied. The deterministic grader records typed expected/forbidden
+assertion details, matched clauses, answer/evidence segment source, absence
+construction, relation components, exact value decisions, and review-required
 decisions; negated forbidden claims such as "there is no emergency" are not
 treated as affirmative forbidden claims.
 
@@ -271,12 +276,30 @@ mode, prompt version, chat model, thinking mode, embedding backend/model,
 verifier state, temperature, and generation limits. It does not auto-download
 models and does not use cloud services.
 
+v0.1.10 adds persistent benchmark campaigns in Diagnostics. A campaign is a
+profile-local SQLite queue of planned benchmark jobs with Quick comparison,
+Standard diagnostic, and Thorough comparison presets. Campaigns run only after
+an explicit Start action, execute one Ollama benchmark job at a time, preserve
+partial results after failed or timed-out jobs, and support pause, cancel,
+retry, and interrupted-campaign resume without rewriting existing benchmark
+history. The planner lists installed Ollama models, filters embedding-only
+models out of automatic chat-model selection, deduplicates Standard
+retrieval-only jobs for a shared embedding configuration, and shows local ETA
+warnings before heavy runs.
+
+Completed campaigns can generate fully local reports without cloud services or
+external assets. Reports include a searchable PDF generated with ReportLab, a
+self-contained offline HTML backup, raw JSON with schema version `1`, and
+Odysseus-generated visual snapshots. Default report data omits full private
+profile paths, raw prompts, thinking traces, and large raw answers unless the
+user enables detailed audit export.
+
 ## User Setup
 
 Install the Windows build from:
 
 ```powershell
-src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.9_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.1.12_x64-setup.exe
 ```
 
 The installer includes the app, Python sidecar code, and a bundled embedded

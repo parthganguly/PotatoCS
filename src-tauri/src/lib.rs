@@ -278,6 +278,11 @@ fn can_retry_after_lost_response(method: &str) -> bool {
             | "evals.history"
             | "evals.comparison"
             | "evals.run"
+            | "campaigns.models"
+            | "campaigns.plan"
+            | "campaigns.list"
+            | "campaigns.get"
+            | "campaigns.report_data"
     )
 }
 

@@ -8,8 +8,11 @@ import {
   Cpu,
   Database,
   FileText,
+  FolderOpen,
   History,
   MessageSquarePlus,
+  Pause,
+  Play,
   Power,
   RefreshCw,
   RotateCw,
@@ -18,18 +21,28 @@ import {
   Send,
   Settings as SettingsIcon,
   Trash2,
-  Upload
+  Upload,
+  XCircle
 } from "lucide-react";
+import html2canvas from "html2canvas";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AppStatus,
   AnswerStyle,
+  BenchmarkCampaign,
   BenchmarkMode,
   BenchmarkCaseDifficulty,
+  BenchmarkCaseDifficultyItem,
   BenchmarkComparison,
   BenchmarkComparisonGroup,
+  CampaignJob,
+  CampaignModelInfo,
+  CampaignPlan,
+  CampaignPreset,
+  CampaignReportData,
+  CampaignReportResult,
   ChatResult,
   DiagnosticsStatus,
   DocumentImportResult,
@@ -77,6 +90,12 @@ const THINKING_MODE_OPTIONS: Array<{ value: Exclude<ThinkingMode, "legacy/unreco
   { value: "on", label: "On" },
   { value: "auto", label: "Auto" }
 ];
+const CAMPAIGN_PRESET_OPTIONS: Array<{ value: CampaignPreset; label: string }> = [
+  { value: "quick", label: "Quick comparison" },
+  { value: "standard", label: "Standard diagnostic" },
+  { value: "thorough", label: "Thorough comparison" }
+];
+const TERMINAL_CAMPAIGN_STATUSES = new Set(["completed", "completed_with_errors", "cancelled", "interrupted", "error"]);
 
 function App() {
   const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
@@ -116,6 +135,24 @@ function App() {
   const [benchmarkThinking, setBenchmarkThinking] = useState<Exclude<ThinkingMode, "legacy/unrecorded">>("off");
   const [benchmarkVerify, setBenchmarkVerify] = useState(false);
   const [benchmarkRepeats, setBenchmarkRepeats] = useState<1 | 3>(1);
+  const [campaignModels, setCampaignModels] = useState<CampaignModelInfo[]>([]);
+  const [campaigns, setCampaigns] = useState<BenchmarkCampaign[]>([]);
+  const [activeCampaign, setActiveCampaign] = useState<BenchmarkCampaign | null>(null);
+  const [campaignPlan, setCampaignPlan] = useState<CampaignPlan | null>(null);
+  const [campaignTitle, setCampaignTitle] = useState("Quick benchmark comparison");
+  const [campaignPreset, setCampaignPreset] = useState<CampaignPreset>("quick");
+  const [campaignSelectedModels, setCampaignSelectedModels] = useState<string[]>([]);
+  const [campaignModes, setCampaignModes] = useState<BenchmarkMode[]>(["end_to_end"]);
+  const [campaignThinkingModes, setCampaignThinkingModes] = useState<Array<Exclude<ThinkingMode, "legacy/unrecorded">>>(["off"]);
+  const [campaignVerifierSettings, setCampaignVerifierSettings] = useState<boolean[]>([false]);
+  const [campaignRepeats, setCampaignRepeats] = useState<1 | 3>(1);
+  const [campaignAutoReport, setCampaignAutoReport] = useState(true);
+  const [campaignOutputFolder, setCampaignOutputFolder] = useState("");
+  const [campaignStatusMessage, setCampaignStatusMessage] = useState("");
+  const [campaignBusy, setCampaignBusy] = useState(false);
+  const [reportData, setReportData] = useState<CampaignReportData | null>(null);
+  const reportViewRef = useRef<HTMLDivElement | null>(null);
+  const autoReportAttempts = useRef<Set<string>>(new Set());
   const [copyStatus, setCopyStatus] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [busy, setBusy] = useState(false);
@@ -187,6 +224,23 @@ function App() {
     }
   }, [activeView, diagnostics]);
 
+  useEffect(() => {
+    if (!activeCampaign || !["queued", "running", "paused"].includes(activeCampaign.status)) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void refreshCampaign(activeCampaign.id, { quiet: true });
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [activeCampaign?.id, activeCampaign?.status]);
+
+  useEffect(() => {
+    if (!activeCampaign || !shouldAutoGenerateCampaignReport(activeCampaign)) return;
+    if (autoReportAttempts.current.has(activeCampaign.id)) return;
+    autoReportAttempts.current.add(activeCampaign.id);
+    void generateCampaignReport(activeCampaign, { automatic: true, screenshots: true });
+  }, [activeCampaign?.id, activeCampaign?.status, activeCampaign?.report_status]);
+
   async function bootstrap() {
     setLoadState("loading");
     setError(null);
@@ -250,16 +304,24 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const [nextDiagnostics, nextSuite, nextHistory, nextComparison] = await Promise.all([
+      const [nextDiagnostics, nextSuite, nextHistory, nextComparison, nextCampaignModels, nextCampaigns] = await Promise.all([
         rpc<DiagnosticsStatus>("diagnostics.get"),
         rpc<EvalSuite>("evals.list"),
         rpc<EvalRun[]>("evals.history", { limit: 20 }),
-        rpc<BenchmarkComparison>("evals.comparison", { limit: 100 })
+        rpc<BenchmarkComparison>("evals.comparison", { limit: 100 }),
+        rpc<CampaignModelInfo[]>("campaigns.models"),
+        rpc<BenchmarkCampaign[]>("campaigns.list", { limit: 20 })
       ]);
       setDiagnostics(nextDiagnostics);
       setEvalSuite(nextSuite);
       setEvalHistory(nextHistory);
       setBenchmarkComparison(nextComparison);
+      setCampaignModels(nextCampaignModels);
+      setCampaigns(nextCampaigns);
+      setActiveCampaign((current) => {
+        if (!current) return nextCampaigns[0] ?? null;
+        return nextCampaigns.find((campaign) => campaign.id === current.id) ?? current;
+      });
       setOllama(nextDiagnostics.ollama);
       setOcrStatus(nextDiagnostics.ocr);
       setRagHealth(nextDiagnostics.rag);
@@ -329,6 +391,306 @@ function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function campaignRequest(): Record<string, unknown> {
+    return {
+      title: campaignTitle,
+      preset: campaignPreset,
+      models: campaignSelectedModels,
+      modes: campaignModes,
+      thinking_modes: campaignThinkingModes,
+      verifier_settings: campaignVerifierSettings,
+      repeats: campaignRepeats,
+      auto_generate_report: campaignAutoReport,
+      output_folder: campaignOutputFolder
+    };
+  }
+
+  async function reviewCampaignPlan() {
+    setCampaignBusy(true);
+    setError(null);
+    setCampaignStatusMessage("");
+    try {
+      const plan = await rpc<CampaignPlan>("campaigns.plan", campaignRequest());
+      setCampaignPlan(plan);
+      setCampaignStatusMessage(`Planned ${plan.planned_job_count} job(s), likely ${formatDuration(plan.estimate.likely_ms)}.`);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function startCampaign() {
+    setCampaignBusy(true);
+    setError(null);
+    setCampaignStatusMessage("");
+    try {
+      const plan = campaignPlan ?? (await rpc<CampaignPlan>("campaigns.plan", campaignRequest()));
+      if (campaignPreset === "thorough" || plan.warnings.some((warning) => ["confirm", "strong"].includes(warning.level))) {
+        const warningText = plan.warnings.map((warning) => warning.message).join("\n");
+        const confirmed = window.confirm(
+          `Start this benchmark campaign?\n\n${plan.planned_job_count} job(s), likely ${formatDuration(plan.estimate.likely_ms)}.\n${warningText}`
+        );
+        if (!confirmed) {
+          setCampaignStatusMessage("Campaign start cancelled.");
+          return;
+        }
+      }
+      const campaign = await rpc<BenchmarkCampaign>("campaigns.create", { plan });
+      const started = await rpc<BenchmarkCampaign>("campaigns.start", { campaign_id: campaign.id });
+      setActiveCampaign(started);
+      setCampaigns((current) => [started, ...current.filter((item) => item.id !== started.id)]);
+      setCampaignPlan(null);
+      setCampaignStatusMessage(`Campaign started: ${started.title}`);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function refreshCampaign(campaignId: string, options: { quiet?: boolean } = {}) {
+    try {
+      const [campaign, nextCampaigns] = await Promise.all([
+        rpc<BenchmarkCampaign>("campaigns.get", { campaign_id: campaignId }),
+        rpc<BenchmarkCampaign[]>("campaigns.list", { limit: 20 })
+      ]);
+      setActiveCampaign(campaign);
+      setCampaigns(nextCampaigns);
+      if (
+        shouldAutoGenerateCampaignReport(campaign) &&
+        !autoReportAttempts.current.has(campaign.id) &&
+        (!campaign.report_paths || Object.keys(campaign.report_paths).length === 0)
+      ) {
+        autoReportAttempts.current.add(campaign.id);
+        void generateCampaignReport(campaign, { automatic: true, screenshots: true });
+      }
+    } catch (err) {
+      if (!options.quiet) setError(readError(err));
+    }
+  }
+
+  async function pauseCampaign(campaign: BenchmarkCampaign) {
+    setCampaignBusy(true);
+    setError(null);
+    try {
+      const updated = await rpc<BenchmarkCampaign>("campaigns.pause", { campaign_id: campaign.id });
+      setActiveCampaign(updated);
+      setCampaignStatusMessage("Campaign will pause before the next job starts.");
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function cancelCampaign(campaign: BenchmarkCampaign) {
+    setCampaignBusy(true);
+    setError(null);
+    try {
+      const updated = await rpc<BenchmarkCampaign>("campaigns.cancel", { campaign_id: campaign.id });
+      setActiveCampaign(updated);
+      setCampaignStatusMessage("Campaign cancellation requested.");
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function resumeCampaign(campaign: BenchmarkCampaign) {
+    setCampaignBusy(true);
+    setError(null);
+    try {
+      const updated = await rpc<BenchmarkCampaign>("campaigns.resume", { campaign_id: campaign.id });
+      setActiveCampaign(updated);
+      setCampaignStatusMessage("Campaign resumed.");
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function retryCampaignJob(job: CampaignJob) {
+    if (!job.id) return;
+    setCampaignBusy(true);
+    setError(null);
+    try {
+      const updated = await rpc<BenchmarkCampaign>("campaigns.retry_job", { job_id: job.id });
+      setActiveCampaign(updated);
+      setCampaignStatusMessage("Job queued for retry.");
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function deleteCampaign(campaign: BenchmarkCampaign) {
+    setCampaignBusy(true);
+    setError(null);
+    try {
+      await rpc("campaigns.delete", { campaign_id: campaign.id });
+      const nextCampaigns = await rpc<BenchmarkCampaign[]>("campaigns.list", { limit: 20 });
+      setCampaigns(nextCampaigns);
+      setActiveCampaign(nextCampaigns[0] ?? null);
+      setCampaignStatusMessage("Campaign record deleted. Linked benchmark history was preserved.");
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function chooseCampaignOutputFolder() {
+    setError(null);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose benchmark report output folder"
+      });
+      if (typeof selected === "string") {
+        setCampaignOutputFolder(selected);
+        setCampaignPlan(null);
+      }
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function generateCampaignReport(
+    campaign: BenchmarkCampaign,
+    options: { automatic?: boolean; screenshots?: boolean } = {}
+  ) {
+    setCampaignBusy(!options.automatic);
+    setError(null);
+    try {
+      const data = await rpc<CampaignReportData>("campaigns.report_data", { campaign_id: campaign.id });
+      const capture = options.screenshots === false
+        ? { screenshots: [], failureReason: "screenshot capture was disabled for this request" }
+        : await captureReportSnapshots(data);
+      const result = await rpc<CampaignReportResult>("campaigns.generate_report", {
+        campaign_id: campaign.id,
+        output_folder: campaign.output_folder || campaignOutputFolder || undefined,
+        screenshots: capture.screenshots,
+        capture_failure_reason: capture.failureReason || undefined
+      });
+      await refreshCampaign(campaign.id, { quiet: true });
+      setCampaignStatusMessage(`Report ${result.status}: ${Object.values(result.paths)[0] ?? "created"}`);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setCampaignBusy(false);
+    }
+  }
+
+  async function captureReportSnapshots(
+    data: CampaignReportData
+  ): Promise<{ screenshots: Array<{ name: string; label: string; data_url: string }>; failureReason: string }> {
+    setReportData(data);
+    await Promise.resolve();
+    if (document.fonts?.ready) {
+      await document.fonts.ready;
+    }
+    await nextFrame();
+    await nextFrame();
+    const root = reportViewRef.current;
+    if (!root) return { screenshots: [], failureReason: "report capture root was not mounted" };
+    const nodes = Array.from(root.querySelectorAll<HTMLElement>("[data-report-snapshot]"));
+    if (nodes.length === 0) {
+      return { screenshots: [], failureReason: "report view mounted with no capture sections" };
+    }
+    const screenshots: Array<{ name: string; label: string; data_url: string }> = [];
+    for (const node of nodes) {
+      const name = node.dataset.reportSnapshot || `snapshot-${screenshots.length + 1}.png`;
+      const label = node.dataset.reportLabel || name.replace(/^\d+-/, "").replace(/-/g, " ").replace(/\.png$/, "");
+      try {
+        await waitForImages(node);
+        const rect = node.getBoundingClientRect();
+        if (rect.width < 80 || rect.height < 40) {
+          return { screenshots, failureReason: `${label} had zero or tiny layout dimensions (${Math.round(rect.width)}x${Math.round(rect.height)})` };
+        }
+        const canvas = await html2canvas(node, {
+          backgroundColor: "#ffffff",
+          logging: false,
+          scale: 1.5,
+          windowWidth: Math.ceil(rect.width),
+          windowHeight: Math.ceil(rect.height)
+        });
+        const data_url = canvas.toDataURL("image/png");
+        if (!isUsefulPngDataUrl(data_url)) {
+          return { screenshots, failureReason: `${label} produced an invalid or tiny PNG data URL` };
+        }
+        screenshots.push({ name, label, data_url });
+      } catch {
+        return { screenshots, failureReason: `capture failed while rendering ${label}` };
+      }
+    }
+    return { screenshots, failureReason: screenshots.length === 0 ? "no screenshots were captured" : "" };
+  }
+
+  async function openCampaignReport(campaign: BenchmarkCampaign, kind: "pdf" | "html" | "folder") {
+    const path = kind === "folder" ? undefined : campaign.report_paths?.[kind];
+    if (kind !== "folder" && !path) return;
+    setError(null);
+    try {
+      await rpc("campaigns.open_report_folder", {
+        campaign_id: campaign.id,
+        path
+      });
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  function toggleCampaignModel(model: string, selected: boolean) {
+    setCampaignSelectedModels((current) =>
+      selected ? dedupeStrings([...current, model]) : current.filter((item) => item !== model)
+    );
+    setCampaignPlan(null);
+  }
+
+  function selectAllChatCampaignModels() {
+    setCampaignSelectedModels(campaignModels.filter((model) => model.capability === "chat").map((model) => model.name));
+    setCampaignPlan(null);
+  }
+
+  function clearCampaignModels() {
+    setCampaignSelectedModels([]);
+    setCampaignPlan(null);
+  }
+
+  function toggleCampaignMode(mode: BenchmarkMode, selected: boolean) {
+    setCampaignModes((current) => (selected ? dedupeBenchmarkModes([...current, mode]) : current.filter((item) => item !== mode)));
+    setCampaignPlan(null);
+  }
+
+  function toggleCampaignThinking(mode: Exclude<ThinkingMode, "legacy/unrecorded">, selected: boolean) {
+    setCampaignThinkingModes((current) =>
+      selected ? dedupeThinkingModes([...current, mode]) : current.filter((item) => item !== mode)
+    );
+    setCampaignPlan(null);
+  }
+
+  function toggleCampaignVerifier(value: boolean, selected: boolean) {
+    setCampaignVerifierSettings((current) => {
+      const next = selected ? [...current, value] : current.filter((item) => item !== value);
+      return Array.from(new Set(next)).sort((a, b) => Number(a) - Number(b));
+    });
+    setCampaignPlan(null);
+  }
+
+  function removePlannedCampaignJob(job: CampaignJob) {
+    if (!campaignPlan) return;
+    setCampaignPlan({
+      ...campaignPlan,
+      planned_jobs: campaignPlan.planned_jobs.filter((item) => item.key !== job.key),
+      planned_job_count: Math.max(0, campaignPlan.planned_job_count - 1)
+    });
   }
 
   async function saveSettings() {
@@ -803,27 +1165,92 @@ function App() {
             benchmarkResult={benchmarkResult}
             benchmarkVerify={benchmarkVerify}
             busy={busy}
+            campaignAutoReport={campaignAutoReport}
+            campaignBusy={campaignBusy}
+            campaignModels={campaignModels}
+            campaignModes={campaignModes}
+            campaignOutputFolder={campaignOutputFolder}
+            campaignPlan={campaignPlan}
+            campaignPreset={campaignPreset}
+            campaignRepeats={campaignRepeats}
+            campaignSelectedModels={campaignSelectedModels}
+            campaignStatusMessage={campaignStatusMessage}
+            campaignThinkingModes={campaignThinkingModes}
+            campaignTitle={campaignTitle}
+            campaignVerifierSettings={campaignVerifierSettings}
+            campaigns={campaigns}
             copyStatus={copyStatus}
             comparison={benchmarkComparison}
             diagnostics={diagnostics}
             error={error}
             evalHistory={evalHistory}
             evalSuite={evalSuite}
+            activeCampaign={activeCampaign}
             benchmarkMode={benchmarkMode}
             benchmarkRepeats={benchmarkRepeats}
             benchmarkThinking={benchmarkThinking}
+            onCancelCampaign={cancelCampaign}
             onClearHistory={clearBenchmarkHistory}
             onCopySummary={copyBenchmarkSummary}
+            onClearCampaignModels={clearCampaignModels}
+            onChooseCampaignOutputFolder={chooseCampaignOutputFolder}
+            onDeleteCampaign={deleteCampaign}
+            onGenerateCampaignReport={(campaign) => generateCampaignReport(campaign, { screenshots: true })}
+            onOpenCampaignReport={openCampaignReport}
+            onPauseCampaign={pauseCampaign}
             onRefresh={refreshDiagnostics}
+            onRefreshCampaign={(campaignId) => refreshCampaign(campaignId)}
+            onRemovePlannedCampaignJob={removePlannedCampaignJob}
+            onResumeCampaign={resumeCampaign}
+            onRetryCampaignJob={retryCampaignJob}
+            onReviewCampaignPlan={reviewCampaignPlan}
             onRunBenchmark={runBenchmark}
+            onSelectAllChatCampaignModels={selectAllChatCampaignModels}
             onSetBenchmarkMode={setBenchmarkMode}
             onSetBenchmarkModel={setBenchmarkModel}
             onSetBenchmarkRepeats={setBenchmarkRepeats}
             onSetBenchmarkThinking={setBenchmarkThinking}
             onSetBenchmarkVerify={setBenchmarkVerify}
+            onSetCampaignAutoReport={setCampaignAutoReport}
+            onSetCampaignModes={setCampaignModes}
+            onSetCampaignOutputFolder={setCampaignOutputFolder}
+            onSetCampaignPreset={(value) => {
+              setCampaignPreset(value);
+              setCampaignTitle(defaultCampaignTitle(value));
+              if (value === "quick") {
+                setCampaignModes(["end_to_end"]);
+                setCampaignThinkingModes(["off"]);
+                setCampaignVerifierSettings([false]);
+                setCampaignRepeats(1);
+              }
+              if (value === "standard") {
+                setCampaignModes(["retrieval_only", "oracle_generation", "end_to_end"]);
+                setCampaignThinkingModes(["off"]);
+                setCampaignVerifierSettings([false]);
+                setCampaignRepeats(1);
+              }
+              setCampaignPlan(null);
+            }}
+            onSetCampaignRepeats={setCampaignRepeats}
+            onSetCampaignSelectedModels={setCampaignSelectedModels}
+            onSetCampaignThinkingModes={setCampaignThinkingModes}
+            onSetCampaignTitle={setCampaignTitle}
+            onSetCampaignVerifierSettings={setCampaignVerifierSettings}
+            onStartCampaign={startCampaign}
+            onToggleCampaignMode={toggleCampaignMode}
+            onToggleCampaignModel={toggleCampaignModel}
+            onToggleCampaignThinking={toggleCampaignThinking}
+            onToggleCampaignVerifier={toggleCampaignVerifier}
           />
         )}
       </section>
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed left-[-12000px] top-0 w-[1040px] bg-white"
+        ref={reportViewRef}
+      >
+        {reportData && <BenchmarkReportView data={reportData} />}
+      </div>
     </main>
   );
 }
@@ -1243,6 +1670,7 @@ function DocumentsWorkspace(props: {
 }
 
 function DiagnosticsWorkspace(props: {
+  activeCampaign: BenchmarkCampaign | null;
   benchmarkModel: string;
   benchmarkMode: BenchmarkMode;
   benchmarkResult: EvalRun | null;
@@ -1250,21 +1678,62 @@ function DiagnosticsWorkspace(props: {
   benchmarkThinking: Exclude<ThinkingMode, "legacy/unrecorded">;
   benchmarkVerify: boolean;
   busy: boolean;
+  campaignAutoReport: boolean;
+  campaignBusy: boolean;
+  campaignModels: CampaignModelInfo[];
+  campaignModes: BenchmarkMode[];
+  campaignOutputFolder: string;
+  campaignPlan: CampaignPlan | null;
+  campaignPreset: CampaignPreset;
+  campaignRepeats: 1 | 3;
+  campaignSelectedModels: string[];
+  campaignStatusMessage: string;
+  campaignThinkingModes: Array<Exclude<ThinkingMode, "legacy/unrecorded">>;
+  campaignTitle: string;
+  campaignVerifierSettings: boolean[];
+  campaigns: BenchmarkCampaign[];
   comparison: BenchmarkComparison | null;
   copyStatus: string;
   diagnostics: DiagnosticsStatus | null;
   error: string | null;
   evalHistory: EvalRun[];
   evalSuite: EvalSuite | null;
+  onCancelCampaign: (campaign: BenchmarkCampaign) => void;
   onClearHistory: () => void;
+  onClearCampaignModels: () => void;
   onCopySummary: () => void;
+  onChooseCampaignOutputFolder: () => void;
+  onDeleteCampaign: (campaign: BenchmarkCampaign) => void;
+  onGenerateCampaignReport: (campaign: BenchmarkCampaign) => void;
+  onOpenCampaignReport: (campaign: BenchmarkCampaign, kind: "pdf" | "html" | "folder") => void;
+  onPauseCampaign: (campaign: BenchmarkCampaign) => void;
   onRefresh: () => void;
+  onRefreshCampaign: (campaignId: string) => void;
+  onRemovePlannedCampaignJob: (job: CampaignJob) => void;
+  onResumeCampaign: (campaign: BenchmarkCampaign) => void;
+  onRetryCampaignJob: (job: CampaignJob) => void;
+  onReviewCampaignPlan: () => void;
   onRunBenchmark: () => void;
+  onSelectAllChatCampaignModels: () => void;
   onSetBenchmarkMode: (value: BenchmarkMode) => void;
   onSetBenchmarkModel: (value: string) => void;
   onSetBenchmarkRepeats: (value: 1 | 3) => void;
   onSetBenchmarkThinking: (value: Exclude<ThinkingMode, "legacy/unrecorded">) => void;
   onSetBenchmarkVerify: (value: boolean) => void;
+  onSetCampaignAutoReport: (value: boolean) => void;
+  onSetCampaignModes: (value: BenchmarkMode[]) => void;
+  onSetCampaignOutputFolder: (value: string) => void;
+  onSetCampaignPreset: (value: CampaignPreset) => void;
+  onSetCampaignRepeats: (value: 1 | 3) => void;
+  onSetCampaignSelectedModels: (value: string[]) => void;
+  onSetCampaignThinkingModes: (value: Array<Exclude<ThinkingMode, "legacy/unrecorded">>) => void;
+  onSetCampaignTitle: (value: string) => void;
+  onSetCampaignVerifierSettings: (value: boolean[]) => void;
+  onStartCampaign: () => void;
+  onToggleCampaignMode: (mode: BenchmarkMode, selected: boolean) => void;
+  onToggleCampaignModel: (model: string, selected: boolean) => void;
+  onToggleCampaignThinking: (mode: Exclude<ThinkingMode, "legacy/unrecorded">, selected: boolean) => void;
+  onToggleCampaignVerifier: (value: boolean, selected: boolean) => void;
 }) {
   const models = props.diagnostics?.ollama.models ?? [];
   const modelDetails = props.diagnostics?.ollama.model_details ?? [];
@@ -1387,6 +1856,47 @@ function DiagnosticsWorkspace(props: {
           </section>
 
           <section className="min-w-0 space-y-4">
+            <BenchmarkCampaignPanel
+              activeCampaign={props.activeCampaign}
+              autoReport={props.campaignAutoReport}
+              busy={props.campaignBusy}
+              campaigns={props.campaigns}
+              modes={props.campaignModes}
+              models={props.campaignModels}
+              outputFolder={props.campaignOutputFolder}
+              plan={props.campaignPlan}
+              preset={props.campaignPreset}
+              repeats={props.campaignRepeats}
+              selectedModels={props.campaignSelectedModels}
+              statusMessage={props.campaignStatusMessage}
+              thinkingModes={props.campaignThinkingModes}
+              title={props.campaignTitle}
+              verifierSettings={props.campaignVerifierSettings}
+              onCancel={props.onCancelCampaign}
+              onChooseOutputFolder={props.onChooseCampaignOutputFolder}
+              onClearModels={props.onClearCampaignModels}
+              onDeleteCampaign={props.onDeleteCampaign}
+              onGenerateReport={props.onGenerateCampaignReport}
+              onOpenReport={props.onOpenCampaignReport}
+              onPause={props.onPauseCampaign}
+              onRefreshCampaign={props.onRefreshCampaign}
+              onRemoveJob={props.onRemovePlannedCampaignJob}
+              onResume={props.onResumeCampaign}
+              onRetryJob={props.onRetryCampaignJob}
+              onReviewPlan={props.onReviewCampaignPlan}
+              onSelectAllChatModels={props.onSelectAllChatCampaignModels}
+              onSetAutoReport={props.onSetCampaignAutoReport}
+              onSetOutputFolder={props.onSetCampaignOutputFolder}
+              onSetPreset={props.onSetCampaignPreset}
+              onSetRepeats={props.onSetCampaignRepeats}
+              onSetTitle={props.onSetCampaignTitle}
+              onStart={props.onStartCampaign}
+              onToggleMode={props.onToggleCampaignMode}
+              onToggleModel={props.onToggleCampaignModel}
+              onToggleThinking={props.onToggleCampaignThinking}
+              onToggleVerifier={props.onToggleCampaignVerifier}
+            />
+
             <div className="rounded-md border border-ink/15 bg-white p-4">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
                 <BarChart3 size={17} aria-hidden="true" />
@@ -1544,6 +2054,668 @@ function DiagnosticsWorkspace(props: {
       </div>
     </>
   );
+}
+
+function BenchmarkCampaignPanel(props: {
+  activeCampaign: BenchmarkCampaign | null;
+  autoReport: boolean;
+  busy: boolean;
+  campaigns: BenchmarkCampaign[];
+  modes: BenchmarkMode[];
+  models: CampaignModelInfo[];
+  outputFolder: string;
+  plan: CampaignPlan | null;
+  preset: CampaignPreset;
+  repeats: 1 | 3;
+  selectedModels: string[];
+  statusMessage: string;
+  thinkingModes: Array<Exclude<ThinkingMode, "legacy/unrecorded">>;
+  title: string;
+  verifierSettings: boolean[];
+  onCancel: (campaign: BenchmarkCampaign) => void;
+  onChooseOutputFolder: () => void;
+  onClearModels: () => void;
+  onDeleteCampaign: (campaign: BenchmarkCampaign) => void;
+  onGenerateReport: (campaign: BenchmarkCampaign) => void;
+  onOpenReport: (campaign: BenchmarkCampaign, kind: "pdf" | "html" | "folder") => void;
+  onPause: (campaign: BenchmarkCampaign) => void;
+  onRefreshCampaign: (campaignId: string) => void;
+  onRemoveJob: (job: CampaignJob) => void;
+  onResume: (campaign: BenchmarkCampaign) => void;
+  onRetryJob: (job: CampaignJob) => void;
+  onReviewPlan: () => void;
+  onSelectAllChatModels: () => void;
+  onSetAutoReport: (value: boolean) => void;
+  onSetOutputFolder: (value: string) => void;
+  onSetPreset: (value: CampaignPreset) => void;
+  onSetRepeats: (value: 1 | 3) => void;
+  onSetTitle: (value: string) => void;
+  onStart: () => void;
+  onToggleMode: (mode: BenchmarkMode, selected: boolean) => void;
+  onToggleModel: (model: string, selected: boolean) => void;
+  onToggleThinking: (mode: Exclude<ThinkingMode, "legacy/unrecorded">, selected: boolean) => void;
+  onToggleVerifier: (value: boolean, selected: boolean) => void;
+}) {
+  const thorough = props.preset === "thorough";
+  const canStart = Boolean(props.plan && props.plan.planned_jobs.length > 0 && props.selectedModels.length > 0);
+  return (
+    <div className="rounded-md border border-ink/15 bg-white p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <BarChart3 size={17} aria-hidden="true" />
+            Benchmark Campaigns
+          </div>
+          <p className="mt-1 text-xs text-ink/55">
+            Plan queued local benchmarks, run one job at a time, and export PDF/HTML/JSON reports.
+          </p>
+        </div>
+        {props.activeCampaign && (
+          <button
+            className="rounded-md border border-ink/15 bg-white px-3 py-1.5 text-xs font-medium hover:bg-[#faf9f3]"
+            disabled={props.busy}
+            onClick={() => props.onRefreshCampaign(props.activeCampaign!.id)}
+            type="button"
+          >
+            Refresh
+          </button>
+        )}
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)]">
+        <div className="space-y-3">
+          <div className="grid gap-3 md:grid-cols-[minmax(180px,1fr)_180px]">
+            <label className="block text-xs font-medium text-ink/65">
+              Campaign title
+              <input
+                className="mt-1 h-10 w-full rounded-md border border-ink/20 px-3 text-sm outline-none focus:border-tide"
+                onChange={(event) => props.onSetTitle(event.target.value)}
+                value={props.title}
+              />
+            </label>
+            <label className="block text-xs font-medium text-ink/65">
+              Preset
+              <select
+                className="mt-1 h-10 w-full rounded-md border border-ink/20 bg-white px-3 text-sm outline-none focus:border-tide"
+                onChange={(event) => props.onSetPreset(event.target.value as CampaignPreset)}
+                value={props.preset}
+              >
+                {CAMPAIGN_PRESET_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="rounded-md border border-ink/10 p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <p className="text-xs font-semibold uppercase text-ink/50">Installed chat model selection</p>
+              <div className="flex gap-2">
+                <button className="rounded-md border border-ink/15 px-2 py-1 text-xs hover:bg-[#faf9f3]" onClick={props.onSelectAllChatModels} type="button">
+                  Select chat
+                </button>
+                <button className="rounded-md border border-ink/15 px-2 py-1 text-xs hover:bg-[#faf9f3]" onClick={props.onClearModels} type="button">
+                  Clear
+                </button>
+              </div>
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              {props.models.length === 0 ? (
+                <p className="text-sm text-ink/55">No Ollama models reported yet.</p>
+              ) : (
+                props.models.map((model) => {
+                  const selected = props.selectedModels.includes(model.name);
+                  const embeddingOnly = model.capability === "embedding";
+                  return (
+                    <label className="flex min-h-[78px] gap-2 rounded-md border border-ink/10 p-2 text-sm" key={model.name}>
+                      <input
+                        checked={selected}
+                        className="mt-1 h-4 w-4 accent-tide"
+                        disabled={embeddingOnly}
+                        onChange={(event) => props.onToggleModel(model.name, event.target.checked)}
+                        type="checkbox"
+                      />
+                      <span className="min-w-0">
+                        <span className="block truncate font-medium" title={model.name}>
+                          {model.name}
+                        </span>
+                        <span className="mt-1 block text-xs text-ink/55">
+                          {model.capability} - {model.parameter_size || "unknown params"} - {model.quantization_level || "unknown quant"} - {formatBytes(model.size)}
+                        </span>
+                        <span className="mt-1 block text-xs text-ink/55">
+                          {formatOffload(model)}
+                          {model.historical_average_latency_ms ? ` - history ${formatMs(model.historical_average_latency_ms)}` : ""}
+                        </span>
+                        {model.warning && <span className="mt-1 block text-xs text-clay">{model.warning}</span>}
+                      </span>
+                    </label>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <CheckboxGroup
+              disabled={!thorough}
+              label="Modes"
+              options={BENCHMARK_MODE_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
+              selected={props.modes}
+              onToggle={(value, selected) => props.onToggleMode(value as BenchmarkMode, selected)}
+            />
+            <CheckboxGroup
+              disabled={!thorough}
+              label="Thinking"
+              options={THINKING_MODE_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
+              selected={props.thinkingModes}
+              onToggle={(value, selected) => props.onToggleThinking(value as Exclude<ThinkingMode, "legacy/unrecorded">, selected)}
+            />
+            <CheckboxGroup
+              disabled={!thorough}
+              label="Verifier"
+              options={[
+                { value: "false", label: "Off" },
+                { value: "true", label: "On" }
+              ]}
+              selected={props.verifierSettings.map(String)}
+              onToggle={(value, selected) => props.onToggleVerifier(value === "true", selected)}
+            />
+            <label className="block rounded-md border border-ink/10 p-3 text-xs font-medium text-ink/65">
+              Repeats
+              <select
+                className="mt-2 h-9 w-full rounded-md border border-ink/20 bg-white px-2 text-sm outline-none focus:border-tide"
+                disabled={!thorough}
+                onChange={(event) => props.onSetRepeats(Number(event.target.value) === 3 ? 3 : 1)}
+                value={props.repeats}
+              >
+                <option value={1}>1 run</option>
+                <option value={3}>3 runs</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+            <label className="block text-xs font-medium text-ink/65">
+              Report output folder
+              <input
+                className="mt-1 h-10 w-full rounded-md border border-ink/20 px-3 text-sm outline-none focus:border-tide"
+                onChange={(event) => props.onSetOutputFolder(event.target.value)}
+                placeholder="Downloads\\Odysseus Reports"
+                value={props.outputFolder}
+              />
+            </label>
+            <button
+              className="mt-5 flex h-10 items-center justify-center gap-2 rounded-md border border-ink/15 bg-white px-3 text-sm font-medium hover:bg-[#faf9f3]"
+              onClick={props.onChooseOutputFolder}
+              type="button"
+            >
+              <FolderOpen size={15} aria-hidden="true" />
+              Choose
+            </button>
+          </div>
+
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              checked={props.autoReport}
+              className="h-4 w-4 accent-tide"
+              onChange={(event) => props.onSetAutoReport(event.target.checked)}
+              type="checkbox"
+            />
+            Generate report automatically when finished
+          </label>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="flex h-10 items-center gap-2 rounded-md border border-ink/15 bg-white px-3 text-sm font-medium hover:bg-[#faf9f3]"
+              disabled={props.busy || props.selectedModels.length === 0}
+              onClick={props.onReviewPlan}
+              type="button"
+            >
+              <Clipboard size={15} aria-hidden="true" />
+              Review plan
+            </button>
+            <button
+              className="flex h-10 items-center gap-2 rounded-md bg-moss px-3 text-sm font-medium text-white hover:bg-[#35543d]"
+              disabled={props.busy || !canStart}
+              onClick={props.onStart}
+              type="button"
+            >
+              <Play size={15} aria-hidden="true" />
+              Start
+            </button>
+          </div>
+          {props.statusMessage && <p className="text-xs text-moss">{props.statusMessage}</p>}
+        </div>
+
+        <div className="space-y-3">
+          <CampaignPlanSummary plan={props.plan} onRemoveJob={props.onRemoveJob} />
+          <ActiveCampaignCard
+            campaign={props.activeCampaign}
+            busy={props.busy}
+            onCancel={props.onCancel}
+            onGenerateReport={props.onGenerateReport}
+            onOpenReport={props.onOpenReport}
+            onPause={props.onPause}
+            onResume={props.onResume}
+            onRetryJob={props.onRetryJob}
+          />
+        </div>
+      </div>
+
+      <CampaignHistory
+        campaigns={props.campaigns}
+        onDeleteCampaign={props.onDeleteCampaign}
+        onGenerateReport={props.onGenerateReport}
+        onOpenReport={props.onOpenReport}
+        onResume={props.onResume}
+      />
+    </div>
+  );
+}
+
+function CheckboxGroup(props: {
+  disabled?: boolean;
+  label: string;
+  options: Array<{ value: string; label: string }>;
+  selected: string[];
+  onToggle: (value: string, selected: boolean) => void;
+}) {
+  return (
+    <div className="rounded-md border border-ink/10 p-3">
+      <p className="text-xs font-semibold uppercase text-ink/50">{props.label}</p>
+      <div className="mt-2 space-y-2">
+        {props.options.map((option) => (
+          <label className="flex items-center gap-2 text-sm" key={option.value}>
+            <input
+              checked={props.selected.includes(option.value)}
+              className="h-4 w-4 accent-tide"
+              disabled={props.disabled}
+              onChange={(event) => props.onToggle(option.value, event.target.checked)}
+              type="checkbox"
+            />
+            {option.label}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CampaignPlanSummary(props: { plan: CampaignPlan | null; onRemoveJob: (job: CampaignJob) => void }) {
+  if (!props.plan) {
+    return (
+      <div className="rounded-md border border-ink/10 p-3">
+        <p className="text-sm font-semibold">Planned jobs</p>
+        <p className="mt-2 text-sm text-ink/55">Review a plan before starting a campaign.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-md border border-ink/10 p-3">
+      <div className="grid grid-cols-3 gap-2 text-xs">
+        <Metric label="Jobs" value={props.plan.planned_jobs.length} />
+        <Metric label="Likely runtime" value={formatDuration(props.plan.estimate.likely_ms)} />
+        <Metric label="Generations" value={props.plan.estimate.model_generation_count} />
+      </div>
+      <p className="mt-2 text-xs text-ink/55">
+        {props.plan.estimate.source_detail ?? "No compatible history; conservative estimate"}
+        {props.plan.estimate.confidence ? ` (${props.plan.estimate.confidence} confidence)` : ""}
+      </p>
+      {props.plan.warnings.length > 0 && (
+        <div className="mt-3 space-y-1">
+          {props.plan.warnings.map((warning) => (
+            <p className="rounded-md border border-gold/30 bg-[#fff8e8] px-2 py-1 text-xs text-[#7a561d]" key={`${warning.level}-${warning.message}`}>
+              {warning.message}
+            </p>
+          ))}
+        </div>
+      )}
+      <div className="mt-3 max-h-[260px] overflow-auto rounded-md border border-ink/10">
+        <table className="w-full min-w-[560px] text-left text-xs">
+          <thead className="bg-[#faf9f3] text-ink/55">
+            <tr>
+              <th className="px-2 py-2 font-medium">#</th>
+              <th className="px-2 py-2 font-medium">Model</th>
+              <th className="px-2 py-2 font-medium">Mode</th>
+              <th className="px-2 py-2 font-medium">Thinking</th>
+              <th className="px-2 py-2 font-medium">Verify</th>
+              <th className="px-2 py-2 font-medium">ETA</th>
+              <th className="px-2 py-2 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-ink/10">
+            {props.plan.planned_jobs.map((job, index) => (
+              <tr key={job.key}>
+                <td className="px-2 py-2">{index + 1}</td>
+                <td className="max-w-[160px] truncate px-2 py-2" title={job.model}>{job.model}</td>
+                <td className="px-2 py-2">{formatBenchmarkMode(job.benchmark_mode)}</td>
+                <td className="px-2 py-2">{job.thinking_mode}</td>
+                <td className="px-2 py-2">{job.verify ? "on" : "off"}</td>
+                <td className="px-2 py-2" title={job.estimate_detail ?? job.estimate_source}>
+                  {formatDuration(job.estimated_runtime_ms)}
+                </td>
+                <td className="px-2 py-2">
+                  <button className="rounded-md border border-ink/15 p-1 hover:bg-[#faf9f3]" onClick={() => props.onRemoveJob(job)} title="Remove job" type="button">
+                    <XCircle size={14} aria-hidden="true" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ActiveCampaignCard(props: {
+  campaign: BenchmarkCampaign | null;
+  busy: boolean;
+  onCancel: (campaign: BenchmarkCampaign) => void;
+  onGenerateReport: (campaign: BenchmarkCampaign) => void;
+  onOpenReport: (campaign: BenchmarkCampaign, kind: "pdf" | "html" | "folder") => void;
+  onPause: (campaign: BenchmarkCampaign) => void;
+  onResume: (campaign: BenchmarkCampaign) => void;
+  onRetryJob: (job: CampaignJob) => void;
+}) {
+  const campaign = props.campaign;
+  if (!campaign) {
+    return (
+      <div className="rounded-md border border-ink/10 p-3">
+        <p className="text-sm font-semibold">Active campaign</p>
+        <p className="mt-2 text-sm text-ink/55">No active campaign selected.</p>
+      </div>
+    );
+  }
+  const running = campaign.status === "running" || campaign.status === "queued";
+  const terminal = TERMINAL_CAMPAIGN_STATUSES.has(campaign.status);
+  return (
+    <div className="rounded-md border border-ink/10 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold">{campaign.title}</p>
+          <p className="text-xs text-ink/55">
+            {campaign.status} - job {campaign.progress.job_index || 0} of {campaign.progress.job_count}
+          </p>
+        </div>
+        <span className="rounded-md border border-ink/10 px-2 py-1 text-xs">{campaign.preset}</span>
+      </div>
+      <div className="mt-3 grid grid-cols-4 gap-2 text-xs">
+        <Metric label="Completed" value={campaign.completed_job_count} />
+        <Metric label="Failed" value={campaign.failed_job_count} />
+        <Metric label="Timeouts" value={campaign.timed_out_job_count} />
+        <Metric label="Elapsed" value={formatDuration(campaign.progress.elapsed_ms)} />
+      </div>
+      {campaign.current_job && (
+        <p className="mt-3 rounded-md border border-tide/15 bg-[#eef8f8] px-2 py-1.5 text-xs text-tide">
+          Current: {campaign.current_job.model} - {formatBenchmarkMode(campaign.current_job.benchmark_mode)} - thinking {campaign.current_job.thinking_mode}
+        </p>
+      )}
+      <div className="mt-3 flex flex-wrap gap-2">
+        {running && (
+          <>
+            <button className="flex items-center gap-1 rounded-md border border-ink/15 px-2 py-1.5 text-xs hover:bg-[#faf9f3]" disabled={props.busy} onClick={() => props.onPause(campaign)} type="button">
+              <Pause size={14} aria-hidden="true" />
+              Pause
+            </button>
+            <button className="flex items-center gap-1 rounded-md border border-clay/30 px-2 py-1.5 text-xs text-clay hover:bg-[#fff3ee]" disabled={props.busy} onClick={() => props.onCancel(campaign)} type="button">
+              <XCircle size={14} aria-hidden="true" />
+              Cancel
+            </button>
+          </>
+        )}
+        {(campaign.status === "paused" || campaign.status === "interrupted" || campaign.status === "draft" || campaign.status === "queued") && (
+          <button className="flex items-center gap-1 rounded-md border border-ink/15 px-2 py-1.5 text-xs hover:bg-[#faf9f3]" disabled={props.busy} onClick={() => props.onResume(campaign)} type="button">
+            <Play size={14} aria-hidden="true" />
+            Resume
+          </button>
+        )}
+        {terminal && (
+          <>
+            <button className="flex items-center gap-1 rounded-md border border-ink/15 px-2 py-1.5 text-xs hover:bg-[#faf9f3]" disabled={props.busy} onClick={() => props.onGenerateReport(campaign)} type="button">
+              <FileText size={14} aria-hidden="true" />
+              Regenerate report
+            </button>
+            <button className="rounded-md border border-ink/15 px-2 py-1.5 text-xs hover:bg-[#faf9f3]" disabled={!campaign.report_paths?.pdf} onClick={() => props.onOpenReport(campaign, "pdf")} type="button">
+              Open PDF
+            </button>
+            <button className="rounded-md border border-ink/15 px-2 py-1.5 text-xs hover:bg-[#faf9f3]" disabled={!campaign.report_paths?.html} onClick={() => props.onOpenReport(campaign, "html")} type="button">
+              Open HTML
+            </button>
+            <button className="rounded-md border border-ink/15 px-2 py-1.5 text-xs hover:bg-[#faf9f3]" disabled={Object.keys(campaign.report_paths || {}).length === 0} onClick={() => props.onOpenReport(campaign, "folder")} type="button">
+              Open folder
+            </button>
+          </>
+        )}
+      </div>
+      {campaign.jobs.some((job) => ["failed", "timed_out"].includes(job.status || "")) && (
+        <div className="mt-3 space-y-1">
+          {campaign.jobs
+            .filter((job) => ["failed", "timed_out"].includes(job.status || ""))
+            .slice(0, 3)
+            .map((job) => (
+              <button className="block text-left text-xs text-clay underline" key={job.id} onClick={() => props.onRetryJob(job)} type="button">
+                Retry job {job.sequence}: {job.model} ({job.status})
+              </button>
+            ))}
+        </div>
+      )}
+      {campaign.report_warnings.length > 0 && (
+        <p className="mt-2 text-xs text-[#7a561d]">{campaign.report_warnings[0]}</p>
+      )}
+    </div>
+  );
+}
+
+function CampaignHistory(props: {
+  campaigns: BenchmarkCampaign[];
+  onDeleteCampaign: (campaign: BenchmarkCampaign) => void;
+  onGenerateReport: (campaign: BenchmarkCampaign) => void;
+  onOpenReport: (campaign: BenchmarkCampaign, kind: "pdf" | "html" | "folder") => void;
+  onResume: (campaign: BenchmarkCampaign) => void;
+}) {
+  return (
+    <div className="mt-4 rounded-md border border-ink/10">
+      <div className="border-b border-ink/10 px-3 py-2 text-sm font-semibold">Campaign history</div>
+      {props.campaigns.length === 0 ? (
+        <p className="px-3 py-4 text-sm text-ink/55">No campaigns yet.</p>
+      ) : (
+        <div className="divide-y divide-ink/10">
+          {props.campaigns.slice(0, 6).map((campaign) => (
+            <div className="grid gap-2 px-3 py-2 text-xs md:grid-cols-[minmax(180px,1fr)_120px_120px_auto]" key={campaign.id}>
+              <div className="min-w-0">
+                <p className="truncate font-medium">{campaign.title}</p>
+                <p className="text-ink/55">{formatTimestamp(campaign.created_at)} - {campaign.selected_models.join(", ") || "no models"}</p>
+              </div>
+              <div>
+                <p>{campaign.status}</p>
+                <p className="text-ink/55">{campaign.completed_job_count}/{campaign.planned_job_count} jobs</p>
+              </div>
+              <div>
+                <p>{formatDuration(campaign.actual_runtime_ms || campaign.progress.elapsed_ms)}</p>
+                <p className="text-ink/55">{campaign.report_status}</p>
+              </div>
+              <div className="flex flex-wrap justify-end gap-1">
+                {campaign.status === "interrupted" && (
+                  <button className="rounded-md border border-ink/15 px-2 py-1 hover:bg-[#faf9f3]" onClick={() => props.onResume(campaign)} type="button">Resume</button>
+                )}
+                <button className="rounded-md border border-ink/15 px-2 py-1 hover:bg-[#faf9f3]" onClick={() => props.onGenerateReport(campaign)} type="button">Report</button>
+                <button className="rounded-md border border-ink/15 px-2 py-1 hover:bg-[#faf9f3]" disabled={Object.keys(campaign.report_paths || {}).length === 0} onClick={() => props.onOpenReport(campaign, "folder")} type="button">Folder</button>
+                <button className="rounded-md border border-clay/30 px-2 py-1 text-clay hover:bg-[#fff3ee]" onClick={() => props.onDeleteCampaign(campaign)} type="button">Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BenchmarkReportView({ data }: { data: CampaignReportData }) {
+  const campaign = data.campaign as Record<string, unknown>;
+  const view = data.view_model ?? {};
+  const jobStatus = (view.job_status ?? {}) as Record<string, unknown>;
+  const caseOutcomes = (view.case_outcomes ?? {}) as Record<string, unknown>;
+  const comparison = data.comparison;
+  const recommendations = data.recommendation ?? {};
+  const balanced = recommendations.balanced as BenchmarkComparisonGroup | null | undefined;
+  const groups = comparison?.groups ?? [];
+  const pipelineModel = (view.pipeline_taxonomy ?? {}) as Record<string, unknown>;
+  const pipeline = ((pipelineModel.counts as Record<string, number> | undefined) ?? data.pipeline_diagnoses ?? {});
+  const pipelineLabels = ((pipelineModel.labels as Record<string, string> | undefined) ?? {});
+  return (
+    <div className="space-y-5 bg-white p-6 text-ink">
+      <ReportSection name="01-executive-summary.png" label="Executive Summary">
+        <p className="text-xs font-semibold uppercase text-ink/45">Odysseus Desktop Benchmark Report</p>
+        <h2 className="mt-1 text-2xl font-semibold">{String(campaign.title ?? "Benchmark campaign")}</h2>
+        <div className="mt-4 grid grid-cols-4 gap-3">
+          <ReportMetric label="Status" value={String(campaign.status ?? "")} />
+          <ReportMetric label="Jobs completed" value={`${jobStatus.completed ?? campaign.completed_job_count ?? 0}/${jobStatus.planned ?? campaign.planned_job_count ?? 0}`} />
+          <ReportMetric label="Job execution failures" value={String(jobStatus.execution_failures ?? campaign.failed_job_count ?? 0)} />
+          <ReportMetric label="Benchmark cases failed" value={String(caseOutcomes.failed ?? 0)} />
+          <ReportMetric label="Grader review" value={String(caseOutcomes.grader_review ?? 0)} />
+          <ReportMetric label="Recommended" value={balanced?.model ?? "none"} />
+        </div>
+        <p className="mt-4 text-sm text-ink/65">{String(recommendations.reason ?? "No eligible recommendation yet.")}</p>
+      </ReportSection>
+
+      <ReportSection name="02-model-comparison.png" label="Model Comparison">
+        <h2 className="text-xl font-semibold">Model Comparison</h2>
+        <table className="mt-3 w-full border-collapse text-left text-xs">
+          <thead className="bg-[#edf3f0]">
+            <tr>
+              <th className="border border-ink/15 px-2 py-1">Model</th>
+              <th className="border border-ink/15 px-2 py-1">Mode</th>
+              <th className="border border-ink/15 px-2 py-1">Thinking</th>
+              <th className="border border-ink/15 px-2 py-1">Latest</th>
+              <th className="border border-ink/15 px-2 py-1">Mean</th>
+              <th className="border border-ink/15 px-2 py-1">Latency</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.slice(0, 8).map((group) => (
+              <tr key={group.key}>
+                <td className="border border-ink/15 px-2 py-1">{group.model}</td>
+                <td className="border border-ink/15 px-2 py-1">{formatBenchmarkMode(group.benchmark_mode)}</td>
+                <td className="border border-ink/15 px-2 py-1">{formatThinkingMode(group.thinking_mode)}</td>
+                <td className="border border-ink/15 px-2 py-1">{group.latest_run_passed}/{group.latest_run_total}</td>
+                <td className="border border-ink/15 px-2 py-1">{formatPercent(group.mean_pass_rate)}</td>
+                <td className="border border-ink/15 px-2 py-1">{formatMs(group.median_avg_latency_ms)}</td>
+              </tr>
+            ))}
+            {groups.length === 0 && (
+              <tr>
+                <td className="border border-ink/15 px-2 py-2 text-ink/55" colSpan={6}>No comparable completed runs.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </ReportSection>
+
+      <ReportSection name="03-pipeline-metrics.png" label="Pipeline Metrics">
+        <h2 className="text-xl font-semibold">Retrieval, Generation, End-To-End</h2>
+        <div className="mt-4 grid grid-cols-4 gap-3">
+          <ReportMetric label={pipelineLabels.retrieval_only ?? "retrieval-caused only"} value={String(pipeline.retrieval_only ?? 0)} />
+          <ReportMetric label={pipelineLabels.generation_only ?? "generation-caused only"} value={String(pipeline.generation_only ?? 0)} />
+          <ReportMetric label={pipelineLabels.both ?? "both retrieval and generation"} value={String(pipeline.both ?? 0)} />
+          <ReportMetric label={pipelineLabels.grader_review ?? "grader review"} value={String(pipeline.grader_review ?? 0)} />
+          <ReportMetric label="Timeouts" value={String(pipeline.timeout ?? 0)} />
+          <ReportMetric label="Runtime errors" value={String(pipeline.runtime_error ?? 0)} />
+          <ReportMetric label="Passed" value={String(pipeline.passed ?? 0)} />
+        </div>
+      </ReportSection>
+
+      <ReportSection name="04-case-difficulty.png" label="Case Difficulty">
+        <h2 className="text-xl font-semibold">Case Difficulty</h2>
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <ReportCaseList title="Passed in tested configurations" items={data.case_difficulty?.usually_pass ?? []} />
+          <ReportCaseList title="Failed in tested configurations" items={data.case_difficulty?.usually_fail ?? []} />
+          <ReportCaseList title="Source failures" items={data.case_difficulty?.frequent_source_failures ?? []} />
+          <ReportCaseList title="Forbidden failures" items={data.case_difficulty?.frequent_forbidden_failures ?? []} />
+        </div>
+      </ReportSection>
+
+      <ReportSection name="05-hardware-summary.png" label="Hardware Summary">
+        <h2 className="text-xl font-semibold">Runtime And Hardware</h2>
+        <div className="mt-4 grid grid-cols-3 gap-3">
+          <ReportMetric label="Operating system" value={String(data.runtime?.operating_system ?? "")} />
+          <ReportMetric label="App version" value={String(data.application?.version ?? "")} />
+          <ReportMetric label="Embedding" value={`${String(data.embedding?.backend ?? "")}/${String(data.embedding?.model ?? "")}`} />
+        </div>
+      </ReportSection>
+
+      <ReportSection name="06-per-model-summary.png" label="Per-Model Summary">
+        <h2 className="text-xl font-semibold">Per-Model Summary</h2>
+        <div className="mt-3 grid grid-cols-3 gap-3">
+          {Array.from(new Set(groups.map((group) => group.model))).slice(0, 6).map((model) => {
+            const modelGroups = groups.filter((group) => group.model === model);
+            const best = [...modelGroups].sort((a, b) => b.latest_run_pass_rate - a.latest_run_pass_rate)[0];
+            return (
+              <div className="rounded-md border border-ink/15 p-3" key={model}>
+                <p className="truncate text-sm font-semibold">{model}</p>
+                <p className="mt-1 text-xs text-ink/60">{modelGroups.length} config(s)</p>
+                <p className="mt-2 text-xs">Best: {best ? `${best.latest_run_passed}/${best.latest_run_total}` : "n/a"}</p>
+              </div>
+            );
+          })}
+          {groups.length === 0 && <p className="text-sm text-ink/55">No model summaries available.</p>}
+        </div>
+      </ReportSection>
+    </div>
+  );
+}
+
+function ReportSection(props: { name: string; label: string; children: React.ReactNode }) {
+  return (
+    <section
+      className="rounded-md border border-ink/15 bg-white p-5"
+      data-report-label={props.label}
+      data-report-snapshot={props.name}
+    >
+      {props.children}
+    </section>
+  );
+}
+
+function ReportMetric({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="rounded-md border border-ink/15 bg-[#faf9f3] p-3">
+      <p className="text-xs font-medium uppercase text-ink/45">{label}</p>
+      <p className="mt-1 text-sm font-semibold">{value || "n/a"}</p>
+    </div>
+  );
+}
+
+function ReportCaseList({ title, items }: { title: string; items: BenchmarkCaseDifficultyItem[] }) {
+  const lowerTitle = title.toLowerCase();
+  return (
+    <div className="rounded-md border border-ink/15 p-3">
+      <p className="text-sm font-semibold">{title}</p>
+      {items.length === 0 ? (
+        <p className="mt-2 text-xs text-ink/55">No cases.</p>
+      ) : (
+        <div className="mt-2 space-y-1">
+          {items.slice(0, 4).map((item) => (
+            <p className="text-xs" key={item.case_id}>
+              {item.case_id}: {caseDifficultyItemText(item, lowerTitle)}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function caseDifficultyItemText(item: BenchmarkCaseDifficultyItem, title: string): string {
+  if (title.includes("source")) {
+    return `${item.source_failures} source failure(s), ${formatPercent(item.source_failure_rate)}`;
+  }
+  if (title.includes("forbidden")) {
+    return `${item.forbidden_failures} forbidden failure(s), ${formatPercent(item.forbidden_failure_rate)}`;
+  }
+  return item.observation_label || `${item.passes}/${item.attempts}`;
 }
 
 function BenchmarkRunCard({ run, title }: { run: EvalRun; title: string }) {
@@ -1749,8 +2921,8 @@ function CaseDifficultySummary({ summary }: { summary: BenchmarkCaseDifficulty }
       <p className="text-sm font-semibold">Case Difficulty</p>
       <p className="mt-1 text-xs text-ink/55">Deterministic summary across saved benchmark runs.</p>
       <div className="mt-3 grid gap-3 md:grid-cols-2">
-        <CaseDifficultyList items={summary.usually_pass} title="Usually pass" />
-        <CaseDifficultyList items={summary.usually_fail} title="Usually fail" />
+        <CaseDifficultyList items={summary.usually_pass} title="Passing cases" />
+        <CaseDifficultyList items={summary.usually_fail} title="Failing cases" />
         <CaseDifficultyList items={summary.frequent_source_failures} title="Frequent source failures" />
         <CaseDifficultyList items={summary.frequent_forbidden_failures} title="Frequent forbidden-claim failures" />
       </div>
@@ -1776,7 +2948,11 @@ function CaseDifficultyList({
             <div className="rounded-md border border-ink/10 bg-[#faf9f3] px-2 py-1.5 text-xs" key={item.case_id}>
               <p className="font-medium">{item.case_id}</p>
               <p className="text-ink/55">
-                {item.passes}/{item.attempts} passed - source failures {item.source_failures} - forbidden failures {item.forbidden_failures}
+                {title.toLowerCase().includes("source")
+                  ? `${item.source_failures} source failure(s), ${formatPercent(item.source_failure_rate)}`
+                  : title.toLowerCase().includes("forbidden")
+                    ? `${item.forbidden_failures} forbidden failure(s), ${formatPercent(item.forbidden_failure_rate)}`
+                    : item.observation_label || `${item.passes}/${item.attempts} passed`}
               </p>
             </div>
           ))}
@@ -2264,10 +3440,25 @@ function formatBytes(bytes: number) {
 }
 
 function formatMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "n/a";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`;
   return `${Math.round(ms)} ms`;
 }
 
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "n/a";
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 9) return `${minutes}m`;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
 function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) return "n/a";
   return `${Math.round(value * 100)}%`;
 }
 
@@ -2333,6 +3524,20 @@ function formatThinkingMode(mode: ThinkingMode): string {
   return mode;
 }
 
+function formatOffload(model: CampaignModelInfo): string {
+  if (model.partially_cpu_offloaded) return "partially CPU-offloaded";
+  if (model.estimated_gpu_loaded_fraction !== null && model.estimated_gpu_loaded_fraction >= 0.98) {
+    return "GPU resident";
+  }
+  if (model.estimated_cpu_loaded_fraction !== null && model.estimated_cpu_loaded_fraction >= 0.98) {
+    return "CPU resident";
+  }
+  if (model.estimated_gpu_loaded_fraction !== null) {
+    return `${Math.round(model.estimated_gpu_loaded_fraction * 100)}% GPU estimate`;
+  }
+  return "offload unknown";
+}
+
 function formatBenchmarkRunLabel(run: EvalRun): string {
   return [
     formatBenchmarkMode(run.benchmark_mode),
@@ -2341,6 +3546,58 @@ function formatBenchmarkRunLabel(run: EvalRun): string {
     formatRunEmbedding(run),
     run.status
   ].join(" - ");
+}
+
+function dedupeBenchmarkModes(values: BenchmarkMode[]): BenchmarkMode[] {
+  const selected = new Set(values);
+  return BENCHMARK_MODE_OPTIONS.map((option) => option.value).filter((value) => selected.has(value));
+}
+
+function dedupeThinkingModes(
+  values: Array<Exclude<ThinkingMode, "legacy/unrecorded">>
+): Array<Exclude<ThinkingMode, "legacy/unrecorded">> {
+  const selected = new Set(values);
+  return THINKING_MODE_OPTIONS.map((option) => option.value).filter((value) => selected.has(value));
+}
+
+function defaultCampaignTitle(preset: CampaignPreset): string {
+  const label = CAMPAIGN_PRESET_OPTIONS.find((option) => option.value === preset)?.label ?? "Benchmark campaign";
+  const now = new Date();
+  return `${label} ${now.toLocaleDateString()} ${now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+function shouldAutoGenerateCampaignReport(campaign: BenchmarkCampaign): boolean {
+  if (!TERMINAL_CAMPAIGN_STATUSES.has(campaign.status)) return false;
+  if (!campaign.auto_generate_report) return false;
+  if (campaign.report_paths && Object.keys(campaign.report_paths).length > 0) return false;
+  return ["", "pending", "awaiting_capture", "capturing", "generating"].includes(campaign.report_status || "");
+}
+
+async function waitForImages(root: HTMLElement): Promise<void> {
+  const images = Array.from(root.querySelectorAll("img"));
+  await Promise.all(
+    images.map((image) => {
+      if (image.complete && image.naturalWidth > 0) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const finish = () => resolve();
+        image.addEventListener("load", finish, { once: true });
+        image.addEventListener("error", finish, { once: true });
+        window.setTimeout(finish, 1500);
+      });
+    })
+  );
+}
+
+function isUsefulPngDataUrl(dataUrl: string): boolean {
+  if (!dataUrl.startsWith("data:image/png;base64,")) return false;
+  const encoded = dataUrl.slice("data:image/png;base64,".length);
+  return encoded.length > 2800 && encoded.startsWith("iVBOR");
 }
 
 function formatScoreSummary(score: Record<string, unknown>): string {

@@ -424,7 +424,7 @@ def comparison_run(
         "model": model,
         "verify": False,
         "suite_name": "local-rag",
-        "suite_version": "v0.1.8",
+        "suite_version": "v0.1.12",
         "total_passed": passed,
         "total_failed": len(case_rows) - passed,
         "average_latency_ms": 1000,

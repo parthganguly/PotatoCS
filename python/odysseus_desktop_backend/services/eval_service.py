@@ -38,12 +38,74 @@ from odysseus_desktop_backend.storage import Database, utc_ms
 
 
 EVAL_SUITE_NAME = "local-rag"
-EVAL_SUITE_VERSION = "v0.1.8"
-PROMPT_VERSION = "rag-benchmark-v0.1.8"
+EVAL_SUITE_VERSION = "v0.1.12"
+PROMPT_VERSION = "rag-benchmark-v0.1.12"
 BENCHMARK_MODES = {"retrieval_only", "oracle_generation", "end_to_end"}
 DEFAULT_BENCHMARK_MODE = "end_to_end"
 DEFAULT_THINKING_MODE = "off"
 WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+CODE_RE = re.compile(r"\b[A-Z]+-\d+[A-Z0-9-]*\b", re.IGNORECASE)
+TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+NEGATION_WORDS = {"no", "not", "never", "without", "cannot", "can't", "doesn't", "dont", "don't", "didn't"}
+NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+ABSENCE_TYPES = {"abstention", "absence_or_abstention"}
+NEGATIVE_TYPES = {"negative", "negative_fact"}
+POSITIVE_TYPES = {"positive", "positive_fact"}
+EXACT_TYPES = {"exact_identifier", "quantity", "date", "date_or_time", "code"}
+RELATION_TYPES = {"relation"}
+PIPELINE_BUCKETS = ("passed", "retrieval_only", "generation_only", "both", "grader_review", "timeout", "runtime_error")
+GUIDANCE_LABEL_ORDER = (
+    "Recommended",
+    "Fastest usable config",
+    "Best quality config",
+    "Provisional",
+    "Preliminary",
+    "Benchmarked",
+    "Recommended for Potato Mode",
+    "Good extraction baseline",
+    "Weak at chronology",
+    "Source contamination risk",
+    "Not evidence-safe",
+    "Verifier not worth latency",
+)
+ABSENCE_VERBS = (
+    "identify",
+    "list",
+    "state",
+    "specify",
+    "mention",
+    "provide",
+    "name",
+    "establish",
+    "confirm",
+    "say",
+    "include",
+)
+ABSENCE_REGEXES = [
+    re.compile(r"\b(?:does|do|did)\s+not\s+(?:identify|list|state|specify|mention|provide|name|establish|confirm|say|include)\b", re.IGNORECASE),
+    re.compile(r"\b(?:is|are|was|were)\s+not\s+(?:identified|listed|stated|specified|mentioned|provided|named|established|confirmed|available)\b", re.IGNORECASE),
+    re.compile(r"\bno\s+[^,;.!?]{0,90}\b(?:is|are|was|were)?\s*(?:listed|identified|provided|available|mentioned|stated|specified|named|confirmed|established)\b", re.IGNORECASE),
+    re.compile(r"\bno\s+information\s+(?:is\s+)?provided\b", re.IGNORECASE),
+    re.compile(r"\b(?:context|document|specification|report|notice|evidence)\s+(?:is\s+)?silent\s+on\b", re.IGNORECASE),
+    re.compile(r"\bcannot\s+(?:determine|confirm|establish)\b", re.IGNORECASE),
+    re.compile(r"\bcan\s+not\s+(?:determine|confirm|establish)\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+(?:stated|available|provided|listed|identified|mentioned|specified|confirmed|established)\b", re.IGNORECASE),
+    re.compile(r"\bprovided\s+evidence\s+does\s+not\s+say\b", re.IGNORECASE),
+]
+CONTRAST_MARKERS = ("but", "although", "though", "however", "yet")
 FACT_STOPWORDS = {
     "a",
     "an",
@@ -385,7 +447,7 @@ class EvalService:
                 embedding_model=str(retrieval_audit.get("embedding_model") or ""),
                 retrieval_metrics=retrieval_metrics,
                 retrieval_candidates=list(retrieval_audit.get("candidates") or []),
-                pipeline_diagnosis="ok" if passed else "retrieval failure",
+                pipeline_diagnosis="passed" if passed else "retrieval_only",
             )
 
         if mode == "oracle_generation":
@@ -599,6 +661,7 @@ class EvalService:
 
     def _store_case_result(self, run_id: str, case: dict[str, Any]) -> None:
         now = utc_ms()
+        diagnosis = canonical_case_diagnosis(case)
         self.db.conn.execute(
             """
             INSERT INTO benchmark_case_results(
@@ -641,7 +704,7 @@ class EvalService:
                 int(case.get("repeat_index") or 1),
                 str(case.get("status") or "completed"),
                 str(case.get("stage") or ""),
-                str(case.get("pipeline_diagnosis") or ""),
+                diagnosis,
                 1 if case.get("counts_toward_primary") else 0,
                 1 if case.get("grader_review_required") else 0,
                 str(case.get("answer_content") or ""),
@@ -717,7 +780,7 @@ class EvalService:
         ).fetchall()
         cases = [benchmark_case_dict(row) for row in rows]
         total_passed = sum(1 for case in cases if case.get("passed"))
-        total_failed = len(cases) - total_passed
+        total_failed = sum(1 for case in cases if primary_case_bucket(case) in {"retrieval_only", "generation_only", "both"})
         latencies = [int(case.get("latency_ms") or 0) for case in cases]
         average_latency_ms = int(sum(latencies) / len(latencies)) if latencies else 0
         embedding_backend = str(cases[0].get("embedding_backend") or "") if cases else ""
@@ -726,6 +789,11 @@ class EvalService:
         runtime_error_count = sum(1 for case in cases if case.get("status") == "error")
         grader_review_count = sum(1 for case in cases if case.get("grader_review_required"))
         scores = score_run_cases(cases)
+        row = self.db.conn.execute("SELECT model, model_info_json FROM benchmark_runs WHERE id = ?", (run_id,)).fetchone()
+        model_info = json_loads(row_get(row, "model_info_json", "{}"), {}) if row is not None else {}
+        observed_model_info = self._observed_model_info(str(row_get(row, "model", ""))) if row is not None else {}
+        if observed_model_info:
+            model_info["observed_after_run"] = observed_model_info
         self.db.conn.execute(
             """
             UPDATE benchmark_runs
@@ -745,6 +813,7 @@ class EvalService:
                 end_to_end_score_json = ?,
                 practical_score_json = ?,
                 adversarial_score_json = ?,
+                model_info_json = ?,
                 completed_at = ?
             WHERE id = ?
             """,
@@ -765,6 +834,7 @@ class EvalService:
                 json.dumps(scores["end_to_end"]),
                 json.dumps(scores["practical"]),
                 json.dumps(scores["adversarial"]),
+                json.dumps(model_info),
                 utc_ms(),
                 run_id,
             ),
@@ -823,6 +893,18 @@ class EvalService:
                     )
                 return {**model, "already_loaded": True, "warning": warning}
         return {"already_loaded": False, "warning": "", "ps": status}
+
+    def _observed_model_info(self, model_name: str) -> dict[str, Any]:
+        if not model_name:
+            return {}
+        try:
+            status = ModelService(self.db).ps()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+        for model in status.get("models", []):
+            if str(model.get("name") or model.get("model") or "") == model_name:
+                return dict(model)
+        return {}
 
     def _store_run(
         self,
@@ -1247,7 +1329,7 @@ def timeout_case_result(
         retrieved_chunks=[],
         embedding_backend="",
         embedding_model="",
-        pipeline_diagnosis=f"timeout during {stage}",
+        pipeline_diagnosis="timeout",
         stage=stage,
         error_message=error,
     )
@@ -1280,7 +1362,7 @@ def error_case_result(
         retrieved_chunks=[],
         embedding_backend="",
         embedding_model="",
-        pipeline_diagnosis="runtime error",
+        pipeline_diagnosis="runtime_error",
         stage=stage,
         error_message=error,
     )
@@ -1363,9 +1445,13 @@ def evaluate_answer(
     grader_review_required = False
 
     expected_passed = True
+    expected_absence_matched = False
     for expected in case.get("expected_facts", []):
-        result = best_match_for_group(answer, expected, mode="expected")
+        result = best_match_for_group(answer, expected, mode="expected", expected_abstention=bool(case.get("expected_abstention")))
         matches.append(result)
+        expected_absence_matched = expected_absence_matched or (
+            result.get("fact_type") in ABSENCE_TYPES and bool(result.get("matched"))
+        )
         if result["final_decision"] == "review":
             grader_review_required = True
             expected_passed = False
@@ -1387,7 +1473,7 @@ def evaluate_answer(
             reasons.append(f"forbidden claim present: {forbidden.get('label')}")
 
     if bool(case.get("expected_abstention")):
-        abstained = answer_abstains(answer)
+        abstained = expected_absence_matched or answer_abstains(answer)
         matches.append(
             {
                 "kind": "abstention",
@@ -1399,22 +1485,18 @@ def evaluate_answer(
                 "matched": abstained,
                 "final_decision": "match" if abstained else "no_match",
                 "decision_reason": "answer clearly abstained" if abstained else "answer did not clearly abstain",
+                "answer_segment": "answer_conclusion",
             }
         )
         if not abstained:
             expected_passed = False
             reasons.append("answer did not clearly abstain")
 
-    source_policy = str(case.get("source_policy") or "all_retrieved").lower()
-    clean_supplied = [item for item in supplied_document_ids if item]
-    if not required_document_id:
-        source_passed = True
-    elif source_policy == "top_retrieved":
-        source_passed = bool(clean_supplied) and clean_supplied[0] == required_document_id
-    else:
-        source_passed = bool(clean_supplied) and all(item == required_document_id for item in clean_supplied)
+    source_result = evaluate_source_policy(case, supplied_document_ids, required_document_id)
+    source_passed = bool(source_result["passed"])
+    matches.append(source_result)
     if not source_passed:
-        reasons.append("supplied evidence did not stay within required source document")
+        reasons.append(str(source_result["decision_reason"]))
 
     passed = expected_passed and forbidden_passed and source_passed and not grader_review_required
     return {
@@ -1428,11 +1510,81 @@ def evaluate_answer(
     }
 
 
-def best_match_for_group(answer: str, group: dict[str, Any], *, mode: str) -> dict[str, Any]:
+def evaluate_source_policy(
+    case: dict[str, Any],
+    supplied_document_ids: list[str],
+    required_document_id: str | None,
+) -> dict[str, Any]:
+    policy = normalize_source_policy(str(case.get("source_policy") or "required_present"))
+    clean_supplied = [item for item in supplied_document_ids if item]
+    nonrequired = [item for item in clean_supplied if required_document_id and item != required_document_id]
+    required_present = bool(required_document_id and required_document_id in clean_supplied)
+    if not required_document_id:
+        passed = True
+        reason = "no required source configured"
+    elif policy in {"required_present", "abstention_source"}:
+        passed = required_present
+        reason = "required source was supplied" if passed else "required source was not supplied"
+    elif policy == "exclusive_source":
+        passed = required_present and not nonrequired
+        reason = "only required source was supplied" if passed else "supplied evidence included a non-required source"
+    elif policy == "no_conflicting_evidence":
+        passed = required_present and not nonrequired
+        reason = "no conflicting supplied evidence" if passed else "conflicting or missing supplied evidence"
+    else:
+        passed = required_present
+        reason = "required source was supplied" if passed else "required source was not supplied"
+    return {
+        "kind": "source_policy",
+        "label": policy,
+        "matched_phrase": "",
+        "answer_window": "",
+        "token_overlap_score": 1.0 if passed else 0.0,
+        "nearby_negation_detected": False,
+        "matched": passed,
+        "passed": passed,
+        "final_decision": "match" if passed else "no_match",
+        "decision_reason": reason,
+        "source_policy": policy,
+        "required_document_id": required_document_id or "",
+        "supplied_document_ids": clean_supplied,
+        "conflicting_supplied_document_ids": nonrequired,
+    }
+
+
+def normalize_source_policy(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"", "all_retrieved", "top_retrieved", "required", "required_source"}:
+        return "required_present"
+    if normalized in {"exclusive", "exclusive_source", "only_required"}:
+        return "exclusive_source"
+    if normalized in {"no_conflicting", "no_conflicting_evidence"}:
+        return "no_conflicting_evidence"
+    if normalized in {"abstention", "abstention_source"}:
+        return "abstention_source"
+    return "required_present"
+
+
+def best_match_for_group(
+    answer: str,
+    group: dict[str, Any],
+    *,
+    mode: str,
+    expected_abstention: bool = False,
+) -> dict[str, Any]:
     phrases = [str(phrase) for phrase in group.get("any", []) if str(phrase).strip()]
+    fact_type = fact_type_for_group(group, phrases, mode=mode, expected_abstention=expected_abstention)
+    label = str(group.get("label") or "")
+    if fact_type in RELATION_TYPES:
+        return match_relation(answer, group, mode=mode, label=label, fact_type=fact_type)
+    if fact_type in ABSENCE_TYPES:
+        return match_absence(answer, group, mode=mode, label=label, fact_type=fact_type)
     if not phrases:
-        return match_record(mode, str(group.get("label") or ""), "", "", 0.0, False, False, "no_match", "no phrases configured")
-    results = [match_phrase(answer, phrase, mode=mode, label=str(group.get("label") or "")) for phrase in phrases]
+        return match_record(mode, label, "", "", 0.0, False, False, "no_match", "no phrases configured", fact_type)
+    results = [
+        match_phrase(answer, phrase, mode=mode, label=label, fact_type=fact_type)
+        for phrase in phrases
+    ]
     if mode == "forbidden":
         failing = [item for item in results if item["matched"]]
         if failing:
@@ -1450,34 +1602,100 @@ def best_match_for_group(answer: str, group: dict[str, Any], *, mode: str) -> di
     return sorted(results, key=lambda item: -float(item["token_overlap_score"]))[0]
 
 
-def match_phrase(answer: str, phrase: str, *, mode: str, label: str) -> dict[str, Any]:
+def fact_type_for_group(
+    group: dict[str, Any],
+    phrases: list[str],
+    *,
+    mode: str,
+    expected_abstention: bool,
+) -> str:
+    explicit = str(group.get("type") or group.get("polarity") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "positive": "positive_fact",
+        "negative": "negative_fact",
+        "abstention": "absence_or_abstention",
+        "absence": "absence_or_abstention",
+        "date": "date_or_time",
+        "time": "date_or_time",
+    }
+    explicit = aliases.get(explicit, explicit)
+    if explicit in POSITIVE_TYPES | NEGATIVE_TYPES | ABSENCE_TYPES | EXACT_TYPES | RELATION_TYPES:
+        return explicit
+    if any(group.get(key) for key in ("subject_aliases", "predicate_aliases", "object_aliases", "value_aliases")):
+        return "relation"
+    if mode == "expected" and expected_abstention:
+        return "absence_or_abstention"
+    joined = " ".join(phrases)
+    normalized = normalize(joined)
+    if CODE_RE.search(joined):
+        return "code"
+    if TIME_RE.search(joined):
+        return "date"
+    if exact_identifier_like(normalized):
+        return "exact_identifier"
+    if NUMBER_RE.search(joined) or any(word in normalized.split() for word in NUMBER_WORDS):
+        return "quantity"
+    if starts_with_negation(normalized) or " cannot " in f" {normalized} " or " does not " in f" {normalized} ":
+        return "negative_fact"
+    return "positive_fact"
+
+
+def exact_identifier_like(text: str) -> bool:
+    if re.search(r"\b(slot|dock|box|code|id|identifier)\s+[a-z0-9]+\b", text):
+        return True
+    tokens = text.split()
+    return len(tokens) <= 3 and any(len(token) <= 2 and any(ch.isdigit() for ch in token) for token in tokens)
+
+
+def starts_with_negation(text: str) -> bool:
+    tokens = text.split()
+    return bool(tokens and tokens[0] in {"no", "not", "never", "without", "cannot"})
+
+
+def match_phrase(answer: str, phrase: str, *, mode: str, label: str, fact_type: str) -> dict[str, Any]:
     normalized_answer = normalize(answer)
     normalized_phrase = normalize(phrase)
     phrase_tokens = fact_tokens(normalized_phrase)
     answer_tokens = fact_tokens(normalized_answer)
     overlap = len(answer_tokens & phrase_tokens) / len(phrase_tokens) if phrase_tokens else 0.0
-    window = answer_window_for_phrase(answer, phrase)
-    negated = nearby_negation(window, phrase)
-    exact = bool(normalized_phrase and normalized_phrase in normalized_answer)
+    window, span_start, span_end = answer_clause_for_phrase(answer, phrase, fact_type=fact_type)
+    negated = scoped_negation(window, phrase)
+    segment_kind = segment_kind_for_span(answer, span_start, span_end, window)
+    phrase_exact = bool(normalized_phrase and normalized_phrase in normalized_answer)
+    exact = exact_phrase_match(normalized_answer, normalized_phrase, answer, phrase, fact_type=fact_type, window=window)
 
     if mode == "forbidden":
-        strong = exact or (phrase_tokens and (phrase_tokens.issubset(answer_tokens) if len(phrase_tokens) <= 2 else overlap >= 0.86))
+        strong = exact if fact_type in EXACT_TYPES else (
+            exact or (phrase_tokens and (phrase_tokens.issubset(answer_tokens) if len(phrase_tokens) <= 2 else overlap >= 0.86))
+        )
+        if strong and fact_type in EXACT_TYPES and not phrase_exact:
+            anchor = predicate_anchor_token(phrase, fact_type=fact_type)
+            if anchor and anchor not in fact_tokens(window):
+                return match_record(mode, label, phrase, window, overlap, negated, False, "no_match", "forbidden exact value matched without predicate", fact_type, span_start, span_end, segment_kind=segment_kind)
         if not strong:
-            return match_record(mode, label, phrase, window, overlap, negated, False, "no_match", "forbidden phrase not present")
+            return match_record(mode, label, phrase, window, overlap, negated, False, "no_match", "forbidden phrase not present", fact_type, span_start, span_end, segment_kind=segment_kind)
         if negated == "clear":
-            return match_record(mode, label, phrase, window, overlap, True, False, "no_match", "nearby negation rejects forbidden match")
+            return match_record(mode, label, phrase, window, overlap, True, False, "no_match", "scoped negation rejects forbidden match", fact_type, span_start, span_end, segment_kind=segment_kind)
         if negated == "ambiguous":
-            return match_record(mode, label, phrase, window, overlap, True, False, "review", "negation scope is ambiguous")
-        return match_record(mode, label, phrase, window, overlap, False, True, "match", "affirmative forbidden claim matched")
+            return match_record(mode, label, phrase, window, overlap, True, False, "review", "negation scope is ambiguous", fact_type, span_start, span_end, segment_kind=segment_kind)
+        if segment_kind == "evidence_quotation" and not evidence_segment_adopted(answer, span_start, span_end):
+            return match_record(mode, label, phrase, window, overlap, False, False, "no_match", "quoted evidence was not adopted as the answer conclusion", fact_type, span_start, span_end, segment_kind=segment_kind)
+        return match_record(mode, label, phrase, window, overlap, False, True, "match", "affirmative forbidden claim matched", fact_type, span_start, span_end, segment_kind=segment_kind)
 
-    strong = exact or (phrase_tokens and (phrase_tokens.issubset(answer_tokens) if len(phrase_tokens) <= 2 else overlap >= 0.62))
+    if fact_type in ABSENCE_TYPES:
+        return match_absence(answer, {"label": label, "any": [phrase]}, mode=mode, label=label, fact_type=fact_type)
+
+    strong = exact if fact_type in EXACT_TYPES else (
+        exact or (phrase_tokens and (phrase_tokens.issubset(answer_tokens) if len(phrase_tokens) <= 2 else overlap >= 0.62))
+    )
     if not strong:
-        return match_record(mode, label, phrase, window, overlap, bool(negated), False, "no_match", "expected phrase not present")
-    if negated == "ambiguous":
-        return match_record(mode, label, phrase, window, overlap, True, False, "review", "expected fact appears in ambiguous negation")
-    if negated == "clear":
-        return match_record(mode, label, phrase, window, overlap, True, False, "no_match", "expected fact appears negated")
-    return match_record(mode, label, phrase, window, overlap, False, True, "match", "expected fact matched")
+        return match_record(mode, label, phrase, window, overlap, bool(negated), False, "no_match", "expected phrase not present", fact_type, span_start, span_end, segment_kind=segment_kind)
+    if fact_type not in NEGATIVE_TYPES:
+        if negated == "ambiguous":
+            return match_record(mode, label, phrase, window, overlap, True, False, "review", "expected fact appears in ambiguous negation", fact_type, span_start, span_end, segment_kind=segment_kind)
+        if negated == "clear":
+            return match_record(mode, label, phrase, window, overlap, True, False, "no_match", "expected fact appears negated", fact_type, span_start, span_end, segment_kind=segment_kind)
+    return match_record(mode, label, phrase, window, overlap, bool(negated), True, "match", "expected fact matched", fact_type, span_start, span_end, segment_kind=segment_kind)
 
 
 def match_record(
@@ -1490,18 +1708,497 @@ def match_record(
     matched: bool,
     decision: str,
     reason: str,
+    fact_type: str = "",
+    span_start: int = -1,
+    span_end: int = -1,
+    *,
+    segment_kind: str = "answer_conclusion",
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "kind": kind,
         "label": label,
+        "fact_type": fact_type,
         "matched_phrase": phrase,
         "answer_window": window,
+        "answer_span": {"start": span_start, "end": span_end},
         "token_overlap_score": overlap,
         "nearby_negation_detected": negated,
         "matched": matched,
         "final_decision": decision,
         "decision_reason": reason,
+        "answer_segment": segment_kind,
     }
+    if details:
+        record.update(details)
+    return record
+
+
+def match_absence(
+    answer: str,
+    group: dict[str, Any],
+    *,
+    mode: str,
+    label: str,
+    fact_type: str,
+) -> dict[str, Any]:
+    targets = assertion_aliases(group, "target_aliases") or absence_targets_from_group(group)
+    phrases = [str(item) for item in group.get("any", []) if str(item).strip()]
+    best_clause = ""
+    best_span = (-1, -1)
+    best_pattern = ""
+    best_score = 0.0
+    best_segment = "answer_conclusion"
+    for clause, start, end in split_answer_clauses(answer):
+        pattern = matched_absence_construction(clause)
+        target = matched_target_alias(clause, targets)
+        score = 0.0
+        if pattern:
+            score += 0.55
+        if target:
+            score += 0.45
+        if not target and any(normalize(phrase) and normalize(phrase) in normalize(clause) for phrase in phrases):
+            target = label
+            score += 0.35
+        if score > best_score:
+            best_clause = " ".join(clause.split())
+            best_span = (start, end)
+            best_pattern = pattern
+            best_score = score
+            best_segment = segment_kind_for_span(answer, start, end, clause)
+
+    mixed = mixed_absence_with_invention(answer, targets)
+    details = {
+        "absence_construction": best_pattern,
+        "target_concept": ", ".join(targets[:4]),
+        "containing_clause": best_clause,
+        "absence_decision": "mixed_invention" if mixed else ("match" if best_pattern and best_score >= 0.75 else "no_match"),
+    }
+
+    if mode == "forbidden":
+        matched = bool(best_pattern and best_score >= 0.75 and not mixed)
+        return match_record(
+            mode,
+            label,
+            phrases[0] if phrases else "",
+            best_clause,
+            min(best_score, 1.0),
+            False,
+            matched,
+            "match" if matched else "no_match",
+            "forbidden absence assertion matched" if matched else "forbidden absence assertion not present",
+            fact_type,
+            best_span[0],
+            best_span[1],
+            segment_kind=best_segment,
+            details=details,
+        )
+
+    if mixed:
+        return match_record(
+            mode,
+            label,
+            phrases[0] if phrases else "",
+            best_clause,
+            min(best_score, 1.0),
+            False,
+            False,
+            "no_match",
+            "absence statement was contradicted by an affirmative invented claim",
+            fact_type,
+            best_span[0],
+            best_span[1],
+            segment_kind=best_segment,
+            details=details,
+        )
+    matched = bool(best_pattern and best_score >= 0.75)
+    return match_record(
+        mode,
+        label,
+        phrases[0] if phrases else "",
+        best_clause,
+        min(best_score, 1.0),
+        False,
+        matched,
+        "match" if matched else "no_match",
+        "answer clearly states the requested information is absent" if matched else "answer did not clearly state absence for the target concept",
+        fact_type,
+        best_span[0],
+        best_span[1],
+        segment_kind=best_segment,
+        details=details,
+    )
+
+
+def match_relation(
+    answer: str,
+    group: dict[str, Any],
+    *,
+    mode: str,
+    label: str,
+    fact_type: str,
+) -> dict[str, Any]:
+    subject_aliases = assertion_aliases(group, "subject_aliases")
+    predicate_aliases = assertion_aliases(group, "predicate_aliases")
+    object_aliases = assertion_aliases(group, "object_aliases")
+    value_aliases = assertion_aliases(group, "value_aliases")
+    best: dict[str, Any] | None = None
+    any_components = relation_components_present(answer, subject_aliases, predicate_aliases, object_aliases, value_aliases)
+    for clause, start, end in relation_candidate_clauses(answer):
+        components = {
+            "subject": matched_target_alias(clause, subject_aliases),
+            "predicate": matched_predicate_alias(clause, predicate_aliases),
+            "object": matched_target_alias(clause, object_aliases) if object_aliases else "",
+            "value": matched_value_alias(clause, value_aliases),
+        }
+        required = [components["subject"], components["predicate"], components["value"]]
+        if object_aliases:
+            required.append(components["object"])
+        score = sum(1 for item in required if item) / max(len(required), 1)
+        if best is None or score > float(best.get("score") or 0.0):
+            best = {
+                "clause": " ".join(clause.split()),
+                "start": start,
+                "end": end,
+                "components": components,
+                "score": score,
+                "negated": scoped_negation(clause, " ".join(subject_aliases + value_aliases)) == "clear",
+                "segment": segment_kind_for_span(answer, start, end, clause),
+            }
+        if score >= 1.0:
+            break
+
+    best = best or {"clause": "", "start": -1, "end": -1, "components": {}, "score": 0.0, "negated": False, "segment": "answer_conclusion"}
+    matched = float(best.get("score") or 0.0) >= 1.0 and not bool(best.get("negated"))
+    details = {
+        "relation_components": best.get("components") or {},
+        "relation_clause": best.get("clause") or "",
+        "relation_scope": str(group.get("scope") or "same_clause"),
+    }
+    if mode == "forbidden":
+        if matched and best.get("segment") == "evidence_quotation" and not evidence_segment_adopted(answer, span_value(best, "start"), span_value(best, "end")):
+            return match_record(
+                mode,
+                label,
+                relation_label(group),
+                str(best.get("clause") or ""),
+                float(best.get("score") or 0.0),
+                False,
+                False,
+                "no_match",
+                "quoted evidence relation was not adopted as the answer conclusion",
+                fact_type,
+                span_value(best, "start"),
+                span_value(best, "end"),
+                segment_kind=str(best.get("segment") or "answer_conclusion"),
+                details=details,
+            )
+        return match_record(
+            mode,
+            label,
+            relation_label(group),
+            str(best.get("clause") or ""),
+            float(best.get("score") or 0.0),
+            bool(best.get("negated")),
+            matched,
+            "match" if matched else "no_match",
+            "forbidden relation matched within one clause" if matched else "forbidden relation components were not bound in one clause",
+            fact_type,
+            span_value(best, "start"),
+            span_value(best, "end"),
+            segment_kind=str(best.get("segment") or "answer_conclusion"),
+            details=details,
+        )
+    if matched:
+        return match_record(
+            mode,
+            label,
+            relation_label(group),
+            str(best.get("clause") or ""),
+            float(best.get("score") or 0.0),
+            False,
+            True,
+            "match",
+            "expected relation matched within one clause",
+            fact_type,
+            span_value(best, "start"),
+            span_value(best, "end"),
+            segment_kind=str(best.get("segment") or "answer_conclusion"),
+            details=details,
+        )
+    if any_components:
+        return match_record(
+            mode,
+            label,
+            relation_label(group),
+            str(best.get("clause") or ""),
+            float(best.get("score") or 0.0),
+            bool(best.get("negated")),
+            False,
+            "review",
+            "relation components appeared but were not safely bound",
+            fact_type,
+            span_value(best, "start"),
+            span_value(best, "end"),
+            segment_kind=str(best.get("segment") or "answer_conclusion"),
+            details=details,
+        )
+    return match_record(
+        mode,
+        label,
+        relation_label(group),
+        str(best.get("clause") or ""),
+        float(best.get("score") or 0.0),
+        False,
+        False,
+        "no_match",
+        "expected relation not present",
+        fact_type,
+        span_value(best, "start"),
+        span_value(best, "end"),
+        segment_kind=str(best.get("segment") or "answer_conclusion"),
+        details=details,
+    )
+
+
+def assertion_aliases(group: dict[str, Any], key: str) -> list[str]:
+    value = group.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def absence_targets_from_group(group: dict[str, Any]) -> list[str]:
+    targets = []
+    label = str(group.get("label") or "").strip()
+    if label:
+        targets.append(label)
+    for phrase in group.get("any") or []:
+        text = normalize(str(phrase))
+        for verb in ABSENCE_VERBS:
+            text = re.sub(rf"\b(?:does|do|did)\s+not\s+{verb}\b", " ", text)
+            text = re.sub(rf"\bcannot\s+{verb}\b", " ", text)
+        text = re.sub(r"\b(no|not|cannot|can|the|a|an|who|what|whether|if)\b", " ", text)
+        cleaned = " ".join(token for token in text.split() if token not in FACT_STOPWORDS)
+        if cleaned:
+            targets.append(cleaned)
+    return dedupe_labels(targets)
+
+
+def matched_absence_construction(clause: str) -> str:
+    for regex in ABSENCE_REGEXES:
+        match = regex.search(clause or "")
+        if match:
+            return " ".join(match.group(0).split())
+    return ""
+
+
+def matched_target_alias(clause: str, aliases: list[str]) -> str:
+    normalized_clause = normalize(clause)
+    clause_tokens = fact_tokens(normalized_clause)
+    for alias in aliases:
+        normalized_alias = normalize(alias)
+        if not normalized_alias:
+            continue
+        alias_tokens = fact_tokens(normalized_alias)
+        if normalized_alias in normalized_clause:
+            return alias
+        if alias_tokens and alias_tokens.issubset(clause_tokens):
+            return alias
+    return ""
+
+
+def matched_predicate_alias(clause: str, aliases: list[str]) -> str:
+    clause_tokens = fact_tokens(clause)
+    for alias in aliases:
+        alias_tokens = fact_tokens(alias)
+        if alias_tokens and alias_tokens.issubset(clause_tokens):
+            return alias
+    return ""
+
+
+def matched_value_alias(clause: str, aliases: list[str]) -> str:
+    for alias in aliases:
+        if exact_values(alias, fact_type="quantity").issubset(exact_values(clause, fact_type="quantity")) and exact_values(alias, fact_type="quantity"):
+            return alias
+        if exact_values(alias, fact_type="date_or_time").issubset(exact_values(clause, fact_type="date_or_time")) and exact_values(alias, fact_type="date_or_time"):
+            return alias
+        if matched_target_alias(clause, [alias]):
+            return alias
+    return ""
+
+
+def mixed_absence_with_invention(answer: str, targets: list[str]) -> bool:
+    saw_absence = False
+    for clause, _, _ in split_answer_clauses(answer):
+        has_absence = bool(matched_absence_construction(clause))
+        target = matched_target_alias(clause, targets)
+        if has_absence and target:
+            saw_absence = True
+            continue
+        if saw_absence and clause_starts_with_contrast(clause) and target and scoped_negation(clause, target) != "clear":
+            return True
+    return False
+
+
+def clause_starts_with_contrast(clause: str) -> bool:
+    tokens = normalize(clause).split()
+    return bool(tokens and tokens[0] in CONTRAST_MARKERS)
+
+
+def relation_candidate_clauses(answer: str) -> list[tuple[str, int, int]]:
+    return split_answer_clauses(answer)
+
+
+def relation_components_present(
+    answer: str,
+    subject_aliases: list[str],
+    predicate_aliases: list[str],
+    object_aliases: list[str],
+    value_aliases: list[str],
+) -> bool:
+    return bool(
+        matched_target_alias(answer, subject_aliases)
+        and matched_predicate_alias(answer, predicate_aliases)
+        and matched_value_alias(answer, value_aliases)
+        and (not object_aliases or matched_target_alias(answer, object_aliases))
+    )
+
+
+def span_value(item: dict[str, Any], key: str) -> int:
+    value = item.get(key)
+    return int(value) if value is not None else -1
+
+
+def relation_label(group: dict[str, Any]) -> str:
+    subject = "/".join(assertion_aliases(group, "subject_aliases")[:2])
+    value = "/".join(assertion_aliases(group, "value_aliases")[:2])
+    return f"{subject} -> {value}".strip(" ->") or str(group.get("label") or "relation")
+
+
+def segment_kind_for_span(answer: str, start: int, end: int, window: str) -> str:
+    if start < 0:
+        return "answer_conclusion"
+    prefix = answer[max(0, start - 120) : start].lower()
+    line_start = answer.rfind("\n", 0, max(start, 0)) + 1
+    line = answer[line_start:end].strip().lower()
+    normalized_window = normalize(window)
+    if (
+        "retrieved context says" in prefix
+        or "provided evidence" in prefix
+        or "evidence snippets" in prefix
+        or line.startswith("-")
+        or line.startswith("\"")
+        or normalized_window.startswith("# ")
+    ):
+        return "evidence_quotation"
+    if "because" in prefix or "therefore" in prefix or "so " in prefix:
+        return "explanatory_text"
+    return "answer_conclusion"
+
+
+def evidence_segment_adopted(answer: str, start: int, end: int) -> bool:
+    tail = normalize(answer[end : end + 160])
+    if any(pattern in tail for pattern in ("therefore", "so the answer", "this means", "the answer is")):
+        return True
+    prefix = normalize(answer[max(0, start - 80) : start])
+    return "answer is" in prefix or "conclusion" in prefix
+
+
+def exact_phrase_match(
+    normalized_answer: str,
+    normalized_phrase: str,
+    answer: str,
+    phrase: str,
+    *,
+    fact_type: str,
+    window: str,
+) -> bool:
+    if normalized_phrase and normalized_phrase in normalized_answer:
+        return True
+    if fact_type not in EXACT_TYPES:
+        return False
+    phrase_values = exact_values(phrase, fact_type=fact_type)
+    if not phrase_values:
+        return False
+    answer_values = exact_values(window or answer, fact_type=fact_type)
+    return phrase_values.issubset(answer_values)
+
+
+def exact_values(text: str, *, fact_type: str) -> set[str]:
+    if fact_type == "code":
+        return {match.group(0).upper() for match in CODE_RE.finditer(text)}
+    if fact_type in {"date", "date_or_time"}:
+        normalized = text.upper().replace("A.M.", "AM").replace("P.M.", "PM")
+        return {match.group(0) for match in TIME_RE.finditer(normalized)}
+    if fact_type == "quantity":
+        normalized = normalize_number_words(normalize(text))
+        values = {match.group(0) for match in NUMBER_RE.finditer(normalized)}
+        units = set()
+        tokens = normalized.split()
+        for index, token in enumerate(tokens[:-1]):
+            if NUMBER_RE.fullmatch(token):
+                units.add(f"{token} {tokens[index + 1]}")
+        return values | units
+    normalized = normalize(text)
+    values = set()
+    for pattern in (r"\bslot\s+[a-z0-9]+\b", r"\bdock\s+[a-z0-9]+\b", r"\bbox\s+[a-z0-9]+\b"):
+        values.update(match.group(0) for match in re.finditer(pattern, normalized))
+    values.update(match.group(0).upper() for match in CODE_RE.finditer(text))
+    return values or {normalized} if normalized else set()
+
+
+def predicate_anchor_token(phrase: str, *, fact_type: str) -> str:
+    if fact_type in {"code", "date", "date_or_time"}:
+        return ""
+    value_tokens = set()
+    for value in exact_values(phrase, fact_type=fact_type):
+        value_tokens.update(fact_tokens(value))
+    for raw in WORD_RE.findall(phrase or ""):
+        token = stem(raw.lower())
+        if token and token not in FACT_STOPWORDS and token not in value_tokens and not NUMBER_RE.fullmatch(token):
+            return token
+    return ""
+
+
+def normalize_number_words(text: str) -> str:
+    return " ".join(NUMBER_WORDS.get(token, token) for token in text.split())
+
+
+def answer_clause_for_phrase(answer: str, phrase: str, *, fact_type: str) -> tuple[str, int, int]:
+    clauses = split_answer_clauses(answer)
+    phrase_values = exact_values(phrase, fact_type=fact_type)
+    normalized_phrase = normalize(phrase)
+    tokens = fact_tokens(phrase)
+    best = (answer or "", 0, len(answer or ""), -1.0)
+    for clause, start, end in clauses:
+        normalized_clause = normalize(clause)
+        if normalized_phrase and normalized_phrase in normalized_clause:
+            return " ".join(clause.split()), start, end
+        if phrase_values and phrase_values.issubset(exact_values(clause, fact_type=fact_type)):
+            return " ".join(clause.split()), start, end
+        clause_tokens = fact_tokens(clause)
+        overlap = len(tokens & clause_tokens) / len(tokens) if tokens else 0.0
+        if overlap > best[3]:
+            best = (clause, start, end, overlap)
+    return " ".join(best[0].split())[:240], best[1], best[2]
+
+
+def split_answer_clauses(answer: str) -> list[tuple[str, int, int]]:
+    text = answer or ""
+    spans: list[tuple[str, int, int]] = []
+    start = 0
+    for match in re.finditer(r"[.;!?]|\bbut\b|\balthough\b|\bthough\b|\bhowever\b|\byet\b", text, flags=re.IGNORECASE):
+        end = match.start()
+        part = text[start:end].strip()
+        if part:
+            spans.append((part, start, end))
+        separator = match.group(0)
+        start = match.start() if separator.isalpha() else match.end()
+    tail = text[start:].strip()
+    if tail:
+        spans.append((tail, start, len(text)))
+    return spans or [(text, 0, len(text))]
 
 
 def answer_window_for_phrase(answer: str, phrase: str, *, radius: int = 90) -> str:
@@ -1528,28 +2225,34 @@ def split_answer_sentences(answer: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()] or [answer or ""]
 
 
-def nearby_negation(window: str, phrase: str) -> str | None:
+def scoped_negation(window: str, phrase: str) -> str | None:
     text = normalize(window)
     phrase_text = normalize(phrase)
     if "not only" in text:
         return "ambiguous"
     anchor = re.escape(first_content_token(phrase_text))
+    if not anchor:
+        return None
     clear_patterns = [
-        r"\bno\b[^.]{0,80}\b" + anchor,
-        r"\bnot\b[^.]{0,100}\b" + anchor,
-        r"\bdoes not\b[^.]{0,120}\b(confirm|establish|show|say|state)?",
-        r"\bdid not\b[^.]{0,120}\b" + anchor,
+        r"\bno\b[^,;.!?]{0,45}\b" + anchor,
+        r"\bnot\b[^,;.!?]{0,55}\b" + anchor,
+        r"\bdoes not\b[^,;.!?]{0,70}\b(confirm|establish|show|say|state)?[^,;.!?]{0,35}\b" + anchor,
+        r"\bdid not\b[^,;.!?]{0,55}\b" + anchor,
         r"\bcannot confirm\b",
         r"\bcan not confirm\b",
-        r"\bnot confirm\b",
-        r"\bnot establish\b",
-        r"\bincorrect to say\b[^.]{0,120}\b" + anchor,
+        r"\bnot confirm\b[^,;.!?]{0,45}\b" + anchor,
+        r"\bnot establish\b[^,;.!?]{0,45}\b" + anchor,
+        r"\bincorrect to say\b[^,;.!?]{0,55}\b" + anchor,
     ]
     if any(re.search(pattern, text) for pattern in clear_patterns):
         return "clear"
-    if re.search(r"\b(not|no|never|without|incorrect|cannot|can't)\b", text):
+    if any(token in NEGATION_WORDS for token in text.split()):
         return "ambiguous"
     return None
+
+
+def nearby_negation(window: str, phrase: str) -> str | None:
+    return scoped_negation(window, phrase)
 
 
 def first_content_token(text: str) -> str:
@@ -1559,26 +2262,16 @@ def first_content_token(text: str) -> str:
 
 
 def answer_abstains(answer: str) -> bool:
-    text = normalize(answer)
-    patterns = [
-        "cannot confirm",
-        "can not confirm",
-        "does not say",
-        "not found",
-        "not established",
-        "no evidence",
-        "retrieved context does not",
-        "not provided",
-    ]
-    return any(pattern in text for pattern in patterns)
+    return any(matched_absence_construction(clause) for clause, _, _ in split_answer_clauses(answer))
 
 
 def diagnose_generation_only(grading: dict[str, Any]) -> str:
-    if grading.get("grader_review_required"):
-        return "deterministic grader review required"
-    if grading.get("passed"):
-        return "ok"
-    return "generation/comprehension failure"
+    return canonical_terminal_diagnosis(
+        grader_review_required=bool(grading.get("grader_review_required")),
+        passed=bool(grading.get("passed")),
+        retrieval_failed=False,
+        generation_failed=not bool(grading.get("passed")),
+    )
 
 
 def diagnose_end_to_end(
@@ -1586,20 +2279,16 @@ def diagnose_end_to_end(
     grading: dict[str, Any],
     verifier: dict[str, Any],
 ) -> str:
-    if verifier.get("status") == "timeout":
-        return "timeout during verifier"
-    if grading.get("grader_review_required"):
-        return "deterministic grader review required"
-    retrieval_failed = not bool(retrieval_metrics.get("hit_at1"))
+    _ = retrieval_metrics
+    retrieval_failed = not bool(grading.get("source_passed"))
     generation_failed = not (grading.get("expected_passed") and grading.get("forbidden_passed"))
-    source_failed = not grading.get("source_passed")
-    if retrieval_failed and (generation_failed or source_failed):
-        return "both retrieval and generation failure"
-    if retrieval_failed or source_failed:
-        return "retrieval failure"
-    if generation_failed:
-        return "generation/comprehension failure"
-    return "ok"
+    return canonical_terminal_diagnosis(
+        verifier_status=str(verifier.get("status") or ""),
+        grader_review_required=bool(grading.get("grader_review_required")),
+        passed=bool(grading.get("passed")),
+        retrieval_failed=retrieval_failed,
+        generation_failed=generation_failed,
+    )
 
 
 def case_summary(case: dict[str, Any]) -> dict[str, Any]:
@@ -1658,7 +2347,7 @@ def benchmark_run_dict(row: Any) -> dict[str, Any]:
 
 
 def benchmark_case_dict(row: Any) -> dict[str, Any]:
-    return {
+    case = {
         "id": row_get(row, "id", ""),
         "run_id": row_get(row, "run_id", ""),
         "case_id": row_get(row, "case_id", ""),
@@ -1701,6 +2390,8 @@ def benchmark_case_dict(row: Any) -> dict[str, Any]:
         "timings": json_loads(row_get(row, "timings_json", "{}"), {}),
         "error_message": row_get(row, "error_message", ""),
     }
+    case["pipeline_diagnosis"] = canonical_case_diagnosis(case)
+    return case
 
 
 def format_benchmark_summary(runs: list[dict[str, Any]]) -> str:
@@ -1774,7 +2465,11 @@ def benchmark_comparison(
         total_runtime_ms = sum(int(run.get("total_runtime_ms") or 0) for run in sorted_runs)
         latest_total = run_total_count(latest_run)
         best_total = run_total_count(best_run)
+        latest_failed = run_failed_count(latest_run)
+        latest_grader_review = run_grader_review_count(latest_run)
+        latest_coverage = run_coverage(latest_run)
         stability_label = repeatability_label(run_count)
+        chronology = chronology_stats_for_runs(sorted_runs)
         timeout_rate = sum(int(run.get("timeout_count") or 0) for run in sorted_runs) / max(
             sum(run_total_count(run) for run in sorted_runs),
             1,
@@ -1797,8 +2492,12 @@ def benchmark_comparison(
             "run_count": run_count,
             "repeatability_label": stability_label,
             "latest_run_passed": run_passed_count(latest_run),
+            "latest_run_failed": latest_failed,
+            "latest_run_grader_review": latest_grader_review,
             "latest_run_total": latest_total,
             "latest_run_pass_rate": run_pass_rate(latest_run),
+            "latest_run_coverage": latest_coverage,
+            "latest_run_adjudicated_total": run_adjudicated_total(latest_run),
             "latest_run_avg_latency_ms": run_average_latency_ms(latest_run),
             "latest_expected_failures": latest_expected_failures,
             "latest_forbidden_failures": latest_forbidden_failures,
@@ -1811,14 +2510,20 @@ def benchmark_comparison(
             "best_created_at": run_created_at(best_run),
             "mean_passed_per_run": sum(run_passed_values) / run_count if run_count else 0.0,
             "mean_pass_rate": sum(run_pass_rates) / run_count if run_count else 0.0,
+            "mean_coverage": sum(run_coverage(run) for run in sorted_runs) / run_count if run_count else 0.0,
             "mean_practical_pass_rate": sum(practical_rates) / run_count if run_count else 0.0,
             "worst_run_practical_pass_rate": min(practical_rates) if practical_rates else 0.0,
             "mean_adversarial_pass_rate": sum(adversarial_rates) / run_count if run_count else 0.0,
+            "chronology_attempted": chronology["attempted"],
+            "chronology_passed": chronology["passed"],
+            "chronology_failed": chronology["failed"],
+            "chronology_pass_rate": chronology["pass_rate"],
             "timeout_rate": timeout_rate,
             "recommendation_eligible": bool(
                 str(latest_run.get("benchmark_mode") or "end_to_end") == "end_to_end"
                 and timeout_rate < 0.5
                 and run_total_count(latest_run) > 0
+                and latest_coverage >= 0.9
             ),
             "median_avg_latency_ms": int(statistics.median(run_latencies)) if run_latencies else 0,
             "mean_avg_latency_ms": int(statistics.mean(run_latencies)) if run_latencies else 0,
@@ -1832,6 +2537,8 @@ def benchmark_comparison(
         group.update(
             {
                 "passed": group["latest_run_passed"],
+                "failed": group["latest_run_failed"],
+                "grader_review": group["latest_run_grader_review"],
                 "total": group["latest_run_total"],
                 "expected_failures": group["latest_expected_failures"],
                 "forbidden_failures": group["latest_forbidden_failures"],
@@ -1889,6 +2596,31 @@ def run_passed_count(run: dict[str, Any]) -> int:
     return int(run.get("total_passed") or 0)
 
 
+def primary_score_for_run(run: dict[str, Any]) -> dict[str, Any]:
+    mode = str(run.get("benchmark_mode") or "end_to_end")
+    if mode == "retrieval_only":
+        score = run.get("retrieval_score")
+    elif mode == "oracle_generation":
+        score = run.get("oracle_score")
+    else:
+        score = run.get("end_to_end_score")
+    return score if isinstance(score, dict) else {}
+
+
+def run_failed_count(run: dict[str, Any]) -> int:
+    score = primary_score_for_run(run)
+    if "failed" in score:
+        return int(score.get("failed") or 0)
+    return int(run.get("total_failed") or 0)
+
+
+def run_grader_review_count(run: dict[str, Any]) -> int:
+    score = primary_score_for_run(run)
+    if "grader_review_count" in score:
+        return int(score.get("grader_review_count") or 0)
+    return int(run.get("grader_review_count") or 0)
+
+
 def run_total_count(run: dict[str, Any]) -> int:
     cases = run_cases(run)
     if cases:
@@ -1896,8 +2628,26 @@ def run_total_count(run: dict[str, Any]) -> int:
     return run_passed_count(run) + int(run.get("total_failed") or 0)
 
 
-def run_pass_rate(run: dict[str, Any]) -> float:
+def run_adjudicated_total(run: dict[str, Any]) -> int:
+    score = primary_score_for_run(run)
+    if "adjudicated_total" in score:
+        return int(score.get("adjudicated_total") or 0)
+    return run_passed_count(run) + run_failed_count(run)
+
+
+def run_coverage(run: dict[str, Any]) -> float:
+    score = primary_score_for_run(run)
+    if "coverage" in score:
+        return float(score.get("coverage") or 0.0)
     total = run_total_count(run)
+    return run_adjudicated_total(run) / total if total else 0.0
+
+
+def run_pass_rate(run: dict[str, Any]) -> float:
+    score = primary_score_for_run(run)
+    if "adjudicated_pass_rate" in score:
+        return float(score.get("adjudicated_pass_rate") or 0.0)
+    total = run_adjudicated_total(run)
     return float(run_passed_count(run)) / total if total else 0.0
 
 
@@ -1928,7 +2678,10 @@ def run_adversarial_pass_rate(run: dict[str, Any]) -> float:
 def pass_rate_for_cases(cases: list[dict[str, Any]]) -> float:
     if not cases:
         return 0.0
-    return sum(1 for case in cases if case.get("passed")) / len(cases)
+    passed = sum(1 for case in cases if case.get("passed"))
+    failed = sum(1 for case in cases if primary_case_bucket(case) in {"retrieval_only", "generation_only", "both"})
+    adjudicated = passed + failed
+    return passed / adjudicated if adjudicated else 0.0
 
 
 def repeatability_label(run_count: int) -> str:
@@ -2039,9 +2792,11 @@ def choose_recommended_group(
 def recommendation_score(group: dict[str, Any]) -> float:
     mean_practical = float(group.get("mean_practical_pass_rate") or group.get("mean_pass_rate") or 0.0)
     worst_practical = float(group.get("worst_run_practical_pass_rate") or 0.0)
+    coverage = float(group.get("mean_coverage") or group.get("latest_run_coverage") or 0.0)
     stability_penalty = 0.02 if int(group.get("run_count") or 0) == 1 else 0.0
     timeout_penalty = float(group.get("timeout_rate") or 0.0) * 0.5
-    return mean_practical * 0.75 + worst_practical * 0.25 - stability_penalty - timeout_penalty
+    coverage_penalty = max(0.0, 0.95 - coverage) * 0.2
+    return mean_practical * 0.75 + worst_practical * 0.25 - stability_penalty - timeout_penalty - coverage_penalty
 
 
 def recommendation_reason(
@@ -2106,7 +2861,7 @@ def guidance_labels_for_group(
         labels.append("Recommended for Potato Mode")
     if pass_rate >= 0.4 and forbidden_failures == 0:
         labels.append("Good extraction baseline")
-    if expected_failures > 0:
+    if int(group.get("chronology_attempted") or 0) >= 2 and float(group.get("chronology_pass_rate") or 0.0) < 0.75:
         labels.append("Weak at chronology")
     if source_failures > 0:
         labels.append("Source contamination risk")
@@ -2121,23 +2876,72 @@ def guidance_labels_for_group(
             labels.append("Verifier improved score but high latency")
         else:
             labels.append("Verifier not worth latency")
-    return dedupe_labels(labels)
+    return finalize_guidance_labels(labels)
 
 
 def add_fastest_usable_label(groups: list[dict[str, Any]]) -> None:
-    usable = [group for group in groups if int(group.get("latest_run_passed") or 0) > 0]
-    if not usable:
+    eligible = [
+        group
+        for group in groups
+        if group.get("recommendation_eligible")
+        and str(group.get("status") or "completed") == "completed"
+        and int(group.get("latest_run_total") or 0) > 0
+    ]
+    if not eligible:
         return
-    best_passed = max(int(group.get("latest_run_passed") or 0) for group in usable)
-    fastest = sorted(
-        (group for group in usable if int(group.get("latest_run_passed") or 0) == best_passed),
-        key=lambda group: (
-            int(group.get("latest_run_avg_latency_ms") or group.get("median_avg_latency_ms") or 0),
-            bool(group.get("verify")),
-            str(group.get("model") or ""),
-        ),
-    )[0]
-    fastest["guidance_labels"] = dedupe_labels(["Fastest usable config", *fastest.get("guidance_labels", [])])
+    by_scope: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for group in eligible:
+        by_scope.setdefault(
+            (
+                str(group.get("suite_version") or ""),
+                str(group.get("benchmark_mode") or ""),
+                str(group.get("embedding_backend") or ""),
+                str(group.get("embedding_model") or ""),
+            ),
+            [],
+        ).append(group)
+    for scoped_groups in by_scope.values():
+        fastest = sorted(
+            scoped_groups,
+            key=lambda group: (
+                int(group.get("median_avg_latency_ms") or group.get("latest_run_avg_latency_ms") or 0),
+                bool(group.get("verify")),
+                str(group.get("thinking_mode") or "") != "off",
+                str(group.get("model") or ""),
+                str(group.get("key") or ""),
+            ),
+        )[0]
+        fastest_latency = max(int(fastest.get("median_avg_latency_ms") or fastest.get("latest_run_avg_latency_ms") or 0), 1)
+        tied = [
+            group
+            for group in scoped_groups
+            if abs(int(group.get("median_avg_latency_ms") or group.get("latest_run_avg_latency_ms") or 0) - fastest_latency)
+            / fastest_latency
+            <= 0.01
+        ]
+        if len(tied) > 1:
+            # Treat <=1% latency differences as noise and avoid declaring a
+            # fastest winner when the measured result is effectively tied.
+            continue
+        fastest["guidance_labels"] = finalize_guidance_labels(["Fastest usable config", *fastest.get("guidance_labels", [])])
+
+
+def chronology_stats_for_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    cases = [
+        case
+        for run in runs
+        for case in run_cases(run)
+        if str(case.get("case_category") or "") == "chronology_comprehension"
+        and str(case.get("status") or "completed") == "completed"
+    ]
+    attempted = len(cases)
+    passed = sum(1 for case in cases if case.get("passed"))
+    return {
+        "attempted": attempted,
+        "passed": passed,
+        "failed": attempted - passed,
+        "pass_rate": passed / attempted if attempted else 0.0,
+    }
 
 
 def case_difficulty_summary(runs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -2207,7 +3011,22 @@ def case_difficulty_item(entry: dict[str, Any]) -> dict[str, Any]:
         "source_failure_rate": source_failures / attempts,
         "forbidden_failures": forbidden_failures,
         "forbidden_failure_rate": forbidden_failures / attempts,
+        "observation_label": case_observation_label(attempts, passes),
     }
+
+
+def case_observation_label(attempts: int, passes: int) -> str:
+    if attempts < 3:
+        if passes == attempts:
+            return f"passed in all tested configurations; provisional, {attempts} observation(s)"
+        if passes == 0:
+            return f"failed in all tested configurations; provisional, {attempts} observation(s)"
+        return f"mixed result; provisional, {attempts} observation(s)"
+    if passes == attempts:
+        return "usually passing"
+    if passes == 0:
+        return "usually failing"
+    return f"mixed result across {attempts} observations"
 
 
 def score_run_cases(cases: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -2238,12 +3057,13 @@ def score_run_cases(cases: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 def aggregate_score(cases: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(cases)
     passed = sum(1 for case in cases if case.get("passed"))
-    timeout = sum(1 for case in cases if case.get("status") == "timeout")
-    errors = sum(1 for case in cases if case.get("status") == "error")
-    grader_review = sum(1 for case in cases if case.get("grader_review_required"))
-    retrieval_failures = sum(1 for case in cases if str(case.get("pipeline_diagnosis") or "").startswith("retrieval"))
-    generation_failures = sum(1 for case in cases if "generation" in str(case.get("pipeline_diagnosis") or ""))
-    both_failures = sum(1 for case in cases if str(case.get("pipeline_diagnosis") or "").startswith("both"))
+    taxonomy = pipeline_taxonomy_counts(cases)
+    timeout = taxonomy["timeout"]
+    errors = taxonomy["runtime_error"]
+    grader_review = taxonomy["grader_review"]
+    failed = taxonomy["retrieval_only"] + taxonomy["generation_only"] + taxonomy["both"]
+    adjudicated_total = passed + failed
+    coverage = adjudicated_total / total if total else 0.0
     hit_at1_values = [
         bool((case.get("retrieval_metrics") or {}).get("hit_at1"))
         for case in cases
@@ -2255,20 +3075,109 @@ def aggregate_score(cases: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(case.get("retrieval_metrics"), dict) and case.get("retrieval_metrics")
     ]
     return {
+        "attempted": total,
         "total": total,
         "passed": passed,
-        "failed": total - passed,
-        "pass_rate": passed / total if total else 0.0,
+        "failed": failed,
+        "grader_review": grader_review,
         "timeout_count": timeout,
         "runtime_error_count": errors,
         "grader_review_count": grader_review,
+        "adjudicated_total": adjudicated_total,
+        "adjudicated_pass_rate": passed / adjudicated_total if adjudicated_total else 0.0,
+        "coverage": coverage,
+        "pass_rate": passed / adjudicated_total if adjudicated_total else 0.0,
+        "raw_pass_rate": passed / total if total else 0.0,
         "timeout_error_rate": (timeout + errors) / total if total else 0.0,
-        "retrieval_caused_failures": retrieval_failures,
-        "generation_caused_failures": generation_failures,
-        "combined_failures": both_failures,
+        "pipeline_taxonomy": taxonomy,
+        "retrieval_caused_failures": taxonomy["retrieval_only"],
+        "generation_caused_failures": taxonomy["generation_only"],
+        "both_failures": taxonomy["both"],
         "hit_at1": sum(1 for value in hit_at1_values if value) / len(hit_at1_values) if hit_at1_values else 0.0,
         "mrr": sum(mrr_values) / len(mrr_values) if mrr_values else 0.0,
     }
+
+
+def canonical_pipeline_diagnosis(value: str) -> str:
+    normalized = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"passed", "ok"}:
+        return "passed"
+    if normalized in {"retrieval_only", "retrieval_failure"} or normalized.startswith("retrieval"):
+        return "retrieval_only"
+    if normalized in {"generation_only", "generation_comprehension_failure"} or "generation" in normalized:
+        return "generation_only"
+    if normalized.startswith("both") or "combined" in normalized:
+        return "both"
+    if "grader" in normalized or "review" in normalized:
+        return "grader_review"
+    if "timeout" in normalized:
+        return "timeout"
+    if "runtime" in normalized or "error" in normalized:
+        return "runtime_error"
+    return "passed" if not normalized else "runtime_error"
+
+
+def canonical_terminal_diagnosis(
+    *,
+    status: str = "",
+    verifier_status: str = "",
+    grader_review_required: bool = False,
+    passed: bool = False,
+    retrieval_failed: bool = False,
+    generation_failed: bool = False,
+) -> str:
+    clean_status = (status or "").strip().lower()
+    clean_verifier_status = (verifier_status or "").strip().lower()
+    if clean_status == "timeout" or clean_verifier_status == "timeout":
+        return "timeout"
+    if clean_status in {"error", "runtime_error"}:
+        return "runtime_error"
+    if grader_review_required:
+        return "grader_review"
+    if passed:
+        return "passed"
+    if retrieval_failed and generation_failed:
+        return "both"
+    if retrieval_failed:
+        return "retrieval_only"
+    return "generation_only"
+
+
+def canonical_case_diagnosis(case: dict[str, Any]) -> str:
+    raw = canonical_pipeline_diagnosis(str(case.get("pipeline_diagnosis") or ""))
+    status = str(case.get("status") or "").strip().lower()
+    if status == "timeout" or raw == "timeout":
+        return "timeout"
+    if status == "error" or raw == "runtime_error":
+        return "runtime_error"
+    if case.get("grader_review_required") or raw == "grader_review":
+        return "grader_review"
+    if case.get("passed"):
+        return "passed"
+    if raw == "passed" and "passed" not in case:
+        return "passed"
+    if raw in {"retrieval_only", "generation_only", "both"}:
+        return raw
+    retrieval_failed = case.get("source_passed") is False
+    generation_failed = not (case.get("expected_passed") and case.get("forbidden_passed"))
+    return canonical_terminal_diagnosis(
+        status=status,
+        passed=False,
+        retrieval_failed=retrieval_failed,
+        generation_failed=generation_failed,
+    )
+
+
+def primary_case_bucket(case: dict[str, Any]) -> str:
+    return canonical_case_diagnosis(case)
+
+
+def pipeline_taxonomy_counts(cases: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {bucket: 0 for bucket in PIPELINE_BUCKETS}
+    for case in cases:
+        category = primary_case_bucket(case)
+        counts[category] += 1
+    return counts
 
 
 def dedupe_labels(labels: list[str]) -> list[str]:
@@ -2280,6 +3189,13 @@ def dedupe_labels(labels: list[str]) -> list[str]:
         seen.add(label)
         result.append(label)
     return result
+
+
+def finalize_guidance_labels(labels: list[str]) -> list[str]:
+    deduped = dedupe_labels(labels)
+    order = {label: index for index, label in enumerate(GUIDANCE_LABEL_ORDER)}
+    original = {label: index for index, label in enumerate(deduped)}
+    return sorted(deduped, key=lambda label: (order.get(label, len(order)), original[label]))
 
 
 def format_embedding_label(run: dict[str, Any]) -> str:

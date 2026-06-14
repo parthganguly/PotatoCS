@@ -415,8 +415,12 @@ export type BenchmarkComparisonGroup = {
   run_count: number;
   repeatability_label: string;
   latest_run_passed: number;
+  latest_run_failed: number;
+  latest_run_grader_review: number;
   latest_run_total: number;
   latest_run_pass_rate: number;
+  latest_run_coverage: number;
+  latest_run_adjudicated_total: number;
   latest_run_avg_latency_ms: number;
   latest_expected_failures: number;
   latest_forbidden_failures: number;
@@ -429,6 +433,7 @@ export type BenchmarkComparisonGroup = {
   best_created_at: number;
   mean_passed_per_run: number;
   mean_pass_rate: number;
+  mean_coverage: number;
   mean_practical_pass_rate: number;
   worst_run_practical_pass_rate: number;
   mean_adversarial_pass_rate: number;
@@ -439,6 +444,8 @@ export type BenchmarkComparisonGroup = {
   cumulative_passed: number;
   cumulative_total: number;
   passed: number;
+  failed: number;
+  grader_review: number;
   total: number;
   expected_failures: number;
   forbidden_failures: number;
@@ -463,6 +470,7 @@ export type BenchmarkCaseDifficultyItem = {
   source_failure_rate: number;
   forbidden_failures: number;
   forbidden_failure_rate: number;
+  observation_label: string;
 };
 
 export type BenchmarkCaseDifficulty = {
@@ -482,6 +490,157 @@ export type BenchmarkComparison = {
   excluded_run_count: number;
   incomplete_run_count: number;
   excluded_suite_versions: string[];
+};
+
+export type CampaignPreset = "quick" | "standard" | "thorough";
+export type CampaignStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "completed_with_errors"
+  | "cancelled"
+  | "interrupted"
+  | "error";
+
+export type CampaignModelInfo = {
+  name: string;
+  capability: "chat" | "embedding" | "unknown";
+  auto_select_chat: boolean;
+  parameter_size: string;
+  quantization_level: string;
+  size: number;
+  size_vram: number;
+  context_length: number;
+  estimated_gpu_loaded_fraction: number | null;
+  estimated_cpu_loaded_fraction: number | null;
+  partially_cpu_offloaded: boolean;
+  historical_average_latency_ms: number;
+  warning: string;
+};
+
+export type CampaignJob = {
+  id?: string;
+  key: string;
+  campaign_id?: string;
+  sequence: number;
+  model: string;
+  benchmark_mode: BenchmarkMode;
+  thinking_mode: Exclude<ThinkingMode, "legacy/unrecorded">;
+  verify: boolean;
+  repeat_count: number;
+  temperature: number;
+  num_predict: number;
+  timeout_policy: Record<string, unknown>;
+  benchmark_run_ids?: string[];
+  status?: string;
+  retry_count?: number;
+  error?: string;
+  estimated_runtime_ms: number;
+  estimated_min_runtime_ms: number;
+  estimate_source?: string;
+  estimate_confidence?: string;
+  estimate_detail?: string;
+  model_info?: Partial<CampaignModelInfo>;
+  warnings?: string[];
+  started_at?: number | null;
+  completed_at?: number | null;
+};
+
+export type CampaignPlan = {
+  request: Record<string, unknown>;
+  installed_models: CampaignModelInfo[];
+  planned_jobs: CampaignJob[];
+  planned_job_count: number;
+  estimate: {
+    min_ms: number;
+    likely_ms: number;
+    uncertain: boolean;
+    job_count: number;
+    model_generation_count: number;
+    verifier_call_count: number;
+    confidence?: string;
+    source_detail?: string;
+  };
+  warnings: Array<{ level: string; message: string }>;
+};
+
+export type BenchmarkCampaign = {
+  id: string;
+  title: string;
+  preset: CampaignPreset;
+  app_version: string;
+  suite_version: string;
+  status: CampaignStatus;
+  selected_models: string[];
+  selected_modes: BenchmarkMode[];
+  selected_thinking_modes: Array<Exclude<ThinkingMode, "legacy/unrecorded">>;
+  verifier_settings: boolean[];
+  repeat_count: number;
+  embedding_backend: string;
+  embedding_model: string;
+  temperature: number;
+  num_predict: number;
+  timeout_policy: Record<string, unknown>;
+  planned_job_count: number;
+  completed_job_count: number;
+  failed_job_count: number;
+  timed_out_job_count: number;
+  skipped_job_count: number;
+  estimated_runtime_ms: number;
+  estimated_min_runtime_ms: number;
+  actual_runtime_ms: number;
+  auto_generate_report: boolean;
+  report_status: string;
+  report_paths: Record<string, string>;
+  report_warnings: string[];
+  report_schema_version: string;
+  output_folder: string;
+  include_detailed_audit: boolean;
+  notes: string;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+  jobs: CampaignJob[];
+  current_job: CampaignJob | null;
+  progress: {
+    job_index: number;
+    job_count: number;
+    completed_terminal_jobs: number;
+    elapsed_ms: number;
+    estimated_remaining_ms: number;
+  };
+};
+
+export type CampaignReportResult = {
+  status: string;
+  paths: Record<string, string>;
+  warnings: string[];
+  report_schema_version: string;
+  screenshot_manifest: Array<Record<string, unknown>>;
+  pdf_status: string;
+};
+
+export type CampaignReportData = {
+  report_schema_version: string;
+  report_status?: string;
+  report_files?: Record<string, string>;
+  campaign: Record<string, unknown>;
+  application: Record<string, unknown>;
+  eval_suite: Record<string, unknown>;
+  runtime: Record<string, unknown>;
+  embedding: Record<string, unknown>;
+  job_matrix: CampaignJob[];
+  benchmark_runs: EvalRun[];
+  comparison: BenchmarkComparison;
+  recommendation: Record<string, BenchmarkComparisonGroup | Record<string, unknown> | string | null>;
+  case_difficulty: BenchmarkCaseDifficulty;
+  pipeline_diagnoses: Record<string, number>;
+  timeouts_errors: Record<string, unknown>;
+  report_generation: Record<string, unknown>;
+  screenshot_manifest: Array<Record<string, unknown>>;
+  view_model?: Record<string, unknown>;
 };
 
 export async function getAppStatus(): Promise<AppStatus> {

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from odysseus_desktop_backend import __version__
 from odysseus_desktop_backend.logging_config import get_logger, setup_logging
+from odysseus_desktop_backend.services.campaign_service import CampaignService
 from odysseus_desktop_backend.services.chat_service import ChatService
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
@@ -58,6 +59,10 @@ class SidecarApp:
         )
         if recovered_runs:
             logger.warning("recovered interrupted benchmark runs count=%s", recovered_runs)
+        self.campaigns = CampaignService(self.db)
+        recovered_campaigns = self.campaigns.recover_interrupted_campaigns()
+        if recovered_campaigns:
+            logger.warning("recovered interrupted benchmark campaigns count=%s", recovered_campaigns)
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
             "health.ping": self.health_ping,
@@ -88,6 +93,20 @@ class SidecarApp:
             "evals.history": self.evals_history,
             "evals.comparison": self.evals_comparison,
             "evals.clear_history": self.evals_clear_history,
+            "campaigns.models": self.campaigns_models,
+            "campaigns.plan": self.campaigns_plan,
+            "campaigns.create": self.campaigns_create,
+            "campaigns.list": self.campaigns_list,
+            "campaigns.get": self.campaigns_get,
+            "campaigns.start": self.campaigns_start,
+            "campaigns.pause": self.campaigns_pause,
+            "campaigns.cancel": self.campaigns_cancel,
+            "campaigns.resume": self.campaigns_resume,
+            "campaigns.retry_job": self.campaigns_retry_job,
+            "campaigns.delete": self.campaigns_delete,
+            "campaigns.report_data": self.campaigns_report_data,
+            "campaigns.generate_report": self.campaigns_generate_report,
+            "campaigns.open_report_folder": self.campaigns_open_report_folder,
             "app.shutdown": self.app_shutdown,
         }
 
@@ -253,6 +272,75 @@ class SidecarApp:
     def evals_clear_history(self, _params: JsonDict) -> JsonDict:
         return self.evals.clear_history()
 
+    def campaigns_models(self, _params: JsonDict) -> list[JsonDict]:
+        return self.campaigns.installed_models()
+
+    def campaigns_plan(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.plan(params)
+
+    def campaigns_create(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.create(params)
+
+    def campaigns_list(self, params: JsonDict) -> list[JsonDict]:
+        return self.campaigns.list(limit=optional_int(params, "limit", 20))
+
+    def campaigns_get(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.get(require_str(params, "campaign_id"))
+
+    def campaigns_start(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.start(require_str(params, "campaign_id"))
+
+    def campaigns_pause(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.pause(require_str(params, "campaign_id"))
+
+    def campaigns_cancel(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.cancel(require_str(params, "campaign_id"))
+
+    def campaigns_resume(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.resume(require_str(params, "campaign_id"))
+
+    def campaigns_retry_job(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.retry_job(require_str(params, "job_id"))
+
+    def campaigns_delete(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.delete(
+            require_str(params, "campaign_id"),
+            delete_benchmark_runs=optional_bool(params, "delete_benchmark_runs", False),
+        )
+
+    def campaigns_report_data(self, params: JsonDict) -> JsonDict:
+        return self.campaigns.report_data(
+            require_str(params, "campaign_id"),
+            include_detailed_audit=optional_bool(params, "include_detailed_audit", False),
+        )
+
+    def campaigns_generate_report(self, params: JsonDict) -> JsonDict:
+        screenshots = params.get("screenshots")
+        if screenshots is not None and not isinstance(screenshots, list):
+            raise RpcError(-32602, "screenshots must be an array")
+        return self.campaigns.generate_report(
+            require_str(params, "campaign_id"),
+            output_folder=optional_str(params, "output_folder"),
+            screenshots=screenshots,
+            capture_failure_reason=optional_str(params, "capture_failure_reason"),
+            include_detailed_audit=optional_bool_or_none(params, "include_detailed_audit"),
+            generate_pdf=optional_bool(params, "generate_pdf", True),
+            generate_html=optional_bool(params, "generate_html", True),
+        )
+
+    def campaigns_open_report_folder(self, params: JsonDict) -> JsonDict:
+        path = optional_str(params, "path")
+        if not path:
+            campaign = self.campaigns.get(require_str(params, "campaign_id"))
+            report_paths = campaign.get("report_paths") or {}
+            target = report_paths.get("pdf") or report_paths.get("html") or report_paths.get("json")
+            if not target:
+                raise RpcError(-32602, "campaign has no report path")
+            from pathlib import Path
+
+            path = str(Path(str(target)).parent)
+        return self.campaigns.open_report_path(path)
+
     def app_shutdown(self, _params: JsonDict) -> JsonDict:
         self.shutdown_requested = True
         return {"ok": True}
@@ -283,6 +371,15 @@ def optional_int(params: JsonDict, key: str, default: int) -> int:
 
 def optional_bool(params: JsonDict, key: str, default: bool) -> bool:
     value = params.get(key, default)
+    if not isinstance(value, bool):
+        raise RpcError(-32602, f"{key} must be a boolean")
+    return value
+
+
+def optional_bool_or_none(params: JsonDict, key: str) -> bool | None:
+    value = params.get(key)
+    if value is None:
+        return None
     if not isinstance(value, bool):
         raise RpcError(-32602, f"{key} must be a boolean")
     return value

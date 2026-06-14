@@ -1,6 +1,6 @@
 {
   "id": "contamination_lab_policy",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "cross_document_contamination",
   "difficulty": "medium",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -14,12 +14,12 @@
   "question": "If the lab label printer is offline, what should intake staff do before refrigeration?",
   "answer_style": "layman",
   "expected_facts": [
-    {"label": "hand label", "any": ["write the sample ID by hand"]},
-    {"label": "log outage", "any": ["log the printer outage"]}
+    {"label": "hand label", "type": "positive", "any": ["write the sample ID by hand"]},
+    {"label": "log outage", "type": "positive", "any": ["log the printer outage"]}
   ],
   "forbidden_claims": [{"label": "visitor badge", "any": ["yellow badge"]}, {"label": "discard", "any": ["discarding unlabeled samples"]}],
   "expected_abstention": false,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Correct policy and unrelated visitor policy coexist."
 }

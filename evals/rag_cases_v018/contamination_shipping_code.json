@@ -1,6 +1,6 @@
 {
   "id": "contamination_shipping_code",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "cross_document_contamination",
   "difficulty": "medium",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -13,10 +13,10 @@
   "gold_chunk_text": "The receiving code is LANTERN-18",
   "question": "What receiving code should be used for shipment HB-204?",
   "answer_style": "extract_only",
-  "expected_facts": [{"label": "receiving code", "any": ["LANTERN-18"]}],
-  "forbidden_claims": [{"label": "wrong receiving code", "any": ["MAPLE-4"]}, {"label": "wrong dock", "any": ["Dock 2"]}],
+  "expected_facts": [{"label": "receiving code", "type": "code", "any": ["LANTERN-18"]}],
+  "forbidden_claims": [{"label": "wrong receiving code", "type": "code", "any": ["MAPLE-4"]}, {"label": "wrong dock", "type": "exact_identifier", "any": ["Dock 2"]}],
   "expected_abstention": false,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Measures whether a same-domain decoy contaminates the supplied evidence."
 }

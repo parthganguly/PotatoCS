@@ -1,6 +1,6 @@
 {
   "id": "chronology_kolkata_duration",
-  "suite_version": "v0.1.8",
+  "suite_version": "v0.1.12",
   "category": "chronology_comprehension",
   "difficulty": "medium",
   "benchmark_modes": ["retrieval_only", "oracle_generation", "end_to_end"],
@@ -14,13 +14,39 @@
   "question": "In the family story, who lived in Kolkata for six months, and why?",
   "answer_style": "precise",
   "expected_facts": [
-    {"label": "person", "any": ["Arun"]},
-    {"label": "duration", "any": ["six months"]},
-    {"label": "reason", "any": ["studying music"]}
+    {
+      "label": "Arun duration",
+      "type": "relation",
+      "subject_aliases": ["Arun", "her brother Arun"],
+      "predicate_aliases": ["lived", "stayed", "stay", "lasted"],
+      "object_aliases": ["Kolkata"],
+      "value_aliases": ["six months"],
+      "scope": "same_clause"
+    },
+    {"label": "reason", "type": "positive_fact", "any": ["studying music"]}
   ],
-  "forbidden_claims": [{"label": "wrong duration", "any": ["two hours in Kolkata", "Leela lived in Kolkata"]}],
+  "forbidden_claims": [
+    {
+      "label": "wrong Arun duration",
+      "type": "relation",
+      "subject_aliases": ["Arun", "her brother Arun"],
+      "predicate_aliases": ["lived", "stayed", "stay", "lasted"],
+      "object_aliases": ["Kolkata"],
+      "value_aliases": ["two hours"],
+      "scope": "same_clause"
+    },
+    {
+      "label": "wrong person in Kolkata",
+      "type": "relation",
+      "subject_aliases": ["Leela"],
+      "predicate_aliases": ["lived", "stayed", "stay", "lasted"],
+      "object_aliases": ["Kolkata"],
+      "value_aliases": ["six months"],
+      "scope": "same_clause"
+    }
+  ],
   "expected_abstention": false,
-  "source_policy": "all_retrieved",
+  "source_policy": "required_present",
   "retrieval_scope": "all",
   "notes": "Prevents moving Leela's two-hour station wait onto Arun's Kolkata stay."
 }
