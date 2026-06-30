@@ -10,6 +10,7 @@ import {
   FileText,
   FolderOpen,
   History,
+  Image as ImageIcon,
   MessageSquarePlus,
   Pause,
   Play,
@@ -44,15 +45,23 @@ import {
   CampaignReportData,
   CampaignReportResult,
   ChatResult,
+  ArtifactAnalysisRun,
+  ArtifactDerivation,
+  ArtifactRecord,
   DiagnosticsStatus,
+  DocumentEvidenceDiagnostic,
   DocumentImportResult,
   DocumentRecord,
   EmbeddingStatus,
   EvalRun,
   EvalCaseResult,
   EvalSuite,
+  ImageEvalRun,
+  ImageEvalSuite,
   LegacyImportReport,
   Message,
+  ModelCapability,
+  MultimodalMode,
   OCRDependencyName,
   OCRResult,
   OCRStatus,
@@ -65,14 +74,52 @@ import {
   RagPreset,
   Session,
   Settings,
+  SourceImportResult,
+  SourceSummary,
   ThinkingMode,
+  VisionBackend,
   getAppStatus,
   rpc
 } from "./tauri";
+import {
+  analyzeArtifact,
+  deleteArtifact,
+  getArtifact,
+  importArtifactPath,
+  importArtifactPaths,
+  indexArtifactDerivation,
+  listArtifactDerivations,
+  listArtifacts,
+  unindexArtifact
+} from "./api/artifacts";
+import { captureFullScreen, captureRegion, importClipboardImage } from "./api/capture";
+import { listImageEvalHistory, listImageEvalSuite, runImageEval } from "./api/imageEvals";
+import {
+  buildConversationModelOptions,
+  installedModelTag,
+  isInstalledModelTag,
+  listModelCapabilities,
+  readableModelLabel,
+  refreshModelCapabilities,
+  visionCapableModels
+} from "./api/models";
+import { conversationSources, deleteSource, importSources, listSources, promoteSource, removeConversationSource } from "./api/sources";
+import { ComposerAttachments, MessageAttachments, documentAttachmentStatusLabel } from "./features/attachments/ComposerAttachments";
+import { ChatProgressBar } from "./features/chat/ChatProgressBar";
+import { ChatHeader } from "./features/chat/ChatHeader";
+import { OperationProgressDiagnostics } from "./features/chat/OperationProgressDiagnostics";
+import type { OperationProgressEvent } from "./features/chat/chatProgress";
+import { useChatProgress } from "./features/chat/useChatProgress";
+import { ImageBenchmarkPanel } from "./features/image-evals/ImageBenchmarkPanel";
+import { ArtifactAnalysisCard } from "./features/multimodal-chat/ImageAttachments";
+import { AppSidebar } from "./features/shell/AppSidebar";
+import { SourcesPage } from "./features/sources/SourcesPage";
+import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisionDiagnostics";
 
 type LoadState = "idle" | "loading" | "error";
-type ActiveView = "chat" | "documents" | "diagnostics";
+type ActiveView = "chat" | "sources" | "diagnostics";
 const SUPPORTED_DOCUMENT_EXTENSIONS = [".txt", ".md", ".pdf"];
+const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
 const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
   { value: "precise", label: "Precise" },
   { value: "layman", label: "Layman" },
@@ -105,16 +152,31 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [ollama, setOllama] = useState<OllamaStatus | null>(null);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
+  const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
+  const [sources, setSources] = useState<SourceSummary[]>([]);
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [selectedArtifactId, setSelectedArtifactId] = useState("");
+  const [selectedArtifact, setSelectedArtifact] = useState<ArtifactRecord | null>(null);
+  const [artifactDerivations, setArtifactDerivations] = useState<ArtifactDerivation[]>([]);
+  const [modelCapabilities, setModelCapabilities] = useState<ModelCapability[]>([]);
   const [ragHealth, setRagHealth] = useState<RAGHealth | null>(null);
   const [ocrStatus, setOcrStatus] = useState<OCRStatus | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>("chat");
   const [draft, setDraft] = useState("");
+  const [pendingSources, setPendingSources] = useState<SourceSummary[]>([]);
+  const [conversationContext, setConversationContext] = useState<SourceSummary[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [chatMultimodalMode, setChatMultimodalMode] = useState<MultimodalMode>("automatic");
+  const [chatVisionModel, setChatVisionModel] = useState("");
+  const [lastChatAnalysis, setLastChatAnalysis] = useState<ArtifactAnalysisRun | null>(null);
   const [modelDraft, setModelDraft] = useState("");
+  const [visionBackendDraft, setVisionBackendDraft] = useState<VisionBackend>("automatic");
   const [importPath, setImportPath] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<RAGSearchResult[]>([]);
   const [retrievedChunks, setRetrievedChunks] = useState<RAGSearchResult[]>([]);
   const [retrievedSnippets, setRetrievedSnippets] = useState<RAGSnippet[]>([]);
+  const [documentEvidence, setDocumentEvidence] = useState<DocumentEvidenceDiagnostic[]>([]);
   const [grounding, setGrounding] = useState<RAGGroundingReport | null>(null);
   const [useRag, setUseRag] = useState(false);
   const [verifyRag, setVerifyRag] = useState(false);
@@ -128,6 +190,12 @@ function App() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsStatus | null>(null);
   const [evalSuite, setEvalSuite] = useState<EvalSuite | null>(null);
   const [evalHistory, setEvalHistory] = useState<EvalRun[]>([]);
+  const [imageEvalSuite, setImageEvalSuite] = useState<ImageEvalSuite | null>(null);
+  const [imageEvalHistory, setImageEvalHistory] = useState<ImageEvalRun[]>([]);
+  const [imageEvalResult, setImageEvalResult] = useState<ImageEvalRun | null>(null);
+  const [imageEvalMode, setImageEvalMode] = useState<MultimodalMode>("ocr_only");
+  const [imageEvalModel, setImageEvalModel] = useState("");
+  const [imageCopyStatus, setImageCopyStatus] = useState("");
   const [benchmarkComparison, setBenchmarkComparison] = useState<BenchmarkComparison | null>(null);
   const [benchmarkResult, setBenchmarkResult] = useState<EvalRun | null>(null);
   const [benchmarkModel, setBenchmarkModel] = useState("");
@@ -154,18 +222,30 @@ function App() {
   const reportViewRef = useRef<HTMLDivElement | null>(null);
   const autoReportAttempts = useRef<Set<string>>(new Set());
   const [copyStatus, setCopyStatus] = useState("");
+  const [imageAnalysisMode, setImageAnalysisMode] = useState<MultimodalMode>("ocr_only");
+  const [imageAnalysisQuestion, setImageAnalysisQuestion] = useState("");
+  const [imageVisionModel, setImageVisionModel] = useState("");
+  const [lastArtifactAnalysis, setLastArtifactAnalysis] = useState<ArtifactAnalysisRun | null>(null);
+  const [captureRegionDraft, setCaptureRegionDraft] = useState({ x: 0, y: 0, width: 800, height: 600 });
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingUserContent, setPendingUserContent] = useState("");
+  const chatProgress = useChatProgress(busy);
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
     [sessions, selectedSessionId]
   );
-  const modelChoices = useMemo(
-    () => dedupeStrings([modelDraft, ...(ollama?.models ?? [])]),
-    [modelDraft, ollama]
+  const conversationModelOptions = useMemo(
+    () => buildConversationModelOptions(ollama, modelCapabilities),
+    [modelCapabilities, ollama]
   );
+  const modelChoices = useMemo(
+    () => conversationModelOptions.map((option) => option.tag),
+    [conversationModelOptions]
+  );
+  const confirmedVisionModels = useMemo(() => visionCapableModels(modelCapabilities), [modelCapabilities]);
 
   useEffect(() => {
     void bootstrap();
@@ -178,10 +258,9 @@ function App() {
     void getCurrentWindow()
       .onDragDropEvent((event) => {
         if (event.payload.type !== "drop") return;
-        const [path] = event.payload.paths;
-        if (!path || disposed) return;
-        setActiveView("documents");
-        void importDocumentPath(path);
+        const paths = event.payload.paths;
+        if (!paths.length || disposed) return;
+        void routeDroppedPaths(paths);
       })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -196,17 +275,20 @@ function App() {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [activeView]);
 
   useEffect(() => {
     setRetrievedChunks([]);
     setRetrievedSnippets([]);
+    setDocumentEvidence([]);
     setGrounding(null);
     if (!selectedSessionId) {
       setMessages([]);
+      setConversationContext([]);
       return;
     }
     void loadMessages(selectedSessionId);
+    void loadConversationContext(selectedSessionId);
   }, [selectedSessionId]);
 
   useEffect(() => {
@@ -223,6 +305,30 @@ function App() {
       void refreshDiagnostics();
     }
   }, [activeView, diagnostics]);
+
+  useEffect(() => {
+    if (activeView === "sources" && sources.length === 0) {
+      void refreshSources();
+    }
+  }, [activeView]);
+
+  useEffect(() => {
+    if (!selectedArtifactId) {
+      setSelectedArtifact(null);
+      setArtifactDerivations([]);
+      setLastArtifactAnalysis(null);
+      return;
+    }
+    void refreshSelectedArtifact(selectedArtifactId);
+  }, [selectedArtifactId]);
+
+  useEffect(() => {
+    const defaultVision = confirmedVisionModels[0]?.model ?? "";
+    if (!defaultVision) return;
+    setChatVisionModel((current) => current || defaultVision);
+    setImageVisionModel((current) => current || defaultVision);
+    setImageEvalModel((current) => current || defaultVision);
+  }, [confirmedVisionModels]);
 
   useEffect(() => {
     if (!activeCampaign || !["queued", "running", "paused"].includes(activeCampaign.status)) {
@@ -245,24 +351,55 @@ function App() {
     setLoadState("loading");
     setError(null);
     try {
-      const [status, nextSettings, nextSessions, nextOllama, nextDocuments, nextHealth, nextOcr] =
+      const [
+        status,
+        nextSettings,
+        nextSessions,
+        nextOllama,
+        nextDocuments,
+        nextArtifacts,
+        nextSources,
+        nextHealth,
+        nextOcr,
+        nextCapabilities,
+        nextImageSuite,
+        nextImageHistory
+      ] =
         await Promise.all([
           getAppStatus(),
           rpc<Settings>("settings.get"),
           rpc<Session[]>("sessions.list"),
           rpc<OllamaStatus>("models.detect_ollama"),
           rpc<DocumentRecord[]>("documents.list"),
+          listArtifacts(),
+          listSources({ filter: sourceFilter }),
           rpc<RAGHealth>("rag.health"),
-          rpc<OCRStatus>("ocr.status")
+          rpc<OCRStatus>("ocr.status"),
+          listModelCapabilities(false),
+          listImageEvalSuite(),
+          listImageEvalHistory(20)
         ]);
       setAppStatus(status);
       setSettings(nextSettings);
-      setModelDraft(String(nextSettings.default_model ?? "llama3.2"));
+      const bootModelChoices = buildConversationModelOptions(nextOllama, nextCapabilities).map((option) => option.tag);
+      const bootDefaultModel = String(nextSettings.default_model ?? "llama3.2");
+      setModelDraft(selectInstalledModelOrFallback(bootDefaultModel, bootModelChoices));
+      setVisionBackendDraft(normalizeVisionBackend(nextSettings.vision_backend));
       setSessions(nextSessions);
       setOllama(nextOllama);
       setDocuments(nextDocuments);
+      setArtifacts(nextArtifacts);
+      setSources(nextSources);
+      setSelectedArtifactId((current) => current || nextArtifacts[0]?.id || "");
       setRagHealth(nextHealth);
       setOcrStatus(nextOcr);
+      setModelCapabilities(nextCapabilities);
+      setImageEvalSuite(nextImageSuite);
+      setImageEvalHistory(nextImageHistory);
+      const defaultVision = visionCapableModels(nextCapabilities)[0]?.model ?? "";
+      setChatVisionModel((current) => current || defaultVision);
+      setImageVisionModel((current) => current || defaultVision);
+      setImageEvalModel((current) => current || defaultVision);
       setSelectedSessionId((current) => current ?? nextSessions[0]?.id ?? null);
       setLoadState("idle");
     } catch (err) {
@@ -278,14 +415,60 @@ function App() {
     ]);
     setDocuments(nextDocuments);
     setRagHealth(nextHealth);
+    setSources(await listSources({ filter: sourceFilter }));
+  }
+
+  async function refreshArtifacts() {
+    const [nextArtifacts, nextSources] = await Promise.all([
+      listArtifacts(),
+      listSources({ filter: sourceFilter })
+    ]);
+    setArtifacts(nextArtifacts);
+    setSources(nextSources);
+    setSelectedArtifactId((current) =>
+      current && nextArtifacts.some((artifact) => artifact.id === current) ? current : nextArtifacts[0]?.id ?? ""
+    );
+    return nextArtifacts;
+  }
+
+  async function refreshSources(filter = sourceFilter) {
+    const [nextSources, nextDocuments, nextArtifacts, nextHealth] = await Promise.all([
+      listSources({ filter }),
+      rpc<DocumentRecord[]>("documents.list"),
+      listArtifacts(),
+      rpc<RAGHealth>("rag.health")
+    ]);
+    setSources(nextSources);
+    setDocuments(nextDocuments);
+    setArtifacts(nextArtifacts);
+    setRagHealth(nextHealth);
+  }
+
+  async function refreshSelectedArtifact(artifactId: string) {
+    setError(null);
+    try {
+      const [artifact, derivations] = await Promise.all([
+        getArtifact(artifactId),
+        listArtifactDerivations(artifactId)
+      ]);
+      setSelectedArtifact(artifact);
+      setArtifactDerivations(derivations);
+    } catch (err) {
+      setSelectedArtifact(null);
+      setArtifactDerivations([]);
+      setError(readError(err));
+    }
   }
 
   async function refreshOllama() {
     setError(null);
     try {
       const nextOllama = await rpc<OllamaStatus>("models.detect_ollama");
+      const nextCapabilities = await listModelCapabilities(false);
+      const refreshedChoices = buildConversationModelOptions(nextOllama, nextCapabilities).map((option) => option.tag);
       setOllama(nextOllama);
-      setModelDraft((current) => current || nextOllama.models[0] || "");
+      setModelCapabilities(nextCapabilities);
+      setModelDraft((current) => selectInstalledModelOrFallback(current, refreshedChoices));
     } catch (err) {
       setError(readError(err));
     }
@@ -304,17 +487,31 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const [nextDiagnostics, nextSuite, nextHistory, nextComparison, nextCampaignModels, nextCampaigns] = await Promise.all([
+      const [
+        nextDiagnostics,
+        nextSuite,
+        nextHistory,
+        nextComparison,
+        nextCampaignModels,
+        nextCampaigns,
+        nextImageSuite,
+        nextImageHistory
+      ] = await Promise.all([
         rpc<DiagnosticsStatus>("diagnostics.get"),
         rpc<EvalSuite>("evals.list"),
         rpc<EvalRun[]>("evals.history", { limit: 20 }),
         rpc<BenchmarkComparison>("evals.comparison", { limit: 100 }),
         rpc<CampaignModelInfo[]>("campaigns.models"),
-        rpc<BenchmarkCampaign[]>("campaigns.list", { limit: 20 })
+        rpc<BenchmarkCampaign[]>("campaigns.list", { limit: 20 }),
+        listImageEvalSuite(),
+        listImageEvalHistory(20)
       ]);
       setDiagnostics(nextDiagnostics);
       setEvalSuite(nextSuite);
       setEvalHistory(nextHistory);
+      setImageEvalSuite(nextImageSuite);
+      setImageEvalHistory(nextImageHistory);
+      setModelCapabilities(nextDiagnostics.image_vision?.model_capabilities ?? []);
       setBenchmarkComparison(nextComparison);
       setCampaignModels(nextCampaignModels);
       setCampaigns(nextCampaigns);
@@ -325,6 +522,15 @@ function App() {
       setOllama(nextDiagnostics.ollama);
       setOcrStatus(nextDiagnostics.ocr);
       setRagHealth(nextDiagnostics.rag);
+      const diagnosticModelChoices = buildConversationModelOptions(
+        nextDiagnostics.ollama,
+        nextDiagnostics.image_vision?.model_capabilities ?? []
+      ).map((option) => option.tag);
+      setModelDraft((current) => selectInstalledModelOrFallback(current, diagnosticModelChoices));
+      const defaultVision = visionCapableModels(nextDiagnostics.image_vision?.model_capabilities ?? [])[0]?.model ?? "";
+      setChatVisionModel((current) => current || defaultVision);
+      setImageVisionModel((current) => current || defaultVision);
+      setImageEvalModel((current) => current || defaultVision);
       setBenchmarkModel((current) =>
         nextDiagnostics.ollama.models.includes(current)
           ? current
@@ -694,14 +900,27 @@ function App() {
   }
 
   async function saveSettings() {
+    const requestedModel = modelDraft.trim() || "llama3.2";
+    if (ollama?.reachable && modelChoices.length === 0) {
+      setError("No installed chat-capable Ollama model is available for conversations.");
+      return;
+    }
+    if (modelChoices.length > 0 && !isInstalledModelTag(requestedModel, modelChoices)) {
+      setError(`Choose an installed conversation model before saving settings. ${readableModelLabel(requestedModel, { installed: false })} is historical only.`);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const next = await rpc<Settings>("settings.set", {
-        values: { default_model: modelDraft.trim() || "llama3.2" }
+        values: {
+          default_model: modelChoices.length > 0 ? installedModelTag(requestedModel, modelChoices) : requestedModel,
+          vision_backend: visionBackendDraft
+        }
       });
       setSettings(next);
-      setModelDraft(String(next.default_model ?? "llama3.2"));
+      setModelDraft(selectInstalledModelOrFallback(String(next.default_model ?? "llama3.2"), modelChoices));
+      setVisionBackendDraft(normalizeVisionBackend(next.vision_backend));
     } catch (err) {
       setError(readError(err));
     } finally {
@@ -710,16 +929,49 @@ function App() {
   }
 
   async function createSession() {
+    if (ollama?.reachable && modelChoices.length === 0) {
+      setError("No installed chat-capable Ollama model is available for conversations.");
+      return;
+    }
+    const requestedModel = modelDraft.trim() || String(settings.default_model || "llama3.2");
+    const sessionModel = modelChoices.length > 0
+      ? selectInstalledModelOrFallback(requestedModel, modelChoices)
+      : requestedModel;
     setBusy(true);
     setError(null);
     try {
       const session = await rpc<Session>("sessions.create", {
-        model: modelDraft.trim() || settings.default_model || "llama3.2"
+        model: sessionModel
       });
       const nextSessions = await rpc<Session[]>("sessions.list");
       setSessions(nextSessions);
       setSelectedSessionId(session.id);
       setActiveView("chat");
+      setPendingSources([]);
+      setConversationContext([]);
+      setSelectedRagDocumentId("");
+      setUseRag(false);
+      setRetrievedChunks([]);
+      setRetrievedSnippets([]);
+      setGrounding(null);
+      setLastChatAnalysis(null);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changeActiveSessionModel(model: string) {
+    if (!selectedSessionId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await rpc<Session>("sessions.update", {
+        session_id: selectedSessionId,
+        updates: { model }
+      });
+      setSessions((current) => current.map((session) => (session.id === updated.id ? updated : session)));
     } catch (err) {
       setError(readError(err));
     } finally {
@@ -750,6 +1002,167 @@ function App() {
       setMessages(await rpc<Message[]>("sessions.messages", { session_id: sessionId }));
     } catch (err) {
       setError(readError(err));
+    }
+  }
+
+  async function loadConversationContext(sessionId: string) {
+    try {
+      setConversationContext(await conversationSources(sessionId));
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function chooseAttachmentFiles() {
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: true,
+        filters: [
+          {
+            name: "Sources",
+            extensions: ["pdf", "txt", "md", "png", "jpg", "jpeg", "webp"]
+          }
+        ]
+      });
+      const paths = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      await importSourcePaths(paths, "session", "chat");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function chooseLibrarySources() {
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: true,
+        filters: [
+          {
+            name: "Sources",
+            extensions: ["pdf", "txt", "md", "png", "jpg", "jpeg", "webp"]
+          }
+        ]
+      });
+      const paths = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      await importSourcePaths(paths, "library", "library");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function importSourcePaths(
+    paths: string[],
+    scope: "library" | "session",
+    target: "library" | "chat",
+    sourceKind = "file"
+  ) {
+    const validPaths = dedupeStrings(paths).filter(isSupportedSourcePath);
+    const unsupported = dedupeStrings(paths).filter((path) => !isSupportedSourcePath(path));
+    if (validPaths.length === 0) {
+      if (unsupported.length > 0) setError(unsupported.map((path) => `${fileName(path)}: unsupported file type`).join("; "));
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await importSources({
+        paths: validPaths,
+        scope,
+        index: true,
+        sourceKind
+      });
+      const imported = sourceSummariesFromImportResult(result);
+      if (target === "chat") {
+        appendPendingSources(imported);
+        setActiveView("chat");
+      } else {
+        setActiveView("sources");
+      }
+      await refreshSources();
+      const failures = failedSourceImports(result).map((item) => `${item.name}: ${item.error}`);
+      const unsupportedErrors = unsupported.map((path) => `${fileName(path)}: unsupported file type`);
+      if (failures.length > 0 || unsupportedErrors.length > 0) {
+        setError([...failures, ...unsupportedErrors].join("; "));
+      }
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function appendPendingSources(nextSources: SourceSummary[]) {
+    setPendingSources((current) => {
+      const combined = [...current];
+      for (const source of nextSources) {
+        if (combined.some((item) => sameSource(item, source))) continue;
+        combined.push(source);
+      }
+      return combined.slice(0, 8);
+    });
+  }
+
+  function removePendingSource(source: SourceSummary) {
+    setPendingSources((current) => current.filter((item) => !sameSource(item, source)));
+  }
+
+  async function removeSourceFromConversation(source: SourceSummary) {
+    if (!selectedSessionId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const nextContext = await removeConversationSource({
+        sessionId: selectedSessionId,
+        backendKind: source.backend_kind,
+        sourceId: source.id
+      });
+      setConversationContext(nextContext);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function addExistingSourceToChat(source: SourceSummary) {
+    appendPendingSources([source]);
+    setActiveView("chat");
+  }
+
+  async function promotePendingSource(source: SourceSummary, index: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      await promoteSource({
+        backendKind: source.backend_kind,
+        sourceId: source.id,
+        index
+      });
+      setPendingSources((current) =>
+        current.map((item) => (sameSource(item, source) ? { ...item, scope: "library" } : item))
+      );
+      await refreshSources();
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteUnifiedSource(source: SourceSummary) {
+    const confirmed = window.confirm(`Delete ${source.display_name}?`);
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteSource(source.backend_kind, source.id);
+      setPendingSources((current) => current.filter((item) => !sameSource(item, source)));
+      await refreshSources();
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -802,6 +1215,137 @@ function App() {
     } catch (err) {
       setError(readError(err));
     }
+  }
+
+  async function routeDroppedPaths(paths: string[]) {
+    const uniquePaths = dedupeStrings(paths).slice(0, 12);
+    const target = activeView === "chat" ? "chat" : "library";
+    await importSourcePaths(uniquePaths, target === "chat" ? "session" : "library", target);
+  }
+
+  async function chooseChatImages() {
+    await chooseImages("chat");
+  }
+
+  async function chooseLibraryImages() {
+    await chooseImages("library");
+  }
+
+  async function chooseImages(target: "chat" | "library") {
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: true,
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "webp"]
+          }
+        ]
+      });
+      const paths = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      await importImagePaths(paths, target);
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function importImagePaths(paths: string[], target: "chat" | "library") {
+    const validPaths = paths.filter(isSupportedImagePath);
+    if (validPaths.length === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await importArtifactPaths(validPaths, "file");
+      await refreshArtifacts();
+      if (target === "chat") {
+        appendPendingArtifacts(result.imported);
+        setActiveView("chat");
+      } else {
+        setSelectedArtifactId(result.imported[0]?.id ?? selectedArtifactId);
+        setActiveView("sources");
+      }
+      if (result.failed.length > 0) {
+        setError(result.failed.map((item) => `${fileName(item.path)}: ${item.error}`).join("; "));
+      }
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importCaptureToArtifacts(path: string, sourceKind: ArtifactRecord["source_kind"], target: "chat" | "library") {
+    setBusy(true);
+    setError(null);
+    try {
+      const artifact = await importArtifactPath(path, sourceKind);
+      await refreshArtifacts();
+      if (target === "chat") {
+        appendPendingArtifacts([artifact]);
+        setActiveView("chat");
+      } else {
+        setSelectedArtifactId(artifact.id);
+        setActiveView("sources");
+      }
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pasteImageToChat() {
+    try {
+      const capture = await importClipboardImage();
+      await importSourcePaths([capture.path], "session", "chat", capture.source_kind);
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function captureScreenToChat() {
+    try {
+      const capture = await captureFullScreen();
+      await importSourcePaths([capture.path], "session", "chat", capture.source_kind);
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function pasteImageToLibrary() {
+    try {
+      const capture = await importClipboardImage();
+      await importCaptureToArtifacts(capture.path, capture.source_kind, "library");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function captureFullScreenToLibrary() {
+    try {
+      const capture = await captureFullScreen();
+      await importCaptureToArtifacts(capture.path, capture.source_kind, "library");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function captureRegionToLibrary() {
+    try {
+      const capture = await captureRegion(captureRegionDraft);
+      await importCaptureToArtifacts(capture.path, capture.source_kind, "library");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  function appendPendingArtifacts(nextArtifacts: ArtifactRecord[]) {
+    appendPendingSources(nextArtifacts.map(artifactToSource));
+  }
+
+  function removePendingArtifact(artifactId: string) {
+    setPendingSources((current) => current.filter((source) => !(source.backend_kind === "artifact" && source.id === artifactId)));
   }
 
   async function runOcr(documentId: string) {
@@ -910,22 +1454,187 @@ function App() {
     }
   }
 
+  async function analyzeSelectedArtifact() {
+    if (!selectedArtifactId) return;
+    const activeVisionBackend = normalizeVisionBackend(visionBackendDraft || settings.vision_backend);
+    if (
+      activeVisionBackend === "ollama" &&
+      (imageAnalysisMode === "vision_only" || imageAnalysisMode === "combined") &&
+      !imageVisionModel.trim()
+    ) {
+      setError("Choose a confirmed local vision model, or switch to OCR only.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const analysis = await analyzeArtifact({
+        artifactId: selectedArtifactId,
+        mode: imageAnalysisMode,
+        visionBackend: activeVisionBackend,
+        question: imageAnalysisQuestion,
+        visionModel: activeVisionBackend === "florence2" || activeVisionBackend === "ocr_only" ? "" : imageVisionModel,
+        requestId: makeRequestId("artifact-analysis")
+      });
+      setLastArtifactAnalysis(analysis);
+      await refreshSelectedArtifact(selectedArtifactId);
+      await refreshArtifacts();
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteSelectedArtifact(artifactId: string) {
+    const confirmed = window.confirm("Delete this image and its derived files from the local profile?");
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteArtifact(artifactId);
+      setPendingSources((current) => current.filter((source) => !(source.backend_kind === "artifact" && source.id === artifactId)));
+      await refreshArtifacts();
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function indexArtifactText(artifactId: string, derivationId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await indexArtifactDerivation(artifactId, derivationId);
+      await Promise.all([refreshDocuments(), refreshSelectedArtifact(artifactId)]);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unindexArtifactText(artifactId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await unindexArtifact(artifactId);
+      await Promise.all([refreshDocuments(), refreshSelectedArtifact(artifactId)]);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyText(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyStatus("Copied text.");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
+  async function refreshCapabilities() {
+    setBusy(true);
+    setError(null);
+    try {
+      const capabilities = await refreshModelCapabilities();
+      setModelCapabilities(capabilities);
+      setDiagnostics((current) =>
+        current
+          ? {
+              ...current,
+              image_vision: current.image_vision
+                ? { ...current.image_vision, model_capabilities: capabilities }
+                : current.image_vision
+            }
+          : current
+      );
+      const defaultVision = visionCapableModels(capabilities)[0]?.model ?? "";
+      setChatVisionModel((current) => current || defaultVision);
+      setImageVisionModel((current) => current || defaultVision);
+      setImageEvalModel((current) => current || defaultVision);
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runImageBenchmark() {
+    if (imageEvalMode !== "ocr_only" && !imageEvalModel.trim()) {
+      setError("Choose a confirmed local vision model for this image benchmark mode.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setImageCopyStatus("");
+    try {
+      const run = await runImageEval(imageEvalMode, imageEvalMode === "ocr_only" ? "" : imageEvalModel.trim());
+      setImageEvalResult(run);
+      setImageEvalHistory(await listImageEvalHistory(20));
+    } catch (err) {
+      setError(readError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyImageBenchmarkSummary() {
+    const summary = imageBenchmarkSummaryMarkdown(imageEvalResult ? [imageEvalResult] : imageEvalHistory);
+    if (!summary.trim()) return;
+    try {
+      await navigator.clipboard.writeText(summary);
+      setImageCopyStatus("Copied image benchmark summary.");
+    } catch (err) {
+      setError(readError(err));
+    }
+  }
+
   async function sendMessage(event: FormEvent) {
     event.preventDefault();
     const message = draft.trim();
-    if (!message) return;
+    const attachedSources = pendingSources;
+    const attachedArtifacts = attachedSources.filter((source) => source.backend_kind === "artifact");
+    const attachedDocuments = attachedSources.filter((source) => source.backend_kind === "document");
+    if (!message && attachedSources.length === 0) return;
+    if (ollama?.reachable && modelChoices.length === 0) {
+      setError("No installed chat-capable Ollama model is available for conversations.");
+      return;
+    }
+    const requestedModel = String(selectedSession?.model || modelDraft.trim() || settings.default_model || "llama3.2");
+    if (modelChoices.length > 0 && !isInstalledModelTag(requestedModel, modelChoices)) {
+      setError(`Choose an installed conversation model before sending. ${readableModelLabel(requestedModel, { installed: false })} is historical only.`);
+      return;
+    }
+    const activeConversationModel = modelChoices.length > 0 ? installedModelTag(requestedModel, modelChoices) : requestedModel;
+    if (
+      normalizeVisionBackend(visionBackendDraft || settings.vision_backend) === "ollama" &&
+      attachedArtifacts.length > 0 &&
+      (chatMultimodalMode === "vision_only" || chatMultimodalMode === "combined") &&
+      !chatVisionModel.trim()
+    ) {
+      setError("Choose a confirmed local vision model, or switch image mode to OCR only.");
+      return;
+    }
     setBusy(true);
     setError(null);
     setDraft("");
+    setPendingUserContent(message || "Attachment");
+    setLastChatAnalysis(null);
     setRetrievedChunks([]);
     setRetrievedSnippets([]);
+    setDocumentEvidence([]);
     setGrounding(null);
     try {
       const params: Record<string, unknown> = {
         message,
         session_id: selectedSessionId,
-        model: modelDraft.trim() || settings.default_model || "llama3.2",
-        use_rag: useRag,
+        model: activeConversationModel,
+        use_rag: useRag || attachedDocuments.length > 0,
         verify_rag: useRag && ragPreset !== "potato" && verifyRag,
         answer_style: answerStyle,
         rag_preset: ragPreset
@@ -933,12 +1642,30 @@ function App() {
       if (useRag && selectedRagDocumentId) {
         params.document_ids = [selectedRagDocumentId];
       }
+      if (attachedDocuments.length > 0) {
+        params.attachment_document_ids = attachedDocuments.map((source) => source.id);
+      }
+      if (attachedArtifacts.length > 0) {
+        const activeVisionBackend = normalizeVisionBackend(visionBackendDraft || settings.vision_backend);
+        params.artifact_ids = attachedArtifacts.map((source) => source.id);
+        params.multimodal_mode = chatMultimodalMode;
+        params.vision_backend = activeVisionBackend;
+        params.vision_model = chatMultimodalMode === "ocr_only" || activeVisionBackend === "florence2" || activeVisionBackend === "ocr_only" ? "" : chatVisionModel.trim();
+        params.analysis_request_id = makeRequestId("chat-image");
+      }
       const result = await rpc<ChatResult>("chat.send", params);
       setSelectedSessionId(result.session.id);
       setMessages(result.messages);
       setRetrievedChunks(result.retrieved_chunks ?? []);
       setRetrievedSnippets(result.retrieved_snippets ?? []);
+      setDocumentEvidence(result.document_evidence ?? []);
       setGrounding(result.grounding ?? null);
+      setLastChatAnalysis(result.artifact_analysis ?? null);
+      await loadConversationContext(result.session.id);
+      if (attachedSources.length > 0) {
+        setPendingSources([]);
+        await refreshSources();
+      }
       setSessions(await rpc<Session[]>("sessions.list"));
     } catch (err) {
       setDraft(message);
@@ -947,6 +1674,7 @@ function App() {
         await loadMessages(selectedSessionId);
       }
     } finally {
+      setPendingUserContent("");
       setBusy(false);
     }
   }
@@ -955,145 +1683,30 @@ function App() {
 
   return (
     <main className="flex h-screen min-h-[620px] bg-paper text-ink">
-      <aside className="flex w-[310px] shrink-0 flex-col border-r border-ink/15 bg-[#eeeee6]">
-        <div className="border-b border-ink/15 px-4 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-md bg-moss text-white">
-              <Bot size={19} aria-hidden="true" />
-            </div>
-            <div className="min-w-0">
-              <h1 className="truncate text-base font-semibold">Odysseus Desktop</h1>
-              <p className="truncate text-xs text-ink/60">Local AI workspace for small models</p>
-            </div>
-          </div>
-        </div>
-
-        <nav className="grid grid-cols-3 gap-2 border-b border-ink/15 px-4 py-3">
-          <button
-            className={`rounded-md px-3 py-2 text-sm font-medium ${
-              activeView === "chat" ? "bg-moss text-white" : "bg-white hover:bg-[#faf9f3]"
-            }`}
-            onClick={() => setActiveView("chat")}
-            type="button"
-          >
-            Chat
-          </button>
-          <button
-            className={`rounded-md px-3 py-2 text-sm font-medium ${
-              activeView === "documents" ? "bg-moss text-white" : "bg-white hover:bg-[#faf9f3]"
-            }`}
-            onClick={() => setActiveView("documents")}
-            type="button"
-          >
-            Documents
-          </button>
-          <button
-            className={`rounded-md px-2 py-2 text-sm font-medium ${
-              activeView === "diagnostics" ? "bg-moss text-white" : "bg-white hover:bg-[#faf9f3]"
-            }`}
-            onClick={() => setActiveView("diagnostics")}
-            type="button"
-          >
-            Diagnostics
-          </button>
-        </nav>
-
-        <section className="border-b border-ink/15 px-4 py-3">
-          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase text-ink/55">
-            <Database size={14} aria-hidden="true" />
-            Profile
-          </div>
-          <p className="truncate text-sm font-medium">{appStatus?.profile_id ?? "default"}</p>
-          <p className="mt-1 truncate text-xs text-ink/55" title={appStatus?.profile_dir ?? ""}>
-            {appStatus?.profile_dir ?? "Starting..."}
-          </p>
-        </section>
-
-        <section className="border-b border-ink/15 px-4 py-3">
-          <div className="mb-2 flex items-center justify-between">
-            <div className="flex items-center gap-2 text-xs font-semibold uppercase text-ink/55">
-              <Power size={14} aria-hidden="true" />
-              Ollama
-            </div>
-            <IconButton onClick={refreshOllama} title="Refresh runtime">
-              <RefreshCw size={15} aria-hidden="true" />
-            </IconButton>
-          </div>
-          <RuntimeStatus status={ollama} />
-        </section>
-
-        <section className="border-b border-ink/15 px-4 py-3">
-          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase text-ink/55">
-            <SettingsIcon size={14} aria-hidden="true" />
-            Settings
-          </div>
-          <div className="flex gap-2">
-            {ollama?.models.length ? (
-              <select
-                className="min-w-0 flex-1 rounded-md border border-ink/20 bg-white px-3 py-2 text-sm outline-none focus:border-tide"
-                onChange={(event) => setModelDraft(event.target.value)}
-                title="Model for new chats"
-                value={modelDraft}
-              >
-                {modelChoices.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                className="min-w-0 flex-1 rounded-md border border-ink/20 bg-white px-3 py-2 text-sm outline-none focus:border-tide"
-                value={modelDraft}
-                onChange={(event) => setModelDraft(event.target.value)}
-                placeholder="llama3.2"
-                title="Model for new chats"
-              />
-            )}
-            <IconButton className="bg-tide text-white hover:bg-[#2e5c66]" disabled={busy} onClick={saveSettings} title="Save settings">
-              <Save size={17} aria-hidden="true" />
-            </IconButton>
-          </div>
-          <p className="mt-2 text-xs text-ink/55">Used when you start a new chat.</p>
-        </section>
-
-        <section className="flex min-h-0 flex-1 flex-col">
-          <div className="flex items-center justify-between px-4 py-3">
-            <h2 className="text-xs font-semibold uppercase text-ink/55">Sessions</h2>
-            <IconButton disabled={busy} onClick={createSession} title="New session">
-              <MessageSquarePlus size={15} aria-hidden="true" />
-            </IconButton>
-          </div>
-          <div className="scrollbar-thin min-h-0 flex-1 overflow-auto px-2 pb-3">
-            {sessions.length === 0 ? (
-              <p className="px-2 py-3 text-sm text-ink/55">No sessions yet.</p>
-            ) : (
-              sessions.map((session) => (
-                <button
-                  key={session.id}
-                  className={`mb-1 flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm ${
-                    selectedSessionId === session.id ? "bg-moss text-white" : "hover:bg-white"
-                  }`}
-                  onClick={() => {
-                    setSelectedSessionId(session.id);
-                    setActiveView("chat");
-                  }}
-                  type="button"
-                >
-                  <span className="min-w-0 flex-1 truncate">{session.title}</span>
-                  <span
-                    className={`truncate text-xs ${
-                      selectedSessionId === session.id ? "text-white/70" : "text-ink/45"
-                    }`}
-                  >
-                    {session.model || settings.default_model || ""}
-                  </span>
-                </button>
-              ))
-            )}
-          </div>
-        </section>
-      </aside>
+      <AppSidebar
+        activeView={activeView}
+        appStatus={appStatus}
+        busy={busy}
+        modelChoices={modelChoices}
+        modelDraft={modelDraft}
+        ollama={ollama}
+        selectedSessionId={selectedSessionId}
+        sessions={sessions}
+        settings={settings}
+        settingsOpen={settingsOpen}
+        visionBackendDraft={visionBackendDraft}
+        onCreateSession={createSession}
+        onRefreshOllama={refreshOllama}
+        onSaveSettings={saveSettings}
+        onSelectSession={(sessionId) => {
+          setSelectedSessionId(sessionId);
+          setActiveView("chat");
+        }}
+        onSetActiveView={setActiveView}
+        onSetModelDraft={setModelDraft}
+        onSetVisionBackendDraft={setVisionBackendDraft}
+        onToggleSettings={() => setSettingsOpen((open) => !open)}
+      />
 
       <section className="flex min-w-0 flex-1 flex-col">
         {activeView === "chat" ? (
@@ -1107,7 +1720,21 @@ function App() {
             messages={messages}
             retrievedChunks={retrievedChunks}
             retrievedSnippets={retrievedSnippets}
+            documentEvidence={documentEvidence}
             grounding={grounding}
+            pendingSources={pendingSources}
+            pendingUserContent={pendingUserContent}
+            progressEvent={chatProgress.current}
+            progressFallbackLabel={chatProgress.fallbackLabel}
+            progressNow={chatProgress.now}
+            conversationContext={conversationContext}
+            sources={sources}
+            modelChoices={modelChoices}
+            multimodalMode={chatMultimodalMode}
+            visionBackend={normalizeVisionBackend(visionBackendDraft || settings.vision_backend)}
+            visionModel={chatVisionModel}
+            visionModels={confirmedVisionModels}
+            artifactAnalysis={lastChatAnalysis}
             selectedRagDocumentId={selectedRagDocumentId}
             selectedSession={selectedSession}
             settings={settings}
@@ -1118,7 +1745,17 @@ function App() {
             onDeleteSession={deleteSession}
             onRetry={bootstrap}
             onSend={sendMessage}
+            onAddExistingSource={addExistingSourceToChat}
+            onAttachFiles={chooseAttachmentFiles}
+            onCaptureScreen={captureScreenToChat}
+            onPasteImage={pasteImageToChat}
+            onPromoteSource={promotePendingSource}
+            onRemoveConversationSource={removeSourceFromConversation}
+            onRemovePendingSource={removePendingSource}
+            onSetMultimodalMode={setChatMultimodalMode}
             onSetDraft={setDraft}
+            onSetSessionModel={changeActiveSessionModel}
+            onSetVisionModel={setChatVisionModel}
             onSetAnswerStyle={setAnswerStyle}
             onSetSelectedRagDocumentId={setSelectedRagDocumentId}
             onSetRagPreset={(value) => {
@@ -1132,32 +1769,20 @@ function App() {
             onSetUseRag={setUseRag}
             onSetVerifyRag={setVerifyRag}
           />
-        ) : activeView === "documents" ? (
-          <DocumentsWorkspace
+        ) : activeView === "sources" ? (
+          <SourcesPage
             busy={busy}
-            documents={documents}
             error={error}
-            importPath={importPath}
-            legacyPath={legacyPath}
-            legacyReport={legacyReport}
-            lastIndexResult={lastIndexResult}
-            lastOcrResult={lastOcrResult}
-            ocrStatus={ocrStatus}
-            ragHealth={ragHealth}
-            searchQuery={searchQuery}
-            searchResults={searchResults}
-            onDelete={deleteDocument}
-            onImport={importDocument}
-            onChooseDocument={chooseDocument}
-            onChooseLegacyFolder={chooseLegacyFolder}
-            onImportLegacy={importLegacyFolder}
-            onRunOcr={runOcr}
-            onReindex={reindexDocument}
-            onRefreshOcrStatus={refreshOcrStatus}
-            onSearch={testRetrieval}
-            onSetImportPath={setImportPath}
-            onSetLegacyPath={setLegacyPath}
-            onSetSearchQuery={setSearchQuery}
+            filter={sourceFilter}
+            sources={sources}
+            onAddSources={chooseLibrarySources}
+            onDelete={deleteUnifiedSource}
+            onFilter={(filter) => {
+              setSourceFilter(filter);
+              void refreshSources(filter);
+            }}
+            onPromote={promotePendingSource}
+            onRefresh={() => refreshSources()}
           />
         ) : (
           <DiagnosticsWorkspace
@@ -1182,9 +1807,18 @@ function App() {
             copyStatus={copyStatus}
             comparison={benchmarkComparison}
             diagnostics={diagnostics}
+            progressEvents={chatProgress.history}
             error={error}
             evalHistory={evalHistory}
             evalSuite={evalSuite}
+            imageCopyStatus={imageCopyStatus}
+            imageEvalHistory={imageEvalHistory}
+            imageEvalMode={imageEvalMode}
+            imageEvalModel={imageEvalModel}
+            imageEvalResult={imageEvalResult}
+            imageEvalSuite={imageEvalSuite}
+            selectedVisionModel={imageVisionModel || chatVisionModel}
+            visionModels={confirmedVisionModels}
             activeCampaign={activeCampaign}
             benchmarkMode={benchmarkMode}
             benchmarkRepeats={benchmarkRepeats}
@@ -1211,6 +1845,11 @@ function App() {
             onSetBenchmarkRepeats={setBenchmarkRepeats}
             onSetBenchmarkThinking={setBenchmarkThinking}
             onSetBenchmarkVerify={setBenchmarkVerify}
+            onCopyImageSummary={copyImageBenchmarkSummary}
+            onRefreshModelCapabilities={refreshCapabilities}
+            onRunImageBenchmark={runImageBenchmark}
+            onSetImageEvalMode={setImageEvalMode}
+            onSetImageEvalModel={setImageEvalModel}
             onSetCampaignAutoReport={setCampaignAutoReport}
             onSetCampaignModes={setCampaignModes}
             onSetCampaignOutputFolder={setCampaignOutputFolder}
@@ -1265,7 +1904,21 @@ function ChatWorkspace(props: {
   messages: Message[];
   retrievedChunks: RAGSearchResult[];
   retrievedSnippets: RAGSnippet[];
+  documentEvidence: DocumentEvidenceDiagnostic[];
   grounding: RAGGroundingReport | null;
+  pendingSources: SourceSummary[];
+  pendingUserContent: string;
+  progressEvent: OperationProgressEvent | null;
+  progressFallbackLabel: string | null;
+  progressNow: number;
+  conversationContext: SourceSummary[];
+  sources: SourceSummary[];
+  modelChoices: string[];
+  multimodalMode: MultimodalMode;
+  visionBackend: VisionBackend;
+  visionModel: string;
+  visionModels: ModelCapability[];
+  artifactAnalysis: ArtifactAnalysisRun | null;
   selectedRagDocumentId: string;
   selectedSession: Session | null;
   settings: Settings;
@@ -1273,109 +1926,60 @@ function ChatWorkspace(props: {
   ragPreset: RagPreset;
   useRag: boolean;
   verifyRag: boolean;
+  onAddExistingSource: (source: SourceSummary) => void;
+  onAttachFiles: () => void;
+  onCaptureScreen: () => void;
   onDeleteSession: (sessionId: string) => void;
+  onPasteImage: () => void;
+  onPromoteSource: (source: SourceSummary, index: boolean) => void;
+  onRemoveConversationSource: (source: SourceSummary) => void;
+  onRemovePendingSource: (source: SourceSummary) => void;
   onRetry: () => void;
   onSend: (event: FormEvent) => void;
   onSetAnswerStyle: (value: AnswerStyle) => void;
   onSetDraft: (value: string) => void;
+  onSetMultimodalMode: (value: MultimodalMode) => void;
   onSetRagPreset: (value: RagPreset) => void;
   onSetSelectedRagDocumentId: (value: string) => void;
+  onSetSessionModel: (value: string) => void;
   onSetUseRag: (value: boolean) => void;
   onSetVerifyRag: (value: boolean) => void;
+  onSetVisionModel: (value: string) => void;
 }) {
-  const indexedDocuments = props.documents.filter(isRagReadyDocument);
   const latestAssistantMessageId = [...props.messages]
     .reverse()
     .find((message) => message.role === "assistant")?.id;
+  const latestMessageId = props.messages[props.messages.length - 1]?.id;
+  const showVision = props.pendingSources.some((source) => source.backend_kind === "artifact") ||
+    props.conversationContext.some((source) => source.backend_kind === "artifact") ||
+    Boolean(props.artifactAnalysis);
 
   return (
     <>
-      <header className="flex h-16 shrink-0 items-center justify-between border-b border-ink/15 px-5">
-        <div className="min-w-0">
-          <h2 className="truncate text-lg font-semibold">
-            {props.selectedSession?.title ?? "New chat"}
-          </h2>
-          <p className="truncate text-xs text-ink/55">
-            {props.selectedSession?.model || props.settings.default_model || "No model selected"}
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          {props.useRag && (
-            <select
-              className="h-10 max-w-[240px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
-              disabled={props.busy || indexedDocuments.length === 0}
-              onChange={(event) => props.onSetSelectedRagDocumentId(event.target.value)}
-              title="Limit retrieval to one document"
-              value={props.selectedRagDocumentId}
-            >
-              <option value="">All indexed documents</option>
-              {indexedDocuments.map((document) => (
-                <option key={document.id} value={document.id}>
-                  {document.title || document.file_name}
-                </option>
-              ))}
-            </select>
-          )}
-          {props.useRag && (
-            <select
-              className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
-              disabled={props.busy}
-              onChange={(event) => props.onSetRagPreset(event.target.value as RagPreset)}
-              title="RAG preset"
-              value={props.ragPreset}
-            >
-              <option value="standard">Standard</option>
-              <option value="potato">Potato Mode</option>
-            </select>
-          )}
-          {props.useRag && (
-            <select
-              className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
-              disabled={props.busy || props.ragPreset === "potato"}
-              onChange={(event) => props.onSetAnswerStyle(event.target.value as AnswerStyle)}
-              title="Answer style"
-              value={props.ragPreset === "potato" ? "evidence_only" : props.answerStyle}
-            >
-              {ANSWER_STYLE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          )}
-          <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
-            <input
-              checked={props.useRag}
-              className="h-4 w-4 accent-moss"
-              onChange={(event) => props.onSetUseRag(event.target.checked)}
-              type="checkbox"
-            />
-            RAG
-          </label>
-          {props.useRag && (
-            <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
-              <input
-                checked={props.ragPreset !== "potato" && props.verifyRag}
-                className="h-4 w-4 accent-tide"
-                disabled={props.ragPreset === "potato"}
-                onChange={(event) => props.onSetVerifyRag(event.target.checked)}
-                type="checkbox"
-              />
-              Verify
-            </label>
-          )}
-          {props.selectedSession && (
-            <IconButton
-              className="text-clay"
-              disabled={props.busy}
-              onClick={() => props.onDeleteSession(props.selectedSession!.id)}
-              title="Delete session"
-            >
-              <Trash2 size={16} aria-hidden="true" />
-            </IconButton>
-          )}
-        </div>
-      </header>
+      <ChatHeader
+        answerStyle={props.answerStyle}
+        busy={props.busy}
+        documents={props.documents}
+        modelChoices={props.modelChoices}
+        multimodalMode={props.multimodalMode}
+        visionBackend={props.visionBackend}
+        ragPreset={props.ragPreset}
+        selectedRagDocumentId={props.selectedRagDocumentId}
+        selectedSession={props.selectedSession}
+        settings={props.settings}
+        showVision={showVision}
+        useRag={props.useRag}
+        verifyRag={props.verifyRag}
+        visionModel={props.visionModel}
+        visionModels={props.visionModels}
+        onDeleteSession={props.onDeleteSession}
+        onSetAnswerStyle={props.onSetAnswerStyle}
+        onSetRagPreset={props.onSetRagPreset}
+        onSetSelectedRagDocumentId={props.onSetSelectedRagDocumentId}
+        onSetSessionModel={props.onSetSessionModel}
+        onSetUseRag={props.onSetUseRag}
+        onSetVerifyRag={props.onSetVerifyRag}
+      />
 
       <ErrorBanner error={props.error} />
 
@@ -1392,7 +1996,7 @@ function ChatWorkspace(props: {
       ) : (
         <>
           <div className="scrollbar-thin flex-1 overflow-auto px-5 py-5">
-            {props.messages.length === 0 ? (
+            {props.messages.length === 0 && !props.pendingUserContent && !props.busy ? (
               <div className="flex h-full items-center justify-center text-center">
                 <div>
                   <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-md bg-gold/20 text-gold">
@@ -1417,11 +2021,50 @@ function ChatWorkspace(props: {
                         detailed
                       />
                     )}
+                    {message.id === latestAssistantMessageId && props.documentEvidence.length > 0 && (
+                      <DocumentEvidenceCard evidence={props.documentEvidence} />
+                    )}
+                    {message.id === latestMessageId && props.artifactAnalysis && (
+                      <ArtifactAnalysisCard analysis={props.artifactAnalysis} />
+                    )}
                   </div>
                 ))}
+                {props.pendingUserContent && (
+                  <div className="flex justify-end">
+                    <div className="max-w-[82%] whitespace-pre-wrap rounded-md bg-moss px-3 py-2 text-sm leading-6 text-white">
+                      {props.pendingUserContent}
+                    </div>
+                  </div>
+                )}
+                {props.busy && (
+                  <ChatProgressBar
+                    event={props.progressEvent}
+                    fallbackLabel={props.progressFallbackLabel}
+                    now={props.progressNow}
+                  />
+                )}
               </div>
             )}
           </div>
+
+          <ComposerAttachments
+            attachments={props.pendingSources}
+            conversationContext={props.conversationContext}
+            busy={props.busy}
+            librarySources={props.sources}
+            mode={props.multimodalMode}
+            visionModel={props.visionModel}
+            visionModels={props.visionModels}
+            onAddSource={props.onAddExistingSource}
+            onAttachFiles={props.onAttachFiles}
+            onCaptureScreen={props.onCaptureScreen}
+            onPasteImage={props.onPasteImage}
+            onPromote={props.onPromoteSource}
+            onRemoveConversationSource={props.onRemoveConversationSource}
+            onRemove={props.onRemovePendingSource}
+            onSetMode={props.onSetMultimodalMode}
+            onSetVisionModel={props.onSetVisionModel}
+          />
 
           <form
             className="flex shrink-0 gap-3 border-t border-ink/15 bg-[#eeeee6] px-5 py-4"
@@ -1431,7 +2074,15 @@ function ChatWorkspace(props: {
               className="max-h-32 min-h-12 flex-1 resize-none rounded-md border border-ink/20 bg-white px-3 py-3 text-sm outline-none focus:border-tide"
               value={props.draft}
               onChange={(event) => props.onSetDraft(event.target.value)}
-              placeholder={props.useRag ? "Ask with document retrieval" : "Message"}
+              placeholder={
+                props.pendingSources.length > 0
+                  ? "Ask about the attachments"
+                  : props.conversationContext.length > 0
+                    ? "Ask about what's in conversation"
+                    : props.useRag
+                      ? "Ask with Sources"
+                      : "Message"
+              }
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -1441,7 +2092,7 @@ function ChatWorkspace(props: {
             />
             <button
               className="flex h-12 w-12 shrink-0 items-center justify-center rounded-md bg-moss text-white hover:bg-[#35543d]"
-              disabled={props.busy || !props.draft.trim()}
+              disabled={props.busy || (!props.draft.trim() && props.pendingSources.length === 0 && props.conversationContext.length === 0)}
               title="Send"
               type="submit"
             >
@@ -1695,9 +2346,18 @@ function DiagnosticsWorkspace(props: {
   comparison: BenchmarkComparison | null;
   copyStatus: string;
   diagnostics: DiagnosticsStatus | null;
+  progressEvents: OperationProgressEvent[];
   error: string | null;
   evalHistory: EvalRun[];
   evalSuite: EvalSuite | null;
+  imageCopyStatus: string;
+  imageEvalHistory: ImageEvalRun[];
+  imageEvalMode: MultimodalMode;
+  imageEvalModel: string;
+  imageEvalResult: ImageEvalRun | null;
+  imageEvalSuite: ImageEvalSuite | null;
+  selectedVisionModel: string;
+  visionModels: ModelCapability[];
   onCancelCampaign: (campaign: BenchmarkCampaign) => void;
   onClearHistory: () => void;
   onClearCampaignModels: () => void;
@@ -1720,6 +2380,11 @@ function DiagnosticsWorkspace(props: {
   onSetBenchmarkRepeats: (value: 1 | 3) => void;
   onSetBenchmarkThinking: (value: Exclude<ThinkingMode, "legacy/unrecorded">) => void;
   onSetBenchmarkVerify: (value: boolean) => void;
+  onCopyImageSummary: () => void;
+  onRefreshModelCapabilities: () => void;
+  onRunImageBenchmark: () => void;
+  onSetImageEvalMode: (value: MultimodalMode) => void;
+  onSetImageEvalModel: (value: string) => void;
   onSetCampaignAutoReport: (value: boolean) => void;
   onSetCampaignModes: (value: BenchmarkMode[]) => void;
   onSetCampaignOutputFolder: (value: string) => void;
@@ -1779,6 +2444,8 @@ function DiagnosticsWorkspace(props: {
                 <PathRow label="Backend log" value={props.diagnostics?.backend_log_path ?? ""} />
               </div>
             </div>
+
+            <OperationProgressDiagnostics events={props.progressEvents} />
 
             <div className="rounded-md border border-ink/15 bg-white p-4">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
@@ -1853,6 +2520,13 @@ function DiagnosticsWorkspace(props: {
               onRefresh={props.onRefresh}
               status={props.diagnostics?.ocr ?? null}
             />
+
+            <ImageVisionDiagnostics
+              busy={props.busy}
+              data={props.diagnostics?.image_vision}
+              selectedVisionModel={props.selectedVisionModel}
+              onRefreshModels={props.onRefreshModelCapabilities}
+            />
           </section>
 
           <section className="min-w-0 space-y-4">
@@ -1897,13 +2571,28 @@ function DiagnosticsWorkspace(props: {
               onToggleVerifier={props.onToggleCampaignVerifier}
             />
 
+            <ImageBenchmarkPanel
+              busy={props.busy}
+              copyStatus={props.imageCopyStatus}
+              history={props.imageEvalHistory}
+              mode={props.imageEvalMode}
+              model={props.imageEvalModel}
+              result={props.imageEvalResult}
+              suite={props.imageEvalSuite}
+              visionModels={props.visionModels}
+              onCopySummary={props.onCopyImageSummary}
+              onRun={props.onRunImageBenchmark}
+              onSetMode={props.onSetImageEvalMode}
+              onSetModel={props.onSetImageEvalModel}
+            />
+
             <div className="rounded-md border border-ink/15 bg-white p-4">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
                 <BarChart3 size={17} aria-hidden="true" />
                 Model Benchmark
               </div>
               <p className="mb-2 text-xs text-ink/55">
-                Benchmarks use bundled local eval fixtures, not your imported Documents library.
+                Benchmarks use bundled local eval fixtures, not your imported Sources library.
               </p>
               <div className="grid grid-cols-[minmax(160px,1fr)_150px_130px_90px] items-center gap-3">
                 <select
@@ -1994,7 +2683,7 @@ function DiagnosticsWorkspace(props: {
                 <Metric label="Latest run" value={latestBenchmarkRun ? formatBenchmarkRunLabel(latestBenchmarkRun) : "none"} />
               </div>
               <p className="mt-2 text-xs text-ink/55">
-                Eval documents are temporary/internal to the benchmark and will not appear in Documents.
+                Eval documents are temporary/internal to the benchmark and will not appear in Sources.
               </p>
               <p className="mt-1 text-xs text-ink/55">
                 Retrieval-only measures ranking without a chat model. Oracle generation bypasses retrieval. Verifier applies only to end-to-end runs.
@@ -3274,6 +3963,96 @@ function RuntimeStatus({ status }: { status: OllamaStatus | null }) {
   );
 }
 
+function DocumentEvidenceCard({ evidence }: { evidence: DocumentEvidenceDiagnostic[] }) {
+  if (evidence.length === 0) return null;
+  return (
+    <div className="max-w-[82%] rounded-md border border-tide/25 bg-[#eef8f8] px-3 py-2 text-xs text-tide">
+      <div className="flex items-center gap-2 font-medium">
+        <FileText size={14} aria-hidden="true" />
+        <span>Document evidence</span>
+      </div>
+      <div className="mt-2 space-y-2">
+        {evidence.map((item) => (
+          <details
+            className="rounded-md border border-tide/15 bg-white px-2 py-1.5 text-ink/75"
+            key={item.document_id}
+            open={evidence.length === 1}
+          >
+            <summary className="cursor-pointer text-xs font-medium text-tide">
+              {item.display_name || item.document_id}
+            </summary>
+            <div className="mt-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
+              <Metric label="File type" value={item.file_type || "unknown"} />
+              <Metric label="Pages" value={item.page_count ?? 0} />
+              <Metric label="Embedded chars" value={item.extracted_text_char_count ?? 0} />
+              <Metric label="OCR status" value={documentEvidenceStatusLabel(item)} />
+              <Metric label="OCR pages with text" value={item.ocr_pages_with_text ?? 0} />
+              <Metric label="OCR chars" value={item.ocr_text_char_count ?? 0} />
+              <Metric label="OCR quality" value={item.ocr_quality || "unknown"} />
+              <Metric label="OCR attempts" value={item.ocr_attempt_count ?? 0} />
+              <Metric label="Crop evidence" value={item.ocr_crop_count ?? 0} />
+              <Metric label="VLM-assisted text" value={item.vlm_text_available ? `yes${item.vlm_text_backends?.length ? ` (${item.vlm_text_backends.join(", ")})` : ""}` : "no"} />
+              <Metric label="Chunks" value={item.chunk_count ?? 0} />
+              <Metric label="Session evidence" value={item.session_attachment_evidence_used ? "yes" : "no"} />
+              <Metric label="Indexed Source evidence" value={item.indexed_source_evidence_used ? "yes" : "no"} />
+              <Metric label="Sent to model" value={item.model_received_document_evidence ? "yes" : "no"} />
+              <Metric label="Retrieved pages" value={formatNumberList(item.retrieved_pages)} />
+            </div>
+            {(item.ocr_query_terms?.length || item.ocr_exact_matches?.length || item.ocr_fuzzy_matches?.length || item.ocr_context_notes?.length) ? (
+              <div className="mt-2 space-y-1 rounded-md bg-[#f7fbfb] px-2 py-2 text-[11px] text-ink/65">
+                {item.ocr_query_terms?.length ? (
+                  <p><span className="font-medium text-tide">OCR query terms:</span> {item.ocr_query_terms.join(", ")}</p>
+                ) : null}
+                {item.ocr_exact_matches?.length ? (
+                  <p><span className="font-medium text-tide">Exact OCR matches:</span> {item.ocr_exact_matches.join(", ")}</p>
+                ) : null}
+                {item.ocr_fuzzy_matches?.length ? (
+                  <p><span className="font-medium text-tide">Fuzzy OCR matches:</span> {formatFuzzyMatches(item.ocr_fuzzy_matches)}</p>
+                ) : null}
+                {item.ocr_context_notes?.length ? (
+                  <p><span className="font-medium text-tide">OCR context:</span> {item.ocr_context_notes.join(" ")}</p>
+                ) : null}
+              </div>
+            ) : null}
+            {item.ocr_line_windows?.length ? (
+              <div className="mt-2 space-y-1 rounded-md bg-[#f7fbfb] px-2 py-2 text-[11px] text-ink/65">
+                <p className="font-medium text-tide">Retrieved OCR line windows</p>
+                {item.ocr_line_windows.slice(0, 3).map((window, index) => (
+                  <p className="whitespace-pre-wrap" key={`${window.page}-${window.line_start}-${index}`}>
+                    p{window.page ?? "?"} lines {window.line_start ?? "?"}-{window.line_end ?? "?"}: {trimDisplayText(window.text || "", 220)}
+                  </p>
+                ))}
+              </div>
+            ) : null}
+            {(item.ocr_selected_attempts?.length || item.ocr_crop_evidence?.length) ? (
+              <div className="mt-2 space-y-1 rounded-md bg-[#f7fbfb] px-2 py-2 text-[11px] text-ink/65">
+                {item.ocr_selected_attempts?.length ? (
+                  <p>
+                    <span className="font-medium text-tide">Selected OCR attempt:</span>{" "}
+                    {formatSelectedOcrAttempt(item.ocr_selected_attempts[0])}
+                  </p>
+                ) : null}
+                {item.ocr_crop_evidence?.length ? (
+                  <p>
+                    <span className="font-medium text-tide">Crop regions:</span>{" "}
+                    {formatCropEvidence(item.ocr_crop_evidence)}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            {item.evidence_action && (
+              <p className="mt-2 text-[11px] text-ink/55">Action: {item.evidence_action}</p>
+            )}
+            {item.ocr_error && (
+              <p className="mt-2 text-[11px] text-clay">{item.ocr_error}</p>
+            )}
+          </details>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function RetrievedSources({
   chunks,
   detailed = false,
@@ -3370,14 +4149,14 @@ function GroundingBadge({ grounding }: { grounding: RAGGroundingReport | null })
 
 function StatusPill({ document }: { document: DocumentRecord }) {
   const lowText = document.is_low_text || document.index_status === "low_text";
-  const label = document.ocr_status === "indexed" ? "OCR indexed" : lowText ? "Needs OCR" : document.index_status;
-  const classes = lowText
-    ? "bg-[#fff8e8] text-[#7a561d] border-gold/30"
-    : document.index_status === "indexed"
+  const label = documentAttachmentStatusLabel(document);
+  const classes = document.ocr_status === "indexed" || document.index_status === "indexed"
       ? "bg-[#edf7ef] text-moss border-moss/20"
-      : document.index_status === "error"
+      : document.ocr_status === "unavailable" || document.index_status === "error"
         ? "bg-[#fff3ee] text-clay border-clay/25"
-        : "bg-[#eef8f8] text-tide border-tide/25";
+        : lowText || document.ocr_status === "no_text"
+          ? "bg-[#fff8e8] text-[#7a561d] border-gold/30"
+          : "bg-[#eef8f8] text-tide border-tide/25";
   return (
     <span className={`rounded-md border px-2 py-1 text-xs font-medium ${classes}`}>
       {label}
@@ -3398,7 +4177,8 @@ function MessageBubble({ message }: { message: Message }) {
           isUser ? "bg-moss text-white" : "border border-ink/15 bg-white text-ink"
         }`}
       >
-        {message.content}
+        {message.content || ((message.artifacts?.length || message.documents?.length) ? "Attachment" : "")}
+        <MessageAttachments message={message} />
       </div>
     </div>
   );
@@ -3496,6 +4276,24 @@ function benchmarkSummaryMarkdown(runs: EvalRun[]): string {
     const notes = failedCases.length > 0 ? `failed: ${failedCases.join(", ")}` : "ok";
     lines.push(
       `| ${run.model} | ${formatBenchmarkMode(run.benchmark_mode)} | ${formatThinkingMode(run.thinking_mode)} | ${formatRunEmbedding(run)} | ${run.temperature.toFixed(2)} | ${run.verify ? "on" : "off"} | ${run.status} | ${run.total_passed} | ${run.total_failed} | ${run.average_latency_ms} ms | ${notes} |`
+    );
+  }
+  return lines.join("\n");
+}
+
+function imageBenchmarkSummaryMarkdown(runs: ImageEvalRun[]): string {
+  if (runs.length === 0) return "";
+  const lines = [
+    "| Model | Mode | Status | Passed | Failed | Review | Timeout | Runtime errors | Runtime | Notes |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+  ];
+  for (const run of runs) {
+    const failedCases = run.cases
+      .filter((result) => !result.passed && !result.grader_review_required)
+      .map((result) => result.case_id);
+    const notes = failedCases.length > 0 ? `failed: ${failedCases.join(", ")}` : run.notes || "ok";
+    lines.push(
+      `| ${run.model || "OCR"} | ${run.mode} | ${run.status} | ${run.total_passed} | ${run.total_failed} | ${run.grader_review_count} | ${run.timeout_count} | ${run.runtime_error_count} | ${run.total_runtime_ms} ms | ${notes} |`
     );
   }
   return lines.join("\n");
@@ -3654,6 +4452,72 @@ function dedupeStrings(values: string[]): string[] {
   return result;
 }
 
+function selectInstalledModelOrFallback(model: string, installedTags: string[]): string {
+  const requested = String(model || "").trim();
+  if (installedTags.length === 0) return requested;
+  if (requested && isInstalledModelTag(requested, installedTags)) {
+    return installedModelTag(requested, installedTags);
+  }
+  return installedTags[0] ?? requested;
+}
+
+function isSupportedImagePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return SUPPORTED_IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function isSupportedSourcePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return [...SUPPORTED_DOCUMENT_EXTENSIONS, ...SUPPORTED_IMAGE_EXTENSIONS].some((extension) => lower.endsWith(extension));
+}
+
+function sourceSummariesFromImportResult(result: SourceImportResult): SourceSummary[] {
+  if ("source" in result) return [result.source];
+  return result.sources ?? result.imported.map((item) => item.source);
+}
+
+function failedSourceImports(result: SourceImportResult): Array<{ name: string; error: string }> {
+  if ("failed" in result) return result.failed;
+  return [];
+}
+
+function sameSource(a: SourceSummary, b: SourceSummary): boolean {
+  return a.backend_kind === b.backend_kind && a.id === b.id;
+}
+
+function artifactToSource(artifact: ArtifactRecord): SourceSummary {
+  const isScreenshot = artifact.source_kind.startsWith("screenshot");
+  return {
+    id: artifact.id,
+    backend_kind: "artifact",
+    source_type: isScreenshot ? "screenshot" : "image",
+    scope: artifact.scope ?? "library",
+    display_name: artifact.name || "Image",
+    mime_type: artifact.mime_type || "image/png",
+    size_bytes: artifact.size_bytes,
+    created_at: artifact.created_at,
+    updated_at: artifact.updated_at,
+    processing_status: artifact.status,
+    indexing_status: "not_indexed",
+    thumbnail_path: artifact.thumbnail_path,
+    width: artifact.width,
+    height: artifact.height,
+    error: artifact.error,
+    artifact
+  };
+}
+
+function fileName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function makeRequestId(prefix: string): string {
+  const random = typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}-${random}`;
+}
+
 function summarizeRetrievedSources(chunks: RAGSearchResult[]): string[] {
   const seen = new Set<string>();
   const sources: string[] = [];
@@ -3674,6 +4538,62 @@ function formatRetrievedSnippetLabel(snippet: RAGSnippet, index: number): string
   const page = snippet.page_start ? `, p. ${snippet.page_start}` : "";
   const snippetId = snippet.snippet_id || `S${index + 1}`;
   return `${snippetId}: ${name}${page}, chunk ${snippet.chunk_id.slice(0, 8)}`;
+}
+
+function documentEvidenceStatusLabel(item: DocumentEvidenceDiagnostic): string {
+  if (item.ocr_status === "indexed") return "OCR indexed";
+  if (item.ocr_status === "running" || item.ocr_status === "indexing" || item.ocr_status === "needed") return "OCR processing";
+  if (item.ocr_status === "no_text") return "no reliable text";
+  if (item.ocr_status === "unavailable") return "OCR failed";
+  return item.ocr_status || item.index_status || "unknown";
+}
+
+function formatNumberList(values?: number[]): string {
+  if (!values || values.length === 0) return "none";
+  return values.join(", ");
+}
+
+function formatFuzzyMatches(matches: Array<{ term?: string; matched_text?: string; distance?: number }>): string {
+  return matches
+    .map((match) => {
+      const matched = match.matched_text || "?";
+      const term = match.term || "?";
+      const distance = typeof match.distance === "number" ? `, d=${match.distance}` : "";
+      return `${matched} ~= ${term}${distance}`;
+    })
+    .join(", ");
+}
+
+function formatSelectedOcrAttempt(attempt?: Record<string, unknown>): string {
+  if (!attempt) return "unknown";
+  const sourceType = String(attempt.source_type || "ocr_text");
+  const preprocessing = String(attempt.preprocessing || "default");
+  const psm = attempt.psm ? `psm ${attempt.psm}` : "psm unknown";
+  const quality = typeof attempt.quality === "object" && attempt.quality
+    ? String((attempt.quality as Record<string, unknown>).label || "unknown")
+    : "unknown";
+  const crop = typeof attempt.crop === "object" && attempt.crop
+    ? String((attempt.crop as Record<string, unknown>).name || "")
+    : "";
+  return [sourceType, crop, preprocessing, psm, quality].filter(Boolean).join(" · ");
+}
+
+function formatCropEvidence(crops?: Array<Record<string, unknown>>): string {
+  if (!crops || crops.length === 0) return "none";
+  return crops.slice(0, 5).map((crop) => {
+    const name = String(crop.name || (crop.coordinates as Record<string, unknown> | undefined)?.name || "crop");
+    const quality = typeof crop.quality === "object" && crop.quality
+      ? String((crop.quality as Record<string, unknown>).label || "unknown")
+      : "unknown";
+    const chars = Number(crop.text_char_count || 0);
+    return `${name} (${quality}, ${chars} chars)`;
+  }).join(", ");
+}
+
+function trimDisplayText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
 }
 
 function chunkToSnippet(chunk: RAGSearchResult, index: number): RAGSnippet {
@@ -3737,6 +4657,13 @@ function readError(err: unknown): string {
     return err;
   }
   return "Something went wrong.";
+}
+
+function normalizeVisionBackend(value: unknown): VisionBackend {
+  if (value === "florence2" || value === "ollama" || value === "ocr_only" || value === "automatic") {
+    return value;
+  }
+  return "automatic";
 }
 
 function unsupportedDocumentReason(path: string): string | null {

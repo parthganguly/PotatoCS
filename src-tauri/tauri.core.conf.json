@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "resources": {
+      "../python": "python",
+      "../python-runtime-core": "python-runtime",
+      "../LICENSE": "LICENSE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    }
+  }
+}

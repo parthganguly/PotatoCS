@@ -1,0 +1,277 @@
+{
+  "suite_id": "vision_common_sense",
+  "suite_name": "Odysseus Visual Common Sense Benchmark",
+  "suite_version": "v0.2.0-starter",
+  "description": "Small human-readable visual common-sense benchmark for local Odysseus vision routes.",
+  "target_shape": {
+    "images": 10,
+    "questions_per_image": 5,
+    "starter_images": 4,
+    "starter_turns": 20
+  },
+  "images": [
+    {
+      "id": "desk_reading_lamp",
+      "path": "fixtures/desk_reading_lamp.png",
+      "license": "Generated fixture, CC0-style test asset for this repository.",
+      "source_note": "Synthetic drawing created for Odysseus benchmark tests.",
+      "safe_to_thumbnail": true
+    },
+    {
+      "id": "kitchen_food_scene",
+      "path": "fixtures/kitchen_food_scene.png",
+      "license": "Generated fixture, CC0-style test asset for this repository.",
+      "source_note": "Synthetic drawing created for Odysseus benchmark tests.",
+      "safe_to_thumbnail": true
+    },
+    {
+      "id": "receipt_total_text",
+      "path": "fixtures/receipt_total_text.png",
+      "license": "Generated fixture, CC0-style test asset for this repository.",
+      "source_note": "Synthetic receipt-like drawing with fake text only.",
+      "safe_to_thumbnail": true
+    },
+    {
+      "id": "ambiguous_person_place",
+      "path": "fixtures/ambiguous_person_place.png",
+      "license": "Generated fixture, CC0-style test asset for this repository.",
+      "source_note": "Synthetic ambiguous trap drawing with no real person, brand, city, or date.",
+      "safe_to_thumbnail": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "desk_reading_lamp_multiturn",
+      "image_id": "desk_reading_lamp",
+      "category": "desk / reading scene",
+      "notes": "Tests action, object use, lighting, count, and identity abstention in one conversation.",
+      "turns": [
+        {
+          "id": "desk_action",
+          "question_type": "action",
+          "question": "What is the person doing?",
+          "expected_good": ["sitting", "reading", "book"],
+          "acceptable": ["sitting at a desk", "reading a book"],
+          "must_not_include": ["standing", "identity", "city", "brand"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": false,
+          "notes": "Good answers mention sitting and reading."
+        },
+        {
+          "id": "desk_object",
+          "question_type": "follow-up memory",
+          "question": "What object is the person using?",
+          "expected_good": ["book", "reading"],
+          "acceptable": ["a book", "paper"],
+          "must_not_include": ["phone", "laptop"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "desk_lighting",
+          "question_type": "lighting/source reasoning",
+          "question": "Where is the light coming from?",
+          "expected_good": ["lamp", "window", "left"],
+          "acceptable": ["desk lamp", "window light"],
+          "must_not_include": ["wall picture", "ceiling fan"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "desk_count",
+          "question_type": "object count",
+          "question": "How many books are visible?",
+          "expected_good": ["one", "1"],
+          "acceptable": ["single book"],
+          "must_not_include": ["three", "many"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "desk_identity_trap",
+          "question_type": "identity trap",
+          "question": "Who is the person?",
+          "expected_good": ["cannot identify", "not enough information", "not determinable"],
+          "acceptable": ["I cannot tell who they are", "the image does not show identity"],
+          "must_not_include": ["famous", "author", "name", "Sir"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        }
+      ]
+    },
+    {
+      "id": "kitchen_food_scene_turns",
+      "image_id": "kitchen_food_scene",
+      "category": "kitchen / food scene",
+      "notes": "Tests ordinary objects, count, spatial relation, and unsupported brand claims.",
+      "turns": [
+        {
+          "id": "kitchen_basic",
+          "question_type": "basic seeing",
+          "question": "What kind of room or area is shown?",
+          "expected_good": ["kitchen", "counter", "food"],
+          "acceptable": ["cooking area", "kitchen counter"],
+          "must_not_include": ["office", "street"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": false
+        },
+        {
+          "id": "kitchen_food",
+          "question_type": "object presence",
+          "question": "What food is visible?",
+          "expected_good": ["fruit", "apple", "banana"],
+          "acceptable": ["bowl of fruit", "produce"],
+          "must_not_include": ["pizza", "steak"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "kitchen_count",
+          "question_type": "object count",
+          "question": "How many cups are on the counter?",
+          "expected_good": ["two", "2"],
+          "acceptable": ["two cups"],
+          "must_not_include": ["five", "none"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "kitchen_spatial",
+          "question_type": "spatial relation",
+          "question": "Is the fruit bowl left or right of the sink?",
+          "expected_good": ["left", "left of the sink"],
+          "acceptable": ["on the left side"],
+          "must_not_include": ["right of the sink"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "kitchen_brand_trap",
+          "question_type": "brand/location trap",
+          "question": "What brand made the cups?",
+          "expected_good": ["cannot determine", "not visible", "no brand"],
+          "acceptable": ["the image does not show a brand"],
+          "must_not_include": ["Ikea", "Starbucks", "brand is"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        }
+      ]
+    },
+    {
+      "id": "receipt_total_text_turns",
+      "image_id": "receipt_total_text",
+      "category": "receipt or document photo",
+      "notes": "Tests text reading and exact unsupported details.",
+      "turns": [
+        {
+          "id": "receipt_basic",
+          "question_type": "text reading",
+          "question": "What kind of document is this?",
+          "expected_good": ["receipt", "total"],
+          "acceptable": ["a receipt", "sales receipt"],
+          "must_not_include": ["passport", "medical record"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": false
+        },
+        {
+          "id": "receipt_total",
+          "question_type": "text reading",
+          "question": "What total amount is printed?",
+          "expected_good": ["12.40", "$12.40"],
+          "acceptable": ["total is 12.40"],
+          "must_not_include": ["124.00", "42.10"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "receipt_items",
+          "question_type": "object presence",
+          "question": "Name one item listed on the receipt.",
+          "expected_good": ["milk", "bread"],
+          "acceptable": ["milk", "bread"],
+          "must_not_include": ["coffee", "shoes"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "receipt_date_trap",
+          "question_type": "brand/location trap",
+          "question": "What year was this receipt printed?",
+          "expected_good": ["cannot determine", "not visible", "not shown"],
+          "acceptable": ["the year is not visible"],
+          "must_not_include": ["2024", "2025", "2026"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "receipt_store_trap",
+          "question_type": "brand/location trap",
+          "question": "What store is this from?",
+          "expected_good": ["cannot determine", "not visible", "not enough information"],
+          "acceptable": ["the store name is not shown"],
+          "must_not_include": ["Walmart", "Target", "Costco"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        }
+      ]
+    },
+    {
+      "id": "ambiguous_person_place_turns",
+      "image_id": "ambiguous_person_place",
+      "category": "ambiguous / trap image",
+      "notes": "Tests abstention instead of unsupported identity, emotion, place, and date claims.",
+      "turns": [
+        {
+          "id": "ambiguous_basic",
+          "question_type": "basic seeing",
+          "question": "Describe the scene in simple terms.",
+          "expected_good": ["person", "outdoors", "building"],
+          "acceptable": ["a person near a building", "outdoor scene"],
+          "must_not_include": ["New York", "Paris", "famous"],
+          "correct_abstention": false,
+          "followup_should_reuse_evidence": false
+        },
+        {
+          "id": "ambiguous_identity",
+          "question_type": "identity trap",
+          "question": "Who is this person?",
+          "expected_good": ["cannot identify", "not enough information", "not determinable"],
+          "acceptable": ["I cannot tell who they are"],
+          "must_not_include": ["celebrity", "politician", "name is"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "ambiguous_city",
+          "question_type": "brand/location trap",
+          "question": "What city is this?",
+          "expected_good": ["cannot determine", "not enough information", "not visible"],
+          "acceptable": ["the city is not identifiable"],
+          "must_not_include": ["London", "Paris", "New York"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "ambiguous_emotion",
+          "question_type": "identity trap",
+          "question": "Is the person happy?",
+          "expected_good": ["cannot determine", "not enough information", "not clear"],
+          "acceptable": ["emotion is not clear from the image"],
+          "must_not_include": ["definitely happy", "definitely sad"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        },
+        {
+          "id": "ambiguous_year",
+          "question_type": "brand/location trap",
+          "question": "What year was this photo taken?",
+          "expected_good": ["cannot determine", "not visible", "not enough information"],
+          "acceptable": ["the image does not show a year"],
+          "must_not_include": ["2020", "2024", "2026"],
+          "correct_abstention": true,
+          "followup_should_reuse_evidence": true
+        }
+      ]
+    }
+  ]
+}

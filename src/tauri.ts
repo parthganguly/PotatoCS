@@ -11,6 +11,7 @@ export type Settings = {
   ollama_endpoint?: string;
   embedding_backend?: string;
   embedding_model?: string;
+  vision_backend?: VisionBackend;
   [key: string]: unknown;
 };
 
@@ -29,6 +30,9 @@ export type Message = {
   role: "system" | "user" | "assistant";
   content: string;
   created_at: number;
+  documents?: DocumentRecord[];
+  artifacts?: ArtifactRecord[];
+  attachments?: MessageAttachment[];
 };
 
 export type OllamaStatus = {
@@ -39,8 +43,20 @@ export type OllamaStatus = {
   version: string;
   models: string[];
   model_details?: OllamaModelInfo[];
+  conversation_models?: ConversationModelCatalogItem[];
   error: string;
   updated_at: number;
+};
+
+export type ConversationModelCatalogItem = {
+  tag: string;
+  canonical_tag: string;
+  display_name: string;
+  role: "chat" | "vision" | "embedding" | "unknown";
+  installed: boolean;
+  stale: boolean;
+  exact_tags: string[];
+  tooltip: string;
 };
 
 export type OllamaModelInfo = {
@@ -75,13 +91,57 @@ export type OllamaPsStatus = {
 export type ChatResult = {
   session: Session;
   user_message: Message;
-  assistant_message: Message;
+  assistant_message: Message | null;
   messages: Message[];
   retrieved_chunks: RAGSearchResult[];
   retrieved_snippets: RAGSnippet[];
   grounding: RAGGroundingReport;
   answer_style: AnswerStyle;
   rag_preset: RagPreset;
+  document_evidence?: DocumentEvidenceDiagnostic[];
+  artifact_analysis?: ArtifactAnalysisRun;
+  attached_artifacts?: ArtifactRecord[];
+  attached_documents?: DocumentRecord[];
+};
+
+export type DocumentEvidenceDiagnostic = {
+  document_id: string;
+  display_name?: string;
+  file_type: string;
+  index_status: string;
+  ocr_status: string;
+  ocr_error: string;
+  is_low_text: boolean;
+  page_count: number;
+  pages_with_extracted_text: number;
+  low_text_page_count: number;
+  extracted_text_char_count: number;
+  ocr_page_count: number;
+  ocr_pages_with_text: number;
+  ocr_text_char_count: number;
+  chunk_count: number;
+  needs_ocr: boolean;
+  evidence_action?: string;
+  session_attachment_evidence_used?: boolean;
+  indexed_source_evidence_used?: boolean;
+  model_received_document_evidence?: boolean;
+  ocr_stats?: Record<string, unknown>;
+  before?: Record<string, unknown>;
+  retrieved_pages?: number[];
+  ocr_query_terms?: string[];
+  ocr_exact_matches?: string[];
+  ocr_fuzzy_matches?: OCRFuzzyMatch[];
+  ocr_context_notes?: string[];
+  ocr_line_windows?: OCRLineWindow[];
+  ocr_quality?: string;
+  ocr_quality_counts?: Record<string, number>;
+  ocr_attempt_count?: number;
+  ocr_crop_count?: number;
+  ocr_selected_attempts?: Array<Record<string, unknown>>;
+  ocr_crop_evidence?: Array<Record<string, unknown>>;
+  vlm_text_available?: boolean;
+  vlm_text_char_count?: number;
+  vlm_text_backends?: string[];
 };
 
 export type AnswerStyle = "precise" | "layman" | "detailed" | "extract_only" | "evidence_only";
@@ -109,6 +169,11 @@ export type DocumentRecord = {
   ocr_status: string;
   ocr_engine: string;
   ocr_error: string;
+  is_internal?: boolean;
+  scope?: SourceScope;
+  promoted_at?: number | null;
+  display_order?: number;
+  status_label?: string;
 };
 
 export type RAGChunk = {
@@ -160,6 +225,36 @@ export type RAGSnippet = {
   page_start: number | null;
   page_end: number | null;
   metadata: Record<string, unknown>;
+  ocr_query_terms?: string[];
+  ocr_exact_matches?: string[];
+  ocr_fuzzy_matches?: OCRFuzzyMatch[];
+  ocr_substring_matches?: string[];
+  ocr_context_notes?: string[];
+  ocr_line_windows?: OCRLineWindow[];
+  ocr_confidence?: number | null;
+  ocr_quality?: Record<string, unknown>;
+  ocr_quality_label?: string;
+  ocr_attempt_count?: number;
+  ocr_crop_count?: number;
+  crop_evidence?: Array<Record<string, unknown>>;
+  selected_ocr_attempt?: Record<string, unknown>;
+  vlm_text_evidence?: Record<string, unknown>;
+  vlm_text_available?: boolean;
+  vlm_text_char_count?: number;
+};
+
+export type OCRFuzzyMatch = {
+  kind?: string;
+  term?: string;
+  matched_text?: string;
+  distance?: number;
+};
+
+export type OCRLineWindow = {
+  page?: number;
+  line_start?: number;
+  line_end?: number;
+  text?: string;
 };
 
 export type RAGGroundingSource = {
@@ -231,6 +326,292 @@ export type OCRStatus = {
   renderer: string;
   message: string;
   dependencies: Record<OCRDependencyName, OCRDependencyStatus>;
+  subprocess_timeout_seconds?: number;
+};
+
+export type ArtifactSourceKind =
+  | "file"
+  | "clipboard"
+  | "screenshot_full"
+  | "screenshot_window"
+  | "screenshot_region"
+  | "derived_crop";
+
+export type ArtifactDerivationKind =
+  | "normalized_image"
+  | "thumbnail"
+  | "crop"
+  | "ocr_text"
+  | "vision_observations"
+  | "combined_evidence";
+
+export type MultimodalMode = "automatic" | "ocr_only" | "vision_only" | "combined";
+export type VisionBackend = "automatic" | "florence2" | "ollama" | "ocr_only";
+
+export type SourceScope = "library" | "session";
+export type SourceBackendKind = "document" | "artifact";
+export type SourceType = "pdf" | "text" | "markdown" | "image" | "screenshot";
+
+export type SourceSummary = {
+  id: string;
+  backend_kind: SourceBackendKind;
+  source_type: SourceType;
+  scope: SourceScope;
+  display_name: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: number;
+  updated_at: number;
+  processing_status: string;
+  indexing_status: string;
+  thumbnail_path?: string;
+  page_count?: number;
+  extracted_text_char_count?: number;
+  ocr_text_char_count?: number;
+  ocr_pages_with_text?: number;
+  chunk_count?: number;
+  diagnostics?: DocumentEvidenceDiagnostic;
+  width?: number;
+  height?: number;
+  warning?: string;
+  error?: string;
+  conversation_status?: "in_conversation";
+  conversation_added_message_id?: string;
+  conversation_created_at?: number;
+  document?: DocumentRecord;
+  artifact?: ArtifactRecord;
+};
+
+export type MessageAttachment = (DocumentRecord & { backend_kind: "document" }) | (ArtifactRecord & { backend_kind: "artifact" });
+
+export type SourceImportItem = {
+  source: SourceSummary;
+  document?: DocumentRecord;
+  artifact?: ArtifactRecord;
+  index?: RAGIndexResult | null | Record<string, unknown>;
+};
+
+export type SourceImportResult = SourceImportItem | {
+  imported: SourceImportItem[];
+  sources: SourceSummary[];
+  failed: Array<{ name: string; error: string }>;
+};
+
+export type ArtifactRecord = {
+  id: string;
+  kind: "image";
+  source_kind: ArtifactSourceKind;
+  name: string;
+  original_filename: string;
+  mime_type: string;
+  original_extension: string;
+  content_hash: string;
+  size_bytes: number;
+  width: number;
+  height: number;
+  normalized_orientation: boolean;
+  status: string;
+  error: string;
+  is_deleted: boolean;
+  created_at: number;
+  updated_at: number;
+  original_format?: string;
+  original_color_mode?: string;
+  original_pixel_count?: number;
+  original_has_alpha?: boolean;
+  original_exif_orientation?: string;
+  preprocessing_version?: string;
+  scope?: SourceScope;
+  promoted_at?: number | null;
+  source_path_redacted?: boolean;
+  thumbnail_path?: string;
+  display_order?: number;
+  status_label?: string;
+  derivations?: ArtifactDerivation[];
+};
+
+export type ArtifactDerivation = {
+  id: string;
+  artifact_id: string;
+  kind: ArtifactDerivationKind;
+  stored_path: string;
+  text_content: string;
+  content_hash: string;
+  producer_type: string;
+  producer_name: string;
+  producer_version: string;
+  producer_model: string;
+  prompt_version: string;
+  confidence: number | null;
+  metadata: Record<string, unknown>;
+  status: string;
+  error: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ArtifactAnalysisRun = {
+  id: string;
+  request_id: string;
+  artifact_id: string;
+  mode: MultimodalMode;
+  user_question: string;
+  requested_vision_backend: VisionBackend | "";
+  actual_vision_backend: VisionBackend | "";
+  requested_vision_model: string;
+  actual_vision_model: string;
+  ocr_engine: string;
+  prompt_version: string;
+  status: "running" | "pending" | "completed" | "completed_with_warnings" | "error" | "timeout" | "interrupted";
+  stage: string;
+  warnings: string[];
+  error: string;
+  output: Record<string, unknown>;
+  evidence: Record<string, unknown>;
+  timings: Record<string, unknown>;
+  created_at: number;
+  started_at: number;
+  completed_at: number | null;
+};
+
+export type ArtifactImportManyResult = {
+  imported: ArtifactRecord[];
+  failed: Array<{ path: string; error: string }>;
+};
+
+export type ArtifactDiagnostics = {
+  supported_formats: string[];
+  max_original_bytes: number;
+  max_decoded_pixels: number;
+  max_images_per_turn: number;
+  preprocessing_version?: string;
+  thumbnail_max_edge: number;
+  vision_max_edge?: number;
+  vision_max_pixels?: number;
+  vision_jpeg_quality?: number;
+  ocr_max_edge?: number;
+  normalized_max_edge: number;
+  storage_root: string;
+  artifact_count: number;
+  derivation_count: number;
+  vision_derivative_count?: number;
+  ocr_derivative_count?: number;
+  interrupted_or_error_analysis_count: number;
+  rag_source_count: number;
+};
+
+export type ModelCapabilityState = "yes" | "no" | "unknown" | "error" | "stale";
+
+export type ModelCapability = {
+  model: string;
+  digest: string;
+  size: number;
+  family: string;
+  parameter_size: string;
+  quantization_level: string;
+  context_length: number;
+  capabilities: string[];
+  text_generation: ModelCapabilityState;
+  vision: ModelCapabilityState;
+  embedding: ModelCapabilityState;
+  tools: ModelCapabilityState;
+  thinking: ModelCapabilityState;
+  raw: Record<string, unknown>;
+  inspected_at: number;
+  error: string;
+};
+
+export type ImageVisionDiagnostics = {
+  artifacts: ArtifactDiagnostics;
+  model_capabilities: ModelCapability[];
+  florence?: FlorenceDiagnostics;
+  capture: CaptureCapabilities;
+  sources?: {
+    library_count: number;
+    session_count: number;
+  };
+};
+
+export type SidecarLaunchInfo = {
+  profile_dir?: string;
+  profile_dir_env?: string;
+  python_executable?: string;
+  cwd?: string;
+  resource_dir?: string;
+  dev_repo_root?: string;
+  app_data_dir?: string;
+  florence_model_dir_env?: string;
+  florence_model_dir_env_state?: string;
+  copied_backend_dir?: string;
+};
+
+export type FlorencePackCandidate = {
+  source: string;
+  path: string;
+  exists: boolean;
+  is_dir: boolean;
+  manifest_path?: string;
+  manifest_present?: boolean;
+  manifest_parsed?: boolean;
+  manifest_valid?: boolean;
+  files_valid?: boolean;
+  checksums_valid?: boolean | "not_checked";
+  hashes_checked?: boolean;
+  ready: boolean;
+  failed_stage?: string;
+  rejection_reason?: string;
+};
+
+export type FlorenceDiagnostics = {
+  pack_id: string;
+  model_id: string;
+  revision: string;
+  license: string;
+  pack_dir: string;
+  state: string;
+  ready: boolean;
+  pack_ready?: boolean;
+  runtime_ready?: boolean;
+  message: string;
+  failed_stage?: string;
+  normal_runtime_downloads: boolean;
+  trust_remote_code: boolean;
+  dependencies: Record<string, unknown>;
+  runtime_pins: Record<string, string>;
+  native_class_status: string;
+  required_files: string[];
+  hashes_checked: boolean;
+  loaded: boolean;
+  selected_pack_path?: string;
+  selected_pack_source?: string;
+  searched_candidates?: FlorencePackCandidate[];
+  path_context?: Record<string, string>;
+  python_executable?: string;
+  stages?: Record<string, Record<string, unknown>>;
+  manifest?: {
+    pack_id?: string;
+    model_id?: string;
+    revision?: string;
+    created_at?: string;
+    file_count?: number;
+  };
+};
+
+export type CaptureCapabilities = {
+  platform: string;
+  full_screen: boolean;
+  region: boolean;
+  window: boolean;
+  clipboard_image?: boolean;
+  message: string;
+};
+
+export type CaptureResult = {
+  path: string;
+  source_kind: ArtifactSourceKind;
+  width: number;
+  height: number;
+  bytes: number;
 };
 
 export type OCRPage = {
@@ -284,12 +665,75 @@ export type DiagnosticsStatus = {
   backend_ready: boolean;
   db_path: string;
   backend_log_path: string;
+  python_executable?: string;
+  sidecar?: SidecarLaunchInfo;
   current_model: string;
   settings: Settings;
   ollama: OllamaStatus;
   ollama_ps?: OllamaPsStatus;
   ocr: OCRStatus;
   rag: RAGHealth;
+  image_vision?: ImageVisionDiagnostics;
+};
+
+export type ImageEvalCaseSummary = {
+  id: string;
+  category: string;
+  modes: MultimodalMode[];
+  question: string;
+  image: string;
+};
+
+export type ImageEvalSuite = {
+  suite_name: string;
+  suite_version: string;
+  prompt_version: string;
+  cases_dir: string;
+  case_count: number;
+  cases: ImageEvalCaseSummary[];
+};
+
+export type ImageEvalCaseResult = {
+  id: string;
+  run_id: string;
+  case_id: string;
+  category: string;
+  mode: MultimodalMode;
+  status: string;
+  passed: boolean;
+  grader_review_required: boolean;
+  reasons: string[];
+  raw_output: string;
+  structured_output: Record<string, unknown>;
+  assertion_matches: Array<Record<string, unknown>>;
+  warnings: string[];
+  error: string;
+  latency_ms: number;
+  image_hash: string;
+  image_width: number;
+  image_height: number;
+  created_at: number;
+};
+
+export type ImageEvalRun = {
+  id: string;
+  suite_name: string;
+  suite_version: string;
+  prompt_version: string;
+  mode: MultimodalMode;
+  model: string;
+  ocr_engine: string;
+  total_passed: number;
+  total_failed: number;
+  grader_review_count: number;
+  timeout_count: number;
+  runtime_error_count: number;
+  total_runtime_ms: number;
+  status: string;
+  notes: string;
+  created_at: number;
+  completed_at: number | null;
+  cases: ImageEvalCaseResult[];
 };
 
 export type EvalCaseSummary = {

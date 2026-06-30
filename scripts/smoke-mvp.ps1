@@ -13,6 +13,14 @@ try {
     }
 
     python -m pytest python/tests
+    python -m py_compile `
+        python/odysseus_desktop_backend/services/artifact_service.py `
+        python/odysseus_desktop_backend/services/vision_service.py `
+        python/odysseus_desktop_backend/services/image_eval_service.py `
+        python/odysseus_desktop_backend/services/ocr_service.py `
+        python/odysseus_desktop_backend/services/model_service.py `
+        python/odysseus_desktop_backend/services/chat_service.py `
+        python/rpc_server.py
     npm run build
 
     $cargo = Get-Command cargo -ErrorAction SilentlyContinue

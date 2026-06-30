@@ -1,19 +1,23 @@
 {
   "name": "odysseus-desktop",
-  "version": "0.1.12",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "npm run build:frontend",
     "build:frontend": "tsc && vite build",
+    "test:progress": "node scripts/test-chat-progress.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "prepare:python": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-python-runtime.ps1",
     "verify:python": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-python-runtime.ps1",
+    "stage:florence": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-florence2-resources.ps1",
+    "verify:florence:packaged": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged-florence.ps1",
     "smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-mvp.ps1",
     "tauri": "tauri",
-    "tauri:dev": "npm run prepare:python && tauri dev",
-    "tauri:build": "npm run prepare:python && npm run verify:python && tauri build"
+    "tauri:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-python-runtime.ps1 -RuntimeDir python-runtime-core -Clean && tauri dev --config src-tauri/tauri.core.conf.json",
+    "tauri:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1",
+    "tauri:build:core": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-core.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

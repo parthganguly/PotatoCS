@@ -8,11 +8,20 @@ __pycache__/
 *.pyo
 *.pyd
 *.sqlite
+*.sqlite3
 *.db
+*.db-wal
+*.db-shm
+Cookies
+Login Data
+Login Data-journal
 src-tauri/target/
 src-tauri/gen/
+src-tauri/generated-resources/
 python-runtime/*
 !python-runtime/.gitkeep
+python-runtime-core/
+python-runtime-florence/
 work/
 outputs/
 logs/
@@ -23,10 +32,13 @@ logs/
 *.msi
 *.msix
 *.appinstaller
+*.exe
+*.nsis.zip
 *_x64-setup.exe
 
 # Local model/runtime artifacts.
 models/
+models/florence2-base-ft/
 ollama-models/
 *.gguf
 *.safetensors
@@ -35,8 +47,13 @@ ollama-models/
 evals/results/
 benchmark-results/
 benchmarks/results/
+benchmarks/vision_common_sense/local_images/
+reports/
+reports/vision_common_sense/
 *.benchmark.json
 *.benchmark.md
+*.vision-run.jsonl
+manual_scores*.csv
 rag-eval-*.json
 rag-eval-*.md
 
@@ -45,6 +62,12 @@ app-data/
 profiles/
 dev.odysseus.desktop/
 .odysseus/
+tmp-real-vicky-*/
+.tmp-webview2-*/
+
+# Local development API probes.
+ask_claude_*.py
+test_claude.py
 
 # Local test documents that should not become fixtures by accident.
 local-test-docs/

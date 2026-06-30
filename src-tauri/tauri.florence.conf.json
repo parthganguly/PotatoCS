@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "resources": {
+      "../python": "python",
+      "../python-runtime-florence": "python-runtime",
+      "generated-resources/models/florence2-base-ft": "models/florence2-base-ft",
+      "../LICENSE": "LICENSE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    }
+  }
+}

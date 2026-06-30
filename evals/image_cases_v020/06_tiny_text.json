@@ -1,0 +1,10 @@
+{
+  "id": "tiny_text",
+  "category": "tiny_text",
+  "image": "fixtures/tiny_text.png",
+  "modes": ["ocr_only", "combined"],
+  "question": "What tiny label is printed?",
+  "assertions": [
+    {"type": "exact_text", "any": ["MAPLE-4"]}
+  ]
+}

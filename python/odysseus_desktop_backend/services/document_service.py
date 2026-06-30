@@ -4,7 +4,7 @@ import hashlib
 import json
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,8 @@ from odysseus_desktop_backend.storage import Database, utc_ms
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 LOW_TEXT_MIN_CHARS = 80
+PAGE_OCR_TEXT_MIN_CHARS = 20
+SOURCE_SCOPES = {"library", "session"}
 logger = get_logger("documents")
 
 
@@ -32,6 +34,7 @@ class OCRPage:
     engine_name: str
     confidence: float | None
     text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class DocumentService:
@@ -40,12 +43,13 @@ class DocumentService:
         self.documents_dir = self.db.profile_dir / "files" / "documents"
         self.documents_dir.mkdir(parents=True, exist_ok=True)
 
-    def import_document(self, path: str) -> dict[str, Any]:
+    def import_document(self, path: str, *, scope: str = "library", title: str | None = None) -> dict[str, Any]:
         source = Path(path).expanduser().resolve()
         logger.info("document import requested path=%s", source)
         if not source.exists() or not source.is_file():
             raise FileNotFoundError(f"File not found: {path}")
 
+        clean_scope = normalize_source_scope(scope)
         extension = source.suffix.lower()
         if extension not in SUPPORTED_EXTENSIONS:
             raise ValueError("Unsupported file type. Choose a .txt, .md, or extractable .pdf file.")
@@ -57,20 +61,21 @@ class DocumentService:
         shutil.copyfile(source, stored_path)
 
         now = utc_ms()
-        title = source.stem.strip() or source.name
+        display_title = " ".join((title or source.stem or source.name).replace("\x00", "").split()).strip()[:128]
+        display_title = display_title or source.name
         file_type = extension.removeprefix(".")
         self.db.conn.execute(
             """
             INSERT INTO documents(
                 id, title, source_path, stored_path, file_name, file_type, content_hash,
                 size_bytes, status, index_status, is_deleted, is_low_text, error,
-                created_at, updated_at, indexed_at
+                created_at, updated_at, indexed_at, scope
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', 'pending', 0, 0, '', ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', 'pending', 0, 0, '', ?, ?, NULL, ?)
             """,
             (
                 document_id,
-                title,
+                display_title,
                 str(source),
                 str(stored_path),
                 source.name,
@@ -79,6 +84,7 @@ class DocumentService:
                 len(content),
                 now,
                 now,
+                clean_scope,
             ),
         )
         self.db.conn.commit()
@@ -162,20 +168,62 @@ class DocumentService:
         self.db.conn.commit()
 
     def replace_pages_from_ocr(self, document_id: str, pages: list[OCRPage]) -> None:
-        extracted = [
-            ExtractedPage(
-                page_number=page.page_number,
-                text=page.text,
-                extraction_method=f"ocr:{page.engine_name}",
-                metadata={
-                    "file_type": "pdf",
-                    "ocr": True,
-                    "engine_name": page.engine_name,
-                    "confidence": page.confidence,
-                },
+        existing_by_page = {
+            int(page["page_number"]): page
+            for page in self.pages(document_id)
+        }
+        seen_page_numbers: set[int] = set()
+        extracted: list[ExtractedPage] = []
+        for page in pages:
+            seen_page_numbers.add(page.page_number)
+            existing = existing_by_page.get(page.page_number)
+            existing_text = str((existing or {}).get("text") or "")
+            if len(existing_text.strip()) >= PAGE_OCR_TEXT_MIN_CHARS:
+                metadata = dict((existing or {}).get("metadata") or {})
+                metadata.update(
+                    {
+                        "file_type": "pdf",
+                        "ocr_attempted": True,
+                        "ocr_text_available": bool(page.text.strip()),
+                        "ocr_engine_name": page.engine_name,
+                        "ocr_confidence": page.confidence,
+                    }
+                )
+                extracted.append(
+                    ExtractedPage(
+                        page_number=page.page_number,
+                        text=existing_text,
+                        extraction_method=str((existing or {}).get("extraction_method") or "pdf_text"),
+                        metadata=metadata,
+                    )
+                )
+                continue
+            extracted.append(
+                ExtractedPage(
+                    page_number=page.page_number,
+                    text=page.text,
+                    extraction_method=f"ocr:{page.engine_name}",
+                    metadata={
+                        "file_type": "pdf",
+                        "ocr": True,
+                        "engine_name": page.engine_name,
+                        "confidence": page.confidence,
+                        **page.metadata,
+                    },
+                )
             )
-            for page in pages
-        ]
+        for page_number, page in existing_by_page.items():
+            if page_number in seen_page_numbers:
+                continue
+            extracted.append(
+                ExtractedPage(
+                    page_number=page_number,
+                    text=str(page.get("text") or ""),
+                    extraction_method=str(page.get("extraction_method") or "pdf_text"),
+                    metadata=dict(page.get("metadata") or {}),
+                )
+            )
+        extracted.sort(key=lambda page: page.page_number)
         self.replace_pages(document_id, extracted)
         self.replace_ocr_pages(document_id, pages)
 
@@ -188,9 +236,9 @@ class DocumentService:
                 """
                 INSERT INTO ocr_pages(
                     id, document_id, source_path, page_number, engine_name, confidence,
-                    text, text_hash, chunk_ids_json, index_status, created_at, updated_at
+                    text, text_hash, chunk_ids_json, index_status, metadata_json, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -202,20 +250,30 @@ class DocumentService:
                     text,
                     hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     index_status,
+                    json.dumps(page.metadata),
                     now,
                     now,
                 ),
             )
         self.db.conn.commit()
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, scope: str | None = "library", include_deleted: bool = False) -> list[dict[str, Any]]:
+        filters = ["COALESCE(is_internal, 0) = 0"]
+        values: list[Any] = []
+        if not include_deleted:
+            filters.append("is_deleted = 0")
+        if scope is not None:
+            filters.append("COALESCE(scope, 'library') = ?")
+            values.append(normalize_source_scope(scope))
+        where = " AND ".join(filters)
         rows = self.db.conn.execute(
-            """
+            f"""
             SELECT *
             FROM documents
-            WHERE is_deleted = 0
+            WHERE {where}
             ORDER BY updated_at DESC
-            """
+            """,
+            values,
         ).fetchall()
         return [self._document_dict(row) for row in rows]
 
@@ -272,7 +330,7 @@ class DocumentService:
         rows = self.db.conn.execute(
             """
             SELECT id, document_id, source_path, page_number, engine_name, confidence,
-                   text, text_hash, chunk_ids_json, index_status, created_at, updated_at
+                   text, text_hash, chunk_ids_json, index_status, metadata_json, created_at, updated_at
             FROM ocr_pages
             WHERE document_id = ?
             ORDER BY page_number ASC
@@ -283,6 +341,7 @@ class DocumentService:
         for row in rows:
             item = dict(row)
             item["chunk_ids"] = json.loads(item.pop("chunk_ids_json") or "[]")
+            item["metadata"] = json.loads(item.pop("metadata_json", "{}") or "{}")
             pages.append(item)
         return pages
 
@@ -316,7 +375,7 @@ class DocumentService:
             index_status="low_text",
             is_low_text=1,
             ocr_status="needed",
-            error="Low-text or scanned PDF detected. OCR is optional in Milestone 3.",
+            error="Image-based or low-text PDF detected. OCR is needed before RAG can use rendered page text.",
         )
 
     def mark_error(self, document_id: str, error: str) -> None:
@@ -347,6 +406,17 @@ class DocumentService:
         self._update_status(
             document_id,
             ocr_status="unavailable",
+            ocr_error=reason,
+            error=reason,
+        )
+
+    def mark_ocr_no_text(self, document_id: str, reason: str) -> None:
+        self._update_status(
+            document_id,
+            status="ocr_no_text",
+            index_status="low_text",
+            is_low_text=1,
+            ocr_status="no_text",
             ocr_error=reason,
             error=reason,
         )
@@ -402,6 +472,166 @@ class DocumentService:
         logger.info("document deleted document_id=%s", document_id)
         return {"deleted": True, "document_id": document_id}
 
+    def promote(self, document_id: str) -> dict[str, Any]:
+        document = self.get(document_id)
+        if document["is_deleted"]:
+            raise ValueError("cannot promote a deleted document")
+        now = utc_ms()
+        self.db.conn.execute(
+            """
+            UPDATE documents
+            SET scope = 'library',
+                promoted_at = COALESCE(promoted_at, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, document_id),
+        )
+        self.db.conn.commit()
+        return self.get(document_id)
+
+    def link_message(self, message_id: str, document_ids: list[str]) -> None:
+        now = utc_ms()
+        for order, document_id in enumerate(document_ids):
+            document = self.get(document_id)
+            if document["is_deleted"]:
+                raise ValueError("cannot attach a deleted document")
+            self.db.conn.execute(
+                """
+                INSERT OR IGNORE INTO message_documents(
+                    message_id, document_id, display_order, scope_at_link, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    document_id,
+                    order,
+                    str(document.get("scope") or "library"),
+                    now,
+                ),
+            )
+        self.db.conn.commit()
+
+    def attachments_for_messages(self, message_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        if not message_ids:
+            return {}
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = self.db.conn.execute(
+            f"""
+            SELECT md.message_id, md.display_order, md.scope_at_link, d.*
+            FROM message_documents md
+            JOIN documents d ON d.id = md.document_id
+            WHERE md.message_id IN ({placeholders})
+            ORDER BY md.message_id, md.display_order
+            """,
+            message_ids,
+        ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {message_id: [] for message_id in message_ids}
+        for row in rows:
+            item = self._document_dict(row)
+            item["display_order"] = int(row["display_order"])
+            item["scope_at_link"] = str(row["scope_at_link"] or item.get("scope") or "library")
+            item["status_label"] = "attachment deleted" if item["is_deleted"] else item["status"]
+            grouped.setdefault(str(row["message_id"]), []).append(item)
+        return grouped
+
+    def hydrate_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped = self.attachments_for_messages([str(message["id"]) for message in messages])
+        hydrated = []
+        for message in messages:
+            item = dict(message)
+            item["documents"] = grouped.get(str(message["id"]), [])
+            hydrated.append(item)
+        return hydrated
+
+    def needs_ocr(self, document_id: str) -> bool:
+        document = self.get(document_id)
+        if document["is_deleted"] or document["file_type"] != "pdf":
+            return False
+        ocr_status = str(document.get("ocr_status") or "")
+        if ocr_status in {"indexed", "running"}:
+            return False
+        if (
+            document["is_low_text"]
+            or document["index_status"] == "low_text"
+            or ocr_status in {"needed", "unavailable", "no_text"}
+        ):
+            return True
+        pages = self.pages(document_id)
+        if not pages:
+            return True
+        return any(len(str(page.get("text") or "").strip()) < PAGE_OCR_TEXT_MIN_CHARS for page in pages)
+
+    def text_diagnostics(self, document_id: str) -> dict[str, Any]:
+        document = self.get(document_id)
+        pages = self.pages(document_id)
+        ocr_pages = self.ocr_pages(document_id)
+        chunks = self.chunks(document_id)
+        extracted_text_char_count = sum(len(str(page.get("text") or "").strip()) for page in pages)
+        ocr_text_char_count = sum(len(str(page.get("text") or "").strip()) for page in ocr_pages)
+        ocr_quality_counts: dict[str, int] = {}
+        ocr_attempt_count = 0
+        ocr_crop_count = 0
+        vlm_text_available = False
+        vlm_text_char_count = 0
+        vlm_backends: list[str] = []
+        selected_attempts: list[dict[str, Any]] = []
+        for page in ocr_pages:
+            metadata = page.get("metadata") if isinstance(page.get("metadata"), dict) else {}
+            quality = metadata.get("ocr_quality") if isinstance(metadata.get("ocr_quality"), dict) else metadata.get("quality")
+            label = str((quality or {}).get("label") or "")
+            if label:
+                ocr_quality_counts[label] = ocr_quality_counts.get(label, 0) + 1
+            try:
+                ocr_attempt_count += int(metadata.get("ocr_attempt_count") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                ocr_crop_count += int(metadata.get("ocr_crop_count") or 0)
+            except (TypeError, ValueError):
+                pass
+            selected = metadata.get("selected_ocr_attempt")
+            if isinstance(selected, dict):
+                selected_attempts.append(selected)
+            vlm = metadata.get("vlm_text_evidence") if isinstance(metadata.get("vlm_text_evidence"), dict) else {}
+            if metadata.get("vlm_text_available") or int(metadata.get("vlm_text_char_count") or 0) > 0:
+                vlm_text_available = True
+            try:
+                vlm_text_char_count += int(metadata.get("vlm_text_char_count") or vlm.get("text_char_count") or 0)
+            except (TypeError, ValueError):
+                pass
+            backend = str(vlm.get("backend") or "")
+            if backend and backend not in vlm_backends:
+                vlm_backends.append(backend)
+        return {
+            "document_id": document_id,
+            "file_type": str(document.get("file_type") or ""),
+            "index_status": str(document.get("index_status") or ""),
+            "ocr_status": str(document.get("ocr_status") or ""),
+            "ocr_error": str(document.get("ocr_error") or ""),
+            "is_low_text": bool(document.get("is_low_text")),
+            "page_count": len(pages),
+            "pages_with_extracted_text": sum(1 for page in pages if str(page.get("text") or "").strip()),
+            "low_text_page_count": sum(
+                1 for page in pages if len(str(page.get("text") or "").strip()) < PAGE_OCR_TEXT_MIN_CHARS
+            ),
+            "extracted_text_char_count": extracted_text_char_count,
+            "ocr_page_count": len(ocr_pages),
+            "ocr_pages_with_text": sum(1 for page in ocr_pages if str(page.get("text") or "").strip()),
+            "ocr_text_char_count": ocr_text_char_count,
+            "chunk_count": len(chunks),
+            "needs_ocr": self.needs_ocr(document_id),
+            "ocr_quality": aggregate_ocr_quality(ocr_quality_counts),
+            "ocr_quality_counts": ocr_quality_counts,
+            "ocr_attempt_count": ocr_attempt_count,
+            "ocr_crop_count": ocr_crop_count,
+            "ocr_selected_attempts": selected_attempts[:6],
+            "vlm_text_available": vlm_text_available,
+            "vlm_text_char_count": vlm_text_char_count,
+            "vlm_text_backends": vlm_backends,
+        }
+
     def _extract_pdf_pages(self, path: Path) -> list[ExtractedPage]:
         try:
             from pypdf import PdfReader
@@ -451,4 +681,22 @@ class DocumentService:
         item = dict(row)
         item["is_deleted"] = bool(item["is_deleted"])
         item["is_low_text"] = bool(item["is_low_text"])
+        item["is_internal"] = bool(item.get("is_internal", 0))
+        item["scope"] = str(item.get("scope") or "library")
         return item
+
+
+def normalize_source_scope(value: str | None) -> str:
+    cleaned = (value or "library").strip()
+    if cleaned not in SOURCE_SCOPES:
+        raise ValueError("source scope must be library or session")
+    return cleaned
+
+
+def aggregate_ocr_quality(counts: dict[str, int]) -> str:
+    if not counts:
+        return ""
+    for label in ("poor", "usable_noisy", "good", "no_text"):
+        if counts.get(label):
+            return label
+    return next(iter(counts))

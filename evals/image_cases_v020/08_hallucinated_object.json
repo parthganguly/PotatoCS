@@ -1,0 +1,11 @@
+{
+  "id": "hallucinated_object_prevention",
+  "category": "hallucination_guard",
+  "image": "fixtures/hallucinated_object.png",
+  "modes": ["vision_only", "combined"],
+  "question": "Is there a dog in this image?",
+  "assertions": [
+    {"type": "forbidden_object", "any": ["dog"]},
+    {"type": "abstention", "any": ["not visible"]}
+  ]
+}

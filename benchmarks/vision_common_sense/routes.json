@@ -1,0 +1,57 @@
+{
+  "routes": [
+    {
+      "route_id": "smoke_stub",
+      "label": "Benchmark plumbing smoke route",
+      "vision_backend": "smoke_stub",
+      "final_model": "",
+      "smoke_only": true,
+      "notes": "Deterministic fake answers for CLI, report, and scoring validation only."
+    },
+    {
+      "route_id": "florence_llama_1b",
+      "label": "Florence 2 Basic + Llama 3.2 1B",
+      "vision_backend": "florence2",
+      "final_model": "llama3.2:1b",
+      "multimodal_mode": "automatic",
+      "requires_florence": true,
+      "requires_ollama_models": ["llama3.2:1b"]
+    },
+    {
+      "route_id": "florence_qwen3_8b",
+      "label": "Florence 2 Basic + Qwen3 8B",
+      "vision_backend": "florence2",
+      "final_model": "qwen3:8b",
+      "multimodal_mode": "automatic",
+      "requires_florence": true,
+      "requires_ollama_models": ["qwen3:8b"]
+    },
+    {
+      "route_id": "florence_nemotron_nano_8b",
+      "label": "Florence 2 Basic + Nemotron Nano Chat 8B",
+      "vision_backend": "florence2",
+      "final_model": "nemotron-nano:8b",
+      "multimodal_mode": "automatic",
+      "requires_florence": true,
+      "requires_ollama_models": ["nemotron-nano:8b"]
+    },
+    {
+      "route_id": "qwen3_vl_2b_direct",
+      "label": "Qwen3-VL 2B direct local vision",
+      "vision_backend": "ollama",
+      "final_model": "qwen3-vl:2b",
+      "vision_model": "qwen3-vl:2b",
+      "multimodal_mode": "automatic",
+      "requires_ollama_models": ["qwen3-vl:2b"],
+      "requires_vision_capability": true
+    },
+    {
+      "route_id": "ocr_llama_1b",
+      "label": "OCR-only fallback + Llama 3.2 1B",
+      "vision_backend": "ocr_only",
+      "final_model": "llama3.2:1b",
+      "multimodal_mode": "ocr_only",
+      "requires_ollama_models": ["llama3.2:1b"]
+    }
+  ]
+}

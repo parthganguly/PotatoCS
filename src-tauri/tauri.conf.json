@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Odysseus Desktop",
-  "version": "0.1.12",
+  "version": "0.2.0",
   "identifier": "dev.odysseus.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -27,13 +27,6 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
-    "resources": {
-      "../python": "python",
-      "../evals": "evals",
-      "../python-runtime": "python-runtime",
-      "../LICENSE": "LICENSE",
-      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
-    }
+    "icon": ["icons/icon.ico"]
   }
 }

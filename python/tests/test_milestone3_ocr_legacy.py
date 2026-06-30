@@ -153,10 +153,11 @@ def test_tesseract_subprocess_uses_utf8_replacement_and_handles_none_stdout(monk
 
     monkeypatch.setattr(ocr_module.subprocess, "run", fake_run)
 
-    text, confidence = engine._run_tesseract(Path("page.png"))
+    text, confidence, metadata = engine._run_tesseract(Path("page.png"))
 
     assert text == ""
     assert confidence is None
+    assert metadata.get("words", []) == []
 
 
 def test_tesseract_nonzero_surfaces_stderr_without_decode_crash(monkeypatch):
@@ -211,7 +212,7 @@ def test_ocr_no_text_returns_clear_empty_result(tmp_path: Path, monkeypatch):
         "embeddings_cached": 0,
         "warning": "OCR ran, but no text was extracted.",
     }
-    assert result["document"]["ocr_status"] == "unavailable"
+    assert result["document"]["ocr_status"] == "no_text"
     assert result["document"]["ocr_error"] == "OCR ran, but no text was extracted."
     db.close()
 

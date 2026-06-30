@@ -1,0 +1,11 @@
+{
+  "id": "ui_buttons_menu",
+  "category": "screenshot_ui",
+  "image": "fixtures/ui_buttons_menu.png",
+  "modes": ["ocr_only", "vision_only", "combined"],
+  "question": "Which action button is visible?",
+  "assertions": [
+    {"type": "exact_text", "any": ["Export Report"]},
+    {"type": "required_object", "any": ["button"]}
+  ]
+}

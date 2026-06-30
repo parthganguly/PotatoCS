@@ -7,7 +7,32 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+
+const MAX_CAPTURE_PIXELS: u64 = 40_000_000;
+const MAX_CLIPBOARD_RGBA_BYTES: usize = (MAX_CAPTURE_PIXELS as usize) * 4;
+const MAX_PROFILE_IMAGE_READ_BYTES: u64 = 2 * 1024 * 1024;
+const PROGRESS_DISCRIMINATOR: &str = "__odysseus_progress__";
+const OPERATION_PROGRESS_EVENT: &str = "operation_progress";
+
+struct ProgressEvent {
+    name: &'static str,
+    payload: Value,
+}
+
+fn parse_progress_event(line: &str) -> Option<ProgressEvent> {
+    if !line.contains(PROGRESS_DISCRIMINATOR) {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(line).ok()?;
+    if payload.get(PROGRESS_DISCRIMINATOR).and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(ProgressEvent {
+        name: OPERATION_PROGRESS_EVENT,
+        payload,
+    })
+}
 
 #[derive(Serialize)]
 struct AppStatus {
@@ -20,6 +45,12 @@ struct AppState {
     profile_id: String,
     profile_dir: PathBuf,
     backend: Mutex<BackendClient>,
+}
+
+struct SidecarLaunchContext {
+    resource_dir: PathBuf,
+    app_data_dir: PathBuf,
+    dev_repo_root: Option<PathBuf>,
 }
 
 impl Drop for AppState {
@@ -63,13 +94,48 @@ impl BackendClient {
     fn spawn(app: &AppHandle, profile_dir: &Path) -> Result<Self, String> {
         let python = locate_python(app)?;
         let script = locate_sidecar_script(app)?;
+        let launch = sidecar_launch_context(app, profile_dir)?;
+        let florence_model_dir = std::env::var("ODYSSEUS_FLORENCE_MODEL_DIR").ok();
 
-        let mut child = Command::new(&python)
+        append_shell_log(
+            profile_dir,
+            &format!(
+                "sidecar launch executable={} script={} cwd={} resource_dir={} dev_repo_root={} app_data_dir={} florence_model_dir={}",
+                python.display(),
+                script.display(),
+                launch.resource_dir.display(),
+                launch.resource_dir.display(),
+                launch
+                    .dev_repo_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unset".to_string()),
+                launch.app_data_dir.display(),
+                florence_model_dir.as_deref().unwrap_or("unset")
+            ),
+        );
+
+        let mut command = Command::new(&python);
+        command
             .arg("-u")
             .arg(&script)
+            .current_dir(&launch.resource_dir)
             .env("ODYSSEUS_PROFILE_DIR", profile_dir)
+            .env("ODYSSEUS_RESOURCE_DIR", &launch.resource_dir)
+            .env("ODYSSEUS_APP_DATA_DIR", &launch.app_data_dir)
             .env("PYTHONUTF8", "1")
-            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONIOENCODING", "utf-8");
+        command
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1");
+        if let Some(dev_repo_root) = &launch.dev_repo_root {
+            command.env("ODYSSEUS_DEV_REPO_ROOT", dev_repo_root);
+        }
+        if let Some(model_dir) = &florence_model_dir {
+            command.env("ODYSSEUS_FLORENCE_MODEL_DIR", model_dir);
+        }
+
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -77,9 +143,16 @@ impl BackendClient {
             .map_err(|err| format!("failed to start Python sidecar with {:?}: {}", python, err))?;
 
         if let Some(stderr) = child.stderr.take() {
+            let progress_app = app.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().flatten() {
+                    if line.contains(PROGRESS_DISCRIMINATOR) {
+                        if let Some(event) = parse_progress_event(&line) {
+                            let _ = progress_app.emit(event.name, event.payload);
+                        }
+                        continue;
+                    }
                     eprintln!("[python-sidecar] {line}");
                 }
             });
@@ -266,6 +339,15 @@ impl BackendClient {
     }
 }
 
+#[derive(Serialize)]
+struct CaptureResult {
+    path: String,
+    source_kind: String,
+    width: u32,
+    height: u32,
+    bytes: u64,
+}
+
 fn can_retry_after_lost_response(method: &str) -> bool {
     matches!(
         method,
@@ -287,6 +369,133 @@ fn can_retry_after_lost_response(method: &str) -> bool {
 }
 
 #[tauri::command]
+fn capture_capabilities() -> Value {
+    json!({
+        "platform": std::env::consts::OS,
+        "full_screen": cfg!(windows),
+        "region": cfg!(windows),
+        "window": false,
+        "clipboard_image": true,
+        "message": if cfg!(windows) {
+            "Full-screen and coordinate region capture are available after an explicit user action. Window capture remains unsupported in v0.2.0."
+        } else {
+            "Screenshot capture is unsupported on this platform in v0.2.0."
+        }
+    })
+}
+
+#[tauri::command]
+fn clipboard_import_image(state: tauri::State<AppState>) -> Result<CaptureResult, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|err| format!("clipboard unavailable: {err}"))?;
+    let image = clipboard
+        .get_image()
+        .map_err(|err| format!("clipboard did not contain an image: {err}"))?;
+    let width = image.width as u32;
+    let height = image.height as u32;
+    let bytes = image.bytes.into_owned();
+    validate_capture_bounds(width, height, bytes.len())?;
+    let path = capture_output_path(&state.profile_dir, "clipboard")?;
+    save_rgba_png(&path, width, height, bytes)?;
+    capture_result(path, "clipboard", width, height)
+}
+
+#[tauri::command]
+fn capture_full_screen(state: tauri::State<AppState>, screen_index: Option<usize>) -> Result<CaptureResult, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        let _ = screen_index;
+        Err("full-screen capture is unsupported on this platform in v0.2.0".to_string())
+    }
+    #[cfg(windows)]
+    {
+        let screens = screenshots::Screen::all().map_err(|err| format!("screen enumeration failed: {err}"))?;
+        if screens.is_empty() {
+            return Err("no screens were available for capture".to_string());
+        }
+        let index = screen_index.unwrap_or(0).min(screens.len() - 1);
+        let image = screens[index]
+            .capture()
+            .map_err(|err| format!("screen capture failed: {err}"))?;
+        let width = image.width();
+        let height = image.height();
+        validate_capture_bounds(width, height, 0)?;
+        let path = capture_output_path(&state.profile_dir, "full-screen")?;
+        image
+            .save(&path)
+            .map_err(|err| format!("failed to save screen capture: {err}"))?;
+        capture_result(path, "screenshot_full", width, height)
+    }
+}
+
+#[tauri::command]
+fn capture_region(
+    state: tauri::State<AppState>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    screen_index: Option<usize>,
+) -> Result<CaptureResult, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        let _ = (x, y, width, height, screen_index);
+        Err("region capture is unsupported on this platform in v0.2.0".to_string())
+    }
+    #[cfg(windows)]
+    {
+        if width == 0 || height == 0 {
+            return Err("region width and height must be positive".to_string());
+        }
+        validate_capture_bounds(width, height, 0)?;
+        let screens = screenshots::Screen::all().map_err(|err| format!("screen enumeration failed: {err}"))?;
+        if screens.is_empty() {
+            return Err("no screens were available for capture".to_string());
+        }
+        let index = screen_index.unwrap_or(0).min(screens.len() - 1);
+        let image = screens[index]
+            .capture_area(x, y, width, height)
+            .map_err(|err| format!("region capture failed: {err}"))?;
+        let path = capture_output_path(&state.profile_dir, "region")?;
+        image
+            .save(&path)
+            .map_err(|err| format!("failed to save region capture: {err}"))?;
+        capture_result(path, "screenshot_region", width, height)
+    }
+}
+
+#[tauri::command]
+fn capture_window() -> Result<CaptureResult, String> {
+    Err("window capture is not implemented in v0.2.0; use full-screen or region capture instead".to_string())
+}
+
+#[tauri::command]
+fn read_profile_artifact_file(state: tauri::State<AppState>, path: String) -> Result<Vec<u8>, String> {
+    let requested = PathBuf::from(path);
+    let profile_artifacts = state
+        .profile_dir
+        .join("files")
+        .join("artifacts")
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve artifact directory: {err}"))?;
+    let resolved = requested
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve artifact file: {err}"))?;
+    if !resolved.starts_with(&profile_artifacts) {
+        return Err("artifact file read escaped the profile artifact directory".to_string());
+    }
+    let metadata = fs::metadata(&resolved).map_err(|err| format!("failed to inspect artifact file: {err}"))?;
+    if !metadata.is_file() {
+        return Err("artifact path is not a file".to_string());
+    }
+    if metadata.len() > MAX_PROFILE_IMAGE_READ_BYTES {
+        return Err("artifact preview exceeds the secure read size limit".to_string());
+    }
+    fs::read(&resolved).map_err(|err| format!("failed to read artifact preview: {err}"))
+}
+
+#[tauri::command]
 fn app_status(state: tauri::State<AppState>) -> AppStatus {
     let backend_ready = state
         .backend
@@ -302,11 +511,11 @@ fn app_status(state: tauri::State<AppState>) -> AppStatus {
 }
 
 #[tauri::command]
-fn rpc_call(
+async fn rpc_call(
     method: String,
     params: Option<Value>,
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let mut backend = state
         .backend
@@ -349,6 +558,58 @@ fn append_shell_log(profile_dir: &Path, message: &str) {
     }
 }
 
+fn capture_output_path(profile_dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let dir = profile_dir
+        .join("files")
+        .join("artifacts")
+        .join("captures");
+    fs::create_dir_all(&dir).map_err(|err| format!("failed to create capture dir: {err}"))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    Ok(dir.join(format!("{prefix}-{stamp}.png")))
+}
+
+fn validate_capture_bounds(width: u32, height: u32, raw_bytes: usize) -> Result<(), String> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels == 0 {
+        return Err("captured image dimensions must be positive".to_string());
+    }
+    if pixels > MAX_CAPTURE_PIXELS {
+        return Err(format!("captured image exceeds {MAX_CAPTURE_PIXELS} pixel limit"));
+    }
+    if raw_bytes > MAX_CLIPBOARD_RGBA_BYTES {
+        return Err("clipboard image exceeds the bounded capture byte limit".to_string());
+    }
+    Ok(())
+}
+
+fn capture_result(path: PathBuf, source_kind: &str, width: u32, height: u32) -> Result<CaptureResult, String> {
+    let bytes = fs::metadata(&path)
+        .map_err(|err| format!("failed to inspect capture file: {err}"))?
+        .len();
+    Ok(CaptureResult {
+        path: path.display().to_string(),
+        source_kind: source_kind.to_string(),
+        width,
+        height,
+        bytes,
+    })
+}
+
+fn save_rgba_png(path: &Path, width: u32, height: u32, bytes: Vec<u8>) -> Result<(), String> {
+    let expected = width as usize * height as usize * 4;
+    if bytes.len() != expected {
+        return Err(format!("clipboard image byte length mismatch: expected {expected}, got {}", bytes.len()));
+    }
+    let buffer = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(width, height, bytes)
+        .ok_or_else(|| "failed to create image buffer from clipboard bytes".to_string())?;
+    buffer
+        .save(path)
+        .map_err(|err| format!("failed to save clipboard image: {err}"))
+}
+
 fn ensure_default_profile(app: &AppHandle) -> Result<(String, PathBuf), String> {
     let app_data = app
         .path()
@@ -377,6 +638,29 @@ fn ensure_default_profile(app: &AppHandle) -> Result<(String, PathBuf), String> 
     }
 
     Ok((profile_id, profile_dir))
+}
+
+fn sidecar_launch_context(app: &AppHandle, _profile_dir: &Path) -> Result<SidecarLaunchContext, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|err| format!("failed to locate app resource dir: {err}"))?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("failed to locate app data dir: {err}"))?;
+    Ok(SidecarLaunchContext {
+        resource_dir,
+        app_data_dir,
+        dev_repo_root: debug_repo_root_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR"))),
+    })
+}
+
+fn debug_repo_root_from_manifest_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    manifest_dir.parent().map(Path::to_path_buf)
 }
 
 fn locate_python(app: &AppHandle) -> Result<PathBuf, String> {
@@ -457,9 +741,41 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_status,
+            capture_capabilities,
+            clipboard_import_image,
+            capture_full_screen,
+            capture_region,
+            capture_window,
+            read_profile_artifact_file,
             rpc_call,
             shutdown_backend
         ])
         .run(tauri::generate_context!())
         .expect("error while running Odysseus Desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_sidecar_stderr_is_not_a_progress_event() {
+        assert!(parse_progress_event("ordinary Python log line").is_none());
+    }
+
+    #[test]
+    fn valid_progress_json_maps_to_operation_progress() {
+        let event = parse_progress_event(
+            r#"{"__odysseus_progress__":true,"stage":"rag_search","label":"Searching sources..."}"#,
+        )
+        .expect("valid progress event");
+        assert_eq!(event.name, "operation_progress");
+        assert_eq!(event.payload["stage"], "rag_search");
+    }
+
+    #[test]
+    fn malformed_progress_json_is_ignored() {
+        assert!(parse_progress_event("{\"__odysseus_progress__\":true").is_none());
+        assert!(parse_progress_event(r#"{"__odysseus_progress__":false}"#).is_none());
+    }
 }

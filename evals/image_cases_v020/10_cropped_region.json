@@ -1,0 +1,11 @@
+{
+  "id": "cropped_region_question",
+  "category": "crop",
+  "image": "fixtures/cropped_region.png",
+  "modes": ["ocr_only", "combined"],
+  "question": "Read only the boxed region.",
+  "crop": {"x": 0.48, "y": 0.32, "width": 0.36, "height": 0.28},
+  "assertions": [
+    {"type": "exact_text", "any": ["TOTAL 42"]}
+  ]
+}

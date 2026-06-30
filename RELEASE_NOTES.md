@@ -1,5 +1,130 @@
 # Release Notes
 
+## v0.2.0 - Sources, Universal Attachments, and Vision Execution
+
+v0.2.0 adds a unified Sources library, universal chat attachments, and local
+image/screenshot understanding while preserving the v0.1.12 RAG benchmark and
+report machinery. It does not add cloud services, telemetry, model downloads,
+agents, shell tools, MCP, image generation, or continuous screen monitoring.
+
+Important versioning note:
+
+- App version is `0.2.0`.
+- Existing RAG eval suite version remains `v0.1.12`.
+- New image eval suite version is `v0.2.0`.
+- Image prompt version is `image-analysis-v0.2.0`.
+
+Highlights:
+
+- Added additive artifact tables for images, derivations, message links,
+  analysis runs, model capabilities, artifact-to-RAG mappings, and separate
+  multimodal eval history.
+- Added session/library scope for documents and artifacts, document-message
+  links, and a Sources facade over the existing DocumentService and
+  ArtifactService.
+- Replaced separate primary Documents and Images tabs with `Chat | Sources |
+  Diagnostics`.
+- Added universal chat attachments for direct PDF, TXT, Markdown, image,
+  pasted image, screenshot, and existing saved Source inputs.
+- Direct PDF/TXT/Markdown attachments are session-scoped by default, hidden
+  from the global Sources library until promoted, and use scoped retrieval for
+  chat instead of whole-file prompt injection.
+- Added profile-local image import for PNG/JPEG/WebP with decoded-byte
+  validation, EXIF orientation handling, profile-owned originals, thumbnails,
+  bounded JPEG vision derivatives, lossless PNG OCR derivatives, content
+  hashes, file-size/pixel bounds, and explicit delete/tombstone behavior.
+- Refactored OCR so direct images and PDF page images share the same OCR image
+  primitive. External OCR subprocesses now have timeouts and structured
+  metadata for dimensions/confidence/word boxes where available.
+- Added an Ollama model capability registry backed by `/api/show`; vision mode
+  requires confirmed `vision` capability and does not infer support from model
+  names alone.
+- Added local Ollama vision chat support with image bytes base64-encoded only
+  at the final request boundary and never stored in SQLite/messages/logs.
+- Native vision requests, external-eyes vision inspection, and historical
+  image follow-up continuity now use persisted vision derivatives instead of
+  repeatedly encoding originals. OCR receives a separate OCR derivative.
+- Added Automatic, OCR-only, vision-only, and combined image analysis modes
+  with separated exact OCR text, model visual observations, warnings,
+  provenance, and final chat-model synthesis.
+- Fixed OCR-only chat so it no longer returns a canned status sentence as the
+  assistant answer; OCR evidence is passed through the selected chat model.
+- Added native-vision routing when the selected chat model is confirmed
+  vision-capable and external-eyes routing when a separate confirmed vision
+  model feeds structured observations to a text-only final model.
+- Added optional Florence 2 Basic local vision as an additive evidence backend
+  behind the same attachment and follow-up continuity system. Florence uses
+  `microsoft/Florence-2-base-ft` from a pinned local model pack, records
+  structured visual evidence, never downloads at normal runtime, and does not
+  replace native Ollama vision.
+- Added deterministic visual evidence curation between Florence/raw
+  observations and weak final text models. The app canonicalizes and
+  deduplicates detected entities, extracts question focus, separates direct
+  observations from supported inference, keeps raw perception output available
+  in Diagnostics, and reduces unsupported visual claims without claiming they
+  are eliminated.
+- Added a lightweight visual grounding guard for external-eyes synthesis. If a
+  final answer introduces excluded entities, unsupported brands/locations/
+  names, or unsupported causal light sources, Odysseus records the guard result
+  and returns a safe grounded fallback instead of persisting the noisy answer.
+- Successful non-text image questions no longer become
+  `completed_with_warnings` only because OCR ran and found no text. The OCR
+  no-text detail remains visible in evidence, while text-reading questions
+  still surface it as a warning.
+- Hardened Florence real-inference startup with BOM-free `manifest.json`
+  writing, BOM/legacy manifest reading, explicit readiness stages from pack
+  discovery through output parsing, exact sidecar-runtime preparation, and a
+  no-synthesis guard when Florence and OCR produce no valid visual evidence.
+- Added a persistent Vision backend setting: Automatic, Basic local vision -
+  Florence 2, Enhanced vision - Ollama, and OCR only.
+- Added chat attachment hydration, request-id recovery for long image analysis,
+  pending thumbnail removal, and mixed attachment turns.
+- Preserved durable "In conversation" image/document context across follow-up
+  turns and restarts, with remove-from-conversation behavior that does not
+  delete the stored attachment.
+- Clarified the app shell: New chat is prominent, recent chats are separate
+  from navigation, compact Ollama/profile status lives at the bottom, the
+  future-chat default model is labelled in Settings, and the active
+  conversation model selector lives in the chat header.
+- Conversation model selection now uses a canonical chat-capable catalog from
+  live Ollama tags plus cached `/api/show` capabilities. It deduplicates
+  aliases such as `llama3.2`/`llama3.2:latest`, preserves sized tags such as
+  `llama3.2:1b`, excludes embedding-only models such as `nomic-embed-text`,
+  and marks old session models that are no longer installed as historical
+  labels rather than selectable current models.
+- Added secure profile-confined thumbnail byte reads for packaged Tauri builds
+  instead of relying only on local path conversion.
+- Added optional RAG indexing of OCR, vision, or combined evidence through
+  hidden internal generated documents with artifact provenance preserved on
+  chunks.
+- Added Image & Vision diagnostics and a compact image benchmark panel.
+- Added deterministic packaged image eval fixtures in `evals\image_cases_v020`
+  with typed deterministic grading, raw output persistence, and leakage guards.
+
+Known limitations:
+
+- Window screenshot capture is intentionally unsupported in v0.2.0; use
+  full-screen or coordinate-region capture.
+- Real installed-build/model/capture acceptance still needs to be recorded on
+  the target Windows hardware after packaging.
+- Vision answer quality depends on the installed local Ollama vision model.
+- Florence 2 Basic is unavailable until its optional local model pack and
+  pinned runtime dependencies are staged with `ODYSSEUS_INCLUDE_FLORENCE=1` or
+  `scripts\prepare-florence2-runtime.ps1`.
+
+Validation commands for v0.2.0:
+
+```powershell
+python -m pytest python\tests
+npm run build
+cargo check --manifest-path src-tauri\Cargo.toml
+python -m py_compile python\odysseus_desktop_backend\services\artifact_service.py python\odysseus_desktop_backend\services\image_preprocessing_service.py python\odysseus_desktop_backend\services\vision_service.py python\odysseus_desktop_backend\services\florence2_service.py python\odysseus_desktop_backend\services\perception_types.py python\odysseus_desktop_backend\services\visual_evidence_curator.py python\odysseus_desktop_backend\services\image_eval_service.py python\odysseus_desktop_backend\services\ocr_service.py python\odysseus_desktop_backend\services\model_service.py python\odysseus_desktop_backend\services\chat_service.py python\rpc_server.py
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-florence2-model.ps1 -AllowMissing
+git diff --check
+npm run smoke
+npm run tauri:build
+```
+
 ## v0.1.12 - Benchmark Trustworthiness and Report Finalization
 
 v0.1.12 fixes remaining benchmark-grading and campaign-report finalization
@@ -411,7 +536,7 @@ Highlights:
   `scripts\run_rag_evals.py`.
 - Bundled the `evals\` fixtures into the Windows installer resources.
 - Clarified that benchmarks use bundled temporary eval fixtures, not the user's
-  imported Documents library.
+  imported Sources library.
 - Clarified benchmark model guidance: 1B-class models are a survival baseline,
   `llama3.2:3b` / `llama3.2:latest` is the intended everyman candidate to
   benchmark first, and verifier mode is slower and not a magic fix for very

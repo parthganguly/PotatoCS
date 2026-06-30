@@ -1,0 +1,11 @@
+{
+  "id": "ocr_vision_disagreement",
+  "category": "ocr_vs_vision",
+  "image": "fixtures/ocr_vision_disagreement.png",
+  "modes": ["combined"],
+  "question": "What does the exact printed code say?",
+  "assertions": [
+    {"type": "exact_text", "any": ["HB-204"]},
+    {"type": "forbidden_object", "any": ["HB-240"]}
+  ]
+}

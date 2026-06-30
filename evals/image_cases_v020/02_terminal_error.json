@@ -1,0 +1,11 @@
+{
+  "id": "terminal_error",
+  "category": "terminal_screenshot",
+  "image": "fixtures/terminal_error.png",
+  "modes": ["ocr_only", "vision_only", "combined"],
+  "question": "What concrete error is visible?",
+  "assertions": [
+    {"type": "exact_text", "any": ["ModuleNotFoundError"]},
+    {"type": "exact_text", "any": ["pillow"]}
+  ]
+}

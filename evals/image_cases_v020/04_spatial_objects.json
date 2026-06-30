@@ -1,0 +1,12 @@
+{
+  "id": "spatial_objects",
+  "category": "photo_like_spatial",
+  "image": "fixtures/spatial_objects.png",
+  "modes": ["vision_only", "combined"],
+  "question": "Where is the red circle relative to the blue square?",
+  "assertions": [
+    {"type": "required_object", "any": ["red circle"]},
+    {"type": "required_object", "any": ["blue square"]},
+    {"type": "spatial_relation", "any": ["left of the blue square", "red circle is left"]}
+  ]
+}

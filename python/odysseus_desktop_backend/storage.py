@@ -161,6 +161,203 @@ class Database:
                 PRIMARY KEY (content_hash, embedding_model)
             );
 
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                original_filename TEXT NOT NULL DEFAULT '',
+                mime_type TEXT NOT NULL DEFAULT '',
+                original_extension TEXT NOT NULL DEFAULT '',
+                stored_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                normalized_orientation INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'imported',
+                error TEXT NOT NULL DEFAULT '',
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifacts_status
+                ON artifacts(kind, is_deleted, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS artifact_derivations (
+                id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                stored_path TEXT NOT NULL DEFAULT '',
+                text_content TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL DEFAULT '',
+                producer_type TEXT NOT NULL DEFAULT '',
+                producer_name TEXT NOT NULL DEFAULT '',
+                producer_version TEXT NOT NULL DEFAULT '',
+                producer_model TEXT NOT NULL DEFAULT '',
+                prompt_version TEXT NOT NULL DEFAULT '',
+                confidence REAL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'created',
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifact_derivations_artifact
+                ON artifact_derivations(artifact_id, kind, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS message_artifacts (
+                message_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                display_order INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (message_id, artifact_id),
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_artifacts_artifact
+                ON message_artifacts(artifact_id);
+
+            CREATE TABLE IF NOT EXISTS message_documents (
+                message_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                display_order INTEGER NOT NULL DEFAULT 0,
+                scope_at_link TEXT NOT NULL DEFAULT 'session',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (message_id, document_id),
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_documents_document
+                ON message_documents(document_id);
+
+            CREATE TABLE IF NOT EXISTS conversation_attachments (
+                session_id TEXT NOT NULL,
+                backend_kind TEXT NOT NULL CHECK (backend_kind IN ('document', 'artifact')),
+                source_id TEXT NOT NULL,
+                added_message_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                removed_at INTEGER,
+                PRIMARY KEY (session_id, backend_kind, source_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversation_attachments_active
+                ON conversation_attachments(session_id, removed_at, created_at);
+
+            CREATE TABLE IF NOT EXISTS artifact_analysis_runs (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                artifact_id TEXT NOT NULL,
+                message_id TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL,
+                user_question TEXT NOT NULL DEFAULT '',
+                requested_vision_backend TEXT NOT NULL DEFAULT '',
+                actual_vision_backend TEXT NOT NULL DEFAULT '',
+                requested_vision_model TEXT NOT NULL DEFAULT '',
+                actual_vision_model TEXT NOT NULL DEFAULT '',
+                ocr_engine TEXT NOT NULL DEFAULT '',
+                prompt_version TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                stage TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                error TEXT NOT NULL DEFAULT '',
+                output_json TEXT NOT NULL DEFAULT '{}',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                timings_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifact_analysis_artifact
+                ON artifact_analysis_runs(artifact_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS artifact_rag_documents (
+                artifact_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                derivation_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (artifact_id, document_id),
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE,
+                FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+                FOREIGN KEY (derivation_id) REFERENCES artifact_derivations(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS model_capabilities (
+                model TEXT PRIMARY KEY,
+                digest TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0,
+                family TEXT NOT NULL DEFAULT '',
+                parameter_size TEXT NOT NULL DEFAULT '',
+                quantization_level TEXT NOT NULL DEFAULT '',
+                context_length INTEGER NOT NULL DEFAULT 0,
+                capabilities_json TEXT NOT NULL DEFAULT '[]',
+                text_generation TEXT NOT NULL DEFAULT 'unknown',
+                vision TEXT NOT NULL DEFAULT 'unknown',
+                embedding TEXT NOT NULL DEFAULT 'unknown',
+                tools TEXT NOT NULL DEFAULT 'unknown',
+                thinking TEXT NOT NULL DEFAULT 'unknown',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                inspected_at INTEGER NOT NULL,
+                error TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS multimodal_eval_runs (
+                id TEXT PRIMARY KEY,
+                suite_name TEXT NOT NULL,
+                suite_version TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                ocr_engine TEXT NOT NULL DEFAULT '',
+                total_passed INTEGER NOT NULL DEFAULT 0,
+                total_failed INTEGER NOT NULL DEFAULT 0,
+                grader_review_count INTEGER NOT NULL DEFAULT 0,
+                timeout_count INTEGER NOT NULL DEFAULT 0,
+                runtime_error_count INTEGER NOT NULL DEFAULT 0,
+                total_runtime_ms INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_multimodal_eval_runs_created
+                ON multimodal_eval_runs(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS multimodal_eval_case_results (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                passed INTEGER NOT NULL DEFAULT 0,
+                grader_review_required INTEGER NOT NULL DEFAULT 0,
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                raw_output TEXT NOT NULL DEFAULT '',
+                structured_output_json TEXT NOT NULL DEFAULT '{}',
+                assertion_matches_json TEXT NOT NULL DEFAULT '[]',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                error TEXT NOT NULL DEFAULT '',
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                image_hash TEXT NOT NULL DEFAULT '',
+                image_width INTEGER NOT NULL DEFAULT 0,
+                image_height INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES multimodal_eval_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_multimodal_eval_cases_run
+                ON multimodal_eval_case_results(run_id, case_id);
+
             CREATE TABLE IF NOT EXISTS benchmark_runs (
                 id TEXT PRIMARY KEY,
                 model TEXT NOT NULL,
@@ -277,6 +474,23 @@ class Database:
         self.ensure_column("documents", "ocr_error", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "indexed_embedding_model", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "indexed_embedding_backend", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "is_internal", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("documents", "source_artifact_id", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "generated_source_label", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "scope", "TEXT NOT NULL DEFAULT 'library'")
+        self.ensure_column("documents", "promoted_at", "INTEGER")
+        self.ensure_column("ocr_pages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        self.ensure_column("artifacts", "scope", "TEXT NOT NULL DEFAULT 'library'")
+        self.ensure_column("artifacts", "promoted_at", "INTEGER")
+        self.ensure_column("artifacts", "original_format", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("artifacts", "original_color_mode", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("artifacts", "original_pixel_count", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("artifacts", "original_has_alpha", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("artifacts", "original_exif_orientation", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("artifacts", "preprocessing_version", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("artifact_analysis_runs", "message_id", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("artifact_analysis_runs", "requested_vision_backend", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("artifact_analysis_runs", "actual_vision_backend", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("benchmark_runs", "embedding_backend", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("benchmark_runs", "embedding_model", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("benchmark_runs", "temperature", "REAL NOT NULL DEFAULT 0")
@@ -339,11 +553,12 @@ class Database:
         if old_embedding_model == "local-hash-v1" and old_embedding_backend is None:
             self.set_setting("embedding_backend", "auto")
             self.set_setting("embedding_model", "nomic-embed-text")
-        self.set_meta_default("schema_version", "6")
+        self.set_meta("schema_version", "10")
         self.set_setting_default("default_model", "llama3.2")
         self.set_setting_default("ollama_endpoint", "http://127.0.0.1:11434")
         self.set_setting_default("embedding_backend", "auto")
         self.set_setting_default("embedding_model", "nomic-embed-text")
+        self.set_setting_default("vision_backend", "automatic")
         self.conn.commit()
 
     def ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -362,6 +577,19 @@ class Database:
             """
             INSERT OR IGNORE INTO app_meta(key, value, updated_at)
             VALUES (?, ?, ?)
+            """,
+            (key, value, now),
+        )
+
+    def set_meta(self, key: str, value: str) -> None:
+        now = utc_ms()
+        self.conn.execute(
+            """
+            INSERT INTO app_meta(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
             """,
             (key, value, now),
         )

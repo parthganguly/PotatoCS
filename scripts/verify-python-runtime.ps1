@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$RuntimeDir = ""
 )
 
@@ -13,11 +13,12 @@ $pythonExe = Join-Path $RuntimeDir "python.exe"
 $backendScript = Join-Path $repoRoot "python\rpc_server.py"
 $backendPackage = Join-Path $repoRoot "python\odysseus_desktop_backend"
 $evalCases = Join-Path $repoRoot "evals\rag_cases"
+$imageEvalCases = Join-Path $repoRoot "evals\image_cases_v020"
 $icon = Join-Path $repoRoot "src-tauri\icons\icon.ico"
 $license = Join-Path $repoRoot "LICENSE"
 $notices = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 
-foreach ($path in @($pythonExe, $backendScript, $backendPackage, $evalCases, $icon, $license, $notices)) {
+foreach ($path in @($pythonExe, $backendScript, $backendPackage, $evalCases, $imageEvalCases, $icon, $license, $notices)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required packaging path is missing: $path"
     }
@@ -30,7 +31,7 @@ import os
 import sqlite3
 import sys
 sys.path.insert(0, os.environ["ODYSSEUS_BACKEND_PATH"])
-for module in ("json", "sqlite3", "numpy", "pypdf", "reportlab", "rpc_server", "odysseus_desktop_backend"):
+for module in ("json", "sqlite3", "numpy", "pypdf", "reportlab", "PIL", "rpc_server", "odysseus_desktop_backend"):
     importlib.import_module(module)
 print("runtime-ok")
 "@
@@ -53,6 +54,54 @@ try {
 }
 
 Write-Host "Python runtime and Tauri resource inputs verified."
+
+if ($env:ODYSSEUS_INCLUDE_FLORENCE -eq "1") {
+    $florenceVerify = @"
+import importlib
+import importlib.metadata
+from transformers import AutoProcessor, Florence2ForConditionalGeneration
+
+expected = {
+    "torch": "2.12.0",
+    "torchvision": "0.27.0",
+    "transformers": "5.12.1",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "huggingface_hub": "1.19.0",
+}
+for module_name, expected_version in expected.items():
+    importlib.import_module(module_name)
+    actual = importlib.metadata.version(module_name)
+    actual_tuple = tuple(int(part) for part in actual.split(".")[:3])
+    expected_tuple = tuple(int(part) for part in expected_version.split(".")[:3])
+    if actual_tuple < expected_tuple:
+        raise SystemExit(f"{module_name} is too old: {actual} < {expected_version}")
+importlib.import_module("PIL")
+print("florence-runtime-ok")
+"@
+    $florenceVerifyPath = Join-Path $env:TEMP "odysseus-verify-florence-runtime.py"
+    $oldHubOffline = $env:HF_HUB_OFFLINE
+    $oldTransformersOffline = $env:TRANSFORMERS_OFFLINE
+    try {
+        $env:HF_HUB_OFFLINE = "1"
+        $env:TRANSFORMERS_OFFLINE = "1"
+        Set-Content -LiteralPath $florenceVerifyPath -Value $florenceVerify -Encoding UTF8
+        & $pythonExe $florenceVerifyPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "Florence runtime dependency verification failed."
+        }
+    } finally {
+        $env:HF_HUB_OFFLINE = $oldHubOffline
+        $env:TRANSFORMERS_OFFLINE = $oldTransformersOffline
+        Remove-Item -LiteralPath $florenceVerifyPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($env:ODYSSEUS_INCLUDE_FLORENCE -eq "1") {
+    & (Join-Path $PSScriptRoot "verify-florence2-model.ps1")
+} else {
+    & (Join-Path $PSScriptRoot "verify-florence2-model.ps1") -AllowMissing
+}
 
 $profileDir = Join-Path $env:TEMP ("odysseus-runtime-verify-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $profileDir | Out-Null

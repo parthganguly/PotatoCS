@@ -22,6 +22,11 @@ The MVP also uses these major third-party components:
 - lucide-react icons, ISC license.
 - NumPy, BSD-style license.
 - pypdf, BSD-style license.
+- ReportLab, BSD-style license.
+- Pillow, HPND-style license.
+- arboard Rust crate, MIT or Apache-2.0 license.
+- image Rust crate, MIT or Apache-2.0 license.
+- screenshots Rust crate, MIT license.
 
 Node, Rust, and Python transitive dependency license details should be reviewed
 from `package-lock.json`, `src-tauri/Cargo.lock`, and the installed Python
@@ -38,3 +43,19 @@ executes locally installed tools when available:
 
 If a distributor chooses to bundle any OCR tool in the future, that distributor
 must include the corresponding license terms for that tool.
+
+## Optional Florence 2 Basic Local Vision
+
+Florence 2 Basic is not bundled in the default runtime. When explicitly staged
+with `ODYSSEUS_INCLUDE_FLORENCE=1`, Odysseus Desktop prepares a local model pack
+for:
+
+- `microsoft/Florence-2-base-ft`
+- License: MIT
+- Pinned revision: `f6c1a25888ffc1d945ee8a1a77ac833c7303d46e`
+
+The optional Florence runtime uses pinned Python packages listed in
+`python/requirements-florence.txt`, including PyTorch, Transformers,
+Safetensors, Tokenizers, and Hugging Face Hub. Normal app startup does not
+download Florence model files and production loading uses local files only with
+`trust_remote_code=false`.

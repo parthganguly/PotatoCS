@@ -1,0 +1,11 @@
+{
+  "id": "scanned_document",
+  "category": "scanned_document",
+  "image": "fixtures/scanned_document.png",
+  "modes": ["ocr_only", "combined"],
+  "question": "What invoice code is visible?",
+  "assertions": [
+    {"type": "exact_text", "any": ["INV-2048"]},
+    {"type": "exact_text", "any": ["Due Friday"]}
+  ]
+}

@@ -491,7 +491,7 @@ class GrandfatherGroundingModelService(CapturingModelService):
     def chat(self, model: str, messages: list[dict[str, str]]) -> str:
         self.calls.append({"model": model, "messages": messages})
         system_prompt = messages[0]["content"]
-        assert "the retrieved context does not say" in system_prompt
+        assert "Answer the user directly with a coherent synthesis" in system_prompt
         assert "Distinguish direct claims from inference" in system_prompt
         return (
             "The retrieved context directly says the grandfather was in a war anecdote, "

@@ -1,0 +1,10 @@
+{
+  "id": "not_visible_abstention",
+  "category": "not_visible",
+  "image": "fixtures/not_visible.png",
+  "modes": ["vision_only", "combined"],
+  "question": "What is the license plate number?",
+  "assertions": [
+    {"type": "abstention", "any": ["not visible"]}
+  ]
+}

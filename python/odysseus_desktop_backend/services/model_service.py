@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import base64
+import re
 import shutil
 import socket
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from odysseus_desktop_backend.logging_config import get_logger
@@ -14,6 +17,10 @@ from odysseus_desktop_backend.storage import Database, utc_ms
 
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 INTERACTIVE_CHAT_TIMEOUT_SECONDS = 120
+VISION_CHAT_TIMEOUT_SECONDS = 240
+MAX_VISION_IMAGES = 4
+MAX_VISION_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_VISION_TOTAL_IMAGE_BYTES = 24 * 1024 * 1024
 BENCHMARK_ANSWER_TIMEOUT_SECONDS = 300
 VERIFIER_TIMEOUT_SECONDS = 180
 CORRECTION_TIMEOUT_SECONDS = 300
@@ -82,6 +89,11 @@ class ModelService:
             "version": version,
             "models": models,
             "model_details": model_details,
+            "conversation_models": build_conversation_model_catalog(
+                models,
+                model_details=model_details,
+                capabilities=list(self._cached_capabilities_by_canonical().values()),
+            ),
             "error": error,
             "updated_at": utc_ms(),
         }
@@ -95,6 +107,61 @@ class ModelService:
             error,
         )
         return status
+
+    def capabilities(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+        status = self.detect_ollama()
+        names = [str(name) for name in status.get("models") or []]
+        cached = {row["model"]: capability_row_dict(row) for row in self.db.conn.execute("SELECT * FROM model_capabilities").fetchall()}
+        results: list[dict[str, Any]] = []
+        for name in names:
+            if refresh or name not in cached:
+                try:
+                    results.append(self.inspect(name))
+                except Exception as exc:  # noqa: BLE001 - diagnostics should keep going
+                    results.append(self._store_capability_error(name, str(exc)))
+            else:
+                results.append(cached[name])
+        return sorted(results, key=lambda item: str(item.get("model") or ""))
+
+    def inspect(self, model: str) -> dict[str, Any]:
+        clean_model = (model or "").strip()
+        if not clean_model:
+            raise ValueError("model is required")
+        data = self._post_json(f"{OLLAMA_ENDPOINT}/api/show", {"model": clean_model}, timeout=10)
+        details = data.get("details") if isinstance(data.get("details"), dict) else {}
+        model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
+        capabilities = [str(item).lower() for item in data.get("capabilities") or [] if isinstance(item, str)]
+        capability_set = set(capabilities)
+        digest = str(data.get("digest") or "")
+        context_length = int(
+            model_info.get("llama.context_length")
+            or model_info.get("general.context_length")
+            or model_info.get("context_length")
+            or 0
+        )
+        item = {
+            "model": clean_model,
+            "digest": digest,
+            "size": int(data.get("size") or 0),
+            "family": str(details.get("family") or model_info.get("general.architecture") or ""),
+            "parameter_size": str(details.get("parameter_size") or ""),
+            "quantization_level": str(details.get("quantization_level") or ""),
+            "context_length": context_length,
+            "capabilities": capabilities,
+            "text_generation": capability_state(capability_set, {"completion", "chat", "generate"}),
+            "vision": capability_state(capability_set, {"vision"}),
+            "embedding": capability_state(capability_set, {"embedding", "embed"}),
+            "tools": capability_state(capability_set, {"tools", "tool"}),
+            "thinking": "unknown",
+            "raw": data,
+            "inspected_at": utc_ms(),
+            "error": "",
+        }
+        self._store_capability(item)
+        return item
+
+    def refresh_capabilities(self) -> list[dict[str, Any]]:
+        return self.capabilities(refresh=True)
 
     def _model_info(self, item: dict[str, Any]) -> dict[str, Any]:
         details = item.get("details") if isinstance(item.get("details"), dict) else {}
@@ -179,6 +246,69 @@ class ModelService:
                 )
         raise ModelMalformedResponseError("malformed response: Ollama returned no assistant message")
 
+    def chat_vision_detailed(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        image_paths: list[str],
+        options: dict[str, Any] | None = None,
+        thinking: str = "auto",
+        timeout: float = VISION_CHAT_TIMEOUT_SECONDS,
+        response_format: str | None = None,
+    ) -> dict[str, Any]:
+        tagged_messages = [dict(message) for message in messages]
+        image_attached = False
+        for message in tagged_messages:
+            if str(message.get("role") or "user") == "user":
+                message["_image_paths"] = list(image_paths)
+                image_attached = True
+                break
+        if not image_attached:
+            tagged_messages.append({"role": "user", "content": "", "_image_paths": list(image_paths)})
+        return self.chat_vision_history_detailed(
+            model,
+            tagged_messages,
+            options=options,
+            thinking=thinking,
+            timeout=timeout,
+            response_format=response_format,
+        )
+
+    def chat_vision_history_detailed(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        options: dict[str, Any] | None = None,
+        thinking: str = "auto",
+        timeout: float = VISION_CHAT_TIMEOUT_SECONDS,
+        response_format: str | None = None,
+    ) -> dict[str, Any]:
+        prepared_messages: list[dict[str, Any]] = []
+        image_attached = False
+        for message in messages:
+            item = {
+                "role": str(message.get("role") or "user"),
+                "content": str(message.get("content") or ""),
+            }
+            raw_paths = message.get("_image_paths") or []
+            image_paths = [str(path) for path in raw_paths if str(path).strip()] if isinstance(raw_paths, list) else []
+            if image_paths and item["role"] == "user":
+                item["images"] = encode_vision_images(image_paths)
+                image_attached = True
+            prepared_messages.append(item)
+        if not image_attached:
+            raise ValueError("at least one historical user message must include image paths")
+        return self.chat_detailed(
+            model,
+            prepared_messages,  # type: ignore[arg-type]
+            options=options,
+            thinking=thinking,
+            timeout=timeout,
+            response_format=response_format,
+        )
+
     def ps(self) -> dict[str, Any]:
         if not self._tcp_reachable("127.0.0.1", 11434):
             return {"models": [], "reachable": False, "error": "Ollama is not reachable"}
@@ -220,6 +350,79 @@ class ModelService:
             ),
         )
         self.db.conn.commit()
+
+    def _cached_capabilities_by_canonical(self) -> dict[str, dict[str, Any]]:
+        rows = self.db.conn.execute("SELECT * FROM model_capabilities").fetchall()
+        return {canonical_model_tag(row["model"]): capability_row_dict(row) for row in rows}
+
+    def _store_capability(self, item: dict[str, Any]) -> None:
+        self.db.conn.execute(
+            """
+            INSERT INTO model_capabilities(
+                model, digest, size, family, parameter_size, quantization_level,
+                context_length, capabilities_json, text_generation, vision,
+                embedding, tools, thinking, raw_json, inspected_at, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(model) DO UPDATE SET
+                digest = excluded.digest,
+                size = excluded.size,
+                family = excluded.family,
+                parameter_size = excluded.parameter_size,
+                quantization_level = excluded.quantization_level,
+                context_length = excluded.context_length,
+                capabilities_json = excluded.capabilities_json,
+                text_generation = excluded.text_generation,
+                vision = excluded.vision,
+                embedding = excluded.embedding,
+                tools = excluded.tools,
+                thinking = excluded.thinking,
+                raw_json = excluded.raw_json,
+                inspected_at = excluded.inspected_at,
+                error = excluded.error
+            """,
+            (
+                item["model"],
+                item.get("digest", ""),
+                int(item.get("size") or 0),
+                item.get("family", ""),
+                item.get("parameter_size", ""),
+                item.get("quantization_level", ""),
+                int(item.get("context_length") or 0),
+                json.dumps(item.get("capabilities") or []),
+                item.get("text_generation", "unknown"),
+                item.get("vision", "unknown"),
+                item.get("embedding", "unknown"),
+                item.get("tools", "unknown"),
+                item.get("thinking", "unknown"),
+                json.dumps(item.get("raw") or {}),
+                int(item.get("inspected_at") or utc_ms()),
+                item.get("error", ""),
+            ),
+        )
+        self.db.conn.commit()
+
+    def _store_capability_error(self, model: str, error: str) -> dict[str, Any]:
+        item = {
+            "model": model,
+            "digest": "",
+            "size": 0,
+            "family": "",
+            "parameter_size": "",
+            "quantization_level": "",
+            "context_length": 0,
+            "capabilities": [],
+            "text_generation": "error",
+            "vision": "error",
+            "embedding": "error",
+            "tools": "error",
+            "thinking": "error",
+            "raw": {},
+            "inspected_at": utc_ms(),
+            "error": error,
+        }
+        self._store_capability(item)
+        return item
 
     def _tcp_reachable(self, host: str, port: int) -> bool:
         try:
@@ -335,3 +538,180 @@ def parse_ps_model(item: dict[str, Any]) -> dict[str, Any]:
         "partially_cpu_offloaded": bool(cpu_fraction is not None and cpu_fraction > 0.05),
         "raw": item,
     }
+
+
+def capability_state(capabilities: set[str], accepted: set[str]) -> str:
+    if not capabilities:
+        return "unknown"
+    return "yes" if capabilities.intersection(accepted) else "no"
+
+
+def canonical_model_tag(model: str) -> str:
+    clean = str(model or "").strip().lower()
+    if not clean:
+        return ""
+    return clean if ":" in clean else f"{clean}:latest"
+
+
+def display_model_name(model: str, *, installed: bool = True) -> str:
+    clean = str(model or "").strip()
+    if not clean:
+        label = "No model"
+    else:
+        clean = re.sub(r":latest$", "", clean, flags=re.IGNORECASE)
+        parts = [part for part in re.split(r"[-_:]", clean) if part]
+        label = " ".join(format_model_part(part) for part in parts)
+    return label if installed else f"{label} · not installed"
+
+
+def format_model_part(part: str) -> str:
+    if re.match(r"^\d+(?:\.\d+)?[bmk]$", part, flags=re.IGNORECASE):
+        return part.upper()
+    if re.match(r"^v\d+(?:\.\d+)?$", part, flags=re.IGNORECASE):
+        return part.upper()
+    if part.lower() == "vl":
+        return "VL"
+    if re.match(r"^llama\d+(?:\.\d+)?$", part, flags=re.IGNORECASE):
+        return re.sub(r"^llama", "Llama ", part, flags=re.IGNORECASE)
+    if part.lower() == "openhermes":
+        return "OpenHermes"
+    return part[:1].upper() + part[1:]
+
+
+def model_role(model: str, capability: dict[str, Any] | None = None) -> str:
+    capability = capability or {}
+    text_generation = str(capability.get("text_generation") or "unknown")
+    vision = str(capability.get("vision") or "unknown")
+    embedding = str(capability.get("embedding") or "unknown")
+    if embedding == "yes" and text_generation != "yes" and vision != "yes":
+        return "embedding"
+    if vision == "yes" and text_generation == "yes":
+        return "vision"
+    if text_generation == "yes":
+        return "chat"
+    if not capability and looks_like_embedding_model(model):
+        return "embedding"
+    if embedding == "yes" and text_generation != "yes":
+        return "embedding"
+    return "unknown"
+
+
+def is_chat_selectable_model(model: str, capability: dict[str, Any] | None = None) -> bool:
+    role = model_role(model, capability)
+    if role == "embedding":
+        return False
+    capability = capability or {}
+    text_generation = str(capability.get("text_generation") or "unknown")
+    vision = str(capability.get("vision") or "unknown")
+    embedding = str(capability.get("embedding") or "unknown")
+    if text_generation == "yes":
+        return True
+    if text_generation == "no":
+        return False
+    if embedding == "yes" and vision != "yes":
+        return False
+    return not looks_like_embedding_model(model)
+
+
+def looks_like_embedding_model(model: str) -> bool:
+    clean = str(model or "").lower()
+    return bool(re.search(r"\bembed(?:ding)?\b", clean) or "nomic-embed" in clean or "bge-" in clean)
+
+
+def build_conversation_model_catalog(
+    installed_models: list[str],
+    *,
+    model_details: list[dict[str, Any]] | None = None,
+    capabilities: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    capabilities_by_canonical = {
+        canonical_model_tag(str(item.get("model") or "")): item
+        for item in capabilities or []
+        if canonical_model_tag(str(item.get("model") or ""))
+    }
+    detail_names = {
+        canonical_model_tag(str(item.get("name") or "")): str(item.get("name") or "")
+        for item in model_details or []
+        if canonical_model_tag(str(item.get("name") or ""))
+    }
+    aliases_by_canonical: dict[str, list[str]] = {}
+    for model in installed_models:
+        canonical = canonical_model_tag(model)
+        if not canonical:
+            continue
+        aliases_by_canonical.setdefault(canonical, []).append(str(model).strip())
+
+    catalog: list[dict[str, Any]] = []
+    for canonical, aliases in aliases_by_canonical.items():
+        tag = preferred_exact_model_tag(aliases, detail_names.get(canonical))
+        capability = capabilities_by_canonical.get(canonical)
+        if not is_chat_selectable_model(tag, capability):
+            continue
+        catalog.append(
+            {
+                "tag": tag,
+                "canonical_tag": canonical,
+                "display_name": display_model_name(tag),
+                "role": model_role(tag, capability),
+                "installed": True,
+                "stale": False,
+                "exact_tags": aliases,
+                "tooltip": f"Installed tags: {', '.join(aliases)}" if len(aliases) > 1 else tag,
+            }
+        )
+    return sorted(catalog, key=lambda item: str(item.get("display_name") or ""))
+
+
+def preferred_exact_model_tag(aliases: list[str], detail_name: str | None = None) -> str:
+    if detail_name and detail_name in aliases:
+        return detail_name
+    latest = next((tag for tag in aliases if tag.lower().endswith(":latest")), "")
+    if latest:
+        return latest
+    return aliases[0] if aliases else ""
+
+
+def historical_model_label(model: str, installed_models: list[str]) -> str:
+    canonical = canonical_model_tag(model)
+    installed = bool(canonical and any(canonical_model_tag(item) == canonical for item in installed_models))
+    return display_model_name(model, installed=installed)
+
+
+def capability_row_dict(row: Any) -> dict[str, Any]:
+    return {
+        "model": row["model"],
+        "digest": row["digest"],
+        "size": int(row["size"] or 0),
+        "family": row["family"],
+        "parameter_size": row["parameter_size"],
+        "quantization_level": row["quantization_level"],
+        "context_length": int(row["context_length"] or 0),
+        "capabilities": json.loads(row["capabilities_json"] or "[]"),
+        "text_generation": row["text_generation"],
+        "vision": row["vision"],
+        "embedding": row["embedding"],
+        "tools": row["tools"],
+        "thinking": row["thinking"],
+        "raw": json.loads(row["raw_json"] or "{}"),
+        "inspected_at": int(row["inspected_at"] or 0),
+        "error": row["error"],
+    }
+
+
+def encode_vision_images(image_paths: list[str]) -> list[str]:
+    if not image_paths:
+        raise ValueError("at least one image is required")
+    if len(image_paths) > MAX_VISION_IMAGES:
+        raise ValueError(f"at most {MAX_VISION_IMAGES} images can be sent to a vision model")
+    encoded: list[str] = []
+    total_bytes = 0
+    for value in image_paths:
+        path = Path(value)
+        size = path.stat().st_size
+        if size > MAX_VISION_IMAGE_BYTES:
+            raise ValueError(f"image exceeds per-image vision limit of {MAX_VISION_IMAGE_BYTES} bytes")
+        total_bytes += size
+        if total_bytes > MAX_VISION_TOTAL_IMAGE_BYTES:
+            raise ValueError(f"vision request exceeds total image limit of {MAX_VISION_TOTAL_IMAGE_BYTES} bytes")
+        encoded.append(base64.b64encode(path.read_bytes()).decode("ascii"))
+    return encoded

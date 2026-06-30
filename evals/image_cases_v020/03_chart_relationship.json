@@ -1,0 +1,10 @@
+{
+  "id": "chart_relationship",
+  "category": "chart",
+  "image": "fixtures/chart_relationship.png",
+  "modes": ["vision_only", "combined"],
+  "question": "Which bar is taller?",
+  "assertions": [
+    {"type": "spatial_relation", "any": ["Beta taller than Alpha", "Beta is taller"]}
+  ]
+}
