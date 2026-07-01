@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "odysseus-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arboard",
  "image 0.25.10",
