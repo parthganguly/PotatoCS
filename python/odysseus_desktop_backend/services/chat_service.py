@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import uuid
@@ -39,7 +40,7 @@ from odysseus_desktop_backend.services.visual_evidence_curator import (
     status_from_warnings,
     visual_evidence_from_observations,
 )
-from odysseus_desktop_backend.services.session_service import SessionService
+from odysseus_desktop_backend.services.session_service import SessionService, parse_message_metadata
 from odysseus_desktop_backend.services.settings_service import SettingsService
 from odysseus_desktop_backend.storage import utc_ms
 
@@ -446,7 +447,33 @@ class ChatService:
                 question=question_for_models,
                 snippets=retrieved_snippets,
             )
-        assistant_message = self.sessions.add_message(session["id"], "assistant", reply)
+        timings = {
+            "answer_latency_ms": int(reply_response.get("elapsed_ms") or 0),
+            "verifier_latency_ms": int(grounding.get("verifier_latency_ms") or 0),
+            "correction_latency_ms": int(grounding.get("correction_latency_ms") or 0),
+            "final_verification_latency_ms": int(grounding.get("final_verification_latency_ms") or 0),
+        }
+        operation_trace = self.build_operation_trace(
+            model_response=reply_response,
+            analysis=analysis,
+            grounding=grounding,
+            timings=timings,
+            rag_enabled=document_context_enabled,
+            verifier_enabled=verify_rag,
+            retrieved_snippets=retrieved_snippets,
+            selected_model=selected_model,
+            selected_rag_preset=selected_rag_preset,
+            selected_thinking_mode=selected_thinking_mode,
+            answer_style=selected_answer_style,
+            embedding_model=str(current_settings.get("embedding_model") or ""),
+            embedding_backend=str(current_settings.get("embedding_backend") or ""),
+        )
+        assistant_message = self.sessions.add_message(
+            session["id"],
+            "assistant",
+            reply,
+            metadata={"operation_trace": operation_trace},
+        )
 
         if session["title"] == "New chat":
             self.sessions.update(session["id"], {"title": self._derive_title(question_for_models)})
@@ -468,12 +495,177 @@ class ChatService:
             "document_evidence": document_evidence,
             "attached_artifacts": self.artifacts.attachments_for_messages([user_message["id"]]).get(user_message["id"], []) if self.artifacts else [],
             "attached_documents": self.documents.attachments_for_messages([user_message["id"]]).get(user_message["id"], []) if self.documents else [],
-            "timings": {
-                "answer_latency_ms": int(reply_response.get("elapsed_ms") or 0),
-                "verifier_latency_ms": int(grounding.get("verifier_latency_ms") or 0),
-                "correction_latency_ms": int(grounding.get("correction_latency_ms") or 0),
-                "final_verification_latency_ms": int(grounding.get("final_verification_latency_ms") or 0),
+            "timings": timings,
+        }
+
+    def build_operation_trace(
+        self,
+        *,
+        model_response: dict[str, Any] | None,
+        analysis: dict[str, Any] | None,
+        grounding: dict[str, Any] | None,
+        timings: dict[str, Any] | None,
+        rag_enabled: bool,
+        verifier_enabled: bool,
+        retrieved_snippets: list[dict[str, Any]] | None,
+        selected_model: str,
+        selected_rag_preset: str,
+        selected_thinking_mode: str,
+        answer_style: str,
+        embedding_model: str = "",
+        embedding_backend: str = "",
+    ) -> dict[str, Any]:
+        """Build a deliberately allow-listed, local-only summary of a completed answer."""
+
+        response = model_response if isinstance(model_response, dict) else {}
+        analysis_data = analysis if isinstance(analysis, dict) else {}
+        grounding_data = grounding if isinstance(grounding, dict) else {}
+        timing_data = timings if isinstance(timings, dict) else {}
+        analysis_timings = analysis_data.get("timings") if isinstance(analysis_data.get("timings"), dict) else {}
+        evidence = analysis_data.get("evidence") if isinstance(analysis_data.get("evidence"), dict) else {}
+        vision_evidence = evidence.get("vision") if isinstance(evidence.get("vision"), dict) else {}
+        output = analysis_data.get("output") if isinstance(analysis_data.get("output"), dict) else {}
+        provenance = output.get("provenance") if isinstance(output.get("provenance"), dict) else {}
+        verifier = grounding_data.get("verifier") if isinstance(grounding_data.get("verifier"), dict) else {}
+        conversation_context = (
+            evidence.get("conversation_context")
+            if isinstance(evidence.get("conversation_context"), dict)
+            else {}
+        )
+
+        context_evidence_action = _safe_trace_label(
+            provenance.get("context_evidence_action")
+            or conversation_context.get("action")
+        )
+        visual_evidence_reused = _trace_bool(provenance.get("raw_evidence_reused"))
+        if visual_evidence_reused is None and context_evidence_action:
+            visual_evidence_reused = context_evidence_action == "reused"
+        vision_rerun = _trace_bool(provenance.get("vision_rerun"))
+        if vision_rerun is None and context_evidence_action:
+            vision_rerun = context_evidence_action == "vision_rerun"
+
+        timing = _compact_trace_fields(
+            {
+                "answer_latency_ms": _trace_int(timing_data.get("answer_latency_ms")),
+                "synthesis_elapsed_ms": _trace_int(analysis_timings.get("synthesis_elapsed_ms")),
+                "preprocessing_elapsed_ms": _trace_int(analysis_timings.get("preprocessing_elapsed_ms")),
+                "vision_elapsed_ms": _trace_int(vision_evidence.get("elapsed_ms")),
+                "verifier_latency_ms": _trace_int(timing_data.get("verifier_latency_ms")),
+                "correction_latency_ms": _trace_int(timing_data.get("correction_latency_ms")),
+                "total_vision_elapsed_ms": _trace_int(analysis_timings.get("elapsed_ms")),
+            }
+        )
+
+        final_answer_model = _safe_trace_label(
+            response.get("model") or provenance.get("final_answer_model") or selected_model
+        )
+        models = _compact_trace_fields(
+            {
+                "final_answer_model": final_answer_model,
+                "vision_backend": _safe_trace_label(
+                    analysis_data.get("actual_vision_backend") or provenance.get("vision_backend")
+                ),
+                "vision_model": _safe_trace_label(
+                    analysis_data.get("actual_vision_model")
+                    or provenance.get("vision_inspection_model")
+                    or vision_evidence.get("model")
+                ),
+                "ocr_engine": _safe_trace_label(analysis_data.get("ocr_engine")),
+                "embedding_model": _safe_trace_label(embedding_model) if rag_enabled else None,
+                "embedding_backend": _safe_trace_label(embedding_backend) if rag_enabled else None,
+            }
+        )
+
+        pipeline = _compact_trace_fields(
+            {
+                "rag_enabled": bool(rag_enabled),
+                "rag_preset": _safe_trace_label(selected_rag_preset) if rag_enabled else None,
+                "verifier_enabled": bool(verifier_enabled),
+                "verifier_status": _safe_trace_label(verifier.get("status") or "not_run"),
+                "requested_multimodal_mode": _safe_trace_label(provenance.get("mode_requested")),
+                "executed_multimodal_mode": _safe_trace_label(provenance.get("mode_executed")),
+                "visual_evidence_reused": visual_evidence_reused,
+                "vision_rerun": vision_rerun,
+                "context_evidence_action": context_evidence_action,
+                "deterministic_visual_answer": _trace_bool(provenance.get("deterministic_visual_answer")),
+                "answer_style": _safe_trace_label(answer_style),
+                "thinking_mode": _safe_trace_label(selected_thinking_mode),
+                "done_reason": _safe_trace_label(response.get("done_reason")),
+            }
+        )
+
+        tokens = _compact_trace_fields(
+            {
+                "prompt_tokens": _trace_int(response.get("prompt_eval_count")),
+                "completion_tokens": _trace_int(response.get("eval_count")),
+                "total_duration_ns": _trace_int(response.get("total_duration_ns")),
+                "load_duration_ns": _trace_int(response.get("load_duration_ns")),
+                "generation_tokens_per_second": _trace_float(response.get("generation_tokens_per_second")),
+            }
+        )
+
+        chunk_ids: list[str] = []
+        document_ids: list[str] = []
+        page_numbers: list[int] = []
+        for snippet in retrieved_snippets or []:
+            if not isinstance(snippet, dict):
+                continue
+            chunk_id = _safe_trace_identifier(snippet.get("chunk_id"))
+            document_id = _safe_trace_identifier(snippet.get("document_id"))
+            if chunk_id and chunk_id not in chunk_ids:
+                chunk_ids.append(chunk_id)
+            if document_id and document_id not in document_ids:
+                document_ids.append(document_id)
+            for key in ("page_start", "page_end"):
+                page_number = _trace_int(snippet.get(key))
+                if page_number is not None and page_number not in page_numbers:
+                    page_numbers.append(page_number)
+
+        warnings: list[str] = []
+        analysis_warnings = analysis_data.get("warnings")
+        for warning in analysis_warnings if isinstance(analysis_warnings, list) else []:
+            safe_warning = _safe_trace_warning(warning)
+            if safe_warning and safe_warning not in warnings:
+                warnings.append(safe_warning)
+            if len(warnings) >= 8:
+                break
+        verifier_status = str(verifier.get("status") or "").strip().lower()
+        verifier_warning = {
+            "failed": "Verifier found claims that need review.",
+            "timeout": "Verifier timed out before completing.",
+            "error": "Verifier could not complete.",
+        }.get(verifier_status, "")
+        if verifier_warning and verifier_warning not in warnings:
+            warnings.append(verifier_warning)
+        if rag_enabled and not (retrieved_snippets or []):
+            warnings.append("RAG returned no retrieved sources.")
+
+        done_reason = str(response.get("done_reason") or "")
+        thinking = response.get("thinking") if isinstance(response.get("thinking"), str) else ""
+        thinking_returned = bool(thinking) and done_reason not in {
+            "deterministic_visual_answer",
+            "local_context_guard",
+        }
+        # TODO(v0.3): only persist returned model-trace text behind an explicit local setting.
+        model_trace = {
+            "thinking_returned": thinking_returned,
+            "thinking_char_count": len(thinking) if thinking_returned else 0,
+            "thinking_truncated": False,
+        }
+
+        return {
+            "schema_version": 1,
+            "timing": timing,
+            "models": models,
+            "pipeline": pipeline,
+            "tokens": tokens,
+            "sources": {
+                "retrieved_chunk_ids": chunk_ids,
+                "retrieved_document_ids": document_ids,
+                "retrieved_page_numbers": sorted(page_numbers),
             },
+            "warnings": warnings,
+            "model_trace": model_trace,
         }
 
     def _recover_multimodal_turn(
@@ -490,16 +682,17 @@ class ChatService:
         if not analysis or not analysis.get("message_id"):
             return None
         row = self.sessions.db.conn.execute(
-            "SELECT id, session_id, role, content, created_at FROM messages WHERE id = ?",
+            "SELECT id, session_id, role, content, metadata_json, created_at FROM messages WHERE id = ?",
             (analysis["message_id"],),
         ).fetchone()
         if row is None:
             return None
         user_message = dict(row)
+        user_message["metadata"] = parse_message_metadata(user_message.pop("metadata_json", "{}"))
         session = self.sessions.get(user_message["session_id"])
         assistant_row = self.sessions.db.conn.execute(
             """
-            SELECT id, session_id, role, content, created_at
+            SELECT id, session_id, role, content, metadata_json, created_at
             FROM messages
             WHERE session_id = ? AND role = 'assistant' AND created_at >= ?
             ORDER BY created_at ASC
@@ -508,6 +701,10 @@ class ChatService:
             (session["id"], user_message["created_at"]),
         ).fetchone()
         assistant_message = dict(assistant_row) if assistant_row else None
+        if assistant_message is not None:
+            assistant_message["metadata"] = parse_message_metadata(
+                assistant_message.pop("metadata_json", "{}")
+            )
         attached_artifacts = self.artifacts.attachments_for_messages([user_message["id"]]).get(user_message["id"], [])
         return {
             "session": session,
@@ -2344,6 +2541,100 @@ class ChatService:
             "contradicted_claims": contradicted_claims or [],
             "regenerated": False,
         }
+
+
+def _compact_trace_fields(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in values.items()
+        if value is not None and value != ""
+    }
+
+
+def _trace_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _trace_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 and math.isfinite(parsed) else None
+
+
+def _trace_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, (int, str)):
+        return None
+    if value in {0, "0", "false", "False"}:
+        return False
+    if value in {1, "1", "true", "True"}:
+        return True
+    return None
+
+
+def _safe_trace_label(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 200 or "\n" in text or "\r" in text:
+        return None
+    if _trace_text_is_sensitive(text):
+        return None
+    return text
+
+
+def _safe_trace_identifier(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text or len(text) > 200:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", text):
+        return None
+    return text
+
+
+def _safe_trace_warning(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 240 or "\n" in text or "\r" in text:
+        return None
+    lowered = text.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "full system prompt",
+            "raw prompt",
+            "raw ollama response",
+            "full rag context",
+            "retrieved chunk text",
+            "full ocr text",
+        )
+    ):
+        return None
+    if _trace_text_is_sensitive(text):
+        return None
+    return text
+
+
+def _trace_text_is_sensitive(text: str) -> bool:
+    if re.search(r"(?i)(?:^|\s)[a-z]:[\\/]", text):
+        return True
+    if text.startswith(("\\\\", "/")):
+        return True
+    if re.search(r"(?i)data:[^;,]+;base64,", text):
+        return True
+    return bool(re.search(r"(?:[A-Za-z0-9+/]{80,}={0,2})", text))
 
 
 def format_snippets_for_verifier(snippets: list[dict[str, Any]]) -> str:

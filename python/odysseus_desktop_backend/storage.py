@@ -469,6 +469,7 @@ class Database:
                 ON benchmark_campaign_jobs(campaign_id, status, sequence);
             """
         )
+        self.ensure_column("messages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self.ensure_column("documents", "ocr_status", "TEXT NOT NULL DEFAULT 'not_needed'")
         self.ensure_column("documents", "ocr_engine", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "ocr_error", "TEXT NOT NULL DEFAULT ''")

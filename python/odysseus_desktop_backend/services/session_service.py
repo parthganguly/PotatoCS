@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -76,17 +77,31 @@ class SessionService:
             return self.get(session_id)
         return self.create(model=model)
 
-    def add_message(self, session_id: str, role: str, content: str) -> dict[str, Any]:
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if role not in {"system", "user", "assistant"}:
             raise ValueError("invalid message role")
         now = utc_ms()
         message_id = str(uuid.uuid4())
+        message_metadata = dict(metadata) if isinstance(metadata, dict) else {}
         self.db.conn.execute(
             """
-            INSERT INTO messages(id, session_id, role, content, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO messages(id, session_id, role, content, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (message_id, session_id, role, content, now),
+            (
+                message_id,
+                session_id,
+                role,
+                content,
+                json.dumps(message_metadata, ensure_ascii=False, separators=(",", ":")),
+                now,
+            ),
         )
         self.db.conn.execute(
             """
@@ -102,6 +117,7 @@ class SessionService:
             "session_id": session_id,
             "role": role,
             "content": content,
+            "metadata": message_metadata,
             "created_at": now,
         }
 
@@ -109,11 +125,22 @@ class SessionService:
         self.get(session_id)
         rows = self.db.conn.execute(
             """
-            SELECT id, session_id, role, content, created_at
+            SELECT id, session_id, role, content, metadata_json, created_at
             FROM messages
             WHERE session_id = ?
             ORDER BY created_at ASC
             """,
             (session_id,),
         ).fetchall()
-        return self.db.rows_to_dicts(rows)
+        messages = self.db.rows_to_dicts(rows)
+        for message in messages:
+            message["metadata"] = parse_message_metadata(message.pop("metadata_json", "{}"))
+        return messages
+
+
+def parse_message_metadata(raw: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(str(raw or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}

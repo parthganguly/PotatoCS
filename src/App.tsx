@@ -107,6 +107,7 @@ import { conversationSources, deleteSource, importSources, listSources, promoteS
 import { ComposerAttachments, MessageAttachments, documentAttachmentStatusLabel } from "./features/attachments/ComposerAttachments";
 import { ChatProgressBar } from "./features/chat/ChatProgressBar";
 import { ChatHeader } from "./features/chat/ChatHeader";
+import { OperationTrace } from "./features/chat/OperationTrace";
 import { OperationProgressDiagnostics } from "./features/chat/OperationProgressDiagnostics";
 import type { OperationProgressEvent } from "./features/chat/chatProgress";
 import { useChatProgress } from "./features/chat/useChatProgress";
@@ -2013,6 +2014,15 @@ function ChatWorkspace(props: {
                 {props.messages.map((message) => (
                   <div className="flex flex-col gap-2" key={message.id}>
                     <MessageBubble message={message} />
+                    {message.role === "assistant" && message.metadata?.operation_trace && (
+                      <OperationTrace
+                        answer={message.content}
+                        hasEvidence={message.id === latestAssistantMessageId && Boolean(
+                          props.retrievedChunks.length || props.documentEvidence.length || props.artifactAnalysis
+                        )}
+                        trace={message.metadata.operation_trace}
+                      />
+                    )}
                     {message.id === latestAssistantMessageId && props.retrievedChunks.length > 0 && (
                       <RetrievedSources
                         chunks={props.retrievedChunks}

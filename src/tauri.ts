@@ -24,12 +24,70 @@ export type Session = {
   last_message_at: number | null;
 };
 
+export type OperationTrace = {
+  schema_version: 1;
+  timing: {
+    answer_latency_ms?: number;
+    synthesis_elapsed_ms?: number;
+    preprocessing_elapsed_ms?: number;
+    vision_elapsed_ms?: number;
+    verifier_latency_ms?: number;
+    correction_latency_ms?: number;
+    total_vision_elapsed_ms?: number;
+  };
+  models: {
+    final_answer_model?: string;
+    vision_backend?: string;
+    vision_model?: string;
+    ocr_engine?: string;
+    embedding_model?: string;
+    embedding_backend?: string;
+  };
+  pipeline: {
+    rag_enabled: boolean;
+    rag_preset?: string;
+    verifier_enabled: boolean;
+    verifier_status?: string;
+    requested_multimodal_mode?: string;
+    executed_multimodal_mode?: string;
+    visual_evidence_reused?: boolean;
+    vision_rerun?: boolean;
+    context_evidence_action?: string;
+    deterministic_visual_answer?: boolean;
+    answer_style?: string;
+    thinking_mode?: string;
+    done_reason?: string;
+  };
+  tokens: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_duration_ns?: number;
+    load_duration_ns?: number;
+    generation_tokens_per_second?: number;
+  };
+  sources: {
+    retrieved_chunk_ids: string[];
+    retrieved_document_ids: string[];
+    retrieved_page_numbers: number[];
+  };
+  warnings: string[];
+  model_trace: {
+    thinking_returned: boolean;
+    thinking_char_count: number;
+    thinking_truncated: boolean;
+  };
+};
+
 export type Message = {
   id: string;
   session_id: string;
   role: "system" | "user" | "assistant";
   content: string;
   created_at: number;
+  metadata?: {
+    operation_trace?: OperationTrace;
+    [key: string]: unknown;
+  };
   documents?: DocumentRecord[];
   artifacts?: ArtifactRecord[];
   attachments?: MessageAttachment[];
