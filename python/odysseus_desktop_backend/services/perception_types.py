@@ -299,6 +299,17 @@ def strict_visual_synthesis_rules() -> str:
     )
 
 
+def opinion_or_evaluation_synthesis_rules() -> str:
+    return (
+        "Opinion/evaluation rules: when the user asks for an opinion or evaluation about visible image content, "
+        "answer in four clearly labeled parts: Visible facts, Reasonable visual interpretation, Opinion, and Limits. "
+        "State only image/OCR-supported facts in Visible facts. Explain apparent meaning without claiming hidden intent "
+        "in Reasonable visual interpretation. Give the requested judgment in Opinion; do not refuse merely because the "
+        "image contains no explicit opinion text. In Limits, identify what the image alone cannot establish, including "
+        "manufacturer or designer intent, exact jurisdiction, measured effectiveness, statistics, and real-world outcomes."
+    )
+
+
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 

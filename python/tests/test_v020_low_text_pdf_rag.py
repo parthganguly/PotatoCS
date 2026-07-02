@@ -8,7 +8,7 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from odysseus_desktop_backend.services.artifact_service import ArtifactService
-from odysseus_desktop_backend.services.chat_service import ChatService
+from odysseus_desktop_backend.services.chat_service import ChatService, PLAIN_CHAT_SYSTEM_PROMPT
 from odysseus_desktop_backend.services.document_service import DocumentService, OCRPage
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.model_service import ModelService
@@ -787,7 +787,10 @@ def test_no_document_evidence_does_not_inject_rag_context(tmp_path: Path):
 
     assert result["retrieved_snippets"] == []
     assert result["assistant_message"]["content"] == "I do not have document evidence to answer from."
-    assert models.calls[0]["messages"] == [{"role": "user", "content": "Tell me about Rebecca?"}]
+    assert models.calls[0]["messages"] == [
+        {"role": "system", "content": PLAIN_CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": "Tell me about Rebecca?"},
+    ]
     db.close()
 
 

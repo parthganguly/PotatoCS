@@ -27,11 +27,13 @@ from odysseus_desktop_backend.services.perception_types import (
     VISION_BACKEND_OCR_ONLY,
     VISION_BACKEND_OLLAMA,
     normalize_vision_backend,
+    opinion_or_evaluation_synthesis_rules,
     strict_visual_synthesis_rules,
 )
 from odysseus_desktop_backend.services.visual_evidence_curator import (
     VISUAL_EVIDENCE_CURATOR_VERSION,
     VISUAL_EVIDENCE_RETRIEVER_VERSION,
+    classify_question,
     compact_synthesis_packet,
     curate_visual_evidence,
     deterministic_visual_answer,
@@ -67,6 +69,13 @@ DEFAULT_RAG_PRESET = "standard"
 POTATO_RETRIEVAL_LIMIT = 2
 NO_ACTIVE_IMAGE_CONTEXT_MESSAGE = (
     "No image is currently in the conversation context. Attach an image or add one from Sources to ask about it."
+)
+PLAIN_CHAT_SYSTEM_PROMPT = (
+    "You are PotatoCs, a local-first desktop assistant. For ordinary general questions, answer directly and "
+    "helpfully using general knowledge. Do not refuse simple factual, explanatory, or arithmetic questions just "
+    "because no local sources were provided. If you are uncertain, say so briefly. If the user asks about local "
+    "documents, images, or sources that were not provided, ask for them or explain the limitation. Keep answers "
+    "grounded and avoid pretending to have checked external sources."
 )
 
 
@@ -309,6 +318,7 @@ class ChatService:
             for item in history
             if item["role"] in {"system", "user", "assistant"}
         ]
+        image_context_ids = active_artifact_ids[:4]
         if rag_context:
             ollama_messages.insert(
                 0,
@@ -328,9 +338,10 @@ class ChatService:
                 selected_answer_style,
                 selected_rag_preset,
             )
+        elif not image_context_ids and not document_context_enabled and not verify_rag:
+            ollama_messages.insert(0, {"role": "system", "content": PLAIN_CHAT_SYSTEM_PROMPT})
 
         generation_options = {"temperature": float(temperature)}
-        image_context_ids = active_artifact_ids[:4]
         if image_context_ids and not multimodal_route:
             emit_progress("model_capability_check")
             multimodal_route = self._resolve_context_multimodal_route(
@@ -1879,9 +1890,16 @@ class ChatService:
         output = analysis.get("output") or {}
         ocr_text = str(output.get("ocr_text") or "").strip()
         action = str(route.get("context_evidence_action") or "")
+        question_type = classify_question(question)
+        opinion_rules = (
+            opinion_or_evaluation_synthesis_rules()
+            if question_type == "opinion_or_evaluation"
+            else ""
+        )
         return (
             "Answer the user's latest question directly using the image already attached in this conversation.\n"
             "Do not say no image was provided. Do not expose hidden reasoning. Do not identify a person from their face.\n"
+            f"{opinion_rules + chr(10) if opinion_rules else ''}"
             f"Question: {question}\n"
             f"Conversation image context: {action or 'active'}\n"
             f"Exact OCR text, if useful: {ocr_text or '[none]'}\n"
@@ -1901,11 +1919,18 @@ class ChatService:
         mode_executed = str(route.get("mode_executed") or analysis.get("mode") or "")
         no_vision = mode_executed.startswith("ocr_only") and not vision_model
         compact_packet = compact_synthesis_packet(question, curated_visual_evidence, ocr_text=ocr_text) if curated_visual_evidence else ""
+        question_type = str(curated_visual_evidence.get("question_type") or classify_question(question))
+        opinion_rules = (
+            opinion_or_evaluation_synthesis_rules()
+            if question_type == "opinion_or_evaluation"
+            else ""
+        )
         return (
             "Answer the user's question using only the compact local image evidence below.\n"
             "Do not expose hidden reasoning. Do not identify a person from their face. "
             "Keep exact OCR text separate from model visual observations.\n"
             f"{strict_visual_synthesis_rules()}\n"
+            f"{opinion_rules + chr(10) if opinion_rules else ''}"
             f"Question: {question}\n\n"
             f"Mode requested: {route.get('mode_requested')}\n"
             f"Mode executed: {mode_executed}\n"

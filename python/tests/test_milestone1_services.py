@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from odysseus_desktop_backend.services.chat_service import ChatService
+from odysseus_desktop_backend.services.chat_service import ChatService, PLAIN_CHAT_SYSTEM_PROMPT
 from odysseus_desktop_backend.services.model_service import ModelService
 from odysseus_desktop_backend.services.session_service import SessionService
 from odysseus_desktop_backend.services.settings_service import SettingsService
@@ -48,7 +48,7 @@ def test_settings_sessions_and_messages_persist(tmp_path: Path):
     reopened.close()
 
 
-def test_chat_is_simple_non_rag_ollama_call(tmp_path: Path):
+def test_chat_is_simple_non_rag_ollama_call_with_default_steering(tmp_path: Path):
     db, settings, _sessions, models, chat = build_services(tmp_path)
     settings.set({"default_model": "mistral"})
 
@@ -60,6 +60,7 @@ def test_chat_is_simple_non_rag_ollama_call(tmp_path: Path):
         {
             "model": "mistral",
             "messages": [
+                {"role": "system", "content": PLAIN_CHAT_SYSTEM_PROMPT},
                 {"role": "user", "content": "No tools or retrieval here"},
             ],
         }

@@ -6,7 +6,7 @@ from typing import Any
 
 
 OCR_NO_TEXT_WARNING = "OCR ran, but no text was extracted."
-VISUAL_EVIDENCE_CURATOR_VERSION = "visual-evidence-curator-v2"
+VISUAL_EVIDENCE_CURATOR_VERSION = "visual-evidence-curator-v3"
 VISUAL_EVIDENCE_RETRIEVER_VERSION = "visual-evidence-retriever-v1"
 
 VISUAL_SNIPPET_KINDS = {
@@ -36,6 +36,7 @@ QUESTION_CLASSES = {
     "brand_or_origin",
     "person_identity",
     "emotion_or_intent",
+    "opinion_or_evaluation",
     "comparison",
     "other",
 }
@@ -317,6 +318,8 @@ def classify_question(question: str) -> str:
     q = f" {normalized} "
     if not q.strip():
         return "other"
+    if is_opinion_or_evaluation_question(normalized):
+        return "opinion_or_evaluation"
     if re.search(r"\b(read|text|say|says|written|words?|letters?|ocr)\b", q):
         return "text_reading"
     if re.search(r"\b(who is|who's|name|identify this person|identity)\b", q):
@@ -364,6 +367,20 @@ def classify_question(question: str) -> str:
     if re.search(r"\b(describe|what is in|what's in|tell me about)\b", q):
         return "scene_description"
     return "other"
+
+
+def is_opinion_or_evaluation_question(normalized_question: str) -> bool:
+    q = str(normalized_question or "")
+    return any(
+        re.search(pattern, q)
+        for pattern in (
+            r"\b(?:what is your opinion|what do you think (?:of|about)|what is your take|what is your view|your opinion|your take|give (?:me )?your opinion)\b",
+            r"\b(?:judge|evaluate|evaluation|critique|rate|review)\b",
+            r"\bis (?:this|that|the)\b.{0,48}\b(?:good|bad|effective|useful|scary|manipulative|persuasive|ethical|appealing|clear|successful)\b",
+            r"\bdo you think\b.{0,48}\b(?:good|bad|effective|useful|scary|manipulative|persuasive|ethical|appealing|clear|successful)\b",
+            r"\b(?:good|bad|effective|useful|scary|manipulative|persuasive|ethical|appealing|clear|successful)\s+(?:advertising|advertisement|ad|design|packaging|poster|label|warning|ui|interface)\b",
+        )
+    )
 
 
 def extract_question_targets(question: str) -> list[str]:
@@ -935,16 +952,26 @@ def compact_synthesis_packet(question: str, curated: dict[str, Any], *, ocr_text
         lines.append("Do not infer a garment or object color unless a retrieved snippet directly states it.")
     if ocr_text.strip():
         lines.extend(["", "OCR TEXT", ocr_text.strip()])
-    lines.extend([
+    answer_rules = [
         "",
         "ANSWER RULES",
         "- Answer directly.",
-        "- Use only the retrieved visual evidence, direct observations, and supported inference above.",
         "- Prefer direct caption or dense-region evidence over object-only evidence.",
         "- Do not add causes, brands, places, identities, motives, or emotions.",
         "- Use may, appears, or likely for inference.",
         "- Do not start with boilerplate about structured visual evidence.",
-    ])
+    ]
+    if curated.get("question_type") == "opinion_or_evaluation":
+        answer_rules.extend([
+            "- Base factual claims on the retrieved visual evidence, direct observations, and supported inference above.",
+            "- Use four labeled parts in order: Visible facts; Reasonable visual interpretation; Opinion; Limits.",
+            "- Give a clearly labeled opinion based on the visible facts; an opinion is a judgment, not a claim that opinion text is visible.",
+            "- Do not refuse merely because the image contains no explicit opinion text.",
+            "- Do not claim hidden intent, manufacturer or designer intent, exact jurisdiction, measured effectiveness, statistics, or real-world outcomes unless provided.",
+        ])
+    else:
+        answer_rules.append("- Use only the retrieved visual evidence, direct observations, and supported inference above.")
+    lines.extend(answer_rules)
     return "\n".join(lines)
 
 
@@ -965,7 +992,15 @@ def guard_visual_answer(answer: str, curated: dict[str, Any]) -> dict[str, Any]:
     })
     for excluded in curated.get("excluded_irrelevant_entities") or []:
         label = canonicalize_label(str(excluded))
-        if label and re.search(rf"\b{re.escape(label)}s?\b", lower):
+        label_tokens = {
+            canonicalize_label(token)
+            for token in re.findall(r"\b[a-z][a-z-]+\b", label)
+            if canonicalize_label(token)
+        }
+        label_is_supported = label in supported_entities or bool(
+            label_tokens and label_tokens.issubset(supported_entities)
+        )
+        if label and not label_is_supported and re.search(rf"\b{re.escape(label)}s?\b", lower):
             return guard_failure("excluded_entity", f"Answer mentioned excluded entity: {label}")
     for brand in ("ikea", "apple", "nike", "samsung", "google"):
         if brand in lower and brand not in supported_entities:

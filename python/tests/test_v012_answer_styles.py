@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from odysseus_desktop_backend.services.chat_service import ChatService
+from odysseus_desktop_backend.services.chat_service import ChatService, PLAIN_CHAT_SYSTEM_PROMPT
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.model_service import ModelService
@@ -121,7 +121,10 @@ def test_invalid_answer_style_does_not_change_non_rag_chat(tmp_path: Path):
 
     assert result["assistant_message"]["content"] == "plain chat"
     assert result["retrieved_chunks"] == []
-    assert models.calls[0]["messages"] == [{"role": "user", "content": "simple chat"}]
+    assert models.calls[0]["messages"] == [
+        {"role": "system", "content": PLAIN_CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": "simple chat"},
+    ]
     db.close()
 
 
