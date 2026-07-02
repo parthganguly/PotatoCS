@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -11,9 +12,16 @@ from typing import Any, Iterator
 
 
 PROGRESS_DISCRIMINATOR = "__odysseus_progress__"
+STRICT_TRACE_ENV_VAR = "ODYSSEUS_STRICT_TRACE"
 _SAFE_STATUSES = {"running", "completed", "error"}
 _SAFE_CACHE_STATUSES = {"reused", "fresh", "miss", "not_applicable"}
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# operation_id is a caller-chosen tag (not a DB row id), so it keeps a broad shape check.
+_OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# session_id/message_id/artifact_id/source_id always reference real DB rows, which are
+# always uuid4 strings at every current call site — validate the shape strictly.
+_TRACE_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _FIXED_LABELS = {
     "operation_failed": "Operation failed.",
     "done": "Done",
@@ -35,9 +43,36 @@ _FIXED_LABELS = {
 }
 
 
+class TraceIdentifierError(ValueError):
+    """Raised in strict-trace mode when a progress identifier is not UUID-shaped."""
+
+
+def _strict_trace_enabled() -> bool:
+    return os.environ.get(STRICT_TRACE_ENV_VAR) == "1"
+
+
 def _safe_identifier(value: object) -> str | None:
     text = str(value or "").strip()
-    return text if text and _IDENTIFIER_RE.fullmatch(text) else None
+    return text if text and _OPERATION_ID_RE.fullmatch(text) else None
+
+
+def _safe_trace_uuid(value: object, field: str) -> str | None:
+    """Validate a DB-row identifier field (session/message/artifact/source id).
+
+    Defaults to dropping non-UUID-shaped values to None so a bad binding can never
+    leak arbitrary text (e.g. a filename or path) into a trace event. Under
+    ODYSSEUS_STRICT_TRACE=1 it raises instead, so tests/dev catch a call site that
+    accidentally binds a non-UUID string. The exception message never includes the
+    offending value, only the field name.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if _TRACE_UUID_RE.fullmatch(text):
+        return text
+    if _strict_trace_enabled():
+        raise TraceIdentifierError(f"{field} must be a UUID-shaped trace identifier")
+    return None
 
 
 def _safe_count(value: object) -> int | None:
@@ -77,10 +112,10 @@ class ProgressEmitter:
         self.started_at = int(time.time() * 1000)
         self._started_monotonic = time.perf_counter()
         self.operation_id = _safe_identifier(operation_id) or f"operation-{uuid.uuid4()}"
-        self.session_id = _safe_identifier(session_id)
-        self.message_id = _safe_identifier(message_id)
-        self.artifact_id = _safe_identifier(artifact_id)
-        self.source_id = _safe_identifier(source_id)
+        self.session_id = _safe_trace_uuid(session_id, "session_id")
+        self.message_id = _safe_trace_uuid(message_id, "message_id")
+        self.artifact_id = _safe_trace_uuid(artifact_id, "artifact_id")
+        self.source_id = _safe_trace_uuid(source_id, "source_id")
 
     def bind(
         self,
@@ -92,13 +127,15 @@ class ProgressEmitter:
     ) -> None:
         try:
             if session_id is not None:
-                self.session_id = _safe_identifier(session_id)
+                self.session_id = _safe_trace_uuid(session_id, "session_id")
             if message_id is not None:
-                self.message_id = _safe_identifier(message_id)
+                self.message_id = _safe_trace_uuid(message_id, "message_id")
             if artifact_id is not None:
-                self.artifact_id = _safe_identifier(artifact_id)
+                self.artifact_id = _safe_trace_uuid(artifact_id, "artifact_id")
             if source_id is not None:
-                self.source_id = _safe_identifier(source_id)
+                self.source_id = _safe_trace_uuid(source_id, "source_id")
+        except TraceIdentifierError:
+            raise
         except Exception:
             return
 

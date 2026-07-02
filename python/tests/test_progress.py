@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
-from odysseus_desktop_backend.progress import ProgressEmitter, emit_progress, progress_operation
+import pytest
+
+from odysseus_desktop_backend.progress import (
+    ProgressEmitter,
+    TraceIdentifierError,
+    emit_progress,
+    progress_operation,
+)
 from odysseus_desktop_backend.services.ocr_service import (
     OCREngineStatus,
     OCRImageResult,
@@ -22,7 +30,8 @@ def progress_lines(captured: str) -> list[dict[str, object]]:
 
 
 def test_progress_emitter_writes_valid_discriminated_json(capsys):
-    emitter = ProgressEmitter(operation_id="chat-image-123", session_id="session-1")
+    session_id = str(uuid.uuid4())
+    emitter = ProgressEmitter(operation_id="chat-image-123", session_id=session_id)
     payload = emitter.emit("florence_load", cache_status="miss")
     events = progress_lines(capsys.readouterr().err)
     assert payload is not None
@@ -30,9 +39,13 @@ def test_progress_emitter_writes_valid_discriminated_json(capsys):
     assert events[0]["__odysseus_progress__"] is True
     assert events[0]["label"] == "Loading Florence..."
     assert events[0]["detail"] is None
+    assert events[0]["session_id"] == session_id
 
 
-def test_progress_labels_and_detail_cannot_leak_paths_or_private_text(capsys):
+def test_progress_labels_and_detail_cannot_leak_paths_or_private_text(capsys, monkeypatch):
+    # Exercises the default (non-strict) runtime fallback: a bad identifier binding
+    # must drop to None, never leak, even when strict mode isn't enabled.
+    monkeypatch.setenv("ODYSSEUS_STRICT_TRACE", "0")
     secret_path = r"C:\Users\Private\Downloads\invoice.png"
     secret_ocr = "Found text: account 12345"
     emitter = ProgressEmitter(operation_id=secret_path, session_id=secret_path, artifact_id="artifact-1")
@@ -41,8 +54,49 @@ def test_progress_labels_and_detail_cannot_leak_paths_or_private_text(capsys):
     event = progress_lines(raw)[0]
     assert event["label"] == "Running OCR page 2/5..."
     assert event["session_id"] is None
+    assert event["artifact_id"] is None
     assert secret_path not in raw
     assert secret_ocr not in raw
+
+
+def test_filename_shaped_identifier_rejected_under_strict_trace_mode(monkeypatch):
+    monkeypatch.setenv("ODYSSEUS_STRICT_TRACE", "1")
+    with pytest.raises(TraceIdentifierError):
+        ProgressEmitter(operation_id="op-1", artifact_id="receipt_total_text.png")
+    with pytest.raises(TraceIdentifierError):
+        ProgressEmitter(operation_id="op-1", session_id="my-document-ocr")
+
+
+def test_unknown_stage_degrades_to_working_without_leaking_raw_text(capsys):
+    emitter = ProgressEmitter(operation_id="op-2")
+    raw_stage = "custom_stage_with_secret_SENTINEL_9f3a"
+    emitter.emit(raw_stage)
+    raw = capsys.readouterr().err
+    event = progress_lines(raw)[0]
+    assert event["stage"] == "working"
+    assert event["label"] == "Working..."
+    assert raw_stage not in raw
+    assert "SENTINEL_9f3a" not in raw
+
+
+@pytest.mark.parametrize(
+    "detail_value",
+    [
+        "raw secret string",
+        {"nested": "secret"},
+        ["list", "of", "secrets"],
+        12345,
+        None,
+    ],
+)
+def test_detail_is_always_serialized_as_null(capsys, detail_value):
+    emitter = ProgressEmitter(operation_id="op-3")
+    payload = emitter.emit("answer_generation", detail=detail_value)
+    raw = capsys.readouterr().err
+    event = progress_lines(raw)[0]
+    assert payload is not None
+    assert payload["detail"] is None
+    assert event["detail"] is None
 
 
 def test_progress_dynamic_retrieval_label_is_numeric_only(capsys):
