@@ -53,6 +53,26 @@ struct SidecarLaunchContext {
     dev_repo_root: Option<PathBuf>,
 }
 
+const PROXY_ENV_VARS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+/// Removes proxy env vars the sidecar would otherwise inherit from the parent
+/// process, since `urllib.request` honors them automatically for any HTTP
+/// call the Python backend makes.
+fn strip_proxy_env_vars(command: &mut Command) {
+    for name in PROXY_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 impl Drop for AppState {
     fn drop(&mut self) {
         if let Ok(mut backend) = self.backend.lock() {
@@ -134,6 +154,7 @@ impl BackendClient {
         if let Some(model_dir) = &florence_model_dir {
             command.env("ODYSSEUS_FLORENCE_MODEL_DIR", model_dir);
         }
+        strip_proxy_env_vars(&mut command);
 
         let mut child = command
             .stdin(Stdio::piped())
@@ -777,5 +798,62 @@ mod tests {
     fn malformed_progress_json_is_ignored() {
         assert!(parse_progress_event("{\"__odysseus_progress__\":true").is_none());
         assert!(parse_progress_event(r#"{"__odysseus_progress__":false}"#).is_none());
+    }
+
+    #[test]
+    fn proxy_env_var_list_contains_all_expected_names() {
+        let expected = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ];
+        for name in expected {
+            assert!(
+                PROXY_ENV_VARS.contains(&name),
+                "expected PROXY_ENV_VARS to contain {name}"
+            );
+        }
+        assert_eq!(PROXY_ENV_VARS.len(), expected.len());
+    }
+
+    #[test]
+    fn strip_proxy_env_vars_removes_inherited_proxy_vars_from_command() {
+        // `Command::env_remove` records the removal on the command's own env
+        // map regardless of whether the var is actually set in this process,
+        // so we can assert on `get_envs()` without touching the real process
+        // environment (which would make the test order-dependent under
+        // parallel test execution).
+        let mut command = Command::new("does-not-matter");
+        command.env("SOME_OTHER_VAR", "kept");
+        strip_proxy_env_vars(&mut command);
+
+        // Windows env vars are case-insensitive, and `Command`'s internal env
+        // map case-folds keys to match: setting HTTP_PROXY and http_proxy is
+        // the same underlying variable, so lookups here must be case-insensitive
+        // too or this test would fail to find entries under a differently-cased
+        // key than the one `env_remove` happened to normalize to.
+        let mut removed_lower = std::collections::HashSet::new();
+        let mut kept_value = None;
+        for (key, value) in command.get_envs() {
+            let key_lower = key.to_string_lossy().to_lowercase();
+            if value.is_none() {
+                removed_lower.insert(key_lower);
+            } else if key_lower == "some_other_var" {
+                kept_value = value;
+            }
+        }
+
+        for name in PROXY_ENV_VARS {
+            assert!(
+                removed_lower.contains(&name.to_lowercase()),
+                "expected {name} to be tracked as removed"
+            );
+        }
+        assert_eq!(kept_value, Some(std::ffi::OsStr::new("kept")));
     }
 }
