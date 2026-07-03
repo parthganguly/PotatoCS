@@ -34,6 +34,42 @@ fn parse_progress_event(line: &str) -> Option<ProgressEvent> {
     })
 }
 
+fn read_next_rpc_response<R: BufRead>(
+    reader: &mut R,
+    expected_id: u64,
+) -> std::io::Result<Option<Value>> {
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+
+        let Ok(response) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+
+        if response.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            return Ok(Some(response));
+        }
+    }
+}
+
+fn stop_child_after_grace_period(child: &mut Child, grace_period: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + grace_period;
+
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_status)) => return Ok(()),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    child.kill().map_err(|err| err.to_string())?;
+    child.wait().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct AppStatus {
     profile_id: String,
@@ -273,16 +309,13 @@ impl BackendClient {
             )));
         }
 
-        loop {
-            let mut line = String::new();
-
-            let read = self.stdout.read_line(&mut line).map_err(|err| {
-                BackendCallError::final_error(format!(
-                    "failed to read Python sidecar response for {method}: {err}"
-                ))
-            })?;
-
-            if read == 0 {
+        let response = match read_next_rpc_response(&mut self.stdout, id).map_err(|err| {
+            BackendCallError::final_error(format!(
+                "failed to read Python sidecar response for {method}: {err}"
+            ))
+        })? {
+            Some(response) => response,
+            None => {
                 self.is_shutdown = true;
                 let message = format!("Python sidecar exited before responding to {method}");
                 if can_retry_after_lost_response(method) {
@@ -290,28 +323,18 @@ impl BackendClient {
                 }
                 return Err(BackendCallError::final_error(message));
             }
+        };
 
-            let response: Value = serde_json::from_str(line.trim()).map_err(|err| {
-                BackendCallError::final_error(format!(
-                    "invalid Python sidecar JSON response for {method}: {err}: {line}"
-                ))
-            })?;
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("sidecar error");
 
-            if response.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-
-            if let Some(error) = response.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("sidecar error");
-
-                return Err(BackendCallError::final_error(message.to_string()));
-            }
-
-            return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+            return Err(BackendCallError::final_error(message.to_string()));
         }
+
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
     fn restart(&mut self, app: &AppHandle, profile_dir: &Path, reason: &str) -> Result<(), String> {
@@ -345,18 +368,7 @@ impl BackendClient {
             self.is_shutdown = true;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_status)) => return Ok(()),
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(err) => return Err(err.to_string()),
-            }
-        }
-
-        self.child.kill().map_err(|err| err.to_string())?;
-        Ok(())
+        stop_child_after_grace_period(&mut self.child, Duration::from_secs(3))
     }
 }
 
@@ -778,6 +790,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn normal_sidecar_stderr_is_not_a_progress_event() {
@@ -798,6 +811,101 @@ mod tests {
     fn malformed_progress_json_is_ignored() {
         assert!(parse_progress_event("{\"__odysseus_progress__\":true").is_none());
         assert!(parse_progress_event(r#"{"__odysseus_progress__":false}"#).is_none());
+    }
+
+    #[test]
+    fn rpc_reader_skips_garbage_and_unrelated_json_before_matching_response() {
+        let input = concat!(
+            "PRIVATE_GARBAGE_MUST_NOT_SURFACE\n",
+            r#"{"jsonrpc":"2.0","id":9,"result":"unrelated"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":7,"result":{"ready":true}}"#,
+            "\n",
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+
+        let response = read_next_rpc_response(&mut reader, 7)
+            .expect("reader should not fail")
+            .expect("matching response should be found");
+
+        assert_eq!(response["result"]["ready"], true);
+    }
+
+    #[test]
+    fn rpc_reader_skips_progress_before_matching_response() {
+        let input = concat!(
+            r#"{"__odysseus_progress__":true,"stage":"rag_search","label":"Searching sources..."}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"result":"done"}"#,
+            "\n",
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+
+        let response = read_next_rpc_response(&mut reader, 3)
+            .expect("reader should not fail")
+            .expect("matching response should be found");
+
+        assert_eq!(response["result"], "done");
+    }
+
+    #[test]
+    fn rpc_reader_ignores_malformed_progress_without_panicking() {
+        let input = concat!(
+            "{\"__odysseus_progress__\":true\n",
+            r#"{"jsonrpc":"2.0","id":4,"result":null}"#,
+            "\n",
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+
+        let response = read_next_rpc_response(&mut reader, 4)
+            .expect("reader should not fail")
+            .expect("matching response should be found");
+
+        assert!(response["result"].is_null());
+    }
+
+    #[test]
+    fn rpc_reader_returns_none_at_eof_without_a_matching_response() {
+        let mut reader = Cursor::new(b"not protocol output\n".as_slice());
+
+        assert!(read_next_rpc_response(&mut reader, 1)
+            .expect("reader should not fail")
+            .is_none());
+    }
+
+    #[test]
+    fn child_cleanup_kills_and_reaps_a_running_child_without_panicking() {
+        let current_test_binary = std::env::current_exe().expect("current test executable");
+        let mut child = Command::new(current_test_binary)
+            .args([
+                "--exact",
+                "tests::lifecycle_sleeping_child_fixture",
+                "--ignored",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleeping child should start");
+        thread::sleep(Duration::from_millis(25));
+        assert!(child
+            .try_wait()
+            .expect("child status should be inspectable")
+            .is_none());
+
+        stop_child_after_grace_period(&mut child, Duration::from_millis(50))
+            .expect("cleanup should kill and reap the child");
+
+        assert!(child
+            .try_wait()
+            .expect("child status should remain inspectable")
+            .is_some());
+    }
+
+    #[test]
+    #[ignore = "helper process spawned by child_cleanup_kills_and_reaps_a_running_child_without_panicking"]
+    fn lifecycle_sleeping_child_fixture() {
+        thread::sleep(Duration::from_secs(60));
     }
 
     #[test]
