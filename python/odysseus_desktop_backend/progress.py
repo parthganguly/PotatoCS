@@ -15,8 +15,11 @@ PROGRESS_DISCRIMINATOR = "__odysseus_progress__"
 STRICT_TRACE_ENV_VAR = "ODYSSEUS_STRICT_TRACE"
 _SAFE_STATUSES = {"running", "completed", "error"}
 _SAFE_CACHE_STATUSES = {"reused", "fresh", "miss", "not_applicable"}
-# operation_id is a caller-chosen tag (not a DB row id), so it keeps a broad shape check.
-_OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# Keep only a trailing UUID from caller-provided operation IDs. Human-readable
+# prefixes are useful at the call site but must not become a metadata side door.
+_OPERATION_UUID_RE = re.compile(
+    r"(?:^|[-:])(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
 # session_id/message_id/artifact_id/source_id always reference real DB rows, which are
 # always uuid4 strings at every current call site — validate the shape strictly.
 _TRACE_UUID_RE = re.compile(
@@ -53,7 +56,8 @@ def _strict_trace_enabled() -> bool:
 
 def _safe_identifier(value: object) -> str | None:
     text = str(value or "").strip()
-    return text if text and _OPERATION_ID_RE.fullmatch(text) else None
+    match = _OPERATION_UUID_RE.search(text)
+    return f"operation-{match.group('uuid').lower()}" if match else None
 
 
 def _safe_trace_uuid(value: object, field: str) -> str | None:
