@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
+
+
+SCHEMA_VERSION = 10
 
 
 def utc_ms() -> int:
@@ -18,12 +22,43 @@ class Database:
         self.profile_dir = Path(profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.profile_dir / "app.db"
+        self._stored_schema_version = self._read_stored_schema_version()
+        if (
+            self._stored_schema_version is not None
+            and self._stored_schema_version > SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                f"Current app schema version {SCHEMA_VERSION} cannot open stored DB "
+                f"schema version {self._stored_schema_version} at {self.path}"
+            )
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA busy_timeout = 5000")
         self.init_schema()
+
+    def _read_stored_schema_version(self) -> int | None:
+        if not self.path.exists():
+            return None
+
+        uri = f"{self.path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            app_meta_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_meta'"
+            ).fetchone()
+            if app_meta_exists is None:
+                return None
+            row = conn.execute(
+                "SELECT value FROM app_meta WHERE key = 'schema_version'"
+            ).fetchone()
+
+        if row is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
 
     def init_schema(self) -> None:
         self.conn.executescript(
@@ -549,17 +584,19 @@ class Database:
         self.ensure_column("benchmark_campaigns", "requested_action", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("benchmark_campaign_jobs", "estimated_min_runtime_ms", "INTEGER NOT NULL DEFAULT 0")
         self.ensure_column("benchmark_campaign_jobs", "model_info_json", "TEXT NOT NULL DEFAULT '{}'")
+        # This v10 compatibility rewrite intentionally remains value-gated so
+        # pre-versioning and already-stamped old profiles retain their behavior.
         old_embedding_model = self.get_setting("embedding_model", None)
         old_embedding_backend = self.get_setting("embedding_backend", None)
         if old_embedding_model == "local-hash-v1" and old_embedding_backend is None:
             self.set_setting("embedding_backend", "auto")
             self.set_setting("embedding_model", "nomic-embed-text")
-        self.set_meta("schema_version", "10")
         self.set_setting_default("default_model", "llama3.2")
         self.set_setting_default("ollama_endpoint", "http://127.0.0.1:11434")
         self.set_setting_default("embedding_backend", "auto")
         self.set_setting_default("embedding_model", "nomic-embed-text")
         self.set_setting_default("vision_backend", "automatic")
+        self.set_meta("schema_version", str(SCHEMA_VERSION))
         self.conn.commit()
 
     def ensure_column(self, table: str, column: str, definition: str) -> None:
