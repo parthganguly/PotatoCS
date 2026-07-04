@@ -11,7 +11,9 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
 - Startup health-ping fix: `7119e40c` (`fix: make startup sidecar health.ping
   failure non-fatal`) — source-level only, see `GATE.md` section 2.
-- Current worktree: clean at `511ab1db` after automated proof suite pass.
+- Current worktree: clean at `5171fdf4` after v0.3.0 version alignment.
+- Version alignment: **DONE** at `5171fdf4` — all version sources report
+  `0.3.0`; see `projects/odysseus/VERSION_ALIGNMENT_2026-07-04.md`.
 - Automated proof suite: **PASS** at `511ab1db` —
   `projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md` (Python 297/0/0,
   progress tests, frontend build, cargo check/test, `git diff --check`);
@@ -31,8 +33,8 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Version and naming state
 
-- `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`: `0.2.1`.
-- Python sidecar `__version__`: `0.2.0`.
+- `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`,
+  Python sidecar `__version__`: all `0.3.0` (aligned at `5171fdf4`).
 - Public brand: `PotatoCs`; requested canonical spelling: `PotatoCS`.
 - Shipped app identity: `Odysseus Desktop` / `odysseus-desktop`.
 - Profile identifier: `dev.odysseus.desktop`.
@@ -76,11 +78,13 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. Current installer SHA-256 does not match the checked-in checksum.
-2. Runtime version sources disagree.
-3. Full installed/package proof has not passed at one immutable commit
-   (version alignment and checksum match remain open; the automated proof
-   suite — `GATE.md` section 3 — is now closed at `511ab1db`).
+1. Current installer SHA-256 does not match the checked-in checksum, and
+   both installer and checksum artifacts are version-stale (`v0.2.1`) after
+   the `0.3.0` alignment — final rebuild and checksum regeneration required.
+2. Full installed/package proof has not passed at one immutable commit
+   (final installer, checksum match and release truthfulness remain open;
+   automated proof suite closed at `511ab1db`, version alignment closed at
+   `5171fdf4`).
 
 ## Freeze
 

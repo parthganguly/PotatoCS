@@ -78,7 +78,12 @@ active suite-wide.
 
 ### 5. Release truthfulness
 
-- [ ] Package, Cargo, Tauri and Python runtime all report `0.3.0`.
+- [x] Package, Cargo, Tauri and Python runtime all report `0.3.0`.
+      Source-level alignment at `5171fdf4` (`chore: align version sources to
+      0.3.0`): `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`,
+      `Cargo.lock`, `tauri.conf.json` and Python `__version__` all `0.3.0`;
+      build/check/test/fixture verification recorded in
+      `projects/odysseus/VERSION_ALIGNMENT_2026-07-04.md`.
 - [ ] Release notes describe v0.3 as proof/hardening, not agentic capability.
 - [ ] Public naming is documented as PotatoCS project / Odysseus Desktop app.
 - [ ] Test counts, skips and smoke claims are generated from the candidate SHA.
@@ -86,8 +91,11 @@ active suite-wide.
 
 ## Current hard failures
 
-- Python sidecar version is `0.2.0` while app sources say `0.2.1`.
-- Installer hash `D6E8A267...00EC209E` differs from checksum `5E2434D4...57E491B`.
+- Installer hash `D6E8A267...00EC209E` differs from checksum `5E2434D4...57E491B`;
+  both artifacts are also version-stale (`v0.2.1`) after the `0.3.0`
+  alignment — a final installer rebuild and checksum regeneration are required.
+- (Resolved at `5171fdf4`: Python sidecar/app version disagreement — all
+  sources now `0.3.0`.)
 
 ## Recorded evidence
 

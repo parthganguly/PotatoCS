@@ -1,14 +1,12 @@
 # Evidence Index
-
 Use paths as pointers; do not paste their full contents into harness files.
 
 ## Repository baseline
 
 - Snapshot SHA: `946746de16e7124df6a1208085e935a0606d6552`.
-- `README.md` — public capability, privacy, limitation and old smoke claims.
-- `docs/milestones.md` — Sources/vision scope and explicit agent/tool exclusions.
-- `docs/releases/v0.2.1.md` — Operation Trace release contract.
-- `docs/v0.2.0-current-state-audit.md` — early multimodal implementation audit.
+- `README.md` (public claims); `docs/milestones.md` (scope/exclusions);
+  `docs/releases/v0.2.1.md` (Operation Trace contract);
+  `docs/v0.2.0-current-state-audit.md` (early multimodal audit).
 
 ## Versions and identity
 
@@ -63,27 +61,18 @@ Use paths as pointers; do not paste their full contents into harness files.
 - `src-tauri/target/release/bundle/nsis/Odysseus Desktop_0.2.1_x64-setup.exe`
 - `dist/PotatoCs-Odysseus-Desktop-v0.2.1-SHA256SUMS.txt`
 
-Current mismatch:
-
+Current mismatch (both artifacts also version-stale `v0.2.1`):
 - Installer: `D6E8A267021366E347A0BD27E0E3796E30E70C6180EE790973D54CDC00EC209E`
 - Checksum file: `5E2434D429A6E4132853791854839820E87FD0FED023C648A2C41D93F57E491B`
 
-## Installed lifecycle evidence
+## Installed lifecycle smoke failure (2026-07-04) — superseded
 
-- `%APPDATA%/dev.odysseus.desktop/profiles/default/logs/backend.log`
-- July 4 lines near 2431–2437 show shutdown followed by launch records without
-  corresponding Python startup or persisted recovery failure.
-- Interactive observation: killing the sidecar can terminate the Tauri host.
-
-## Installed lifecycle smoke failure (2026-07-04)
-
-- Commit `c2cc4d16d2f33735b34ef92e0a1b720567434404`:
-  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
-- Candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`, installer SHA-256
-  `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
-- Verdict **FAIL**: clean install/close/relaunch/idle-kill/final-orphan PASS;
-  sidecar kill during startup `health.ping` **FAIL** (terminated host, no
-  fixed-label recovery logs). Superseded by the re-run below.
+- Commit `c2cc4d16`: `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
+- Candidate `1682dd14`, installer SHA-256 `BE31DEF7...D23C5F00`.
+- Verdict **FAIL**: sidecar kill during startup `health.ping` terminated the
+  host, no fixed-label recovery logs; all other steps passed. Superseded by
+  the passing re-run below; the report retains the first failure and cleanup
+  record required by the gate's retry rule.
 
 ## Installed lifecycle smoke re-run — PASS (2026-07-04)
 
@@ -103,6 +92,18 @@ Current mismatch:
 - Satisfies `GATE.md` section 4 two-run matrix and section 2 host-survival
   for the startup `health.ping` path.
 
+## Version alignment to 0.3.0 — DONE (2026-07-04)
+
+- Commit `5171fdf4841ac095a6cfb9fb5d8f2e5640f8a81c`
+  (`chore: align version sources to 0.3.0`):
+  `projects/odysseus/VERSION_ALIGNMENT_2026-07-04.md`.
+- All six version sources now `0.3.0`; frontend build, cargo check/test
+  (20/0/4 ignored) and migration/IPC fixture tests passed post-change.
+- Closes the version half of `GATE.md` section 5's first item at source
+  level. Does not prove installed runtime reporting, checksum match,
+  release notes or naming docs; `v0.2.1` installer/checksum artifacts are
+  now version-stale pending final rebuild.
+
 ## Automated proof suite — PASS (2026-07-04)
 
 - Candidate `511ab1db593ceffe786306c32c4cf9572f751655` (`304c6284` plus one
@@ -116,41 +117,29 @@ Current mismatch:
 
 ## Startup health-ping recovery evidence
 
-- Commit `7119e40c59dfb401be400242dee2f0fffde95fff`
-  (`src-tauri/src/lib.rs` only): fixes the `c2cc4d16` crash path so startup
-  `health.ping` sidecar death no longer propagates a hard error out of the
-  Tauri setup hook. Rust fixtures prove host survival on kill during startup
-  `health.ping`, recovered and retry-also-fails cases; fixed-label logs use
-  `context=startup_health`, no RPC payload/private content.
-- Cargo test: 20 passed, 0 failed, 4 ignored. Cargo check and
-  `git diff --check`: passed.
-- Installed-level proof is in the re-run entry above.
+- Commit `7119e40c` (`src-tauri/src/lib.rs` only): startup `health.ping`
+  sidecar death no longer propagates a hard error out of the Tauri setup
+  hook. Rust fixtures prove host survival (recovered and retry-also-fails
+  cases); fixed-label `context=startup_health` logs, no payload content.
+- Cargo test 20/0/4 ignored; cargo check and `git diff --check` passed.
+  Installed-level proof is in the re-run entry above.
 
 ## Bounded shutdown evidence
 
-- Commit: `e9f36fbcaeb62b19fb009df78e9306cef5b0e12d`.
-- Subject: `fix: bound sidecar shutdown cleanup`.
-- Changed path: `src-tauri/src/lib.rs` only.
-- Proves: graceful shutdown deadline; hung-child forced kill and reap.
-- Cargo test: 14 passed, 0 failed, 3 ignored helper fixtures.
-- Cargo check: passed.
-- Lifecycle logs use fixed request/cleanup results without RPC payload content.
-- Does not prove host survival after external kill, restart, installed lifecycle,
-  package integrity, version alignment or release readiness.
+- Commit `e9f36fbc` (`fix: bound sidecar shutdown cleanup`),
+  `src-tauri/src/lib.rs` only. Proves graceful-shutdown deadline and
+  hung-child forced kill/reap; fixed-label logs, no RPC payload content.
+- Cargo test 14/0/3 ignored; cargo check passed. Does not prove host
+  survival, installed lifecycle, package or release readiness.
 
 ## Forced sidecar recovery evidence
 
-- Commit: `bd635ea2d5a99415923fe97fc60861587077e35e`.
-- Subject: `fix: recover from forced sidecar death`.
-- Changed path: `src-tauri/src/lib.rs` only.
-- Rust fixture proves sidecar exit detection without terminating the test host.
-- Safe allowlisted RPC: one restart and one retry maximum.
-- Non-idempotent RPC: no restart/replay after sidecar loss.
-- Fixed-label logs cover exit, restart attempted/succeeded/failed and retry result.
-- Cargo test: 18 passed, 0 failed, 4 ignored helper fixtures.
-- Cargo check and `git diff --check`: passed.
-- Does not prove installed lifecycle, installed profile continuity, package integrity,
-  version alignment, checksum correctness or release readiness.
+- Commit `bd635ea2` (`fix: recover from forced sidecar death`),
+  `src-tauri/src/lib.rs` only. Proves exit detection without host
+  termination; safe RPC one restart/one retry max; no non-idempotent
+  replay; fixed-label exit/restart/retry logs.
+- Cargo test 18/0/4 ignored; cargo check and `git diff --check` passed.
+  Does not prove installed lifecycle, package, version or release readiness.
 
 ## Evidence rules
 
