@@ -103,6 +103,17 @@ Current mismatch:
 - Satisfies `GATE.md` section 4 two-run matrix and section 2 host-survival
   for the startup `health.ping` path.
 
+## Automated proof suite — PASS (2026-07-04)
+
+- Candidate `511ab1db593ceffe786306c32c4cf9572f751655` (`304c6284` plus one
+  docs commit; no source drift):
+  `projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md`.
+- Python 297 passed/0 failed/0 skipped with autouse non-loopback egress
+  guard; `npm run test:progress`, `npm run build:frontend`, cargo
+  check/test (20/0/4 ignored) and `git diff --check` all passed.
+- Closes `GATE.md` section 3. Does not prove version alignment, checksum
+  match, installed package hygiene or release truthfulness.
+
 ## Startup health-ping recovery evidence
 
 - Commit `7119e40c59dfb401be400242dee2f0fffde95fff`

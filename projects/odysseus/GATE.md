@@ -37,16 +37,26 @@ Purpose: ship a proof/hardening release without adding product scope.
 
 ### 3. Automated proof
 
-- [ ] Full Python suite passes with the non-loopback egress guard active.
-- [ ] Trace privacy sentinel sweep passes.
-- [ ] Progress identifier tests pass in strict mode.
-- [ ] Schema upgrade, future-version refusal and idempotence tests pass.
-- [ ] IPC golden fixtures pass.
-- [ ] RAG grounding/retrieval and restart-persistence tests pass.
-- [ ] `npm run test:progress` passes.
-- [ ] `npm run build:frontend` passes.
-- [x] `cargo check --manifest-path src-tauri/Cargo.toml` passes (`bd635ea2`).
-- [x] `cargo test --manifest-path src-tauri/Cargo.toml` passes (`bd635ea2`).
+All items below are evidence-backed at candidate `511ab1db` (`304c6284` plus
+one docs commit; no source drift) — see
+`projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md`. Python suite:
+297 passed, 0 failed, 0 skipped, with the autouse non-loopback egress guard
+active suite-wide.
+
+- [x] Full Python suite passes with the non-loopback egress guard active.
+- [x] Trace privacy sentinel sweep passes.
+- [x] Progress identifier tests pass in strict mode
+      (`test_filename_shaped_identifier_rejected_under_strict_trace_mode`).
+- [x] Schema upgrade, future-version refusal and idempotence tests pass.
+- [x] IPC golden fixtures pass.
+- [x] RAG grounding/retrieval and restart-persistence tests pass.
+- [x] `npm run test:progress` passes.
+- [x] `npm run build:frontend` passes (chunk-size warning only).
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` passes
+      (`bd635ea2`; re-confirmed at `511ab1db`).
+- [x] `cargo test --manifest-path src-tauri/Cargo.toml` passes
+      (`bd635ea2`; re-confirmed at `511ab1db`: 20 passed, 0 failed,
+      4 ignored helper fixtures).
 
 ### 4. Installed package proof
 

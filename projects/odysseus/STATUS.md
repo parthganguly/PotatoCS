@@ -11,7 +11,11 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
 - Startup health-ping fix: `7119e40c` (`fix: make startup sidecar health.ping
   failure non-fatal`) — source-level only, see `GATE.md` section 2.
-- Current worktree: clean at `304c6284` after installed lifecycle re-verify.
+- Current worktree: clean at `511ab1db` after automated proof suite pass.
+- Automated proof suite: **PASS** at `511ab1db` —
+  `projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md` (Python 297/0/0,
+  progress tests, frontend build, cargo check/test, `git diff --check`);
+  closes `GATE.md` section 3.
 - Latest tag: `v0.2.1`; no v0.3 tag or version exists.
 - Release gate: **RED — v0.3 proof incomplete** (other sections remain open).
 - Installed lifecycle smoke: **PASS** —
@@ -75,8 +79,8 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 1. Current installer SHA-256 does not match the checked-in checksum.
 2. Runtime version sources disagree.
 3. Full installed/package proof has not passed at one immutable commit
-   (version alignment, checksum match and automated proof suite sections of
-   `GATE.md` remain open even though installed lifecycle is now proved).
+   (version alignment and checksum match remain open; the automated proof
+   suite — `GATE.md` section 3 — is now closed at `511ab1db`).
 
 ## Freeze
 
