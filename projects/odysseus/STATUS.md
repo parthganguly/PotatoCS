@@ -11,19 +11,19 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
 - Startup health-ping fix: `7119e40c` (`fix: make startup sidecar health.ping
   failure non-fatal`) — source-level only, see `GATE.md` section 2.
-- Current worktree: harness-only updates pending.
+- Current worktree: clean at `304c6284` after installed lifecycle re-verify.
 - Latest tag: `v0.2.1`; no v0.3 tag or version exists.
-- Release gate: **RED — v0.3 proof incomplete**.
-- Installed lifecycle smoke: **FAIL (source fix pending re-verify)** —
-  `c2cc4d16` records
-  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` against
-  candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`, installer SHA-256
-  `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`. Clean
-  install, normal close, relaunch and idle-sidecar-kill-survives-host all
-  passed; killing the sidecar during startup `health.ping` terminated the
-  host and no fixed-label recovery logs were recorded for that path.
-  `7119e40c` fixes this at the source level with Rust fixture evidence; the
-  installed smoke must be re-run against a new installer built from it.
+- Release gate: **RED — v0.3 proof incomplete** (other sections remain open).
+- Installed lifecycle smoke: **PASS** —
+  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`
+  records two complete passing runs against candidate
+  `304c6284d8d0638e48171e9e181384ae364182ee` (includes source fix
+  `7119e40c`), installer SHA-256
+  `04A1C2BD317FBB14BB52EADE5DC8A2E6F3BB289E9C88B1636A3B60193C3C7DCC`. Clean
+  install, normal close, relaunch, idle sidecar kill, sidecar kill during
+  startup `health.ping`, and final orphan check all passed twice; the host
+  now survives and auto-recovers from a sidecar kill during startup
+  `health.ping`, with fixed-label recovery logs present.
 
 ## Version and naming state
 
@@ -51,15 +51,17 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Non-idempotent RPCs are not replayed after sidecar loss.
 - Fixed-label exit/restart/retry lifecycle logs.
 - Startup `health.ping` sidecar death is non-fatal to the setup hook,
-  source-proved only (`7119e40c`).
+  proved at both source (`7119e40c`) and installed levels (re-run smoke).
 
 ## Partial or unproved
 
 - Window-specific screenshot capture is unsupported.
 - Multimodal benchmark plumbing exists; committed real-route evidence is skipped/unscored.
 - Local-first evidence is strong but is not an OS-level runtime firewall.
-- Shutdown/recovery has Rust fixture evidence; installed behavior remains unproved.
-- Current HEAD has no single green, installed proof bundle.
+- Shutdown/recovery Rust fixture evidence is now backed by a passing
+  installed-level re-verify for the startup `health.ping` path.
+- Current HEAD still has no single green, full-release proof bundle (version
+  alignment, checksum match and automated proof suite remain open).
 
 ## Not started
 
@@ -70,14 +72,11 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. Installed-app host survival and recovery after sidecar kill are unproved
-   at the installed-package level. The startup `health.ping` path was proved
-   failing (`c2cc4d16`) and is now source-fixed (`7119e40c`), but the
-   installed smoke has not been re-run against a new installer.
-2. Profile survival across installed kill/restart/relaunch is unproved.
-3. Current installer SHA-256 does not match the checked-in checksum.
-4. Runtime version sources disagree.
-5. Full installed/package proof has not passed at one immutable commit.
+1. Current installer SHA-256 does not match the checked-in checksum.
+2. Runtime version sources disagree.
+3. Full installed/package proof has not passed at one immutable commit
+   (version alignment, checksum match and automated proof suite sections of
+   `GATE.md` remain open even though installed lifecycle is now proved).
 
 ## Freeze
 

@@ -77,39 +77,43 @@ Current mismatch:
 
 ## Installed lifecycle smoke failure (2026-07-04)
 
-- Commit: `c2cc4d16d2f33735b34ef92e0a1b720567434404`.
-- Subject: `docs: record installed lifecycle smoke failure`.
-- Report path: `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
-- Candidate SHA tested: `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`.
-- Installer SHA-256: `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
-- Verdict: **FAIL**.
-- Clean install launched: PASS.
-- Normal close: PASS.
-- Relaunch: PASS.
-- Idle sidecar kill: PASS — did not terminate host.
-- Sidecar kill during startup `health.ping`: **FAIL** — terminated host.
-- Fixed-label recovery logs for the crash path: **absent**.
-- Final orphan check: PASS.
-- Does not prove installed package, version, checksum or release readiness,
-  and does not satisfy the required two-run installed lifecycle matrix.
+- Commit `c2cc4d16d2f33735b34ef92e0a1b720567434404`:
+  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
+- Candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`, installer SHA-256
+  `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
+- Verdict **FAIL**: clean install/close/relaunch/idle-kill/final-orphan PASS;
+  sidecar kill during startup `health.ping` **FAIL** (terminated host, no
+  fixed-label recovery logs). Superseded by the re-run below.
+
+## Installed lifecycle smoke re-run — PASS (2026-07-04)
+
+- Commit `304c6284d8d0638e48171e9e181384ae364182ee` (includes source fix
+  `7119e40c`): `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`.
+- Candidate `304c6284d8d0638e48171e9e181384ae364182ee`, installer SHA-256
+  `04A1C2BD317FBB14BB52EADE5DC8A2E6F3BB289E9C88B1636A3B60193C3C7DCC`,
+  size `32,362,413` bytes.
+- Verdict **PASS**, two complete runs: clean install, normal close,
+  relaunch, idle sidecar kill (host survives), sidecar kill during startup
+  `health.ping` (host survives, auto-restart succeeds), final orphan check —
+  all PASS both runs.
+- Fixed-label recovery logs (`phase=exit/restart/retry`,
+  `context=startup_health`) present for both startup-kill events, no RPC
+  payload/private content. Profile `app.db` (92,561,408 bytes) survived both
+  runs, matching the prior failing smoke's recorded size.
+- Satisfies `GATE.md` section 4 two-run matrix and section 2 host-survival
+  for the startup `health.ping` path.
 
 ## Startup health-ping recovery evidence
 
-- Commit: `7119e40c59dfb401be400242dee2f0fffde95fff`.
-- Subject: `fix: make startup sidecar health.ping failure non-fatal`.
-- Changed path: `src-tauri/src/lib.rs` only.
-- Fixes the `c2cc4d16` crash path: startup `health.ping` sidecar death no
-  longer propagates a hard error out of the Tauri setup hook.
-- Rust fixtures `startup_health_ping_kill_recovers_without_terminating_host`
-  and `startup_health_ping_kill_survives_even_when_retry_also_fails` prove
-  host survival on kill during startup `health.ping`, recovered and
-  retry-also-fails cases.
-- Fixed-label logs cover exit/restart/retry with `context=startup_health`,
-  no RPC payload/private content.
+- Commit `7119e40c59dfb401be400242dee2f0fffde95fff`
+  (`src-tauri/src/lib.rs` only): fixes the `c2cc4d16` crash path so startup
+  `health.ping` sidecar death no longer propagates a hard error out of the
+  Tauri setup hook. Rust fixtures prove host survival on kill during startup
+  `health.ping`, recovered and retry-also-fails cases; fixed-label logs use
+  `context=startup_health`, no RPC payload/private content.
 - Cargo test: 20 passed, 0 failed, 4 ignored. Cargo check and
   `git diff --check`: passed.
-- Source fix only; installed smoke must be re-run against a new installer
-  built from this commit.
+- Installed-level proof is in the re-run entry above.
 
 ## Bounded shutdown evidence
 

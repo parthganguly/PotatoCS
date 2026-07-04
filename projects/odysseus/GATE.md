@@ -17,17 +17,20 @@ Purpose: ship a proof/hardening release without adding product scope.
 - [x] Graceful shutdown has a bounded deadline (`e9f36fbc`).
 - [x] Hung shutdown reaches forced kill and child reap (`e9f36fbc`).
 - [ ] Normal close leaves no Python sidecar orphan.
-- [ ] Killing only the sidecar does not terminate the Tauri host.
-      Installed smoke `c2cc4d16` (candidate `1682dd14`) proved this **FAILED**
-      for the startup `health.ping` path. Source fix `7119e40c` now applies
-      the same restart/retry discipline to the startup health check; Rust
-      fixtures prove the host survives a sidecar kill during startup
-      `health.ping`. Still unchecked pending a new installer built from
-      `7119e40c` and a re-run of the installed lifecycle smoke.
+- [x] Killing only the sidecar does not terminate the Tauri host.
+      Installed smoke re-run (candidate `304c6284`, installer SHA-256
+      `04A1C2BD317FBB14BB52EADE5DC8A2E6F3BB289E9C88B1636A3B60193C3C7DCC`) proved
+      the host survives sidecar kill both idle and during startup
+      `health.ping`, across two complete runs. See
+      `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`.
 - [x] Rust forced-death fixture detects exit and keeps the test host alive (`bd635ea2`).
 - [x] A safe idempotent request can restart/retry the sidecar once (`bd635ea2`).
 - [x] Non-idempotent requests are not replayed after sidecar loss (`bd635ea2`).
-- [ ] Profile data survives shutdown, forced death, restart and relaunch.
+- [x] Profile data survives shutdown, forced death, restart and relaunch.
+      Installed re-run: `app.db` was `92,561,408` bytes after both runs,
+      matching the size recorded in the prior failing smoke, across
+      uninstall/reinstall, four launch/close cycles and two forced sidecar
+      kills per run.
 - [x] Lifecycle unit logs record fixed-label exit/restart/retry outcomes (`bd635ea2`).
 - [ ] Host logs record spawn, health failure, exit status, restart and forced kill.
 - [ ] Spawn/restart failure reaches the UI as an actionable degraded state.
@@ -48,19 +51,18 @@ Purpose: ship a proof/hardening release without adding product scope.
 ### 4. Installed package proof
 
 - [ ] Florence/runtime/resource hygiene verification passes.
-- [ ] NSIS installer is built from the recorded candidate SHA.
-      Attempted at `c2cc4d16`: candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`,
-      installer SHA-256 `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
-      Not counted as passing because the run this installer was tested in failed.
+- [x] NSIS installer is built from the recorded candidate SHA.
+      Candidate `304c6284d8d0638e48171e9e181384ae364182ee` (includes source
+      fix `7119e40c`), installer SHA-256
+      `04A1C2BD317FBB14BB52EADE5DC8A2E6F3BB289E9C88B1636A3B60193C3C7DCC`, size
+      `32,362,413` bytes. This run passed both matrix runs.
 - [ ] Clean install launches and reports backend/OCR/Florence truthfully.
-      Clean install and launch succeeded in `c2cc4d16`; OCR/Florence
-      truthfulness was not separately checked in that run.
-- [ ] Installed lifecycle matrix passes twice: close, relaunch, kill, recover, close.
-      **NOT COMPLETE.** `c2cc4d16` records only a single, failing run: normal
-      close and relaunch passed; idle sidecar kill did not terminate the host;
-      killing the sidecar during startup `health.ping` did terminate the host
-      with no fixed-label recovery logs for that path; final orphan check
-      passed after cleanup. The required second full run was not executed.
+      Clean install and launch passed in both re-run runs; OCR/Florence
+      truthfulness was not separately checked.
+- [x] Installed lifecycle matrix passes twice: close, relaunch, kill, recover, close.
+      Both runs passed against candidate `304c6284` (installer SHA-256
+      `04A1C2BD317FBB14BB52EADE5DC8A2E6F3BB289E9C88B1636A3B60193C3C7DCC`), see
+      `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`.
 - [ ] Installer SHA-256 is recalculated after the final build.
 - [ ] Published checksum and asset filename match the actual installer.
 
@@ -74,13 +76,6 @@ Purpose: ship a proof/hardening release without adding product scope.
 
 ## Current hard failures
 
-- Installed sidecar shutdown/kill/recovery smoke is not green. `c2cc4d16`
-  (`projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`) proved
-  **FAIL** at candidate `1682dd14`: killing the owned sidecar during the
-  startup `health.ping` request terminated the installed host, with no
-  fixed-label recovery logs for that crash path. Source fix `7119e40c`
-  addresses this at the source level (Rust fixture evidence only); the
-  installed lifecycle smoke has not been re-run against a new installer.
 - Python sidecar version is `0.2.0` while app sources say `0.2.1`.
 - Installer hash `D6E8A267...00EC209E` differs from checksum `5E2434D4...57E491B`.
 
@@ -115,10 +110,20 @@ Purpose: ship a proof/hardening release without adding product scope.
   startup `health.ping`, both when a retry recovers and when the retry
   itself also fails; fixed-label logs record the crash path with no
   RPC payload/private content.
-- This evidence proves the source fix only; it does not prove installed
-  behavior. The installed lifecycle smoke must be re-run against a new
-  installer built from `7119e40c` before this checkbox or the installed
-  package proof can be marked passing.
+- This evidence proves the source fix only; installed behavior is proved by
+  the re-run below.
+- `304c6284` records the installed lifecycle smoke re-run:
+  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`.
+- Candidate: `304c6284d8d0638e48171e9e181384ae364182ee` (includes `7119e40c`).
+  Installer SHA-256: `04A1C2BD317FBB14BB52EADE5DC8A2E6F3BB289E9C88B1636A3B60193C3C7DCC`.
+- Verdict: **PASS**, both runs. Clean install, normal close, relaunch, idle
+  sidecar kill (host survives), sidecar kill during startup `health.ping`
+  (host survives, auto-restarts) and final orphan check all passed twice.
+  Fixed-label recovery logs (`context=startup_health`) present for both
+  startup-kill events, no RPC payload/private content. Profile `app.db`
+  (92,561,408 bytes) survived both runs.
+- This evidence proves installed sidecar lifecycle/recovery only; it does not
+  prove version alignment, checksum match or full release readiness.
 
 ## Gate rule
 

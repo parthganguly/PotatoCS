@@ -1,62 +1,45 @@
-# Next Task: Re-run Installed Lifecycle Smoke on the Fixed Candidate
+# Next Task: Close Remaining v0.3 Release Gate Sections
 
 Priority: **P0 release blocker**
 Primary owner: **Human**, with Codex-assisted implementation
-Gate: `GATE.md` sections 2 and 4
+Gate: `GATE.md` sections 1, 3, 4 (remaining items) and 5
 
 ## Objective
 
-The startup `health.ping` sidecar-death crash recorded in
-`INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` is now source-fixed at
-`7119e40c59dfb401be400242dee2f0fffde95fff` (`fix: make startup sidecar
-health.ping failure non-fatal`), with Rust fixture evidence only. Build a
-new installer from this commit and re-run the full installed lifecycle
-smoke to prove the fix holds at the installed-package level, and to
-complete the required two-run matrix.
+The installed lifecycle matrix now passes twice at candidate `304c6284`
+(source fix `7119e40c`), closing `GATE.md` section 2's host-survival
+checkbox and section 4's two-run matrix checkbox — see
+`projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md` and
+`EVIDENCE_INDEX.md`. The release gate remains **RED**: version alignment,
+checksum match, the automated proof suite (section 3) and release
+truthfulness (section 5) are still open.
 
 ## Prerequisite
 
-- Candidate SHA: `7119e40c59dfb401be400242dee2f0fffde95fff`.
-- Read `INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` in full before starting;
-  it defines the exact command/observation format to reuse.
-- See `GATE.md` current hard failures and `EVIDENCE_INDEX.md` "Startup
-  health-ping recovery evidence" for what is already proved and what is not.
+- Read `GATE.md` in full for the current checkbox state.
+- Read `STATUS.md` "Active blockers" for the remaining concrete gaps:
+  installer SHA-256 vs. checked-in checksum mismatch, and Python sidecar
+  version (`0.2.0`) vs. app sources (`0.2.1`) disagreement.
 
 ## Procedure
 
-1. Build a fresh installer from `7119e40c` (or later, if the user has since
-   advanced HEAD) using the same build command as the prior smoke.
-2. Run the full installed lifecycle matrix twice: clean install, launch,
-   normal close, relaunch, idle-sidecar kill (host survives), sidecar kill
-   during startup `health.ping` (host must survive this time), final orphan
-   check.
-3. Confirm fixed-label recovery logs are present in
-   `%APPDATA%\dev.odysseus.desktop\profiles\default\logs\backend.log` for
-   the startup-kill path, with no RPC payload/private content.
-4. Confirm profile continuity (`app.db`) survives across both runs.
-5. Record installer path, size, SHA-256, and all commands/timestamps/PIDs.
-
-## Required evidence
-
-- New installer SHA-256, built from the recorded candidate SHA.
-- Two complete, passing lifecycle-matrix runs (or one pass + one documented
-  retry with its first failure preserved per `TOKEN_RULES.md`).
-- Fixed-label log excerpts for the startup-kill path from the installed app.
-- Profile continuity evidence across both runs.
-
-## Acceptance
-
-- Both installed lifecycle matrix runs pass, including sidecar kill during
-  startup `health.ping` not terminating the host.
-- Evidence is indexed by exact path and hash in `EVIDENCE_INDEX.md`.
-- `GATE.md` section 2 "Killing only the sidecar does not terminate the Tauri
-  host" and section 4 "Installed lifecycle matrix passes twice" are checked
-  only after this evidence exists.
+1. Decide and record the target release version alignment across
+   `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and
+   the Python sidecar `__version__`.
+2. Run the full automated proof suite listed in `GATE.md` section 3
+   (Python tests with egress guard, trace privacy sentinel, progress tests,
+   schema/IPC fixtures, RAG tests, `npm run test:progress`,
+   `npm run build:frontend`) and record pass/fail per item.
+3. Rebuild the installer from the final aligned-version candidate and
+   recalculate/publish a matching SHA-256 checksum file.
+4. Draft release notes describing v0.3 as proof/hardening only.
+5. Assemble the final proof report tying candidate SHA, commands,
+   environment, hashes and any unresolved skips together.
 
 ## Stop conditions
 
-- Do not modify branding, versions or release artifacts.
-- Do not touch source in `src-tauri` or `python/` beyond what re-running the
-  smoke requires (none expected).
-- Do not mark the full release gate green; other `GATE.md` sections remain
-  open (version alignment, checksum match, automated proof suite).
+- Do not modify branding beyond documented PotatoCS/Odysseus Desktop naming.
+- Do not mark the full release gate green until every `GATE.md` checkbox in
+  sections 1, 3, 4 and 5 has commit/artifact-backed evidence.
+- Do not re-run the installed lifecycle smoke again unless a source change
+  invalidates the existing `304c6284` re-run evidence.
