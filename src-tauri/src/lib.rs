@@ -198,6 +198,17 @@ impl BackendCallError {
 
 impl BackendClient {
     fn spawn(app: &AppHandle, profile_dir: &Path) -> Result<Self, String> {
+        let mut client = Self::spawn_process(app, profile_dir)?;
+        client
+            .call_once("health.ping", json!({}))
+            .map_err(|err| err.message)?;
+        Ok(client)
+    }
+
+    /// Spawns the sidecar process without verifying `health.ping`, so callers
+    /// can apply their own recovery discipline around the initial health
+    /// check (see `spawn_for_startup`).
+    fn spawn_process(app: &AppHandle, profile_dir: &Path) -> Result<Self, String> {
         let python = locate_python(app)?;
         let script = locate_sidecar_script(app)?;
         let launch = sidecar_launch_context(app, profile_dir)?;
@@ -274,7 +285,7 @@ impl BackendClient {
             .take()
             .ok_or_else(|| "Python sidecar stdout was not available".to_string())?;
 
-        let mut client = Self {
+        let client = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -282,10 +293,74 @@ impl BackendClient {
             is_shutdown: false,
         };
 
-        client
-            .call_once("health.ping", json!({}))
-            .map_err(|err| err.message)?;
         Ok(client)
+    }
+
+    /// Spawns the sidecar for app startup and applies the same restart/retry
+    /// discipline as running-state recovery to the initial `health.ping`:
+    /// a sidecar death or non-response during the startup health check is
+    /// recorded and recovered from rather than propagated as a hard setup
+    /// error, so it never aborts the Tauri setup hook.
+    fn spawn_for_startup(app: &AppHandle, profile_dir: &Path) -> Result<Self, String> {
+        let mut client = Self::spawn_process(app, profile_dir)?;
+        Self::verify_health_with_startup_recovery(&mut client, profile_dir, || {
+            Self::spawn_process(app, profile_dir)
+        })?;
+        Ok(client)
+    }
+
+    fn verify_health_with_startup_recovery<F>(
+        client: &mut Self,
+        profile_dir: &Path,
+        mut respawn: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<Self, String>,
+    {
+        let err = match client.call_once("health.ping", json!({})) {
+            Ok(_) => return Ok(()),
+            Err(err) => err,
+        };
+
+        append_shell_log(
+            profile_dir,
+            &format!(
+                "sidecar lifecycle phase=exit result=detected event={} context=startup_health",
+                err.lifecycle_event.unwrap_or("unknown")
+            ),
+        );
+        append_shell_log(
+            profile_dir,
+            "sidecar lifecycle phase=restart result=attempted context=startup_health",
+        );
+
+        match respawn() {
+            Ok(mut replacement) => {
+                append_shell_log(
+                    profile_dir,
+                    "sidecar lifecycle phase=restart result=succeeded context=startup_health",
+                );
+                match replacement.call_once("health.ping", json!({})) {
+                    Ok(_) => append_shell_log(
+                        profile_dir,
+                        "sidecar lifecycle phase=retry result=succeeded context=startup_health",
+                    ),
+                    Err(_) => append_shell_log(
+                        profile_dir,
+                        "sidecar lifecycle phase=retry result=failed context=startup_health",
+                    ),
+                }
+                *client = replacement;
+                Ok(())
+            }
+            Err(spawn_err) => {
+                append_shell_log(
+                    profile_dir,
+                    "sidecar lifecycle phase=restart result=failed context=startup_health",
+                );
+                Err(spawn_err)
+            }
+        }
     }
 
     fn call_with_recovery(
@@ -917,7 +992,7 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             let (profile_id, profile_dir) = ensure_default_profile(&app_handle)?;
-            let backend = BackendClient::spawn(&app_handle, &profile_dir)?;
+            let backend = BackendClient::spawn_for_startup(&app_handle, &profile_dir)?;
 
             app.manage(AppState {
                 profile_id,
@@ -1135,6 +1210,85 @@ mod tests {
             .expect("lifecycle log");
         assert!(log.contains("sidecar shutdown phase=request result=already_exited"));
         assert!(log.contains("sidecar shutdown phase=cleanup result=graceful"));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn startup_health_ping_kill_recovers_without_terminating_host() {
+        let profile_dir = lifecycle_test_profile("startup-health-kill-recovers");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        let mut restart_count = 0;
+
+        let result = BackendClient::verify_health_with_startup_recovery(
+            &mut backend,
+            &profile_dir,
+            || {
+                restart_count += 1;
+                Ok(spawn_lifecycle_backend(
+                    "tests::lifecycle_single_rpc_response_fixture",
+                ))
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "host process must survive a sidecar kill during startup health.ping"
+        );
+        assert_eq!(restart_count, 1);
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains(
+            "sidecar lifecycle phase=exit result=detected event=child_exited context=startup_health"
+        ));
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=attempted context=startup_health"
+        ));
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=succeeded context=startup_health"
+        ));
+        assert!(log.contains(
+            "sidecar lifecycle phase=retry result=succeeded context=startup_health"
+        ));
+        let _ = backend.shutdown(&profile_dir);
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn startup_health_ping_kill_survives_even_when_retry_also_fails() {
+        let profile_dir = lifecycle_test_profile("startup-health-kill-retry-fails");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        let mut restart_count = 0;
+
+        let result = BackendClient::verify_health_with_startup_recovery(
+            &mut backend,
+            &profile_dir,
+            || {
+                restart_count += 1;
+                let mut replacement =
+                    spawn_lifecycle_backend("tests::lifecycle_already_exited_fixture");
+                replacement
+                    .child
+                    .wait()
+                    .expect("replacement fixture should exit");
+                Ok(replacement)
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "host process must survive even when the startup retry itself fails"
+        );
+        assert_eq!(restart_count, 1);
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=succeeded context=startup_health"
+        ));
+        assert!(log.contains(
+            "sidecar lifecycle phase=retry result=failed context=startup_health"
+        ));
         let _ = fs::remove_dir_all(profile_dir);
     }
 
