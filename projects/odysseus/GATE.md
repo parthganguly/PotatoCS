@@ -18,6 +18,11 @@ Purpose: ship a proof/hardening release without adding product scope.
 - [x] Hung shutdown reaches forced kill and child reap (`e9f36fbc`).
 - [ ] Normal close leaves no Python sidecar orphan.
 - [ ] Killing only the sidecar does not terminate the Tauri host.
+      Installed smoke `c2cc4d16` (candidate `1682dd14`) proves this **FAILS**
+      for the startup `health.ping` path: killing the owned sidecar during
+      that request terminated the host, and no fixed-label recovery logs
+      were emitted for that crash path. Idle-sidecar kill after startup
+      passed in the same run.
 - [x] Rust forced-death fixture detects exit and keeps the test host alive (`bd635ea2`).
 - [x] A safe idempotent request can restart/retry the sidecar once (`bd635ea2`).
 - [x] Non-idempotent requests are not replayed after sidecar loss (`bd635ea2`).
@@ -43,8 +48,18 @@ Purpose: ship a proof/hardening release without adding product scope.
 
 - [ ] Florence/runtime/resource hygiene verification passes.
 - [ ] NSIS installer is built from the recorded candidate SHA.
+      Attempted at `c2cc4d16`: candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`,
+      installer SHA-256 `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
+      Not counted as passing because the run this installer was tested in failed.
 - [ ] Clean install launches and reports backend/OCR/Florence truthfully.
+      Clean install and launch succeeded in `c2cc4d16`; OCR/Florence
+      truthfulness was not separately checked in that run.
 - [ ] Installed lifecycle matrix passes twice: close, relaunch, kill, recover, close.
+      **NOT COMPLETE.** `c2cc4d16` records only a single, failing run: normal
+      close and relaunch passed; idle sidecar kill did not terminate the host;
+      killing the sidecar during startup `health.ping` did terminate the host
+      with no fixed-label recovery logs for that path; final orphan check
+      passed after cleanup. The required second full run was not executed.
 - [ ] Installer SHA-256 is recalculated after the final build.
 - [ ] Published checksum and asset filename match the actual installer.
 
@@ -58,7 +73,11 @@ Purpose: ship a proof/hardening release without adding product scope.
 
 ## Current hard failures
 
-- Installed sidecar shutdown/kill/recovery smoke is not green.
+- Installed sidecar shutdown/kill/recovery smoke is not green. `c2cc4d16`
+  (`projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`) proves
+  **FAIL**: killing the owned sidecar during the startup `health.ping`
+  request terminates the installed host, with no fixed-label recovery logs
+  for that crash path.
 - Python sidecar version is `0.2.0` while app sources say `0.2.1`.
 - Installer hash `D6E8A267...00EC209E` differs from checksum `5E2434D4...57E491B`.
 
@@ -74,6 +93,17 @@ Purpose: ship a proof/hardening release without adding product scope.
 - Cargo check: passed.
 - This evidence proves unit-level exit detection, one safe restart/retry maximum,
   unsafe no-replay and fixed-label logs; it does not prove installed behavior.
+- `c2cc4d16` records the first installed lifecycle smoke attempt:
+  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
+- Candidate: `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`. Installer SHA-256:
+  `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
+- Verdict: **FAIL**. Clean install launched; normal close passed; relaunch
+  passed; idle sidecar kill did not terminate the host; killing the sidecar
+  during startup `health.ping` terminated the host; fixed-label recovery logs
+  were absent for that crash path; final orphan check passed.
+- This evidence does not prove installed package, version, checksum or
+  release readiness, and does not satisfy the two-run installed lifecycle
+  matrix requirement.
 
 ## Gate rule
 

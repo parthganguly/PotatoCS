@@ -6,12 +6,19 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 ## Repository snapshot
 
 - Branch: `main`, tracking `origin/main`.
-- HEAD: `bd635ea2d5a99415923fe97fc60861587077e35e`.
+- Last committed baseline before this harness update: `c2cc4d16d2f33735b34ef92e0a1b720567434404`.
 - Shutdown evidence: `e9f36fbc` (`fix: bound sidecar shutdown cleanup`).
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
 - Current worktree: harness-only updates pending.
 - Latest tag: `v0.2.1`; no v0.3 tag or version exists.
 - Release gate: **RED — v0.3 proof incomplete**.
+- Installed lifecycle smoke: **FAIL** — `c2cc4d16` records
+  `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` against
+  candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`, installer SHA-256
+  `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`. Clean
+  install, normal close, relaunch and idle-sidecar-kill-survives-host all
+  passed; killing the sidecar during startup `health.ping` terminated the
+  host and no fixed-label recovery logs were recorded for that path.
 
 ## Version and naming state
 
@@ -56,7 +63,8 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. Installed-app host survival and recovery after sidecar kill are unproved.
+1. Installed-app host survival and recovery after sidecar kill are unproved;
+   worse, the startup `health.ping` path is proved failing (`c2cc4d16`).
 2. Profile survival across installed kill/restart/relaunch is unproved.
 3. Current installer SHA-256 does not match the checked-in checksum.
 4. Runtime version sources disagree.

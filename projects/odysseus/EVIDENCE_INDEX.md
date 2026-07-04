@@ -75,6 +75,24 @@ Current mismatch:
   corresponding Python startup or persisted recovery failure.
 - Interactive observation: killing the sidecar can terminate the Tauri host.
 
+## Installed lifecycle smoke failure (2026-07-04)
+
+- Commit: `c2cc4d16d2f33735b34ef92e0a1b720567434404`.
+- Subject: `docs: record installed lifecycle smoke failure`.
+- Report path: `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
+- Candidate SHA tested: `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`.
+- Installer SHA-256: `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`.
+- Verdict: **FAIL**.
+- Clean install launched: PASS.
+- Normal close: PASS.
+- Relaunch: PASS.
+- Idle sidecar kill: PASS — did not terminate host.
+- Sidecar kill during startup `health.ping`: **FAIL** — terminated host.
+- Fixed-label recovery logs for the crash path: **absent**.
+- Final orphan check: PASS.
+- Does not prove installed package, version, checksum or release readiness,
+  and does not satisfy the required two-run installed lifecycle matrix.
+
 ## Bounded shutdown evidence
 
 - Commit: `e9f36fbcaeb62b19fb009df78e9306cef5b0e12d`.
