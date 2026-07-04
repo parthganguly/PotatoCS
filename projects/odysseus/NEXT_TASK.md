@@ -1,49 +1,49 @@
-# Next Task: Make Forced Sidecar Death Recoverable and Observable
+# Next Task: Installed-App Lifecycle Smoke Procedure and Proof
 
 Priority: **P0 release blocker**  
-Primary owner: **Codex**  
-Gate: `GATE.md` section 2
+Primary owner: **Human**, with Codex-assisted evidence capture
+Gate: `GATE.md` sections 2 and 4
 
 ## Objective
 
-Make forced sidecar death recoverable and observable while keeping the Tauri
-host alive and avoiding replay of unsafe operations.
+Prove graceful shutdown and forced sidecar recovery in the installed Windows app
+without changing source or treating unit fixtures as installed-app evidence.
 
-## Scope
+## Prerequisite
 
-- Detect that the owned Python child exited or its RPC pipe closed.
-- Keep the Tauri host running after sidecar death.
-- Persist fixed, privacy-safe exit and recovery phase/result logs.
-- Allow one restart for an explicitly safe idempotent request.
-- Retry that safe request at most once after a successful restart.
-- Surface restart failure as an error without terminating the host.
+- Use an installer with recorded commit provenance including `bd635ea2`.
+- Record installer path and SHA-256 before installation.
+- If provenance is missing, stop; do not rebuild or infer it.
 
-## Likely files
+## Procedure
 
-- `src-tauri/src/lib.rs`
-- Focused Rust lifecycle tests in the same file
+1. Record clean starting process tree and selected test profile path.
+2. Install and launch; confirm backend readiness and record host/sidecar PIDs.
+3. Close normally; prove host and owned sidecar both exit with no orphan.
+4. Relaunch; kill only the recorded sidecar PID, never a process-name tree.
+5. Prove the Tauri host remains alive.
+6. Trigger one safe diagnostics request; prove one sidecar restart and one retry.
+7. Confirm fixed-label exit/restart/retry logs contain no private payloads.
+8. Confirm selected profile data remains readable after recovery and relaunch.
+9. Close normally and repeat the lifecycle matrix once.
 
-## Required tests
+## Required evidence
 
-- Killing only the fixture sidecar does not terminate the test host process.
-- A safe idempotent request triggers one restart and one retry.
-- A non-idempotent request is never replayed after a lost response.
-- Restart failure is returned and logged without private payloads.
-- Repeated failure cannot create an unbounded restart loop.
-- `cargo test --manifest-path src-tauri/Cargo.toml`
-- `cargo check --manifest-path src-tauri/Cargo.toml`
-- `git diff --check`
+- Installer path, SHA-256 and source commit provenance.
+- Timestamped host/sidecar PID snapshots for both runs.
+- Sanitized lifecycle log excerpts for graceful, kill, restart and retry outcomes.
+- Profile continuity result without copying private profile content.
+- Pass/fail matrix with first failures and cleanup retained.
 
-## Acceptance evidence
+## Acceptance
 
-- Patch limited to forced-death detection, bounded recovery, logging and tests.
-- Test transcript proves host survival and one-restart maximum.
-- Log samples cover exit, restart success and restart failure.
-- Exact reviewed commit SHA is recorded in `EVIDENCE_INDEX.md`.
+- Two complete installed lifecycle runs pass at one installer hash.
+- No orphan process, host termination, restart loop or unsafe replay occurs.
+- Evidence is indexed by exact path and hash in `EVIDENCE_INDEX.md`.
 
 ## Stop conditions
 
-- Do not add or redesign recovery UI.
-- Do not change app features, branding, versions or installer artifacts.
-- Do not alter shutdown classification unless a focused regression requires it.
-- Stop if recovery would replay a non-idempotent request.
+- Do not modify app source, branding, versions or release artifacts.
+- Do not rebuild, publish, rename or replace an installer without user authority.
+- Do not mark package, checksum, version or release proof complete in this task.
+- Stop if killing the sidecar also terminates the host; preserve logs and PIDs.

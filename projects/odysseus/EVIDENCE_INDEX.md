@@ -87,6 +87,20 @@ Current mismatch:
 - Does not prove host survival after external kill, restart, installed lifecycle,
   package integrity, version alignment or release readiness.
 
+## Forced sidecar recovery evidence
+
+- Commit: `bd635ea2d5a99415923fe97fc60861587077e35e`.
+- Subject: `fix: recover from forced sidecar death`.
+- Changed path: `src-tauri/src/lib.rs` only.
+- Rust fixture proves sidecar exit detection without terminating the test host.
+- Safe allowlisted RPC: one restart and one retry maximum.
+- Non-idempotent RPC: no restart/replay after sidecar loss.
+- Fixed-label logs cover exit, restart attempted/succeeded/failed and retry result.
+- Cargo test: 18 passed, 0 failed, 4 ignored helper fixtures.
+- Cargo check and `git diff --check`: passed.
+- Does not prove installed lifecycle, installed profile continuity, package integrity,
+  version alignment, checksum correctness or release readiness.
+
 ## Evidence rules
 
 - Historical pass claims do not prove current HEAD.

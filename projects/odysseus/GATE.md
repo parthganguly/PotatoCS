@@ -18,8 +18,11 @@ Purpose: ship a proof/hardening release without adding product scope.
 - [x] Hung shutdown reaches forced kill and child reap (`e9f36fbc`).
 - [ ] Normal close leaves no Python sidecar orphan.
 - [ ] Killing only the sidecar does not terminate the Tauri host.
-- [ ] A safe idempotent request can restart the sidecar once.
+- [x] Rust forced-death fixture detects exit and keeps the test host alive (`bd635ea2`).
+- [x] A safe idempotent request can restart/retry the sidecar once (`bd635ea2`).
+- [x] Non-idempotent requests are not replayed after sidecar loss (`bd635ea2`).
 - [ ] Profile data survives shutdown, forced death, restart and relaunch.
+- [x] Lifecycle unit logs record fixed-label exit/restart/retry outcomes (`bd635ea2`).
 - [ ] Host logs record spawn, health failure, exit status, restart and forced kill.
 - [ ] Spawn/restart failure reaches the UI as an actionable degraded state.
 
@@ -33,8 +36,8 @@ Purpose: ship a proof/hardening release without adding product scope.
 - [ ] RAG grounding/retrieval and restart-persistence tests pass.
 - [ ] `npm run test:progress` passes.
 - [ ] `npm run build:frontend` passes.
-- [x] `cargo check --manifest-path src-tauri/Cargo.toml` passes (`e9f36fbc`).
-- [x] `cargo test --manifest-path src-tauri/Cargo.toml` passes (`e9f36fbc`).
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` passes (`bd635ea2`).
+- [x] `cargo test --manifest-path src-tauri/Cargo.toml` passes (`bd635ea2`).
 
 ### 4. Installed package proof
 
@@ -66,6 +69,11 @@ Purpose: ship a proof/hardening release without adding product scope.
 - Cargo check: passed.
 - This evidence does not prove host survival, restart, installed lifecycle, package,
   version or release readiness.
+- `bd635ea2d5a99415923fe97fc60861587077e35e` adds forced-death fixture recovery.
+- Cargo test: 18 passed, 0 failed, 4 ignored helper fixtures.
+- Cargo check: passed.
+- This evidence proves unit-level exit detection, one safe restart/retry maximum,
+  unsafe no-replay and fixed-label logs; it does not prove installed behavior.
 
 ## Gate rule
 
