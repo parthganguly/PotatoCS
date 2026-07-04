@@ -54,20 +54,67 @@ fn read_next_rpc_response<R: BufRead>(
     }
 }
 
-fn stop_child_after_grace_period(child: &mut Child, grace_period: Duration) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildStopOutcome {
+    AlreadyExited,
+    ExitedDuringGracePeriod,
+    KilledAfterGracePeriod,
+}
+
+impl ChildStopOutcome {
+    fn log_value(self) -> &'static str {
+        match self {
+            Self::AlreadyExited | Self::ExitedDuringGracePeriod => "graceful",
+            Self::KilledAfterGracePeriod => "forced",
+        }
+    }
+}
+
+fn stop_child_after_grace_period(
+    child: &mut Child,
+    grace_period: Duration,
+) -> Result<ChildStopOutcome, String> {
+    match child.try_wait() {
+        Ok(Some(_status)) => return Ok(ChildStopOutcome::AlreadyExited),
+        Ok(None) => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
     let deadline = Instant::now() + grace_period;
 
     while Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_status)) => return Ok(()),
+            Ok(Some(_status)) => return Ok(ChildStopOutcome::ExitedDuringGracePeriod),
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(err) => return Err(err.to_string()),
         }
     }
 
-    child.kill().map_err(|err| err.to_string())?;
+    match child.try_wait() {
+        Ok(Some(_status)) => return Ok(ChildStopOutcome::ExitedDuringGracePeriod),
+        Ok(None) => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
+    if let Err(kill_error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_status)) => Ok(ChildStopOutcome::KilledAfterGracePeriod),
+            _ => Err(kill_error.to_string()),
+        };
+    }
     child.wait().map_err(|err| err.to_string())?;
-    Ok(())
+    Ok(ChildStopOutcome::KilledAfterGracePeriod)
+}
+
+fn write_shutdown_request<W: Write>(writer: &mut W, request_id: u64) -> Result<(), String> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "app.shutdown",
+        "params": {},
+    });
+    writeln!(writer, "{}", request).map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())
 }
 
 #[derive(Serialize)]
@@ -112,7 +159,7 @@ fn strip_proxy_env_vars(command: &mut Command) {
 impl Drop for AppState {
     fn drop(&mut self) {
         if let Ok(mut backend) = self.backend.lock() {
-            let _ = backend.shutdown();
+            let _ = backend.shutdown(&self.profile_dir);
         }
     }
 }
@@ -338,7 +385,7 @@ impl BackendClient {
     }
 
     fn restart(&mut self, app: &AppHandle, profile_dir: &Path, reason: &str) -> Result<(), String> {
-        let _ = self.shutdown();
+        let _ = self.shutdown(profile_dir);
         *self = Self::spawn(app, profile_dir)?;
         append_shell_log(
             profile_dir,
@@ -362,13 +409,69 @@ impl BackendClient {
         }
     }
 
-    fn shutdown(&mut self) -> Result<(), String> {
-        if !self.is_shutdown {
-            let _ = self.call_once("app.shutdown", json!({}));
-            self.is_shutdown = true;
+    fn request_shutdown_without_waiting(&mut self) -> Result<&'static str, String> {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => return Ok("already_exited"),
+            Ok(None) => {}
+            Err(err) => return Err(err.to_string()),
         }
 
-        stop_child_after_grace_period(&mut self.child, Duration::from_secs(3))
+        let id = self.next_id;
+        self.next_id += 1;
+        write_shutdown_request(&mut self.stdin, id)?;
+        Ok("sent")
+    }
+
+    fn shutdown(&mut self, profile_dir: &Path) -> Result<(), String> {
+        self.shutdown_with_grace_period(profile_dir, Duration::from_secs(3))
+    }
+
+    fn shutdown_with_grace_period(
+        &mut self,
+        profile_dir: &Path,
+        grace_period: Duration,
+    ) -> Result<(), String> {
+        if !self.is_shutdown {
+            let request_result = self.request_shutdown_without_waiting();
+            append_shell_log(
+                profile_dir,
+                &format!(
+                    "sidecar shutdown phase=request result={}",
+                    request_result.as_ref().copied().unwrap_or("failed")
+                ),
+            );
+            self.is_shutdown = true;
+        } else {
+            append_shell_log(
+                profile_dir,
+                "sidecar shutdown phase=request result=skipped_already_shutdown",
+            );
+        }
+
+        let cleanup_started = Instant::now();
+        match stop_child_after_grace_period(&mut self.child, grace_period) {
+            Ok(outcome) => {
+                append_shell_log(
+                    profile_dir,
+                    &format!(
+                        "sidecar shutdown phase=cleanup result={} elapsed_ms={}",
+                        outcome.log_value(),
+                        cleanup_started.elapsed().as_millis()
+                    ),
+                );
+                Ok(())
+            }
+            Err(err) => {
+                append_shell_log(
+                    profile_dir,
+                    &format!(
+                        "sidecar shutdown phase=cleanup result=failed elapsed_ms={}",
+                        cleanup_started.elapsed().as_millis()
+                    ),
+                );
+                Err(err)
+            }
+        }
     }
 }
 
@@ -570,7 +673,7 @@ fn shutdown_backend(state: tauri::State<AppState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "backend lock is poisoned".to_string())?;
 
-    backend.shutdown()
+    backend.shutdown(&state.profile_dir)
 }
 
 fn append_shell_log(profile_dir: &Path, message: &str) {
@@ -792,6 +895,34 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn lifecycle_test_profile(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("odysseus-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn spawn_lifecycle_backend(fixture: &str) -> BackendClient {
+        let current_test_binary = std::env::current_exe().expect("current test executable");
+        let mut child = Command::new(current_test_binary)
+            .args(["--exact", fixture, "--ignored"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("lifecycle fixture should start");
+        let stdin = child.stdin.take().expect("fixture stdin");
+        let stdout = child.stdout.take().expect("fixture stdout");
+        BackendClient {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            is_shutdown: false,
+        }
+    }
+
     #[test]
     fn normal_sidecar_stderr_is_not_a_progress_event() {
         assert!(parse_progress_event("ordinary Python log line").is_none());
@@ -874,6 +1005,83 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_request_contains_only_fixed_protocol_metadata() {
+        let private_sentinel = "PRIVATE_SHUTDOWN_SENTINEL_MUST_NOT_APPEAR";
+        let mut output = Vec::new();
+        write_shutdown_request(&mut output, 17).expect("shutdown request should serialize");
+        let text = String::from_utf8(output).expect("shutdown request should be UTF-8");
+        let request: Value = serde_json::from_str(text.trim()).expect("valid shutdown JSON");
+
+        assert_eq!(request["jsonrpc"], "2.0");
+        assert_eq!(request["id"], 17);
+        assert_eq!(request["method"], "app.shutdown");
+        assert_eq!(request["params"], json!({}));
+        assert!(!text.contains(private_sentinel));
+    }
+
+    #[test]
+    fn responsive_shutdown_is_bounded_and_repeated_shutdown_is_harmless() {
+        let profile_dir = lifecycle_test_profile("responsive-shutdown");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_shutdown_responsive_fixture");
+        let started = Instant::now();
+
+        backend
+            .shutdown_with_grace_period(&profile_dir, Duration::from_secs(1))
+            .expect("responsive child should shut down");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(backend.child.try_wait().expect("child status").is_some());
+
+        backend
+            .shutdown_with_grace_period(&profile_dir, Duration::from_millis(10))
+            .expect("repeated shutdown should be harmless");
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains("sidecar shutdown phase=request result=sent"));
+        assert!(log.contains("sidecar shutdown phase=cleanup result=graceful"));
+        assert!(log.contains("sidecar shutdown phase=request result=skipped_already_shutdown"));
+        assert!(!log.contains("PRIVATE_SHUTDOWN_SENTINEL_MUST_NOT_APPEAR"));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn hung_shutdown_is_killed_and_reaped_within_the_bound() {
+        let profile_dir = lifecycle_test_profile("hung-shutdown");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        let started = Instant::now();
+
+        backend
+            .shutdown_with_grace_period(&profile_dir, Duration::from_millis(75))
+            .expect("hung child should be killed and reaped");
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "elapsed={elapsed:?}");
+        assert!(backend.child.try_wait().expect("child status").is_some());
+
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains("sidecar shutdown phase=request result=sent"));
+        assert!(log.contains("sidecar shutdown phase=cleanup result=forced"));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn already_exited_child_cleanup_succeeds() {
+        let profile_dir = lifecycle_test_profile("already-exited-shutdown");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_already_exited_fixture");
+        thread::sleep(Duration::from_millis(100));
+
+        backend
+            .shutdown_with_grace_period(&profile_dir, Duration::from_millis(10))
+            .expect("already-exited child cleanup should succeed");
+        assert!(backend.child.try_wait().expect("child status").is_some());
+
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains("sidecar shutdown phase=request result=already_exited"));
+        assert!(log.contains("sidecar shutdown phase=cleanup result=graceful"));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
     fn child_cleanup_kills_and_reaps_a_running_child_without_panicking() {
         let current_test_binary = std::env::current_exe().expect("current test executable");
         let mut child = Command::new(current_test_binary)
@@ -893,8 +1101,9 @@ mod tests {
             .expect("child status should be inspectable")
             .is_none());
 
-        stop_child_after_grace_period(&mut child, Duration::from_millis(50))
+        let outcome = stop_child_after_grace_period(&mut child, Duration::from_millis(50))
             .expect("cleanup should kill and reap the child");
+        assert_eq!(outcome, ChildStopOutcome::KilledAfterGracePeriod);
 
         assert!(child
             .try_wait()
@@ -907,6 +1116,21 @@ mod tests {
     fn lifecycle_sleeping_child_fixture() {
         thread::sleep(Duration::from_secs(60));
     }
+
+    #[test]
+    #[ignore = "helper process spawned by responsive shutdown test"]
+    fn lifecycle_shutdown_responsive_fixture() {
+        let mut request = String::new();
+        std::io::stdin()
+            .read_line(&mut request)
+            .expect("shutdown request");
+        let request: Value = serde_json::from_str(request.trim()).expect("valid shutdown request");
+        assert_eq!(request["method"], "app.shutdown");
+    }
+
+    #[test]
+    #[ignore = "helper process spawned by already-exited shutdown test"]
+    fn lifecycle_already_exited_fixture() {}
 
     #[test]
     fn proxy_env_var_list_contains_all_expected_names() {
