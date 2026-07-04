@@ -175,13 +175,15 @@ struct BackendClient {
 struct BackendCallError {
     message: String,
     restartable: bool,
+    lifecycle_event: Option<&'static str>,
 }
 
 impl BackendCallError {
-    fn restartable(message: String) -> Self {
+    fn restartable(message: String, lifecycle_event: &'static str) -> Self {
         Self {
             message,
             restartable: true,
+            lifecycle_event: Some(lifecycle_event),
         }
     }
 
@@ -189,6 +191,7 @@ impl BackendCallError {
         Self {
             message,
             restartable: false,
+            lifecycle_event: None,
         }
     }
 }
@@ -292,19 +295,71 @@ impl BackendClient {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        self.call_with_recovery_using(profile_dir, method, params, |client| {
+            client.restart(app, profile_dir)
+        })
+    }
+
+    fn call_with_recovery_using<F>(
+        &mut self,
+        profile_dir: &Path,
+        method: &str,
+        params: Value,
+        restart: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce(&mut Self) -> Result<(), String>,
+    {
         match self.call_once(method, params.clone()) {
             Ok(value) => Ok(value),
-            Err(err) if err.restartable && method != "app.shutdown" => {
+            Err(err) if err.restartable => {
                 append_shell_log(
                     profile_dir,
                     &format!(
-                        "restarting Python sidecar after RPC failure: {}",
-                        err.message
+                        "sidecar lifecycle phase=exit result=detected event={}",
+                        err.lifecycle_event.unwrap_or("unknown")
                     ),
                 );
-                self.restart(app, profile_dir, &err.message)?;
-                self.call_once(method, params)
-                    .map_err(|retry_err| retry_err.message)
+                if !can_restart_and_retry(method) {
+                    append_shell_log(
+                        profile_dir,
+                        "sidecar lifecycle phase=restart result=skipped_non_idempotent",
+                    );
+                    return Err(err.message);
+                }
+
+                append_shell_log(
+                    profile_dir,
+                    "sidecar lifecycle phase=restart result=attempted",
+                );
+                if let Err(restart_error) = restart(self) {
+                    append_shell_log(
+                        profile_dir,
+                        "sidecar lifecycle phase=restart result=failed",
+                    );
+                    return Err(format!("Python sidecar restart failed: {restart_error}"));
+                }
+                append_shell_log(
+                    profile_dir,
+                    "sidecar lifecycle phase=restart result=succeeded",
+                );
+
+                match self.call_once(method, params) {
+                    Ok(value) => {
+                        append_shell_log(
+                            profile_dir,
+                            "sidecar lifecycle phase=retry result=succeeded",
+                        );
+                        Ok(value)
+                    }
+                    Err(retry_error) => {
+                        append_shell_log(
+                            profile_dir,
+                            "sidecar lifecycle phase=retry result=failed",
+                        );
+                        Err(retry_error.message)
+                    }
+                }
             }
             Err(err) => Err(err.message),
         }
@@ -314,15 +369,17 @@ impl BackendClient {
         if self.is_shutdown {
             return Err(BackendCallError::restartable(
                 "Python sidecar is not running".to_string(),
+                "not_running",
             ));
         }
 
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 self.is_shutdown = true;
-                return Err(BackendCallError::restartable(format!(
-                    "Python sidecar exited before handling {method} (status: {status})"
-                )));
+                return Err(BackendCallError::restartable(
+                    format!("Python sidecar exited before handling {method} (status: {status})"),
+                    "child_exited",
+                ));
             }
             Ok(None) => {}
             Err(err) => {
@@ -344,31 +401,31 @@ impl BackendClient {
 
         if let Err(err) = writeln!(self.stdin, "{}", request) {
             self.is_shutdown = true;
-            return Err(BackendCallError::restartable(format!(
-                "Python sidecar pipe closed while sending {method}: {err}"
-            )));
+            return Err(BackendCallError::restartable(
+                format!("Python sidecar pipe closed while sending {method}: {err}"),
+                "stdin_closed",
+            ));
         }
 
         if let Err(err) = self.stdin.flush() {
             self.is_shutdown = true;
-            return Err(BackendCallError::restartable(format!(
-                "Python sidecar pipe closed while flushing {method}: {err}"
-            )));
+            return Err(BackendCallError::restartable(
+                format!("Python sidecar pipe closed while flushing {method}: {err}"),
+                "stdin_closed",
+            ));
         }
 
         let response = match read_next_rpc_response(&mut self.stdout, id).map_err(|err| {
-            BackendCallError::final_error(format!(
-                "failed to read Python sidecar response for {method}: {err}"
-            ))
+            BackendCallError::restartable(
+                format!("failed to read Python sidecar response for {method}: {err}"),
+                "stdout_closed",
+            )
         })? {
             Some(response) => response,
             None => {
                 self.is_shutdown = true;
                 let message = format!("Python sidecar exited before responding to {method}");
-                if can_retry_after_lost_response(method) {
-                    return Err(BackendCallError::restartable(message));
-                }
-                return Err(BackendCallError::final_error(message));
+                return Err(BackendCallError::restartable(message, "stdout_closed"));
             }
         };
 
@@ -384,13 +441,9 @@ impl BackendClient {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    fn restart(&mut self, app: &AppHandle, profile_dir: &Path, reason: &str) -> Result<(), String> {
+    fn restart(&mut self, app: &AppHandle, profile_dir: &Path) -> Result<(), String> {
         let _ = self.shutdown(profile_dir);
         *self = Self::spawn(app, profile_dir)?;
-        append_shell_log(
-            profile_dir,
-            &format!("Python sidecar restarted successfully after: {reason}"),
-        );
         Ok(())
     }
 
@@ -484,7 +537,7 @@ struct CaptureResult {
     bytes: u64,
 }
 
-fn can_retry_after_lost_response(method: &str) -> bool {
+fn can_restart_and_retry(method: &str) -> bool {
     matches!(
         method,
         "diagnostics.get"
@@ -495,7 +548,6 @@ fn can_retry_after_lost_response(method: &str) -> bool {
             | "evals.list"
             | "evals.history"
             | "evals.comparison"
-            | "evals.run"
             | "campaigns.models"
             | "campaigns.plan"
             | "campaigns.list"
@@ -906,7 +958,7 @@ mod tests {
     fn spawn_lifecycle_backend(fixture: &str) -> BackendClient {
         let current_test_binary = std::env::current_exe().expect("current test executable");
         let mut child = Command::new(current_test_binary)
-            .args(["--exact", fixture, "--ignored"])
+            .args(["--exact", fixture, "--ignored", "--nocapture"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -921,6 +973,11 @@ mod tests {
             next_id: 1,
             is_shutdown: false,
         }
+    }
+
+    fn kill_lifecycle_child(backend: &mut BackendClient) {
+        backend.child.kill().expect("fixture child should be killable");
+        backend.child.wait().expect("fixture child should be reaped");
     }
 
     #[test]
@@ -1082,6 +1139,147 @@ mod tests {
     }
 
     #[test]
+    fn forced_sidecar_death_restarts_and_retries_one_safe_request() {
+        let profile_dir = lifecycle_test_profile("forced-death-safe-retry");
+        let private_sentinel = "PRIVATE_SAFE_RETRY_SENTINEL_MUST_NOT_REACH_LOGS";
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        let mut restart_count = 0;
+
+        let result = backend
+            .call_with_recovery_using(
+                &profile_dir,
+                "diagnostics.get",
+                json!({"private": private_sentinel}),
+                |client| {
+                    restart_count += 1;
+                    *client = spawn_lifecycle_backend(
+                        "tests::lifecycle_single_rpc_response_fixture",
+                    );
+                    Ok(())
+                },
+            )
+            .expect("safe request should recover");
+
+        assert_eq!(result["recovered"], true);
+        assert_eq!(restart_count, 1);
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains(
+            "sidecar lifecycle phase=exit result=detected event=child_exited"
+        ));
+        assert!(log.contains("sidecar lifecycle phase=restart result=attempted"));
+        assert!(log.contains("sidecar lifecycle phase=restart result=succeeded"));
+        assert!(log.contains("sidecar lifecycle phase=retry result=succeeded"));
+        assert!(!log.contains(private_sentinel));
+        let _ = backend.shutdown(&profile_dir);
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn forced_sidecar_death_never_replays_non_idempotent_request() {
+        let profile_dir = lifecycle_test_profile("forced-death-unsafe-request");
+        let private_sentinel = "PRIVATE_UNSAFE_RETRY_SENTINEL_MUST_NOT_REACH_LOGS";
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        let mut restart_count = 0;
+
+        let error = backend
+            .call_with_recovery_using(
+                &profile_dir,
+                "chat.send",
+                json!({"message": private_sentinel}),
+                |_client| {
+                    restart_count += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("non-idempotent request must not be replayed");
+
+        assert!(error.contains("exited before handling"));
+        assert_eq!(restart_count, 0);
+        assert!(!can_restart_and_retry("chat.send"));
+        assert!(!can_restart_and_retry("evals.run"));
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=skipped_non_idempotent"
+        ));
+        assert!(!log.contains(private_sentinel));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn forced_sidecar_restart_failure_is_returned_and_privacy_safe() {
+        let profile_dir = lifecycle_test_profile("forced-death-restart-failure");
+        let private_sentinel = "PRIVATE_RESTART_FAILURE_MUST_NOT_REACH_LOGS";
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        let mut restart_count = 0;
+
+        let error = backend
+            .call_with_recovery_using(
+                &profile_dir,
+                "diagnostics.get",
+                json!({}),
+                |_client| {
+                    restart_count += 1;
+                    Err(private_sentinel.to_string())
+                },
+            )
+            .expect_err("restart failure should be returned");
+
+        assert!(error.contains("Python sidecar restart failed"));
+        assert_eq!(restart_count, 1);
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains("sidecar lifecycle phase=restart result=attempted"));
+        assert!(log.contains("sidecar lifecycle phase=restart result=failed"));
+        assert!(!log.contains(private_sentinel));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn second_failure_after_restart_does_not_loop() {
+        let profile_dir = lifecycle_test_profile("forced-death-retry-bound");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        let mut restart_count = 0;
+
+        let error = backend
+            .call_with_recovery_using(
+                &profile_dir,
+                "diagnostics.get",
+                json!({}),
+                |client| {
+                    restart_count += 1;
+                    let mut replacement = spawn_lifecycle_backend(
+                        "tests::lifecycle_already_exited_fixture",
+                    );
+                    replacement
+                        .child
+                        .wait()
+                        .expect("replacement fixture should exit");
+                    *client = replacement;
+                    Ok(())
+                },
+            )
+            .expect_err("second failure should be returned without another restart");
+
+        assert!(error.contains("exited before handling"));
+        assert_eq!(restart_count, 1);
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert_eq!(
+            log.matches("sidecar lifecycle phase=restart result=attempted")
+                .count(),
+            1
+        );
+        assert!(log.contains("sidecar lifecycle phase=retry result=failed"));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
     fn child_cleanup_kills_and_reaps_a_running_child_without_panicking() {
         let current_test_binary = std::env::current_exe().expect("current test executable");
         let mut child = Command::new(current_test_binary)
@@ -1131,6 +1329,24 @@ mod tests {
     #[test]
     #[ignore = "helper process spawned by already-exited shutdown test"]
     fn lifecycle_already_exited_fixture() {}
+
+    #[test]
+    #[ignore = "helper process spawned by forced-death recovery test"]
+    fn lifecycle_single_rpc_response_fixture() {
+        let mut request = String::new();
+        std::io::stdin()
+            .read_line(&mut request)
+            .expect("RPC request");
+        let request: Value = serde_json::from_str(request.trim()).expect("valid RPC request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"recovered": true},
+        });
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", response).expect("RPC response");
+        stdout.flush().expect("flush RPC response");
+    }
 
     #[test]
     fn proxy_env_var_list_contains_all_expected_names() {
