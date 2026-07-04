@@ -14,8 +14,8 @@ Purpose: ship a proof/hardening release without adding product scope.
 
 ### 2. Sidecar lifecycle
 
-- [ ] Graceful shutdown has a bounded deadline.
-- [ ] Hung shutdown reaches forced kill and child reap.
+- [x] Graceful shutdown has a bounded deadline (`e9f36fbc`).
+- [x] Hung shutdown reaches forced kill and child reap (`e9f36fbc`).
 - [ ] Normal close leaves no Python sidecar orphan.
 - [ ] Killing only the sidecar does not terminate the Tauri host.
 - [ ] A safe idempotent request can restart the sidecar once.
@@ -33,8 +33,8 @@ Purpose: ship a proof/hardening release without adding product scope.
 - [ ] RAG grounding/retrieval and restart-persistence tests pass.
 - [ ] `npm run test:progress` passes.
 - [ ] `npm run build:frontend` passes.
-- [ ] `cargo check --manifest-path src-tauri/Cargo.toml` passes.
-- [ ] `cargo test --manifest-path src-tauri/Cargo.toml` passes.
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` passes (`e9f36fbc`).
+- [x] `cargo test --manifest-path src-tauri/Cargo.toml` passes (`e9f36fbc`).
 
 ### 4. Installed package proof
 
@@ -58,6 +58,14 @@ Purpose: ship a proof/hardening release without adding product scope.
 - Installed sidecar shutdown/kill/recovery smoke is not green.
 - Python sidecar version is `0.2.0` while app sources say `0.2.1`.
 - Installer hash `D6E8A267...00EC209E` differs from checksum `5E2434D4...57E491B`.
+
+## Recorded evidence
+
+- `e9f36fbcaeb62b19fb009df78e9306cef5b0e12d` bounds shutdown cleanup.
+- Cargo test: 14 passed, 0 failed, 3 ignored helper fixtures.
+- Cargo check: passed.
+- This evidence does not prove host survival, restart, installed lifecycle, package,
+  version or release readiness.
 
 ## Gate rule
 

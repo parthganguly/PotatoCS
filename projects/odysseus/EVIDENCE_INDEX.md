@@ -75,6 +75,18 @@ Current mismatch:
   corresponding Python startup or persisted recovery failure.
 - Interactive observation: killing the sidecar can terminate the Tauri host.
 
+## Bounded shutdown evidence
+
+- Commit: `e9f36fbcaeb62b19fb009df78e9306cef5b0e12d`.
+- Subject: `fix: bound sidecar shutdown cleanup`.
+- Changed path: `src-tauri/src/lib.rs` only.
+- Proves: graceful shutdown deadline; hung-child forced kill and reap.
+- Cargo test: 14 passed, 0 failed, 3 ignored helper fixtures.
+- Cargo check: passed.
+- Lifecycle logs use fixed request/cleanup results without RPC payload content.
+- Does not prove host survival after external kill, restart, installed lifecycle,
+  package integrity, version alignment or release readiness.
+
 ## Evidence rules
 
 - Historical pass claims do not prove current HEAD.
