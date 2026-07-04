@@ -6,19 +6,24 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 ## Repository snapshot
 
 - Branch: `main`, tracking `origin/main`.
-- Last committed baseline before this harness update: `c2cc4d16d2f33735b34ef92e0a1b720567434404`.
+- Last committed baseline: `7119e40c59dfb401be400242dee2f0fffde95fff`.
 - Shutdown evidence: `e9f36fbc` (`fix: bound sidecar shutdown cleanup`).
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
+- Startup health-ping fix: `7119e40c` (`fix: make startup sidecar health.ping
+  failure non-fatal`) — source-level only, see `GATE.md` section 2.
 - Current worktree: harness-only updates pending.
 - Latest tag: `v0.2.1`; no v0.3 tag or version exists.
 - Release gate: **RED — v0.3 proof incomplete**.
-- Installed lifecycle smoke: **FAIL** — `c2cc4d16` records
+- Installed lifecycle smoke: **FAIL (source fix pending re-verify)** —
+  `c2cc4d16` records
   `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` against
   candidate `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`, installer SHA-256
   `BE31DEF76A0A3EA60FAED198AC70FE0D4A9015EA2D1AEBD6D5835478D23C5F00`. Clean
   install, normal close, relaunch and idle-sidecar-kill-survives-host all
   passed; killing the sidecar during startup `health.ping` terminated the
   host and no fixed-label recovery logs were recorded for that path.
+  `7119e40c` fixes this at the source level with Rust fixture evidence; the
+  installed smoke must be re-run against a new installer built from it.
 
 ## Version and naming state
 
@@ -45,6 +50,8 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Forced-death detection with one safe idempotent restart/retry maximum.
 - Non-idempotent RPCs are not replayed after sidecar loss.
 - Fixed-label exit/restart/retry lifecycle logs.
+- Startup `health.ping` sidecar death is non-fatal to the setup hook,
+  source-proved only (`7119e40c`).
 
 ## Partial or unproved
 
@@ -63,8 +70,10 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. Installed-app host survival and recovery after sidecar kill are unproved;
-   worse, the startup `health.ping` path is proved failing (`c2cc4d16`).
+1. Installed-app host survival and recovery after sidecar kill are unproved
+   at the installed-package level. The startup `health.ping` path was proved
+   failing (`c2cc4d16`) and is now source-fixed (`7119e40c`), but the
+   installed smoke has not been re-run against a new installer.
 2. Profile survival across installed kill/restart/relaunch is unproved.
 3. Current installer SHA-256 does not match the checked-in checksum.
 4. Runtime version sources disagree.

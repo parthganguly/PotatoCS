@@ -18,11 +18,12 @@ Purpose: ship a proof/hardening release without adding product scope.
 - [x] Hung shutdown reaches forced kill and child reap (`e9f36fbc`).
 - [ ] Normal close leaves no Python sidecar orphan.
 - [ ] Killing only the sidecar does not terminate the Tauri host.
-      Installed smoke `c2cc4d16` (candidate `1682dd14`) proves this **FAILS**
-      for the startup `health.ping` path: killing the owned sidecar during
-      that request terminated the host, and no fixed-label recovery logs
-      were emitted for that crash path. Idle-sidecar kill after startup
-      passed in the same run.
+      Installed smoke `c2cc4d16` (candidate `1682dd14`) proved this **FAILED**
+      for the startup `health.ping` path. Source fix `7119e40c` now applies
+      the same restart/retry discipline to the startup health check; Rust
+      fixtures prove the host survives a sidecar kill during startup
+      `health.ping`. Still unchecked pending a new installer built from
+      `7119e40c` and a re-run of the installed lifecycle smoke.
 - [x] Rust forced-death fixture detects exit and keeps the test host alive (`bd635ea2`).
 - [x] A safe idempotent request can restart/retry the sidecar once (`bd635ea2`).
 - [x] Non-idempotent requests are not replayed after sidecar loss (`bd635ea2`).
@@ -74,10 +75,12 @@ Purpose: ship a proof/hardening release without adding product scope.
 ## Current hard failures
 
 - Installed sidecar shutdown/kill/recovery smoke is not green. `c2cc4d16`
-  (`projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`) proves
-  **FAIL**: killing the owned sidecar during the startup `health.ping`
-  request terminates the installed host, with no fixed-label recovery logs
-  for that crash path.
+  (`projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`) proved
+  **FAIL** at candidate `1682dd14`: killing the owned sidecar during the
+  startup `health.ping` request terminated the installed host, with no
+  fixed-label recovery logs for that crash path. Source fix `7119e40c`
+  addresses this at the source level (Rust fixture evidence only); the
+  installed lifecycle smoke has not been re-run against a new installer.
 - Python sidecar version is `0.2.0` while app sources say `0.2.1`.
 - Installer hash `D6E8A267...00EC209E` differs from checksum `5E2434D4...57E491B`.
 
@@ -104,6 +107,18 @@ Purpose: ship a proof/hardening release without adding product scope.
 - This evidence does not prove installed package, version, checksum or
   release readiness, and does not satisfy the two-run installed lifecycle
   matrix requirement.
+- `7119e40c59dfb401be400242dee2f0fffde95fff` fixes startup `health.ping`
+  sidecar death at the source level.
+- Cargo test: 20 passed, 0 failed, 4 ignored helper fixtures.
+- Cargo check and `git diff --check`: passed.
+- Rust fixtures prove the host process survives a sidecar kill during
+  startup `health.ping`, both when a retry recovers and when the retry
+  itself also fails; fixed-label logs record the crash path with no
+  RPC payload/private content.
+- This evidence proves the source fix only; it does not prove installed
+  behavior. The installed lifecycle smoke must be re-run against a new
+  installer built from `7119e40c` before this checkbox or the installed
+  package proof can be marked passing.
 
 ## Gate rule
 

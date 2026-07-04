@@ -1,4 +1,4 @@
-# Next Task: Make Startup Sidecar Health Failure Non-Fatal
+# Next Task: Re-run Installed Lifecycle Smoke on the Fixed Candidate
 
 Priority: **P0 release blocker**
 Primary owner: **Human**, with Codex-assisted implementation
@@ -6,55 +6,57 @@ Gate: `GATE.md` sections 2 and 4
 
 ## Objective
 
-Fix the setup-hook panic recorded in
-`INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`: killing the owned sidecar while
-the startup `health.ping` request is in flight currently terminates the Tauri
-host (`Failed to setup app: error encountered during setup hook: Python
-sidecar exited before responding to health.ping`). Startup health-check
-failure must be handled the same way the already-fixed forced-death and
-bounded-shutdown paths are (`bd635ea2`, `e9f36fbc`): recorded, recoverable,
-and non-fatal to the host process.
+The startup `health.ping` sidecar-death crash recorded in
+`INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` is now source-fixed at
+`7119e40c59dfb401be400242dee2f0fffde95fff` (`fix: make startup sidecar
+health.ping failure non-fatal`), with Rust fixture evidence only. Build a
+new installer from this commit and re-run the full installed lifecycle
+smoke to prove the fix holds at the installed-package level, and to
+complete the required two-run matrix.
 
 ## Prerequisite
 
-- Candidate baseline for this fix is `1682dd14cdee9a3c145e3c6c034e5ebd54c2eced`,
-  the SHA tested in the failing smoke run.
-- Read `INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` in full before changing code.
+- Candidate SHA: `7119e40c59dfb401be400242dee2f0fffde95fff`.
+- Read `INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` in full before starting;
+  it defines the exact command/observation format to reuse.
+- See `GATE.md` current hard failures and `EVIDENCE_INDEX.md` "Startup
+  health-ping recovery evidence" for what is already proved and what is not.
 
 ## Procedure
 
-1. Locate the setup hook that calls `health.ping` during startup and currently
-   propagates a hard error out of the hook.
-2. Change the failure path so a sidecar death/non-response during startup
-   health check does not abort app setup; apply the same restart/retry
-   discipline already proven for the running-state forced-death case.
-3. Emit fixed-label lifecycle logs for the startup failure path (exit,
-   restart attempted/succeeded/failed, retry result) with no RPC payload
-   content, matching the existing bounded-shutdown/forced-recovery log shape.
-4. Add or extend a Rust fixture that kills the sidecar during startup
-   `health.ping` and proves the host process survives.
-5. Run `cargo test` and `cargo check` in `src-tauri`; record pass/fail counts.
+1. Build a fresh installer from `7119e40c` (or later, if the user has since
+   advanced HEAD) using the same build command as the prior smoke.
+2. Run the full installed lifecycle matrix twice: clean install, launch,
+   normal close, relaunch, idle-sidecar kill (host survives), sidecar kill
+   during startup `health.ping` (host must survive this time), final orphan
+   check.
+3. Confirm fixed-label recovery logs are present in
+   `%APPDATA%\dev.odysseus.desktop\profiles\default\logs\backend.log` for
+   the startup-kill path, with no RPC payload/private content.
+4. Confirm profile continuity (`app.db`) survives across both runs.
+5. Record installer path, size, SHA-256, and all commands/timestamps/PIDs.
 
 ## Required evidence
 
-- Changed path(s), scoped to source needed for this fix.
-- Fixture proving host survives a sidecar kill during startup `health.ping`.
-- Fixed-label log excerpts for the startup failure path.
-- `cargo test` and `cargo check` results.
+- New installer SHA-256, built from the recorded candidate SHA.
+- Two complete, passing lifecycle-matrix runs (or one pass + one documented
+  retry with its first failure preserved per `TOKEN_RULES.md`).
+- Fixed-label log excerpts for the startup-kill path from the installed app.
+- Profile continuity evidence across both runs.
 
 ## Acceptance
 
-- Killing the owned sidecar during startup `health.ping` no longer terminates
-  the host process in the Rust fixture.
-- Fixed-label logs exist for the startup failure path.
+- Both installed lifecycle matrix runs pass, including sidecar kill during
+  startup `health.ping` not terminating the host.
 - Evidence is indexed by exact path and hash in `EVIDENCE_INDEX.md`.
+- `GATE.md` section 2 "Killing only the sidecar does not terminate the Tauri
+  host" and section 4 "Installed lifecycle matrix passes twice" are checked
+  only after this evidence exists.
 
 ## Stop conditions
 
-- Do not mark the installed package proof green.
-- Do not mark the two-run installed lifecycle matrix green.
 - Do not modify branding, versions or release artifacts.
-- Do not rebuild, publish, rename or replace an installer without user authority.
-- This task proves the source fix only; the installed-app lifecycle smoke in
-  `INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md` must be re-run separately
-  against a new installer built from the fixed commit.
+- Do not touch source in `src-tauri` or `python/` beyond what re-running the
+  smoke requires (none expected).
+- Do not mark the full release gate green; other `GATE.md` sections remain
+  open (version alignment, checksum match, automated proof suite).

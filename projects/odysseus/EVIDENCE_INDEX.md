@@ -93,6 +93,24 @@ Current mismatch:
 - Does not prove installed package, version, checksum or release readiness,
   and does not satisfy the required two-run installed lifecycle matrix.
 
+## Startup health-ping recovery evidence
+
+- Commit: `7119e40c59dfb401be400242dee2f0fffde95fff`.
+- Subject: `fix: make startup sidecar health.ping failure non-fatal`.
+- Changed path: `src-tauri/src/lib.rs` only.
+- Fixes the `c2cc4d16` crash path: startup `health.ping` sidecar death no
+  longer propagates a hard error out of the Tauri setup hook.
+- Rust fixtures `startup_health_ping_kill_recovers_without_terminating_host`
+  and `startup_health_ping_kill_survives_even_when_retry_also_fails` prove
+  host survival on kill during startup `health.ping`, recovered and
+  retry-also-fails cases.
+- Fixed-label logs cover exit/restart/retry with `context=startup_health`,
+  no RPC payload/private content.
+- Cargo test: 20 passed, 0 failed, 4 ignored. Cargo check and
+  `git diff --check`: passed.
+- Source fix only; installed smoke must be re-run against a new installer
+  built from this commit.
+
 ## Bounded shutdown evidence
 
 - Commit: `e9f36fbcaeb62b19fb009df78e9306cef5b0e12d`.
