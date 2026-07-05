@@ -25,7 +25,8 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
   progress tests, frontend build, cargo check/test, `git diff --check`);
   closes `GATE.md` section 3.
 - Latest tag: `v0.2.1`; no v0.3 tag or version exists.
-- Release gate: **RED — v0.3 proof incomplete** (other sections remain open).
+- Release gate: **RED — publish-time asset verification only**; all other
+  boxes evidence-backed or explicitly deferred (see `GATE.md`).
 - Installed lifecycle smoke: **PASS** —
   `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`
   records two complete passing runs against candidate
@@ -85,13 +86,13 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. `GATE.md` still has open checkboxes: section 1 (scope/source recording),
-   section 2 (normal-close orphan at matrix level, host spawn/health/exit
-   logging, UI degraded state), section 4 hygiene and clean-install
-   truthfulness checkboxes (evidence exists in `RELEASE_PROOF_v0.3.0.md`
-   but they are not yet marked), and section 5 test-counts checkbox.
-2. Nothing is published: the checksum/asset match is proved at repo-artifact
-   level only and must be re-verified at publish time.
+1. Publish-time only: the single open `GATE.md` checkbox is published
+   checksum/asset verification. The repo-artifact checksum matches locally;
+   the uploaded asset hash/filename must be verified at release time.
+   All other gate boxes are evidence-backed or explicitly deferred
+   (spawn/restart degraded-state UI → v0.3.1/v0.4); the `e1c8c774`
+   pre-freeze answer-quality exception is documented in
+   `docs/releases/v0.3.0.md`.
 
 ## Freeze
 
