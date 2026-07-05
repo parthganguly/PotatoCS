@@ -1,6 +1,6 @@
 # PotatoCS / Odysseus Status
 
-Updated: 2026-07-04  
+Updated: 2026-07-05.
 Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Repository snapshot
@@ -11,7 +11,13 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
 - Startup health-ping fix: `7119e40c` (`fix: make startup sidecar health.ping
   failure non-fatal`) — source-level only, see `GATE.md` section 2.
-- Current worktree: clean at `5171fdf4` after v0.3.0 version alignment.
+- Current worktree: clean at `e335705f` after final v0.3.0 artifact commit.
+- Final v0.3.0 installer: built from candidate `e8702c50`
+  (`Odysseus Desktop_0.3.0_x64-setup.exe`, SHA-256 `0D759D25...26FFB4`,
+  32,375,003 bytes); matching checksum file, release notes and proof report
+  committed at `e335705f` — see
+  `projects/odysseus/RELEASE_PROOF_v0.3.0.md`. Installed runtime verified
+  reporting `0.3.0`. Not published.
 - Version alignment: **DONE** at `5171fdf4` — all version sources report
   `0.3.0`; see `projects/odysseus/VERSION_ALIGNMENT_2026-07-04.md`.
 - Automated proof suite: **PASS** at `511ab1db` —
@@ -66,8 +72,9 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Local-first evidence is strong but is not an OS-level runtime firewall.
 - Shutdown/recovery Rust fixture evidence is now backed by a passing
   installed-level re-verify for the startup `health.ping` path.
-- Current HEAD still has no single green, full-release proof bundle (version
-  alignment, checksum match and automated proof suite remain open).
+- The release gate is still not green: remaining open checkboxes are listed
+  under Active blockers; version alignment, checksum match, automated proof
+  suite and the final installer/proof bundle are closed.
 
 ## Not started
 
@@ -78,13 +85,13 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. Current installer SHA-256 does not match the checked-in checksum, and
-   both installer and checksum artifacts are version-stale (`v0.2.1`) after
-   the `0.3.0` alignment — final rebuild and checksum regeneration required.
-2. Full installed/package proof has not passed at one immutable commit
-   (final installer, checksum match and release truthfulness remain open;
-   automated proof suite closed at `511ab1db`, version alignment closed at
-   `5171fdf4`).
+1. `GATE.md` still has open checkboxes: section 1 (scope/source recording),
+   section 2 (normal-close orphan at matrix level, host spawn/health/exit
+   logging, UI degraded state), section 4 hygiene and clean-install
+   truthfulness checkboxes (evidence exists in `RELEASE_PROOF_v0.3.0.md`
+   but they are not yet marked), and section 5 test-counts checkbox.
+2. Nothing is published: the checksum/asset match is proved at repo-artifact
+   level only and must be re-verified at publish time.
 
 ## Freeze
 

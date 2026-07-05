@@ -2,7 +2,6 @@
 Use paths as pointers; do not paste their full contents into harness files.
 
 ## Repository baseline
-
 - Snapshot SHA: `946746de16e7124df6a1208085e935a0606d6552`.
 - `README.md` (public claims); `docs/milestones.md` (scope/exclusions);
   `docs/releases/v0.2.1.md` (Operation Trace contract);
@@ -10,22 +9,16 @@ Use paths as pointers; do not paste their full contents into harness files.
 
 ## Versions and identity
 
-- `package.json`
-- `src-tauri/Cargo.toml`
-- `src-tauri/tauri.conf.json`
-- `python/odysseus_desktop_backend/__init__.py`
-- `src/features/shell/AppSidebar.tsx`
-- `python/odysseus_desktop_backend/services/chat_service.py`
+- `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`,
+  `python/odysseus_desktop_backend/__init__.py`.
+- `src/features/shell/AppSidebar.tsx`,
+  `python/odysseus_desktop_backend/services/chat_service.py`.
 
 ## Multimodal implementation
 
-- `python/odysseus_desktop_backend/services/artifact_service.py`
-- `python/odysseus_desktop_backend/services/image_preprocessing_service.py`
-- `python/odysseus_desktop_backend/services/ocr_service.py`
-- `python/odysseus_desktop_backend/services/model_service.py`
-- `python/odysseus_desktop_backend/services/vision_service.py`
-- `python/odysseus_desktop_backend/services/florence2_service.py`
-- `python/odysseus_desktop_backend/services/source_service.py`
+- `python/odysseus_desktop_backend/services/`: `artifact_service.py`,
+  `image_preprocessing_service.py`, `ocr_service.py`, `model_service.py`,
+  `vision_service.py`, `florence2_service.py`, `source_service.py`.
 - `src-tauri/src/lib.rs` — capture and sidecar supervisor.
 - `src/features/vision-diagnostics/ImageVisionDiagnostics.tsx`
 
@@ -40,39 +33,46 @@ Use paths as pointers; do not paste their full contents into harness files.
 
 ## Trust/proof tests
 
-- `python/tests/test_v021_operation_trace.py`
-- `python/tests/test_trace_privacy_sentinel.py`
-- `python/tests/test_no_egress.py`
-- `python/tests/test_progress.py`
-- `python/tests/test_migrations.py`
-- `python/tests/fixtures/v021_schema.sql`
-- `python/tests/test_ipc_golden_fixtures.py`
-- `python/tests/fixtures/ipc_contract.golden.json`
-- `python/tests/test_v011_rag_reliability.py`
-- `python/tests/test_v014_real_retrieval.py`
-- `python/tests/test_mvp_hardening_smoke.py`
+- `python/tests/`: `test_v021_operation_trace.py`,
+  `test_trace_privacy_sentinel.py`, `test_no_egress.py`, `test_progress.py`,
+  `test_migrations.py`, `test_ipc_golden_fixtures.py`,
+  `test_v011_rag_reliability.py`, `test_v014_real_retrieval.py`,
+  `test_mvp_hardening_smoke.py`.
+- Fixtures: `python/tests/fixtures/v021_schema.sql`,
+  `python/tests/fixtures/ipc_contract.golden.json`.
 
 ## Packaging proof
 
-- `scripts/build-release.ps1`
+- `scripts/build-release.ps1`, `scripts/build-core.ps1`
 - `scripts/verify-packaged-florence.ps1`
 - `scripts/verify-installer-resource-hygiene.ps1`
 - `scripts/inspect-florence-installer.ps1`
-- `src-tauri/target/release/bundle/nsis/Odysseus Desktop_0.2.1_x64-setup.exe`
-- `dist/PotatoCs-Odysseus-Desktop-v0.2.1-SHA256SUMS.txt`
+- `src-tauri/target/release/bundle/nsis/Odysseus Desktop_0.3.0_x64-setup.exe`
+- `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
+- Historical `v0.2.1` installer/checksum mismatch
+  (`D6E8A267...00EC209E` vs `5E2434D4...57E491B`) resolved at `e335705f`:
+  stale checksum file deleted, matching `v0.3.0` file committed.
 
-Current mismatch (both artifacts also version-stale `v0.2.1`):
-- Installer: `D6E8A267021366E347A0BD27E0E3796E30E70C6180EE790973D54CDC00EC209E`
-- Checksum file: `5E2434D429A6E4132853791854839820E87FD0FED023C648A2C41D93F57E491B`
+## Final v0.3.0 installer and proof — 2026-07-05
+
+- Commit `e335705f` (`docs: add v0.3.0 release proof and checksum`), build
+  candidate `e8702c50788d81207a5d712a5c196625f492c37f`:
+  `projects/odysseus/RELEASE_PROOF_v0.3.0.md`, `docs/releases/v0.3.0.md`,
+  `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`.
+- Installer SHA-256
+  `0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4`,
+  size `32,375,003` bytes; Core hygiene PASS (all counters 0); installed
+  runtime reports `0.3.0` (registry, exe metadata, sidecar source,
+  `backend.log`); full Python suite re-run at candidate: 297/0/0.
+- Does not prove publish-time asset match or the still-open `GATE.md`
+  section 1/2 items; nothing is published.
 
 ## Installed lifecycle smoke failure (2026-07-04) — superseded
 
-- Commit `c2cc4d16`: `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`.
-- Candidate `1682dd14`, installer SHA-256 `BE31DEF7...D23C5F00`.
-- Verdict **FAIL**: sidecar kill during startup `health.ping` terminated the
-  host, no fixed-label recovery logs; all other steps passed. Superseded by
-  the passing re-run below; the report retains the first failure and cleanup
-  record required by the gate's retry rule.
+- Commit `c2cc4d16`: `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04.md`
+  (candidate `1682dd14`, installer `BE31DEF7...D23C5F00`). **FAIL** on
+  startup `health.ping` kill; superseded by the passing re-run below while
+  retaining the gate-rule first-failure and cleanup record.
 
 ## Installed lifecycle smoke re-run — PASS (2026-07-04)
 
