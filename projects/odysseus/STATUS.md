@@ -1,6 +1,6 @@
 # PotatoCS / Odysseus Status
 
-Updated: 2026-07-05.
+Updated: 2026-07-05 — v0.3.0 released, gate GREEN.
 Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Repository snapshot
@@ -11,22 +11,21 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Recovery evidence: `bd635ea2` (`fix: recover from forced sidecar death`).
 - Startup health-ping fix: `7119e40c` (`fix: make startup sidecar health.ping
   failure non-fatal`) — source-level only, see `GATE.md` section 2.
-- Current worktree: clean at `e335705f` after final v0.3.0 artifact commit.
+- Current worktree: clean at `5f6eeab9`, tag `v0.3.0` pushed.
 - Final v0.3.0 installer: built from candidate `e8702c50`
   (`Odysseus Desktop_0.3.0_x64-setup.exe`, SHA-256 `0D759D25...26FFB4`,
   32,375,003 bytes); matching checksum file, release notes and proof report
-  committed at `e335705f` — see
-  `projects/odysseus/RELEASE_PROOF_v0.3.0.md`. Installed runtime verified
-  reporting `0.3.0`. Not published.
+  committed at `e335705f` — see `projects/odysseus/RELEASE_PROOF_v0.3.0.md`.
+- **Published**: GitHub Release `v0.3.0` is live with both assets; the
+  downloaded installer's SHA-256 was independently verified to match.
 - Version alignment: **DONE** at `5171fdf4` — all version sources report
   `0.3.0`; see `projects/odysseus/VERSION_ALIGNMENT_2026-07-04.md`.
 - Automated proof suite: **PASS** at `511ab1db` —
   `projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md` (Python 297/0/0,
   progress tests, frontend build, cargo check/test, `git diff --check`);
   closes `GATE.md` section 3.
-- Latest tag: `v0.2.1`; no v0.3 tag or version exists.
-- Release gate: **RED — publish-time asset verification only**; all other
-  boxes evidence-backed or explicitly deferred (see `GATE.md`).
+- Latest tag: `v0.3.0` (pushed and released).
+- Release gate: **GREEN — v0.3.0 release proof complete** (see `GATE.md`).
 - Installed lifecycle smoke: **PASS** —
   `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`
   records two complete passing runs against candidate
@@ -73,9 +72,8 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 - Local-first evidence is strong but is not an OS-level runtime firewall.
 - Shutdown/recovery Rust fixture evidence is now backed by a passing
   installed-level re-verify for the startup `health.ping` path.
-- The release gate is still not green: remaining open checkboxes are listed
-  under Active blockers; version alignment, checksum match, automated proof
-  suite and the final installer/proof bundle are closed.
+- The release gate is now green; see the Freeze note below for what stays
+  out of scope until the next gate is opened.
 
 ## Not started
 
@@ -86,16 +84,12 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-1. Publish-time only: the single open `GATE.md` checkbox is published
-   checksum/asset verification. The repo-artifact checksum matches locally;
-   the uploaded asset hash/filename must be verified at release time.
-   All other gate boxes are evidence-backed or explicitly deferred
-   (spawn/restart degraded-state UI → v0.3.1/v0.4); the `e1c8c774`
-   pre-freeze answer-quality exception is documented in
-   `docs/releases/v0.3.0.md`.
+None. `GATE.md` is green. Spawn/restart degraded-state UI is deferred to
+v0.3.1/v0.4, not a v0.3.0 blocker.
 
 ## Freeze
 
-Until `GATE.md` is green, do not add agents, tools, research, memory, skills,
-compare/Cookbook, new vision backends, window capture, full internal rebranding,
-or unrelated UI/answer-quality work.
+`GATE.md` is green for v0.3.0. A new gate should be opened before adding
+agents, tools, research, memory, skills, compare/Cookbook, new vision
+backends, window capture, full internal rebranding, or unrelated
+UI/answer-quality work.

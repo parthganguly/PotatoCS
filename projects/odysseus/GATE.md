@@ -1,7 +1,6 @@
 # v0.3.0 Release Proof Gate
 
-State: **RED — publish-time asset verification only** (all other boxes
-evidence-backed or deferred; green only after the uploaded asset is verified).
+State: **GREEN — v0.3.0 release proof complete**
 Purpose: ship a proof/hardening release without adding product scope.
 
 ## Required pass conditions
@@ -93,12 +92,9 @@ with the autouse non-loopback egress guard active suite-wide).
 - [x] Installer SHA-256 is recalculated after the final build.
       `0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4`
       at `e8702c50` (`RELEASE_PROOF_v0.3.0.md`).
-- [ ] Published checksum and asset filename match the actual installer.
-      Repo-artifact checksum is prepared and matches locally:
-      `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt` (`e335705f`)
-      carries the installer hash above with asset name
-      `PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe`. Publish-time
-      asset verification remains pending.
+- [x] Published checksum and asset filename match the actual installer.
+      GitHub Release `v0.3.0` asset verified after upload; downloaded asset
+      SHA-256 matched `0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4`.
 
 ### 5. Release truthfulness
 
@@ -123,7 +119,8 @@ with the autouse non-loopback egress guard active suite-wide).
 ## Current hard failures
 
 - None. (Version disagreement resolved at `5171fdf4`; installer/checksum
-  mismatch resolved at `e335705f`.) Open checkboxes above still block release.
+  mismatch resolved at `e335705f`; publish-time asset verification passed
+  against the uploaded GitHub Release.)
 
 ## Recorded evidence
 
