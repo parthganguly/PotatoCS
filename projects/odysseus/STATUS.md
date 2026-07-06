@@ -1,7 +1,16 @@
 # PotatoCS / Odysseus Status
 
-Updated: 2026-07-05 — v0.3.0 released, gate GREEN.
+Updated: 2026-07-06 — v0.3.1 prep in progress.
 Authority: live repository plus the roadmap reconciliation report at HEAD below.
+
+## v0.3.1 prep
+
+- Branch `release/v0.3.1-prep` exists: version sources bumped to `0.3.1`,
+  release notes at `docs/releases/v0.3.1.md`, patch gate at
+  `projects/odysseus/GATE_v0.3.1.md`.
+- v0.3.1 gate: **RED — installer/build/publish verification pending**.
+- v0.3.0 remains the latest published release until v0.3.1 is actually
+  published.
 
 ## Repository snapshot
 
