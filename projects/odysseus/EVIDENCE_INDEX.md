@@ -48,7 +48,9 @@ Use paths as pointers; do not paste their full contents into harness files.
 - `scripts/verify-installer-resource-hygiene.ps1`
 - `scripts/inspect-florence-installer.ps1`
 - `src-tauri/target/release/bundle/nsis/Odysseus Desktop_0.3.0_x64-setup.exe`
-- `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
+- `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
+  (originally committed at `dist/…`; moved out of Vite-generated `dist/`
+  for issue #4 — content byte-identical)
 - Historical `v0.2.1` installer/checksum mismatch
   (`D6E8A267...00EC209E` vs `5E2434D4...57E491B`) resolved at `e335705f`:
   stale checksum file deleted, matching `v0.3.0` file committed.
@@ -58,7 +60,8 @@ Use paths as pointers; do not paste their full contents into harness files.
 - Commit `e335705f` (`docs: add v0.3.0 release proof and checksum`), build
   candidate `e8702c50788d81207a5d712a5c196625f492c37f`:
   `projects/odysseus/RELEASE_PROOF_v0.3.0.md`, `docs/releases/v0.3.0.md`,
-  `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`.
+  `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt` (record since
+  moved to `docs/releases/`, issue #4).
 - Installer SHA-256
   `0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4`,
   size `32,375,003` bytes; Core hygiene PASS (all counters 0); installed
