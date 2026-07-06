@@ -5,10 +5,16 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## v0.3.1 prep
 
-- Branch `release/v0.3.1-prep` exists: version sources bumped to `0.3.1`,
+- PR #8 merged to `main` at `971c0102`: version sources report `0.3.1`,
   release notes at `docs/releases/v0.3.1.md`, patch gate at
   `projects/odysseus/GATE_v0.3.1.md`.
-- v0.3.1 gate: **RED — installer/build/publish verification pending**.
+- Installer proof **DONE** at candidate `971c0102`: core installer built
+  (SHA-256 `F130D92B…111D`, 32,370,775 bytes), installed app verified at
+  `0.3.1` (registry/exe/sidecar/runtime log), graceful close with 0
+  orphans — see `projects/odysseus/RELEASE_PROOF_v0.3.1.md` and
+  `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.1-SHA256SUMS.txt`.
+- v0.3.1 gate: **RED — publish (asset upload/download-hash verification)
+  pending**.
 - v0.3.0 remains the latest published release until v0.3.1 is actually
   published.
 

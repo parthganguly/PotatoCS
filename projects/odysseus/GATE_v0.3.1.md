@@ -1,6 +1,6 @@
 # v0.3.1 Patch Release Gate
 
-State: **RED — installer/build/publish verification pending**
+State: **RED — publish (asset upload/download-hash verification) pending**
 
 Scope: patch release only — degraded-backend UI (PR #5), checksum-record
 build safety (PR #6), and docs shipped since v0.3.0. No v0.4 features.
@@ -38,12 +38,20 @@ build safety (PR #6), and docs shipped since v0.3.0. No v0.4 features.
       `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
       still present and unmodified after the build).
 
-## 5. Installer and publish (blocked — not started)
+## 5. Installer and publish (publish pending)
 
-- [ ] Installer built from a recorded candidate SHA on this branch/main.
-- [ ] Installer SHA-256 calculated and recorded (checksum file + proof
-      report, following the v0.3.0 pattern).
-- [ ] Installed app reports version 0.3.1.
+- [x] Installer built from a recorded candidate SHA on this branch/main —
+      candidate `971c0102` (main, PR #8 squash-merge), `npm run
+      tauri:build:core` exit 0, hygiene PASS; see
+      `RELEASE_PROOF_v0.3.1.md`.
+- [x] Installer SHA-256 calculated and recorded (checksum file + proof
+      report, following the v0.3.0 pattern) — `F130D92B…111D`,
+      32,370,775 bytes;
+      `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.1-SHA256SUMS.txt`.
+- [x] Installed app reports version 0.3.1 — registry DisplayVersion, exe
+      File/ProductVersion, installed sidecar `__version__`, and runtime
+      log `sidecar starting version=0.3.1` all verified; graceful close
+      with 0 orphan sidecars.
 - [ ] GitHub Release `v0.3.1` asset uploaded and downloaded-asset hash
       independently verified.
 
