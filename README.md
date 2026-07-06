@@ -9,13 +9,55 @@ hyperscalers, and frontier labs buying hardware in bulk. PotatoCs explores the
 opposite path — making the models people can actually run on modest machines
 more useful through software.
 
-The current Windows build ships as **Odysseus Desktop v0.2.1**. It wraps local
+The current Windows build ships as **Odysseus Desktop v0.3.0**. It wraps local
 models with OCR, semantic retrieval, evidence-grounded answers, diagnostics,
 benchmark reports, and per-answer operation traces.
 
 PotatoCs is for the computers people already own: older laptops, office PCs,
 modest gaming machines, and “potato” hardware that will never be a data center
 node.
+
+## Download v0.3.0
+
+**PotatoCS** is the project; **Odysseus Desktop** is the shipped Windows app.
+
+The current published release is
+[Odysseus Desktop v0.3.0](https://github.com/parthganguly/odysseus-desktop/releases/tag/v0.3.0),
+a **proof/hardening release**: it hardens sidecar shutdown and restart
+behavior and aligns version reporting across the app. It ships the same
+local-first workflow as earlier builds — OCR, semantic retrieval (RAG),
+evidence-grounded answers, and local vision — and adds no new agents, tools,
+research, or memory features.
+
+Release assets:
+
+- Installer: `PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe`
+- Checksum: `PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
+
+After downloading both files into the same folder, verify the installer in
+PowerShell:
+
+```powershell
+$installer = ".\PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe"
+Get-FileHash $installer -Algorithm SHA256
+Get-Content ".\PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt"
+```
+
+The `Hash` value from the first command must match the hash in the checksum
+file:
+
+```text
+0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4
+```
+
+Do not run the installer if the hashes do not match.
+
+Windows may show a SmartScreen warning because this installer is not
+code-signed yet. Verify the SHA-256 hash before running it.
+
+v0.3.0 is a proof/hardening release, not a claim of production readiness. See
+the [v0.3.0 release notes](docs/releases/v0.3.0.md) for its full scope and
+validation details.
 
 ## Why PotatoCs exists
 
@@ -49,34 +91,24 @@ Ollama-backed local model runtime.
 - Stores sessions, Sources, settings, benchmark history, and operation traces
   in local SQLite profiles.
 
-## Current release: v0.2.1
+## Current release: v0.3.0
 
-PotatoCs currently ships the **Odysseus Desktop v0.2.1** Windows build.
+PotatoCs currently ships **Odysseus Desktop v0.3.0**, a proof/hardening
+release. It does not add new product features; it hardens sidecar
+shutdown/restart behavior, aligns version reporting across the app, and
+ships with a recorded, commit-tied proof bundle. See
+[Download v0.3.0](#download-v030) above for the installer, checksum, and
+verification steps, and the
+[v0.3.0 release notes](docs/releases/v0.3.0.md) for the full validation
+summary.
 
-v0.2.1 adds **Stats for Nerds / Operation Trace** under assistant messages. A
-trace exposes per-answer timing, model routing, pipeline state, token counts,
-RAG/source identifiers, warnings, and model-trace availability without turning
-private prompt or document content into diagnostic payloads.
-
-See the [v0.2.1 release notes](docs/releases/v0.2.1.md) for the complete change
-and validation summary.
-
-## Download / installer
-
-Download the draft or published Windows release from
-[GitHub Releases](https://github.com/parthganguly/odysseus-desktop/releases).
-
-- Installer: `Odysseus Desktop_0.2.1_x64-setup.exe`
-- Checksum: `PotatoCs-Odysseus-Desktop-v0.2.1-SHA256SUMS.txt`
-
-Verify the installer from PowerShell after placing both files in one folder:
-
-```powershell
-(Get-FileHash -Algorithm SHA256 -LiteralPath '.\Odysseus Desktop_0.2.1_x64-setup.exe').Hash
-Get-Content -LiteralPath '.\PotatoCs-Odysseus-Desktop-v0.2.1-SHA256SUMS.txt'
-```
-
-The two SHA-256 values must match exactly.
+The most recent feature release was **v0.2.1**, which added **Stats for
+Nerds / Operation Trace** under assistant messages. A trace exposes
+per-answer timing, model routing, pipeline state, token counts, RAG/source
+identifiers, warnings, and model-trace availability without turning private
+prompt or document content into diagnostic payloads. See the
+[v0.2.1 release notes](docs/releases/v0.2.1.md) for that change and
+validation summary.
 
 ## Hardware expectations
 
@@ -159,7 +191,7 @@ tool.
 ## Known limitations
 
 - The app, installer, package, and profile identifiers still use **Odysseus
-  Desktop** in v0.2.1.
+  Desktop** in v0.3.0.
 - The Windows installer is large.
 - Ollama models are not bundled and can require substantial downloads.
 - Local VLMs and Florence can be slow on consumer hardware.
