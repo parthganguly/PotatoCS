@@ -29,6 +29,7 @@ import html2canvas from "html2canvas";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   AppStatus,
   AnswerStyle,
@@ -79,6 +80,7 @@ import {
   ThinkingMode,
   VisionBackend,
   getAppStatus,
+  retryBackend,
   rpc
 } from "./tauri";
 import {
@@ -114,6 +116,7 @@ import { useChatProgress } from "./features/chat/useChatProgress";
 import { ImageBenchmarkPanel } from "./features/image-evals/ImageBenchmarkPanel";
 import { ArtifactAnalysisCard } from "./features/multimodal-chat/ImageAttachments";
 import { AppSidebar } from "./features/shell/AppSidebar";
+import { backendBannerState, isBackendDegradedEvent } from "./features/shell/backendStatus";
 import { SourcesPage } from "./features/sources/SourcesPage";
 import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisionDiagnostics";
 
@@ -147,6 +150,8 @@ const TERMINAL_CAMPAIGN_STATUSES = new Set(["completed", "completed_with_errors"
 
 function App() {
   const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
+  const [backendDegraded, setBackendDegraded] = useState(false);
+  const [backendRetrying, setBackendRetrying] = useState(false);
   const [settings, setSettings] = useState<Settings>({});
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -250,6 +255,30 @@ function App() {
 
   useEffect(() => {
     void bootstrap();
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<unknown>("backend_degraded", (event) => {
+      if (!disposed && isBackendDegradedEvent(event.payload)) {
+        setBackendDegraded(event.payload.degraded);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -381,6 +410,7 @@ function App() {
           listImageEvalHistory(20)
         ]);
       setAppStatus(status);
+      setBackendDegraded(Boolean(status.backend_degraded));
       setSettings(nextSettings);
       const bootModelChoices = buildConversationModelOptions(nextOllama, nextCapabilities).map((option) => option.tag);
       const bootDefaultModel = String(nextSettings.default_model ?? "llama3.2");
@@ -406,6 +436,20 @@ function App() {
     } catch (err) {
       setLoadState("error");
       setError(readError(err));
+    }
+  }
+
+  async function retryDegradedBackend() {
+    setBackendRetrying(true);
+    try {
+      await retryBackend();
+      setBackendDegraded(false);
+      setAppStatus(await getAppStatus());
+    } catch {
+      // Keep the fixed banner copy; raw retry errors never reach the UI.
+      setBackendDegraded(true);
+    } finally {
+      setBackendRetrying(false);
     }
   }
 
@@ -1710,6 +1754,11 @@ function App() {
       />
 
       <section className="flex min-w-0 flex-1 flex-col">
+        <BackendDegradedBanner
+          degraded={backendDegraded}
+          retrying={backendRetrying}
+          onRetry={retryDegradedBackend}
+        />
         {activeView === "chat" ? (
           <ChatWorkspace
             busy={busy}
@@ -4211,6 +4260,31 @@ function IconButton(props: {
     >
       {props.children}
     </button>
+  );
+}
+
+function BackendDegradedBanner(props: {
+  degraded: boolean;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const banner = backendBannerState(props.degraded, props.retrying);
+  if (!banner.visible) return null;
+  return (
+    <div
+      role="alert"
+      className="flex items-center justify-between gap-3 border-b border-clay/30 bg-[#fff3ee] px-5 py-3 text-sm text-clay"
+    >
+      <span>{banner.message}</span>
+      <button
+        type="button"
+        disabled={banner.retryDisabled}
+        onClick={props.onRetry}
+        className="shrink-0 rounded border border-clay/40 px-3 py-1 text-xs font-medium text-clay hover:bg-clay/10 disabled:opacity-60"
+      >
+        {banner.retryLabel}
+      </button>
+    </div>
   );
 }
 

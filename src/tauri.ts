@@ -4,6 +4,7 @@ export type AppStatus = {
   profile_id: string;
   profile_dir: string;
   backend_ready: boolean;
+  backend_degraded: boolean;
 };
 
 export type Settings = {
@@ -1147,6 +1148,10 @@ export type CampaignReportData = {
 
 export async function getAppStatus(): Promise<AppStatus> {
   return invoke<AppStatus>("app_status");
+}
+
+export async function retryBackend(): Promise<void> {
+  return invoke<void>("retry_backend");
 }
 
 export async function rpc<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {

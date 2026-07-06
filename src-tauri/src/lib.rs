@@ -14,6 +14,7 @@ const MAX_CLIPBOARD_RGBA_BYTES: usize = (MAX_CAPTURE_PIXELS as usize) * 4;
 const MAX_PROFILE_IMAGE_READ_BYTES: u64 = 2 * 1024 * 1024;
 const PROGRESS_DISCRIMINATOR: &str = "__odysseus_progress__";
 const OPERATION_PROGRESS_EVENT: &str = "operation_progress";
+const BACKEND_DEGRADED_EVENT: &str = "backend_degraded";
 
 struct ProgressEvent {
     name: &'static str,
@@ -122,6 +123,7 @@ struct AppStatus {
     profile_id: String,
     profile_dir: String,
     backend_ready: bool,
+    backend_degraded: bool,
 }
 
 struct AppState {
@@ -170,6 +172,9 @@ struct BackendClient {
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
     is_shutdown: bool,
+    /// True once spawn/restart recovery is exhausted (restart failed, or the
+    /// one safe retry died again), until a later restart succeeds.
+    degraded: bool,
 }
 
 struct BackendCallError {
@@ -291,6 +296,7 @@ impl BackendClient {
             stdout: BufReader::new(stdout),
             next_id: 1,
             is_shutdown: false,
+            degraded: false,
         };
 
         Ok(client)
@@ -345,10 +351,13 @@ impl BackendClient {
                         profile_dir,
                         "sidecar lifecycle phase=retry result=succeeded context=startup_health",
                     ),
-                    Err(_) => append_shell_log(
-                        profile_dir,
-                        "sidecar lifecycle phase=retry result=failed context=startup_health",
-                    ),
+                    Err(_) => {
+                        replacement.degraded = true;
+                        append_shell_log(
+                            profile_dir,
+                            "sidecar lifecycle phase=retry result=failed context=startup_health",
+                        );
+                    }
                 }
                 *client = replacement;
                 Ok(())
@@ -386,7 +395,10 @@ impl BackendClient {
         F: FnOnce(&mut Self) -> Result<(), String>,
     {
         match self.call_once(method, params.clone()) {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                self.degraded = false;
+                Ok(value)
+            }
             Err(err) if err.restartable => {
                 append_shell_log(
                     profile_dir,
@@ -396,6 +408,10 @@ impl BackendClient {
                     ),
                 );
                 if !can_restart_and_retry(method) {
+                    // The sidecar is gone but this request must not be
+                    // replayed; the backend is degraded until a restart
+                    // (automatic on a later safe call, or user retry) succeeds.
+                    self.degraded = true;
                     append_shell_log(
                         profile_dir,
                         "sidecar lifecycle phase=restart result=skipped_non_idempotent",
@@ -407,12 +423,13 @@ impl BackendClient {
                     profile_dir,
                     "sidecar lifecycle phase=restart result=attempted",
                 );
-                if let Err(restart_error) = restart(self) {
+                if restart(self).is_err() {
+                    self.degraded = true;
                     append_shell_log(
                         profile_dir,
                         "sidecar lifecycle phase=restart result=failed",
                     );
-                    return Err(format!("Python sidecar restart failed: {restart_error}"));
+                    return Err("Python sidecar restart failed".to_string());
                 }
                 append_shell_log(
                     profile_dir,
@@ -421,6 +438,7 @@ impl BackendClient {
 
                 match self.call_once(method, params) {
                     Ok(value) => {
+                        self.degraded = false;
                         append_shell_log(
                             profile_dir,
                             "sidecar lifecycle phase=retry result=succeeded",
@@ -428,6 +446,9 @@ impl BackendClient {
                         Ok(value)
                     }
                     Err(retry_error) => {
+                        if retry_error.restartable {
+                            self.degraded = true;
+                        }
                         append_shell_log(
                             profile_dir,
                             "sidecar lifecycle phase=retry result=failed",
@@ -520,6 +541,41 @@ impl BackendClient {
         let _ = self.shutdown(profile_dir);
         *self = Self::spawn(app, profile_dir)?;
         Ok(())
+    }
+
+    /// User-initiated retry from the degraded-state UI. Reuses the existing
+    /// restart path and reports only fixed-label outcomes: the underlying
+    /// error detail never reaches the frontend.
+    fn user_retry(&mut self, app: &AppHandle, profile_dir: &Path) -> Result<(), String> {
+        self.user_retry_using(profile_dir, |client| client.restart(app, profile_dir))
+    }
+
+    fn user_retry_using<F>(&mut self, profile_dir: &Path, restart: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut Self) -> Result<(), String>,
+    {
+        append_shell_log(
+            profile_dir,
+            "sidecar lifecycle phase=restart result=attempted context=user_retry",
+        );
+        match restart(self) {
+            Ok(()) => {
+                self.degraded = false;
+                append_shell_log(
+                    profile_dir,
+                    "sidecar lifecycle phase=restart result=succeeded context=user_retry",
+                );
+                Ok(())
+            }
+            Err(_) => {
+                self.degraded = true;
+                append_shell_log(
+                    profile_dir,
+                    "sidecar lifecycle phase=restart result=failed context=user_retry",
+                );
+                Err("Python sidecar restart failed".to_string())
+            }
+        }
     }
 
     fn is_ready(&mut self) -> bool {
@@ -760,16 +816,17 @@ fn read_profile_artifact_file(state: tauri::State<AppState>, path: String) -> Re
 
 #[tauri::command]
 fn app_status(state: tauri::State<AppState>) -> AppStatus {
-    let backend_ready = state
+    let (backend_ready, backend_degraded) = state
         .backend
         .lock()
-        .map(|mut backend| backend.is_ready())
-        .unwrap_or(false);
+        .map(|mut backend| (backend.is_ready(), backend.degraded))
+        .unwrap_or((false, true));
 
     AppStatus {
         profile_id: state.profile_id.clone(),
         profile_dir: state.profile_dir.display().to_string(),
         backend_ready,
+        backend_degraded,
     }
 }
 
@@ -780,17 +837,64 @@ async fn rpc_call(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
-    let mut backend = state
-        .backend
-        .lock()
-        .map_err(|_| "backend lock is poisoned".to_string())?;
+    // Capture the result and the degraded-state transition while holding the
+    // lock, then drop the guard before emitting: frontend IPC must not extend
+    // the backend critical section.
+    let (result, transition) = {
+        let mut backend = state
+            .backend
+            .lock()
+            .map_err(|_| "backend lock is poisoned".to_string())?;
 
-    backend.call_with_recovery(
-        &app,
-        &state.profile_dir,
-        &method,
-        params.unwrap_or_else(|| json!({})),
-    )
+        let was_degraded = backend.degraded;
+        let result = backend.call_with_recovery(
+            &app,
+            &state.profile_dir,
+            &method,
+            params.unwrap_or_else(|| json!({})),
+        );
+        (result, degraded_transition(was_degraded, backend.degraded))
+    };
+
+    emit_degraded_transition(&app, transition);
+
+    result
+}
+
+#[tauri::command]
+fn retry_backend(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    // Same lock discipline as rpc_call: emit only after the guard is dropped.
+    let (result, transition) = {
+        let mut backend = state
+            .backend
+            .lock()
+            .map_err(|_| "backend lock is poisoned".to_string())?;
+
+        let was_degraded = backend.degraded;
+        let result = backend.user_retry(&app, &state.profile_dir);
+        (result, degraded_transition(was_degraded, backend.degraded))
+    };
+
+    emit_degraded_transition(&app, transition);
+
+    result
+}
+
+/// Returns the new degraded value only when it changed, so the shell emits
+/// `backend_degraded` on both directions of the transition (false -> true and
+/// true -> false, including automatic recovery) without repeating unchanged
+/// state after every call.
+fn degraded_transition(was_degraded: bool, is_degraded: bool) -> Option<bool> {
+    (was_degraded != is_degraded).then_some(is_degraded)
+}
+
+fn emit_degraded_transition(app: &AppHandle, transition: Option<bool>) {
+    if let Some(degraded) = transition {
+        let _ = app.emit(
+            BACKEND_DEGRADED_EVENT,
+            json!({ "__odysseus_backend_degraded__": true, "degraded": degraded }),
+        );
+    }
 }
 
 #[tauri::command]
@@ -1010,6 +1114,7 @@ pub fn run() {
             capture_region,
             capture_window,
             read_profile_artifact_file,
+            retry_backend,
             rpc_call,
             shutdown_backend
         ])
@@ -1047,6 +1152,7 @@ mod tests {
             stdout: BufReader::new(stdout),
             next_id: 1,
             is_shutdown: false,
+            degraded: false,
         }
     }
 
@@ -1281,6 +1387,10 @@ mod tests {
             "host process must survive even when the startup retry itself fails"
         );
         assert_eq!(restart_count, 1);
+        assert!(
+            backend.degraded,
+            "a failed startup retry must mark the backend degraded"
+        );
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
             .expect("lifecycle log");
         assert!(log.contains(
@@ -1298,6 +1408,7 @@ mod tests {
         let private_sentinel = "PRIVATE_SAFE_RETRY_SENTINEL_MUST_NOT_REACH_LOGS";
         let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
         kill_lifecycle_child(&mut backend);
+        backend.degraded = true;
         let mut restart_count = 0;
 
         let result = backend
@@ -1317,6 +1428,15 @@ mod tests {
 
         assert_eq!(result["recovered"], true);
         assert_eq!(restart_count, 1);
+        assert!(
+            !backend.degraded,
+            "automatic restart/retry recovery must clear the degraded state"
+        );
+        assert_eq!(
+            degraded_transition(true, backend.degraded),
+            Some(false),
+            "recovery must surface a degraded:false transition to the frontend"
+        );
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
             .expect("lifecycle log");
         assert!(log.contains(
@@ -1351,7 +1471,15 @@ mod tests {
             .expect_err("non-idempotent request must not be replayed");
 
         assert!(error.contains("exited before handling"));
+        assert!(
+            !error.contains(private_sentinel),
+            "request payload must not leak into the caller-facing error"
+        );
         assert_eq!(restart_count, 0);
+        assert!(
+            backend.degraded,
+            "sidecar loss on a non-idempotent request must mark the backend degraded"
+        );
         assert!(!can_restart_and_retry("chat.send"));
         assert!(!can_restart_and_retry("evals.run"));
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
@@ -1384,7 +1512,15 @@ mod tests {
             .expect_err("restart failure should be returned");
 
         assert!(error.contains("Python sidecar restart failed"));
+        assert!(
+            !error.contains(private_sentinel),
+            "restart error detail must not reach the caller-facing message"
+        );
         assert_eq!(restart_count, 1);
+        assert!(
+            backend.degraded,
+            "exhausted restart must mark the backend degraded"
+        );
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
             .expect("lifecycle log");
         assert!(log.contains("sidecar lifecycle phase=restart result=attempted"));
@@ -1430,6 +1566,93 @@ mod tests {
             1
         );
         assert!(log.contains("sidecar lifecycle phase=retry result=failed"));
+        assert!(
+            backend.degraded,
+            "a retry that dies again must mark the backend degraded"
+        );
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn user_retry_recovers_a_degraded_backend() {
+        let profile_dir = lifecycle_test_profile("user-retry-recovers");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        backend.degraded = true;
+
+        backend
+            .user_retry_using(&profile_dir, |client| {
+                let mut replacement =
+                    spawn_lifecycle_backend("tests::lifecycle_single_rpc_response_fixture");
+                replacement
+                    .call_once("health.ping", json!({}))
+                    .map_err(|err| err.message)?;
+                *client = replacement;
+                Ok(())
+            })
+            .expect("user retry should recover the backend");
+
+        assert!(!backend.degraded, "successful retry must clear degraded");
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=attempted context=user_retry"
+        ));
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=succeeded context=user_retry"
+        ));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn user_retry_failure_stays_degraded_and_privacy_safe() {
+        let profile_dir = lifecycle_test_profile("user-retry-fails");
+        let private_sentinel = "PRIVATE_USER_RETRY_SENTINEL_MUST_NOT_REACH_LOGS";
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        kill_lifecycle_child(&mut backend);
+        backend.degraded = true;
+
+        let error = backend
+            .user_retry_using(&profile_dir, |_client| Err(private_sentinel.to_string()))
+            .expect_err("failing retry should be reported");
+
+        assert_eq!(error, "Python sidecar restart failed");
+        assert!(!error.contains(private_sentinel));
+        assert!(backend.degraded, "failed retry must keep degraded set");
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
+            .expect("lifecycle log");
+        assert!(log.contains(
+            "sidecar lifecycle phase=restart result=failed context=user_retry"
+        ));
+        assert!(!log.contains(private_sentinel));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn degraded_transition_emits_both_directions_and_stays_quiet_otherwise() {
+        assert_eq!(degraded_transition(false, true), Some(true));
+        assert_eq!(degraded_transition(true, false), Some(false));
+        assert_eq!(degraded_transition(false, false), None);
+        assert_eq!(degraded_transition(true, true), None);
+    }
+
+    #[test]
+    fn plain_successful_call_clears_a_stale_degraded_flag() {
+        let profile_dir = lifecycle_test_profile("plain-success-clears-degraded");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_single_rpc_response_fixture");
+        backend.degraded = true;
+
+        backend
+            .call_with_recovery_using(&profile_dir, "health.ping", json!({}), |_client| {
+                panic!("no restart should be needed for a healthy sidecar")
+            })
+            .expect("healthy sidecar should answer");
+
+        assert!(
+            !backend.degraded,
+            "a successful call must clear a stale degraded flag"
+        );
+        let _ = backend.shutdown(&profile_dir);
         let _ = fs::remove_dir_all(profile_dir);
     }
 
