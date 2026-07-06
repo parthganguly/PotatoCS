@@ -19,13 +19,17 @@
 - Installer: `src-tauri\target\release\bundle\nsis\Odysseus Desktop_0.3.0_x64-setup.exe`
 - Size: `32,375,003` bytes.
 - SHA-256: `0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4`
-- Checksum file: `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`,
-  asset name `PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe`
+- Checksum file: `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
+  (originally committed at `dist/…`; moved out of Vite-generated `dist/`
+  for issue #4, content byte-identical). Asset name
+  `PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe`
   (existing `PotatoCs` asset convention retained; publishing requires
   renaming/copying the installer to that asset name).
 - The stale, mismatched `v0.2.1` checksum file was deliberately replaced
-  (deleted) by the `v0.3.0` file. `dist/` is gitignored; the checksum file
-  must be committed with `git add -f`, as its predecessor was.
+  (deleted) by the `v0.3.0` file. At the time, `dist/` was gitignored and
+  the checksum file was committed with `git add -f`, as its predecessor
+  was; the record now lives in `docs/releases/` so `npm run build:frontend`
+  cannot delete it (issue #4).
 
 ## Package/resource hygiene (GATE section 4)
 
@@ -105,7 +109,8 @@ Silent uninstall of 0.2.1, silent install of the new 0.3.0 installer, then:
 1. `git rev-parse HEAD` → `e8702c50…` (clean).
 2. `npm run tauri:build:core` → exit 0; runtime verify + hygiene PASS.
 3. `Get-FileHash -Algorithm SHA256` on the installer → `0D759D25…26FFB4`.
-4. Wrote `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`.
+4. Wrote `dist/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt` (record
+   since moved to `docs/releases/`, issue #4).
 5. `uninstall.exe /S`; installer `/S`; registry/exe/sidecar version checks.
 6. Two launches with log inspection; orphan checks → 0.
 7. `python -m pytest python\tests` → 297/0/0.
