@@ -87,11 +87,14 @@ function rowById(rows, id) {
 }
 
 // All ready: every row is ready except vision, which is always optional/heavy.
+// Ready rows carry no setup guidance.
 {
   const rows = readinessRows(inputs());
   assert.equal(rows.length, 8);
   for (const id of ["app_shell", "backend", "ollama", "chat_model", "document_search", "lexical_fallback", "ocr"]) {
-    assert.equal(rowById(rows, id).state, "ready", `${id} should be ready`);
+    const item = rowById(rows, id);
+    assert.equal(item.state, "ready", `${id} should be ready`);
+    assert.equal(item.guidance, undefined, `${id} must not carry guidance when ready`);
   }
   assert.equal(rowById(rows, "vision").state, "heavy");
   assert.equal(hasCriticalReadinessGap(rows), false);
@@ -107,7 +110,12 @@ function rowById(rows, id) {
   assert.equal(runtime.state, "missing");
   assert.match(runtime.explanation, /runtime not found/i);
   assert.match(runtime.nextStep, /Install Ollama.*Re-check/i);
-  assert.equal(rowById(rows, "chat_model").state, "unavailable");
+  assert.ok(runtime.guidance, "missing runtime must carry install guidance");
+  assert.match(runtime.guidance.steps.join(" "), /download ollama/i);
+  assert.equal(runtime.guidance.command.text, "https://ollama.com/download");
+  const gated = rowById(rows, "chat_model");
+  assert.equal(gated.state, "unavailable");
+  assert.equal(gated.guidance, undefined, "runtime-gated chat row must not show pull guidance");
   assert.equal(hasCriticalReadinessGap(rows), true);
 }
 
@@ -119,6 +127,8 @@ function rowById(rows, id) {
   const runtime = rowById(rows, "ollama");
   assert.equal(runtime.state, "missing");
   assert.match(runtime.nextStep, /Start Ollama/i);
+  assert.ok(runtime.guidance, "installed-not-running must carry start guidance");
+  assert.equal(runtime.guidance.command.text, "ollama serve");
   assert.equal(hasCriticalReadinessGap(rows), true);
 }
 
@@ -129,6 +139,12 @@ function rowById(rows, id) {
   assert.equal(chatModel.state, "missing");
   assert.match(chatModel.explanation, /No chat model found/i);
   assert.match(chatModel.nextStep, /pull a small model/i);
+  // Guidance exists, but the model recommendation is a deferred human
+  // decision (V04_MODEL_RECOMMENDATION_DECISION.md): no copyable command and
+  // no concrete model name may appear until it is approved.
+  assert.ok(chatModel.guidance, "missing chat model must carry guidance");
+  assert.equal(chatModel.guidance.command, undefined, "no chat-model command until a recommendation is approved");
+  assert.match(chatModel.guidance.steps.join(" "), /still being decided/i);
   assert.equal(hasCriticalReadinessGap(rows), true);
 }
 
@@ -145,6 +161,11 @@ function rowById(rows, id) {
   const search = rowById(rows, "document_search");
   assert.equal(search.state, "degraded");
   assert.match(search.explanation, /basic keyword search.*embedding model/i);
+  // The embedding command is the one approved model name: the backend's own
+  // wired default (embedding_service.py DEFAULT_EMBEDDING_MODEL).
+  assert.ok(search.guidance, "degraded search must carry embedding guidance");
+  assert.equal(search.guidance.command.text, "ollama pull nomic-embed-text");
+  assert.match(search.guidance.steps.join(" "), /optional/i);
   const fallback = rowById(rows, "lexical_fallback");
   assert.equal(fallback.state, "ready");
   assert.match(fallback.explanation, /keyword matching/i);
@@ -157,6 +178,9 @@ function rowById(rows, id) {
   const ocr = rowById(rows, "ocr");
   assert.equal(ocr.state, "unavailable");
   assert.match(ocr.explanation, /Tesseract or a PDF renderer/i);
+  // Basic pointer only — no OCR install wizard and no command yet.
+  assert.ok(ocr.guidance, "unavailable OCR must carry basic guidance");
+  assert.equal(ocr.guidance.command, undefined, "no OCR install command yet");
   assert.equal(hasCriticalReadinessGap(rows), false);
 }
 
@@ -183,9 +207,15 @@ function rowById(rows, id) {
     })
   );
   assert.equal(rowById(withVision, "vision").state, "heavy");
+  assert.equal(rowById(withVision, "vision").guidance, undefined, "installed vision model needs no guidance");
   const withoutVision = readinessRows(inputs());
-  assert.equal(rowById(withoutVision, "vision").state, "heavy");
-  assert.match(rowById(withoutVision, "vision").explanation, /optional and may be slow on weak computers/i);
+  const visionRow = rowById(withoutVision, "vision");
+  assert.equal(visionRow.state, "heavy");
+  assert.match(visionRow.explanation, /optional and may be slow on weak computers/i);
+  // Guidance labels vision as optional/heavy and never offers a pull command.
+  assert.ok(visionRow.guidance, "vision without a model carries optional/heavy guidance");
+  assert.equal(visionRow.guidance.command, undefined, "vision guidance must never offer a download command");
+  assert.match(visionRow.guidance.steps.join(" "), /optional and heavy/i);
   assert.equal(hasCriticalReadinessGap(withVision), false);
 }
 
@@ -201,7 +231,10 @@ function rowById(rows, id) {
     })
   );
   for (const item of rows) {
-    for (const text of [item.label, item.stateLabel, item.explanation, item.nextStep]) {
+    const guidanceTexts = item.guidance
+      ? [...item.guidance.steps, ...(item.guidance.command ? [item.guidance.command.label, item.guidance.command.text] : [])]
+      : [];
+    for (const text of [item.label, item.stateLabel, item.explanation, item.nextStep, ...guidanceTexts]) {
       for (const fragment of ["Traceback", "C:", "\\", "{", "}", "jsonrpc", "/etc/passwd"]) {
         assert.equal(
           text.includes(fragment),
@@ -222,11 +255,13 @@ function rowById(rows, id) {
   assert.equal(hasCriticalReadinessGap(rows), true);
 }
 
-// Checking: probing rows show the checking state.
+// Checking: probing rows show the checking state and no guidance.
 {
   const rows = readinessRows(inputs({ checking: true }));
   for (const id of ["ollama", "chat_model", "document_search", "lexical_fallback", "ocr", "vision"]) {
-    assert.equal(rowById(rows, id).state, "checking", `${id} should be checking`);
+    const item = rowById(rows, id);
+    assert.equal(item.state, "checking", `${id} should be checking`);
+    assert.equal(item.guidance, undefined, `${id} must not show guidance while checking`);
   }
 }
 
