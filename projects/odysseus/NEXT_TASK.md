@@ -1,47 +1,37 @@
-# Next Task: Build Final 0.3.0 Installer, Regenerate Checksum, Produce Release Proof Report
+# Next Task: Start v0.4 — Potato Mode + First-Run Runtime Simplification
 
-Priority: **P0 release blocker**
-Primary owner: **Human**, with Codex-assisted implementation
-Gate: `GATE.md` sections 1, 2 (remaining), 4 (remaining) and 5 (remaining)
+Priority: **P1 planning-to-execution**
+Primary owner: maintainer, with model-assisted implementation
+Predecessors: v0.3.0 and v0.3.1 released; `GATE.md` and `GATE_v0.3.1.md` both GREEN.
 
 ## Objective
 
-Build the final v0.3.0 installer from the aligned candidate, regenerate a
-matching SHA-256 checksum, and produce the release proof report. Version
-alignment closed at `5171fdf4`
-(`projects/odysseus/VERSION_ALIGNMENT_2026-07-04.md`); automated proof suite
-closed at `511ab1db`
-(`projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md`). The gate remains
-**RED**: final installer, checksum match, hygiene checks and release
-truthfulness are open.
+Execute the accepted v0.4 scope (issue #3, closed):
+**Potato Mode + First-Run Runtime Simplification**. The prior task in this
+file — build the v0.3.0 installer and proof — completed at `e335705f`
+(`RELEASE_PROOF_v0.3.0.md`); v0.3.1 followed and completed at `971c0102`
+(`RELEASE_PROOF_v0.3.1.md`).
 
-## Prerequisite
+## Prerequisite reading
 
-- Read `GATE.md` in full for current checkbox state.
-- Existing `v0.2.1` installer and checksum artifacts are version-stale and
-  mismatched; do not reuse them as evidence.
+- `projects/odysseus/V04_POTATO_MODE_SCOPE.md` — accepted scope and audit.
+- `projects/odysseus/V04_EXECUTION_PLAN.md` — slice-by-slice execution order.
+- `projects/odysseus/V04_ISSUE_BREAKDOWN.md` — draft issue backlog.
+- `projects/odysseus/V04_BATON_FOR_SMALLER_MODELS.md` — rules for
+  lower-context models continuing this work.
 
 ## Procedure
 
-1. Record the final candidate SHA; confirm clean worktree.
-2. Build the installer from that SHA (`npm run tauri:build:core` or the
-   release script); restore the transiently deleted checksum file if the
-   build removes it, then replace it deliberately in step 3.
-3. Recalculate SHA-256 of the new installer; write the matching checksum
-   file with the correct `v0.3.0` asset filename.
-4. Run Florence/runtime/resource hygiene verification scripts
-   (`GATE.md` section 4).
-5. Verify the installed app reports `0.3.0` (package/Cargo/Tauri/Python) and
-   backend/OCR/Florence truthfully on clean install.
-6. Draft release notes describing v0.3 as proof/hardening only; document
-   PotatoCS project / Odysseus Desktop naming.
-7. Assemble the final proof report tying candidate SHA, commands,
-   environment, hashes, test counts and unresolved skips together.
+1. Merge the v0.4 planning baton PR (docs only).
+2. Open GitHub issues from `V04_ISSUE_BREAKDOWN.md` **only with maintainer
+   approval**, in dependency order.
+3. Work each issue as one branch / one PR with a small diff, per
+   `V04_BATON_FOR_SMALLER_MODELS.md`.
+4. Do not build or publish any installer until the v0.4 release-gate task.
 
 ## Stop conditions
 
-- Do not mark the full gate green until every open checkbox in sections
-  1, 2, 4 and 5 has commit/artifact-backed evidence.
-- Do not re-run the installed lifecycle smoke unless a source change
-  invalidates the `304c6284` re-run evidence.
-- Do not add product scope, branding changes or new capabilities.
+- No agents, tools, research, memory, skills, Cookbook, compare, or new
+  vision backends in v0.4.
+- No app source changes without an accepted issue.
+- No release assets touched outside an explicit release task.
