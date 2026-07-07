@@ -6,7 +6,13 @@ authority is `V04_POTATO_MODE_SCOPE.md`. One issue → one branch → one PR.
 
 Dependency chain: 1 → 2 → 3 → (4, 5 in either order, 4 recommended first)
 → 6 → 7 → 8 → 9. Issue 2's audit report may adjust later issues before
-they open.
+they open. Additionally: **issue 10 (hardware/resource audit) must
+complete before issue 4's final Potato Mode default values are locked**;
+issues 11 (Potato Proof smoke matrix) and 12 (package/hardware docs) must
+be done before issue 9 can close the gate. The Pareto Value Map
+(`V04_PARETO_VALUE_MAP.md`) controls priority: issues that unlock
+first-run readiness, model setup, Potato Mode, guardrails, storage,
+diagnostics, and proof outrank cosmetic or long-term features.
 
 ## Issue 1 — docs: fix post-v0.3.1 current-release drift
 
@@ -162,6 +168,65 @@ they open.
   `src-tauri/tauri.conf.json`, sidecar `__version__`.
 - Acceptance: gate GREEN with commit-tied evidence before tag/publish;
   downloaded-asset hash independently verified.
-- Tests: full matrix per `GATE_v0.3.1.md` precedent plus first-run smoke.
+- Tests: full matrix per `GATE_v0.3.1.md` precedent plus first-run smoke
+  and the Potato Proof smoke matrix (issue 11) on P1/P2-class hardware or
+  a documented simulated equivalent — P3 gaming-laptop proof alone does
+  not close this gate.
 - Model: checklist assembly Sonnet/Codex; **final review and go/no-go is
   Fable + maintainer**.
+
+## Issue 10 — audit: hardware/resource readiness and Potato Proof metrics
+
+- Purpose: replace the proposed budgets in `POTATO_PROOF_MATRIX.md` §B
+  with measured numbers before Potato Mode defaults are locked.
+- Scope: measure cold launch, idle RAM/CPU, profile growth per PDF,
+  import/OCR CPU and memory behavior, and time-to-first-sourced-answer on
+  at least one P1/P2-class machine or a documented RAM/CPU-capped
+  simulated equivalent; record method + raw numbers; confirm or revise
+  each §B budget; flag any budget that current code cannot meet.
+- Non-goals: no code changes; no tuning; measurement only.
+- Likely files (read): app at runtime; output
+  `projects/odysseus/V04_HARDWARE_AUDIT.md` updating
+  `POTATO_PROOF_MATRIX.md` §B statuses.
+- Acceptance: every §B budget marked measured-pass, measured-fail, or
+  still-proposed with reason; constraint method (real HW vs VM caps)
+  documented.
+- Ordering: **must complete before issue 4's final default values are
+  locked** (context length, retrieval limit, batch size, OCR caps).
+- Tests: none (measurement report); `git diff --check`.
+- Model: Fable or strong model designs method; runs may be human-assisted.
+
+## Issue 11 — test: Potato Proof smoke matrix
+
+- Purpose: turn `POTATO_PROOF_MATRIX.md` §D scenarios 1–14 into a
+  repeatable, evidence-producing smoke procedure for the v0.4 gate.
+- Scope: scripted or checklisted runs for each scenario (fresh install /
+  missing Ollama / missing models / giant PDF / OCR / low disk / delete
+  reclaim / kill mid-job / offline), each producing recorded evidence
+  (output, screenshot, or log) tied to a commit; per-tier
+  pass/degrade/unsupported record per §D scenario 14.
+- Non-goals: no new app features; gaps found become issues, not inline
+  fixes.
+- Likely files: `projects/odysseus/POTATO_PROOF_SMOKE_v0.4.md` (procedure
+  + results), possibly small scripts under `scripts/`.
+- Acceptance: every scenario has a recorded result; failures block issue
+  9; no scenario marked pass without evidence.
+- Tests: the smoke itself plus `git diff --check` on docs.
+- Model: procedure design Fable; execution smaller-model or human-safe.
+
+## Issue 12 — docs: core vs heavy package and hardware expectations
+
+- Purpose: a noob must know which download fits their machine before
+  downloading.
+- Scope: README/release-notes section mapping tiers P0–P4 to
+  expectations (what works, what degrades, what is unsupported); core vs
+  heavy (Florence-class) package distinction with install sizes;
+  unsigned-installer/SmartScreen explanation; offline setup notes;
+  hash-verification steps kept current.
+- Non-goals: no packaging changes; no new installer variants; docs only.
+- Likely files: `README.md`, `docs/releases/v0.4*.md`,
+  `projects/odysseus/POTATO_PROOF_MATRIX.md` (tier table is the source).
+- Acceptance: a reader can pick the right package and predict behavior on
+  their tier; no claim contradicts measured issue 10/11 results.
+- Tests: `git diff --check` only (docs-only).
+- Model: Sonnet/Codex from approved copy; tier claims reviewed by Fable.

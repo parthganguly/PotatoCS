@@ -5,6 +5,19 @@ Status: planning only. No implementation started. Scope authority:
 `V04_ISSUE_BREAKDOWN.md`. Rules for lower-context models:
 `V04_BATON_FOR_SMALLER_MODELS.md`.
 
+## Potato Proof addendum
+
+Hardware-tier proof requirements live in `POTATO_PROOF_MATRIX.md`
+(tiers P0–P4, proposed resource budgets, failure modes, proof scenarios)
+and `POTATO_NICHE_ESSENTIALS.md` (the niche low-end behavior checklist).
+The v0.4 release gate must include a first-run/potato proof smoke run
+against that matrix. Proof from an old gaming laptop (tier P3) alone is
+insufficient: v0.4 is not done until the proof scenarios pass on
+P1/P2-class hardware or a clearly documented simulated equivalent.
+
+- `V04_PARETO_VALUE_MAP.md` is the priority filter; if a task does not
+  support a Pareto item, defer it.
+
 ## A. Mission
 
 Make Odysseus Desktop excellent for a noob on a low-end Windows machine:
