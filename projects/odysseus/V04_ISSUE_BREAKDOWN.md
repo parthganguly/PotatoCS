@@ -9,7 +9,10 @@ Dependency chain: 1 → 2 → 3 → (4, 5 in either order, 4 recommended first)
 they open. Additionally: **issue 10 (hardware/resource audit) must
 complete before issue 4's final Potato Mode default values are locked**;
 issues 11 (Potato Proof smoke matrix) and 12 (package/hardware docs) must
-be done before issue 9 can close the gate.
+be done before issue 9 can close the gate. The Pareto Value Map
+(`V04_PARETO_VALUE_MAP.md`) controls priority: issues that unlock
+first-run readiness, model setup, Potato Mode, guardrails, storage,
+diagnostics, and proof outrank cosmetic or long-term features.
 
 ## Issue 1 — docs: fix post-v0.3.1 current-release drift
 

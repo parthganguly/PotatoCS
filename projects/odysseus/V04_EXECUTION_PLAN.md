@@ -15,6 +15,9 @@ against that matrix. Proof from an old gaming laptop (tier P3) alone is
 insufficient: v0.4 is not done until the proof scenarios pass on
 P1/P2-class hardware or a clearly documented simulated equivalent.
 
+- `V04_PARETO_VALUE_MAP.md` is the priority filter; if a task does not
+  support a Pareto item, defer it.
+
 ## A. Mission
 
 Make Odysseus Desktop excellent for a noob on a low-end Windows machine:

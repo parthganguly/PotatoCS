@@ -92,6 +92,8 @@ format:
   requires P1/P2-class hardware or a documented simulated equivalent
   (see `POTATO_PROOF_MATRIX.md`).
 - Close a gate or mark a checklist item while any box remains unchecked.
+- Work on a low-priority feature while a Pareto item
+  (`V04_PARETO_VALUE_MAP.md`) remains missing or unaudited.
 
 Any of these means: stop, report what you were about to do and why, and
 wait for the maintainer.
