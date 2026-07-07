@@ -115,6 +115,8 @@ import type { OperationProgressEvent } from "./features/chat/chatProgress";
 import { useChatProgress } from "./features/chat/useChatProgress";
 import { ImageBenchmarkPanel } from "./features/image-evals/ImageBenchmarkPanel";
 import { ArtifactAnalysisCard } from "./features/multimodal-chat/ImageAttachments";
+import { ReadinessPanel } from "./features/readiness/ReadinessPanel";
+import { firstRunReadinessNeeded, readinessRows } from "./features/readiness/readinessRows";
 import { AppSidebar } from "./features/shell/AppSidebar";
 import { backendBannerState, isBackendDegradedEvent } from "./features/shell/backendStatus";
 import { SourcesPage } from "./features/sources/SourcesPage";
@@ -167,6 +169,8 @@ function App() {
   const [modelCapabilities, setModelCapabilities] = useState<ModelCapability[]>([]);
   const [ragHealth, setRagHealth] = useState<RAGHealth | null>(null);
   const [ocrStatus, setOcrStatus] = useState<OCRStatus | null>(null);
+  const [showReadiness, setShowReadiness] = useState(false);
+  const [readinessChecking, setReadinessChecking] = useState(false);
   const [activeView, setActiveView] = useState<ActiveView>("chat");
   const [draft, setDraft] = useState("");
   const [pendingSources, setPendingSources] = useState<SourceSummary[]>([]);
@@ -432,6 +436,22 @@ function App() {
       setImageVisionModel((current) => current || defaultVision);
       setImageEvalModel((current) => current || defaultVision);
       setSelectedSessionId((current) => current ?? nextSessions[0]?.id ?? null);
+      const userDocumentCount = nextDocuments.filter(
+        (document) => !document.is_deleted && !document.is_internal
+      ).length;
+      setShowReadiness(
+        firstRunReadinessNeeded({
+          sessionCount: nextSessions.length,
+          userDocumentCount,
+          rows: readinessRows({
+            checking: false,
+            backendDegraded: Boolean(status.backend_degraded),
+            ollama: nextOllama,
+            ragHealth: nextHealth,
+            ocrStatus: nextOcr
+          })
+        })
+      );
       setLoadState("idle");
     } catch (err) {
       setLoadState("error");
@@ -450,6 +470,28 @@ function App() {
       setBackendDegraded(true);
     } finally {
       setBackendRetrying(false);
+    }
+  }
+
+  async function recheckReadiness() {
+    setReadinessChecking(true);
+    try {
+      const status = await getAppStatus();
+      setAppStatus(status);
+      setBackendDegraded(Boolean(status.backend_degraded));
+      const [nextOllama, nextHealth, nextOcr] = await Promise.all([
+        rpc<OllamaStatus>("models.detect_ollama"),
+        rpc<RAGHealth>("rag.health"),
+        rpc<OCRStatus>("ocr.status")
+      ]);
+      setOllama(nextOllama);
+      setRagHealth(nextHealth);
+      setOcrStatus(nextOcr);
+    } catch {
+      // Rows keep rendering fixed copy from the last known statuses; raw
+      // re-check errors never reach the readiness UI.
+    } finally {
+      setReadinessChecking(false);
     }
   }
 
@@ -1759,7 +1801,20 @@ function App() {
           retrying={backendRetrying}
           onRetry={retryDegradedBackend}
         />
-        {activeView === "chat" ? (
+        {showReadiness ? (
+          <ReadinessPanel
+            rows={readinessRows({
+              checking: readinessChecking,
+              backendDegraded,
+              ollama,
+              ragHealth,
+              ocrStatus
+            })}
+            checking={readinessChecking}
+            onRecheck={() => void recheckReadiness()}
+            onContinue={() => setShowReadiness(false)}
+          />
+        ) : activeView === "chat" ? (
           <ChatWorkspace
             busy={busy}
             draft={draft}
@@ -1930,6 +1985,7 @@ function App() {
             onToggleCampaignModel={toggleCampaignModel}
             onToggleCampaignThinking={toggleCampaignThinking}
             onToggleCampaignVerifier={toggleCampaignVerifier}
+            onOpenReadiness={() => setShowReadiness(true)}
           />
         )}
       </section>
@@ -2458,6 +2514,7 @@ function DiagnosticsWorkspace(props: {
   onToggleCampaignModel: (model: string, selected: boolean) => void;
   onToggleCampaignThinking: (mode: Exclude<ThinkingMode, "legacy/unrecorded">, selected: boolean) => void;
   onToggleCampaignVerifier: (value: boolean, selected: boolean) => void;
+  onOpenReadiness: () => void;
 }) {
   const models = props.diagnostics?.ollama.models ?? [];
   const modelDetails = props.diagnostics?.ollama.model_details ?? [];
@@ -2476,9 +2533,18 @@ function DiagnosticsWorkspace(props: {
               : "Benchmark status unavailable"}
           </p>
         </div>
-        <IconButton disabled={props.busy} onClick={props.onRefresh} title="Refresh diagnostics">
-          <RefreshCw size={15} aria-hidden="true" />
-        </IconButton>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={props.onOpenReadiness}
+            className="rounded border border-ink/20 px-3 py-1 text-xs font-medium text-ink/70 hover:bg-ink/5"
+          >
+            Check setup
+          </button>
+          <IconButton disabled={props.busy} onClick={props.onRefresh} title="Refresh diagnostics">
+            <RefreshCw size={15} aria-hidden="true" />
+          </IconButton>
+        </div>
       </header>
 
       <ErrorBanner error={props.error} />
