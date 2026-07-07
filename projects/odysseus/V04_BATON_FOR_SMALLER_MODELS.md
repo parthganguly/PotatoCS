@@ -88,6 +88,9 @@ format:
 - Touch installer bundling, NSIS config, or `docs/releases/` assets
   casually.
 - Claim a smoke test passed without recorded evidence (commands + output).
+- Claim potato support based only on a developer gaming laptop — proof
+  requires P1/P2-class hardware or a documented simulated equivalent
+  (see `POTATO_PROOF_MATRIX.md`).
 - Close a gate or mark a checklist item while any box remains unchecked.
 
 Any of these means: stop, report what you were about to do and why, and
