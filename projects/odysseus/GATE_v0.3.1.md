@@ -1,6 +1,6 @@
 # v0.3.1 Patch Release Gate
 
-State: **RED — publish (asset upload/download-hash verification) pending**
+State: **GREEN — v0.3.1 release proof complete**
 
 Scope: patch release only — degraded-backend UI (PR #5), checksum-record
 build safety (PR #6), and docs shipped since v0.3.0. No v0.4 features.
@@ -38,7 +38,7 @@ build safety (PR #6), and docs shipped since v0.3.0. No v0.4 features.
       `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
       still present and unmodified after the build).
 
-## 5. Installer and publish (publish pending)
+## 5. Installer and publish (complete)
 
 - [x] Installer built from a recorded candidate SHA on this branch/main —
       candidate `971c0102` (main, PR #8 squash-merge), `npm run
@@ -52,10 +52,16 @@ build safety (PR #6), and docs shipped since v0.3.0. No v0.4 features.
       File/ProductVersion, installed sidecar `__version__`, and runtime
       log `sidecar starting version=0.3.1` all verified; graceful close
       with 0 orphan sidecars.
-- [ ] GitHub Release `v0.3.1` asset uploaded and downloaded-asset hash
+- [x] GitHub Release `v0.3.1` asset uploaded and downloaded-asset hash
       independently verified.
+      GitHub Release `v0.3.1` asset verified after upload; downloaded
+      installer SHA-256 matched
+      `F130D92BB1974035EAA28089B06AC06EF65F251FA072FF9E28595180211C111D`
+      (32,370,775 bytes; `sha256sum -c` against the downloaded checksum
+      file: OK). Release:
+      https://github.com/parthganguly/odysseus-desktop/releases/tag/v0.3.1
 
 ## Exit criteria
 
-The gate turns GREEN only when every box above is checked. Until then,
-v0.3.0 remains the latest published release; do not tag or publish v0.3.1.
+All boxes above are checked; the gate is GREEN. Tag `v0.3.1` is pushed
+and the GitHub Release is published as latest (2026-07-07).

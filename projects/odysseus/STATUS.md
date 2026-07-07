@@ -1,9 +1,9 @@
 # PotatoCS / Odysseus Status
 
-Updated: 2026-07-06 — v0.3.1 prep in progress.
+Updated: 2026-07-07 — v0.3.1 released, gate GREEN.
 Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
-## v0.3.1 prep
+## v0.3.1 release
 
 - PR #8 merged to `main` at `971c0102`: version sources report `0.3.1`,
   release notes at `docs/releases/v0.3.1.md`, patch gate at
@@ -13,10 +13,13 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
   `0.3.1` (registry/exe/sidecar/runtime log), graceful close with 0
   orphans — see `projects/odysseus/RELEASE_PROOF_v0.3.1.md` and
   `docs/releases/PotatoCs-Odysseus-Desktop-v0.3.1-SHA256SUMS.txt`.
-- v0.3.1 gate: **RED — publish (asset upload/download-hash verification)
-  pending**.
-- v0.3.0 remains the latest published release until v0.3.1 is actually
-  published.
+- **Published**: GitHub Release `v0.3.1` is live and marked latest with
+  both assets
+  (https://github.com/parthganguly/odysseus-desktop/releases/tag/v0.3.1);
+  the downloaded installer's SHA-256 was independently verified to match
+  `F130D92B…111D`. Latest tag: `v0.3.1` (annotated, pushed).
+- v0.3.1 gate: **GREEN — v0.3.1 release proof complete** (see
+  `GATE_v0.3.1.md`).
 
 ## Repository snapshot
 
@@ -39,7 +42,7 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
   `projects/odysseus/AUTOMATED_PROOF_SUITE_2026-07-04.md` (Python 297/0/0,
   progress tests, frontend build, cargo check/test, `git diff --check`);
   closes `GATE.md` section 3.
-- Latest tag: `v0.3.0` (pushed and released).
+- Tag `v0.3.0`: pushed and released (superseded as latest by `v0.3.1`).
 - Release gate: **GREEN — v0.3.0 release proof complete** (see `GATE.md`).
 - Installed lifecycle smoke: **PASS** —
   `projects/odysseus/INSTALLED_APP_LIFECYCLE_SMOKE_2026-07-04_RERUN.md`
