@@ -37,17 +37,28 @@ Explicitly excluded:
 - Memory, skills, compare and Cookbook.
 - New vision backends, window capture, redesign and full identity migration.
 
-### v0.3.1 — Stabilization only
+### v0.3.1 — Stabilization only (released)
 
-- Regressions found after v0.3.0.
-- Small packaging, diagnostics or compatibility fixes.
-- No new agentic product surface.
+- Degraded-backend banner with Retry for the sidecar recovery-failure path.
+- Build-safety fix protecting the tracked release checksum.
+- No new agentic product surface. Gate GREEN in `GATE_v0.3.1.md`.
 
 ## Future product lines
 
-### v0.4.0 — Safe bounded tools
+### v0.4 — Potato Mode + First-Run Runtime Simplification
 
-- Start only after the v0.3 proof gate remains stable.
+- Accepted scope for issue #3; see `V04_POTATO_MODE_SCOPE.md` and
+  `V04_EXECUTION_PLAN.md`.
+- First-run readiness screen, plain-language runtime status, Potato Mode
+  conservative-settings preset, guided Ollama/model setup, indexing
+  throttle/pause/cancel, profile storage visibility/cleanup, and redacted
+  noob diagnostics.
+- No agents, tools, research, memory, skills, compare, Cookbook, new vision
+  backends, or cloud features.
+
+### Deferred — Safe bounded tools (previously slated as v0.4.0)
+
+- Deferred until the Potato Mode baseline ships and stays stable.
 - Explicit allowlists, user confirmation, cancellation and audit traces.
 - No unrestricted shell; no ambient access to files, network or credentials.
 - Define threat model and tool-specific proof gates before implementation.

@@ -9,7 +9,7 @@ hyperscalers, and frontier labs buying hardware in bulk. PotatoCs explores the
 opposite path — making the models people can actually run on modest machines
 more useful through software.
 
-The current Windows build ships as **Odysseus Desktop v0.3.0**. It wraps local
+The current Windows build ships as **Odysseus Desktop v0.3.1**. It wraps local
 models with OCR, semantic retrieval, evidence-grounded answers, diagnostics,
 benchmark reports, and per-answer operation traces.
 
@@ -17,37 +17,38 @@ PotatoCs is for the computers people already own: older laptops, office PCs,
 modest gaming machines, and “potato” hardware that will never be a data center
 node.
 
-## Download v0.3.0
+## Download v0.3.1
 
 **PotatoCS** is the project; **Odysseus Desktop** is the shipped Windows app.
 
 The current published release is
-[Odysseus Desktop v0.3.0](https://github.com/parthganguly/odysseus-desktop/releases/tag/v0.3.0),
-a **proof/hardening release**: it hardens sidecar shutdown and restart
-behavior and aligns version reporting across the app. It ships the same
-local-first workflow as earlier builds — OCR, semantic retrieval (RAG),
-evidence-grounded answers, and local vision — and adds no new agents, tools,
-research, or memory features.
+[Odysseus Desktop v0.3.1](https://github.com/parthganguly/odysseus-desktop/releases/tag/v0.3.1),
+a **patch release** on the v0.3.0 proof/hardening line: it adds a
+degraded-backend banner with a Retry action for the sidecar recovery-failure
+path, plus a build-safety fix. It ships the same local-first workflow as
+earlier builds — OCR, semantic retrieval (RAG), evidence-grounded answers,
+and local vision — and adds no new agents, tools, research, or memory
+features.
 
 Release assets:
 
-- Installer: `PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe`
-- Checksum: `PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt`
+- Installer: `PotatoCs-Odysseus-Desktop-v0.3.1-Windows-x64-setup.exe`
+- Checksum: `PotatoCs-Odysseus-Desktop-v0.3.1-SHA256SUMS.txt`
 
 After downloading both files into the same folder, verify the installer in
 PowerShell:
 
 ```powershell
-$installer = ".\PotatoCs-Odysseus-Desktop-v0.3.0-Windows-x64-setup.exe"
+$installer = ".\PotatoCs-Odysseus-Desktop-v0.3.1-Windows-x64-setup.exe"
 Get-FileHash $installer -Algorithm SHA256
-Get-Content ".\PotatoCs-Odysseus-Desktop-v0.3.0-SHA256SUMS.txt"
+Get-Content ".\PotatoCs-Odysseus-Desktop-v0.3.1-SHA256SUMS.txt"
 ```
 
 The `Hash` value from the first command must match the hash in the checksum
 file:
 
 ```text
-0D759D2560919A5F8B657D8D9C245D965FD770745C01749F1D77DF022426FFB4
+F130D92BB1974035EAA28089B06AC06EF65F251FA072FF9E28595180211C111D
 ```
 
 Do not run the installer if the hashes do not match.
@@ -55,9 +56,12 @@ Do not run the installer if the hashes do not match.
 Windows may show a SmartScreen warning because this installer is not
 code-signed yet. Verify the SHA-256 hash before running it.
 
-v0.3.0 is a proof/hardening release, not a claim of production readiness. See
-the [v0.3.0 release notes](docs/releases/v0.3.0.md) for its full scope and
-validation details.
+v0.3.1 is a stabilization patch, not a claim of production readiness. See
+the [v0.3.1 release notes](docs/releases/v0.3.1.md) for its full scope and
+validation details. The previous release,
+[v0.3.0](https://github.com/parthganguly/odysseus-desktop/releases/tag/v0.3.0),
+was the proof/hardening baseline; see the
+[v0.3.0 release notes](docs/releases/v0.3.0.md).
 
 ## Why PotatoCs exists
 
@@ -91,16 +95,17 @@ Ollama-backed local model runtime.
 - Stores sessions, Sources, settings, benchmark history, and operation traces
   in local SQLite profiles.
 
-## Current release: v0.3.0
+## Current release: v0.3.1
 
-PotatoCs currently ships **Odysseus Desktop v0.3.0**, a proof/hardening
-release. It does not add new product features; it hardens sidecar
-shutdown/restart behavior, aligns version reporting across the app, and
-ships with a recorded, commit-tied proof bundle. See
-[Download v0.3.0](#download-v030) above for the installer, checksum, and
-verification steps, and the
-[v0.3.0 release notes](docs/releases/v0.3.0.md) for the full validation
-summary.
+PotatoCs currently ships **Odysseus Desktop v0.3.1**, a stabilization patch
+on the v0.3.0 proof/hardening release. It does not add new product features;
+it makes sidecar recovery failure visible through a degraded-backend banner
+with a Retry action, and fixes a build step that could delete a tracked
+release checksum. See [Download v0.3.1](#download-v031) above for the
+installer, checksum, and verification steps, and the
+[v0.3.1 release notes](docs/releases/v0.3.1.md) for the full validation
+summary. v0.3.0 remains documented as the previous proof/hardening release
+in the [v0.3.0 release notes](docs/releases/v0.3.0.md).
 
 The most recent feature release was **v0.2.1**, which added **Stats for
 Nerds / Operation Trace** under assistant messages. A trace exposes
@@ -191,7 +196,7 @@ tool.
 ## Known limitations
 
 - The app, installer, package, and profile identifiers still use **Odysseus
-  Desktop** in v0.3.0.
+  Desktop** in v0.3.1.
 - The Windows installer is large.
 - Ollama models are not bundled and can require substantial downloads.
 - Local VLMs and Florence can be slow on consumer hardware.
@@ -205,10 +210,15 @@ tool.
 
 ## Roadmap
 
-The next planned patch, v0.2.2, focuses on answer quality: plain-chat steering
-and visual opinion/evaluation over-abstention. Longer-term work includes
-smaller packaging options, more reliable visual routing, improved local model
-guidance, and clearer privacy and performance diagnostics.
+The next planned line, v0.4, is **Potato Mode + First-Run Runtime
+Simplification**: a first-run readiness screen, a one-action conservative
+settings preset, guided local model setup, indexing guardrails, profile
+storage visibility, and noob-safe diagnostics. See
+[ROADMAP.md](projects/odysseus/ROADMAP.md) and
+[V04_POTATO_MODE_SCOPE.md](projects/odysseus/V04_POTATO_MODE_SCOPE.md).
+Longer-term work includes smaller packaging options, more reliable visual
+routing, improved local model guidance, and clearer privacy and performance
+diagnostics.
 
 ## Development setup
 
