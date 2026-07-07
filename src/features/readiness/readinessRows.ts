@@ -1,4 +1,13 @@
 import type { OCRStatus, OllamaStatus, RAGHealth } from "../../tauri";
+import {
+  CHAT_MODEL_GUIDANCE,
+  EMBEDDING_MODEL_GUIDANCE,
+  OCR_BASIC_GUIDANCE,
+  OLLAMA_INSTALL_GUIDANCE,
+  OLLAMA_START_GUIDANCE,
+  SetupGuidance,
+  VISION_OPTIONAL_GUIDANCE
+} from "./setupGuidance";
 
 /**
  * Pure mapping from the existing status calls (app_status, models.detect_ollama,
@@ -34,6 +43,8 @@ export type ReadinessRow = {
   stateLabel: string;
   explanation: string;
   nextStep: string;
+  /** Fixed setup guidance for this gap; absent when nothing needs doing. */
+  guidance?: SetupGuidance;
 };
 
 export type ReadinessInputs = {
@@ -59,9 +70,18 @@ function row(
   label: string,
   state: ReadinessState,
   explanation: string,
-  nextStep = ""
+  nextStep = "",
+  guidance?: SetupGuidance
 ): ReadinessRow {
-  return { id, label, state, stateLabel: READINESS_STATE_LABELS[state], explanation, nextStep };
+  const base: ReadinessRow = {
+    id,
+    label,
+    state,
+    stateLabel: READINESS_STATE_LABELS[state],
+    explanation,
+    nextStep
+  };
+  return guidance ? { ...base, guidance } : base;
 }
 
 function installedModelCount(ollama: OllamaStatus, role: "chat" | "vision"): number {
@@ -96,7 +116,8 @@ function ollamaRow(inputs: ReadinessInputs): ReadinessRow {
       label,
       "missing",
       "Ollama is installed but not running.",
-      "Start Ollama, then come back and click Re-check."
+      "Start Ollama, then come back and click Re-check.",
+      OLLAMA_START_GUIDANCE
     );
   }
   return row(
@@ -104,7 +125,8 @@ function ollamaRow(inputs: ReadinessInputs): ReadinessRow {
     label,
     "missing",
     "Local AI runtime not found.",
-    "Install Ollama, then come back and click Re-check."
+    "Install Ollama, then come back and click Re-check.",
+    OLLAMA_INSTALL_GUIDANCE
   );
 }
 
@@ -132,7 +154,8 @@ function chatModelRow(inputs: ReadinessInputs): ReadinessRow {
     label,
     "missing",
     "No chat model found.",
-    "After installing Ollama, pull a small model from your terminal, then click Re-check."
+    "After installing Ollama, pull a small model from your terminal, then click Re-check.",
+    CHAT_MODEL_GUIDANCE
   );
 }
 
@@ -151,7 +174,8 @@ function documentSearchRow(inputs: ReadinessInputs): ReadinessRow {
     label,
     "degraded",
     "Document search can still use basic keyword search, but smarter semantic search needs an embedding model.",
-    "You can keep working now and add an embedding model later."
+    "You can keep working now and add an embedding model later.",
+    EMBEDDING_MODEL_GUIDANCE
   );
 }
 
@@ -188,7 +212,8 @@ function ocrRow(inputs: ReadinessInputs): ReadinessRow {
     label,
     "unavailable",
     "OCR is unavailable. Scanned PDFs may not be readable until Tesseract or a PDF renderer is installed.",
-    "Regular text documents still work without OCR."
+    "Regular text documents still work without OCR.",
+    OCR_BASIC_GUIDANCE
   );
 }
 
@@ -208,7 +233,9 @@ function visionRow(inputs: ReadinessInputs): ReadinessRow {
     "vision",
     label,
     "heavy",
-    "Vision features are optional and may be slow on weak computers. Everything else works without them."
+    "Vision features are optional and may be slow on weak computers. Everything else works without them.",
+    "",
+    VISION_OPTIONAL_GUIDANCE
   );
 }
 

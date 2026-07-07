@@ -1,4 +1,5 @@
-import { RefreshCw } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Check, Copy, RefreshCw } from "lucide-react";
 import { ReadinessRow, ReadinessState } from "./readinessRows";
 
 const STATE_DOT_CLASSES: Record<ReadinessState, string> = {
@@ -10,6 +11,45 @@ const STATE_DOT_CLASSES: Record<ReadinessState, string> = {
   checking: "bg-sky-400",
   error: "bg-clay"
 };
+
+/**
+ * Copies fixed guidance text to the clipboard. Copy-only by design: the app
+ * never runs these commands and never downloads models itself.
+ */
+function CopyCommandButton(props: { label: string; text: string }) {
+  const [copied, setCopied] = useState(false);
+  const resetTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => window.clearTimeout(resetTimer.current), []);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(props.text);
+      setCopied(true);
+      window.clearTimeout(resetTimer.current);
+      resetTimer.current = window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard unavailable: the command text stays visible for manual copy.
+    }
+  }
+
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <code className="min-w-0 flex-1 truncate rounded bg-ink/5 px-2 py-1 font-mono text-xs text-ink/80">
+        {props.text}
+      </code>
+      <button
+        type="button"
+        onClick={copy}
+        aria-label={`Copy: ${props.label}`}
+        className="flex shrink-0 items-center gap-1.5 rounded border border-ink/20 px-2 py-1 text-xs font-medium text-ink/70 hover:bg-ink/5"
+      >
+        {copied ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </div>
+  );
+}
 
 export function ReadinessPanel(props: {
   rows: ReadinessRow[];
@@ -43,6 +83,21 @@ export function ReadinessPanel(props: {
               </div>
               <p className="mt-1 text-sm text-ink/70">{item.explanation}</p>
               {item.nextStep && <p className="mt-1 text-xs text-ink/55">{item.nextStep}</p>}
+              {item.guidance && (
+                <div className="mt-2 rounded border border-ink/10 bg-ink/[0.03] p-2.5">
+                  <ol className="list-decimal space-y-1 pl-4 text-xs text-ink/65">
+                    {item.guidance.steps.map((step) => (
+                      <li key={step}>{step}</li>
+                    ))}
+                  </ol>
+                  {item.guidance.command && (
+                    <CopyCommandButton
+                      label={item.guidance.command.label}
+                      text={item.guidance.command.text}
+                    />
+                  )}
+                </div>
+              )}
             </li>
           ))}
         </ul>
