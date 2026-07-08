@@ -6,12 +6,12 @@
  *
  * Commands are copy-only. The app never runs them, never downloads models
  * itself, and never adds network calls beyond the existing loopback Ollama
- * checks. The only concrete model name allowed here is the embedding model
- * the backend already uses as its wired default (`nomic-embed-text`,
- * `python/odysseus_desktop_backend/services/embedding_service.py`). The chat
- * model recommendation is deferred pending human approval — see
- * `projects/odysseus/V04_MODEL_RECOMMENDATION_DECISION.md`; no guessed chat
- * model name may be wired here until that decision is approved.
+ * checks. Concrete model names here are limited to what
+ * `projects/odysseus/V04_MODEL_RECOMMENDATION_DECISION.md` approves: the
+ * embedding model already wired as the backend's default
+ * (`nomic-embed-text`) and the chat-model default approved in that decision
+ * (`llama3.2:3b`, worded "try this first", not "recommended" — no
+ * potato-proof runs have validated it yet).
  */
 
 export type SetupCommand = {
@@ -48,17 +48,20 @@ export const OLLAMA_START_GUIDANCE: SetupGuidance = {
 };
 
 /**
- * Ollama runs but no chat model is installed. No copyable command yet: the
- * small-chat-model recommendation is a pending human decision
- * (`V04_MODEL_RECOMMENDATION_DECISION.md`), and copying a guessed name would
- * start a multi-gigabyte download on someone else's advice.
+ * Ollama runs but no chat model is installed. The command below is the
+ * approved v0.4 default from `V04_MODEL_RECOMMENDATION_DECISION.md` §3: one
+ * conservative command, worded "try this first" rather than "recommended"
+ * since no potato-proof runs have validated it yet. The 4 GB "survival
+ * machine" alternative is mentioned in words only — it does not get its own
+ * copy button.
  */
 export const CHAT_MODEL_GUIDANCE: SetupGuidance = {
   steps: [
-    "Open a terminal and install a small chat model from the Ollama library with an ollama pull command.",
-    "This app does not recommend a specific model yet — a tested recommendation for weak computers is still being decided.",
+    "Open a terminal and run the command below to install a small chat model. Try this first.",
+    "If this computer is a very weak, 4 GB \"survival machine,\" the even smaller llama3.2:1b model may work better instead.",
     "After the download finishes, click Re-check."
-  ]
+  ],
+  command: { label: "Install a chat model", text: "ollama pull llama3.2:3b" }
 };
 
 /** Semantic search is off because the embedding model is not installed. */
