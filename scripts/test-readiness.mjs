@@ -139,12 +139,15 @@ function rowById(rows, id) {
   assert.equal(chatModel.state, "missing");
   assert.match(chatModel.explanation, /No chat model found/i);
   assert.match(chatModel.nextStep, /pull a small model/i);
-  // Guidance exists, but the model recommendation is a deferred human
-  // decision (V04_MODEL_RECOMMENDATION_DECISION.md): no copyable command and
-  // no concrete model name may appear until it is approved.
+  // Guidance carries the approved v0.4 default command
+  // (V04_MODEL_RECOMMENDATION_DECISION.md §3): "try this first", not
+  // "recommended", plus a words-only mention of the smaller 1b alternative
+  // for very weak machines with no second copy button.
   assert.ok(chatModel.guidance, "missing chat model must carry guidance");
-  assert.equal(chatModel.guidance.command, undefined, "no chat-model command until a recommendation is approved");
-  assert.match(chatModel.guidance.steps.join(" "), /still being decided/i);
+  assert.equal(chatModel.guidance.command.text, "ollama pull llama3.2:3b");
+  assert.match(chatModel.guidance.steps.join(" "), /try this first/i);
+  assert.doesNotMatch(chatModel.guidance.steps.join(" "), /recommended/i);
+  assert.match(chatModel.guidance.steps.join(" "), /llama3\.2:1b/);
   assert.equal(hasCriticalReadinessGap(rows), true);
 }
 
