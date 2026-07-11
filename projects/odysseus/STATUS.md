@@ -1,6 +1,6 @@
 # PotatoCS / Odysseus Status
 
-Updated: 2026-07-07 — v0.3.1 released, gate GREEN.
+Updated: 2026-07-11 — v0.3.1 is the current release, gate GREEN.
 Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## v0.3.1 release
@@ -20,6 +20,18 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
   `F130D92B…111D`. Latest tag: `v0.3.1` (annotated, pushed).
 - v0.3.1 gate: **GREEN — v0.3.1 release proof complete** (see
   `GATE_v0.3.1.md`).
+
+## v0.4 readiness work — 2026-07-11
+
+- **DONE — readiness status audit:** PR #23 mapped the existing status
+  sources and RPCs needed by the first-run experience (`27cc2b15`).
+- **DONE — first-run readiness panel:** PR #24 added the readiness row
+  mapping, panel, app wiring, and focused test coverage (`9ec4d8d7`).
+- **DONE — Ollama/model setup guidance:** PR #25 added the setup helper and
+  recommendation decision record (`70c6010c`); PR #27 approved
+  `llama3.2:3b` as the chat-model recommendation (`43ef0634`); PR #28 wired
+  the approved `ollama pull llama3.2:3b` guidance (`c1fe0358`). The helper
+  remains guidance-only: there are no automatic model downloads.
 
 ## Repository snapshot
 
@@ -102,8 +114,11 @@ Authority: live repository plus the roadmap reconciliation report at HEAD below.
 
 ## Active blockers
 
-None. `GATE.md` is green. Spawn/restart degraded-state UI is deferred to
-v0.3.1/v0.4, not a v0.3.0 blocker.
+- **v0.4:** GitHub Issue #20, “audit: hardware/resource readiness and Potato
+  Proof metrics,” is the active blocker. Its measurements must confirm or
+  revise the proposed resource budgets before Potato Mode defaults are
+  locked in backlog Issue 4.
+- The v0.3.0 and v0.3.1 release gates remain GREEN.
 
 ## Freeze
 

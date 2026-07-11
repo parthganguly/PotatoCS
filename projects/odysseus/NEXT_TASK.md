@@ -1,37 +1,42 @@
-# Next Task: Start v0.4 — Potato Mode + First-Run Runtime Simplification
+# Next Task: Issue #20 — Hardware/Resource Readiness Audit
 
-Priority: **P1 planning-to-execution**
-Primary owner: maintainer, with model-assisted implementation
-Predecessors: v0.3.0 and v0.3.1 released; `GATE.md` and `GATE_v0.3.1.md` both GREEN.
+Priority: **P1 measurement gate for Potato Mode defaults**
+Primary owner: maintainer/auditor
+Predecessors: readiness audit (PR #23), first-run readiness panel (PR #24),
+and Ollama/model setup guidance (PRs #25, #27, #28) complete.
 
 ## Objective
 
-Execute the accepted v0.4 scope (issue #3, closed):
-**Potato Mode + First-Run Runtime Simplification**. The prior task in this
-file — build the v0.3.0 installer and proof — completed at `e335705f`
-(`RELEASE_PROOF_v0.3.0.md`); v0.3.1 followed and completed at `971c0102`
-(`RELEASE_PROOF_v0.3.1.md`).
+Execute GitHub Issue #20, **“audit: hardware/resource readiness and Potato
+Proof metrics.”** This is measurement only: no tuning, no Potato Mode
+implementation, and no code changes. The output updates
+`projects/odysseus/POTATO_PROOF_MATRIX.md` with measured numbers that can
+confirm or revise its proposed §B budgets before Potato Mode defaults are
+locked in backlog Issue 4 / Slice 2.
 
 ## Prerequisite reading
 
-- `projects/odysseus/V04_POTATO_MODE_SCOPE.md` — accepted scope and audit.
+- `projects/odysseus/POTATO_PROOF_MATRIX.md` — proposed §B budgets and the
+  destination for measured results.
 - `projects/odysseus/V04_EXECUTION_PLAN.md` — slice-by-slice execution order.
 - `projects/odysseus/V04_ISSUE_BREAKDOWN.md` — draft issue backlog.
-- `projects/odysseus/V04_BATON_FOR_SMALLER_MODELS.md` — rules for
-  lower-context models continuing this work.
 
 ## Procedure
 
-1. Merge the v0.4 planning baton PR (docs only).
-2. Open GitHub issues from `V04_ISSUE_BREAKDOWN.md` **only with maintainer
-   approval**, in dependency order.
-3. Work each issue as one branch / one PR with a small diff, per
-   `V04_BATON_FOR_SMALLER_MODELS.md`.
-4. Do not build or publish any installer until the v0.4 release-gate task.
+1. Run the Issue #20 hardware/resource measurements without changing app
+   behavior, defaults, or code.
+2. Record the measured numbers in `POTATO_PROOF_MATRIX.md` §B with enough
+   context to distinguish the measured hardware/setup from proposals.
+3. Mark every §B budget clearly and visibly as **measured-pass**,
+   **measured-fail**, or **still-proposed**. Never present a proposed number
+   as measured.
+4. Use those results as the gate for the later human/Fable decision that
+   locks Potato Mode defaults in backlog Issue 4 / Slice 2.
 
 ## Stop conditions
 
-- No agents, tools, research, memory, skills, Cookbook, compare, or new
-  vision backends in v0.4.
-- No app source changes without an accepted issue.
-- No release assets touched outside an explicit release task.
+- No tuning and no Potato Mode implementation.
+- No code changes; Issue #20 changes measurement documentation only.
+- Do not lock defaults while any relevant §B budget is still proposed or
+  lacks a clear measured-pass/measured-fail disposition.
+- No installer or release asset changes.
