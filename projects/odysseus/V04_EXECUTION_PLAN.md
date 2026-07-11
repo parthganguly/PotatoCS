@@ -1,6 +1,8 @@
 # v0.4 Execution Plan — Potato Mode + First-Run Runtime Simplification
 
-Status: planning only. No implementation started. Scope authority:
+Status: execution in progress. Slices 0, 1, and 3 are complete; the next
+required stage is GitHub Issue #20's hardware/resource readiness audit,
+followed by Slice 2 / v0.4.2 Potato Mode defaults. Scope authority:
 `V04_POTATO_MODE_SCOPE.md` (accepted for issue #3, closed). Issue drafts:
 `V04_ISSUE_BREAKDOWN.md`. Rules for lower-context models:
 `V04_BATON_FOR_SMALLER_MODELS.md`.
@@ -30,12 +32,16 @@ instead of hidden. Every v0.4 change serves that first experience or waits.
 
 ## B. Release shape
 
-Ship v0.4 as a sequence of small PRs, each gated on the previous:
+Ship v0.4 as a sequence of small PRs with explicit dependency gates:
 
-- **v0.4.0** — planning/docs/readiness audit (this baton + audit issue).
-- **v0.4.1** — first-run readiness screen.
-- **v0.4.2** — Potato Mode settings preset.
-- **v0.4.3** — Ollama/model setup helper.
+- **v0.4.0** — planning/docs/readiness audit. **Complete:** PR #23,
+  `27cc2b15`.
+- **v0.4.1** — first-run readiness screen. **Complete:** PR #24,
+  `9ec4d8d7`.
+- **v0.4.2** — Potato Mode settings preset. **Not started:** defaults are
+  gated on the measurements from GitHub Issue #20.
+- **v0.4.3** — Ollama/model setup helper. **Complete:** PRs #25, #27, and
+  #28 (`70c6010c`, `43ef0634`, `c1fe0358`).
 - **v0.4.4** — indexing throttle/pause/cancel + giant-doc guardrails.
 - **v0.4.5** — profile storage visibility and cleanup.
 - **v0.4.6** — noob diagnostics / redacted support bundle.
@@ -47,7 +53,16 @@ choice; the gate/proof step is mandatory either way.
 
 ## C. Execution order
 
-### Slice 0 — v0.4.0 planning/docs/readiness audit
+The next required stage is GitHub Issue #20, the measurement-only
+hardware/resource readiness audit. Its results must confirm or revise the
+`POTATO_PROOF_MATRIX.md` §B budgets before Slice 2 / v0.4.2 defaults are
+locked. After Slice 2, preserve the future order below: Slice 4 indexing
+throttle, Slice 5 storage, Slice 6 diagnostics, then Slice 7 Potato Proof
+and release gating.
+
+### Slice 0 — v0.4.0 planning/docs/readiness audit — COMPLETE
+
+- Completion evidence: PR #23, commit `27cc2b15`.
 - Objective: land this baton, fix docs drift, then audit the real first-run
   code paths (boot status fetches, settings store, cancel paths, storage
   layout) and confirm/correct the "Unknown/Partial" rows in
@@ -62,7 +77,10 @@ choice; the gate/proof step is mandatory either way.
 - Risk: low. Model: audit report needs a strong model (Fable preferred);
   drift fixes are smaller-model safe.
 
-### Slice 1 — v0.4.1 first-run readiness screen
+### Slice 1 — v0.4.1 first-run readiness screen — COMPLETE
+
+- Completion evidence: PR #24, commit `9ec4d8d7`; readiness panel, row
+  mapping, app wiring, and focused test coverage landed.
 - Objective: on launch (or empty profile), show plain-language readiness
   rows: app/backend, local AI runtime (Ollama), chat model, document search
   (embedding model + lexical fallback), scanned-document reading (OCR).
@@ -80,7 +98,10 @@ choice; the gate/proof step is mandatory either way.
 - Risk: medium. Model: architecture + copy design is Fable; wiring existing
   status fields into rows and tests are smaller-model safe afterwards.
 
-### Slice 2 — v0.4.2 Potato Mode preset
+### Slice 2 — v0.4.2 Potato Mode preset — NOT STARTED; BLOCKED ON ISSUE #20
+
+- Gate: do not lock defaults until GitHub Issue #20 has measured the
+  hardware/resource budgets recorded in `POTATO_PROOF_MATRIX.md` §B.
 - Objective: one action applies conservative settings: small recommended
   model, short context, conservative retrieval breadth, low embedding batch
   size, OCR guardrails on, heavy features labeled. Reversible; plain
@@ -98,7 +119,11 @@ choice; the gate/proof step is mandatory either way.
   semantics and default values are Fable/human; mechanical plumbing after
   the design is smaller-model safe.
 
-### Slice 3 — v0.4.3 Ollama/model setup helper
+### Slice 3 — v0.4.3 Ollama/model setup helper — COMPLETE
+
+- Completion evidence: PR #25 / `70c6010c` added guidance, PR #27 /
+  `43ef0634` approved `llama3.2:3b`, and PR #28 / `c1fe0358` wired the
+  approved `ollama pull llama3.2:3b` command. No auto-downloads were added.
 - Objective: when Ollama or a model is missing, show guided steps in noob
   words: install link, copyable `ollama pull <recommended-model>` command,
   re-detect button. No in-app downloads without explicit maintainer

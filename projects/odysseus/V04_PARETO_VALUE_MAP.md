@@ -1,6 +1,7 @@
 # v0.4 Pareto Value Map — The 20% That Makes the App Worth Using
 
-Status: planning only. This is the priority filter over
+Status: execution in progress; readiness audit, first-run readiness, and
+model setup guidance are complete. This is the priority filter over
 `V04_EXECUTION_PLAN.md`, `V04_ISSUE_BREAKDOWN.md`, `POTATO_PROOF_MATRIX.md`,
 and `POTATO_NICHE_ESSENTIALS.md`. It answers one question: what are the few
 functions that make Odysseus Desktop worthwhile for a noob on a potato, and
@@ -20,12 +21,12 @@ Everything below is ranked by how directly it serves that sentence.
 
 | Rank | Function | Why it creates value | Status | Existing evidence | Planned issue/slice | Fable/human needed? | Must happen before |
 |---|---|---|---|---|---|---|---|
-| 1 | First-run readiness screen | First minutes decide adoption; empty chat = abandonment | Missing | No first-run/onboarding code in `src/` (scope §3 A2) | Issue 3 / v0.4.1 | Fable: state model + copy | Setup helper (rank 3), Potato Mode UX |
-| 2 | Plain-language missing-dependency guidance | Raw errors are the #1 noob wall | Partial | Boot fetches status but shows jargon (`src/App.tsx:402-407`); OCR deps already plain (`ocr_service.py:259-306`) | Issues 2→3 (audit, then rows) | Fable: copy + error-state model | Any claim the app is noob-ready |
-| 3 | Ollama/text-model/embedding-model detection + setup helper | Model download is the setup cliff | Partial | Detection Done (`model_service.py:60-88`, `embedding_service.py:118-146`); guidance/recommendation Missing (scope §3 B2/B5/B6) | Issue 5 / v0.4.3 | Fable/human: model recommendation; no auto-downloads | First sourced answer for a fresh user |
+| 1 | First-run readiness screen | First minutes decide adoption; empty chat = abandonment | Done | PR #24 / `9ec4d8d7`: `src/features/readiness/ReadinessPanel.tsx`, `readinessRows.ts`, `src/App.tsx` wiring, and `scripts/test-readiness.mjs` | Issue 3 / v0.4.1 — complete | No — implemented from the audited state model | Setup helper (rank 3), Potato Mode UX |
+| 2 | Plain-language missing-dependency guidance | Raw errors are the #1 noob wall | Partial | PR #24 / `9ec4d8d7` provides plain-language readiness rows and next steps; PR #25 / `70c6010c` adds focused Ollama/model guidance. Available evidence does not establish that every dependency error outside readiness was rewritten. | Issues 2→3 — readiness scope complete; broader error copy remains unproved | Fable review for any broader error-copy pass | Any claim that all dependency errors are noob-ready |
+| 3 | Ollama/text-model/embedding-model detection + setup helper | Model download is the setup cliff | Done (guidance; no auto-downloads) | Detection already existed; PR #25 / `70c6010c` added the helper, PR #27 / `43ef0634` approved `llama3.2:3b`, and PR #28 / `c1fe0358` wired `ollama pull llama3.2:3b` guidance | Issue 5 / v0.4.3 — complete | No — recommendation approved; auto-downloads remain out of scope | First sourced answer for a fresh user |
 | 4 | One document → one sourced answer | The core value path; everything else is support | Done (unproven on P1/P2) | Imports (`document_service.py:15`), progress (`progress.py:92-101`), snippets + abstain (`chat_service.py:2274`) | Keep; proof via issue 11 | No — verify only | v0.4 gate (needs potato-tier proof) |
-| 5 | Honest lexical fallback when embeddings missing | App works before full setup, without lying | Partial | Fallback works (`embedding_service.py:388`, `rag_service.py:815-855`); honest user-facing copy missing | Issue 3 (readiness row copy) | Fable: copy | Readiness screen claiming "document search: ready" |
-| 6 | Potato Mode conservative preset | One switch beats ten knobs for noobs | Missing | Settings are a bare KV store (`settings_service.py:8-22`); no preset concept | Issue 4 / v0.4.2 | Fable/human: default values — locked only after issue 10 audit | Any "runs well on 8 GB" claim |
+| 5 | Honest lexical fallback when embeddings missing | App works before full setup, without lying | Partial | Fallback works (`embedding_service.py:388`, `rag_service.py:815-855`); PR #24 added readiness rows, but the allowed evidence does not prove the exact lexical-fallback copy shown to users | Issue 3 readiness UI complete; exact fallback-copy claim remains unproved | Fable: verify copy before marking Done | Readiness screen claiming "document search: ready" |
+| 6 | Potato Mode conservative preset | One switch beats ten knobs for noobs | Missing | Settings are a bare KV store (`settings_service.py:8-22`); no preset concept; defaults are blocked on GitHub Issue #20 (backlog Issue 10 audit) | Issue 4 / v0.4.2, after Issue #20 | Fable/human: default values — locked only after Issue #20 audit | Any "runs well on 8 GB" claim |
 | 7 | Giant PDF/OCR guardrails | A 500-page scan must not freeze a potato | Missing | No page limits/throttles in `ocr_service.py` (scope §3 C6/E3) | Issue 6 / v0.4.4 | Fable: limit/queue design | Advertising large-document support |
 | 8 | Pause/cancel indexing/OCR | Users must escape heavy work they started | Missing | Cancel exists only for benchmark campaigns (`campaign_service.py`) | Issue 6 / v0.4.4 | Fable: cancellation semantics (written spec) | Rank 7 being claimed done |
 | 9 | Storage visibility and cleanup | Disk is scarce; deletion must actually reclaim | Partial/Missing | `delete_document` uses `mark_deleted` (`rag_service.py:164-168`), file-copy cleanup unverified; no size UI (scope §3 G1-G4) | Issue 7 / v0.4.5 | Fable/human: deletion semantics | Heavy local workflows (many imports, reports) |
@@ -40,16 +41,18 @@ Everything below is ranked by how directly it serves that sentence.
 
 Blunt accounting — planned is not done:
 
-- **Already strong:** rank 4 (one doc → sourced answer, on strong hardware),
-  rank 10 (degraded banner + Retry). Two of fifteen.
-- **Exists but needs noob/potato UX:** rank 2 (status exists, copy is
-  jargon), rank 3 (detection done, guidance absent), rank 5 (fallback works,
-  honesty copy missing), rank 13 (core package shipped, labels/docs absent).
-- **Planned but not implemented:** ranks 1, 6, 7, 8, 11, 12, 14. That is
-  seven of the fifteen — nearly half the value list is paper.
+- **Already strong or now completed:** rank 1 (first-run readiness), rank 3
+  (model setup guidance), rank 4 (one doc → sourced answer, on strong
+  hardware), rank 10 (degraded banner + Retry). Four of fifteen.
+- **Exists but remains partial/unproved:** rank 2 (readiness guidance exists,
+  but broader dependency-error copy is unproved), rank 5 (fallback works,
+  exact honesty copy remains unproved), rank 13 (core package shipped,
+  labels/docs absent).
+- **Planned but not implemented:** ranks 6, 7, 8, 11, 12, 14. That is six
+  of the fifteen; rank 14 remains **Planned, not run**.
 - **Needs audit before implementation:** rank 6 defaults (blocked on issue
-  10 hardware audit), rank 9 deletion semantics (`mark_deleted` unverified),
-  rank 1/2 status sources (blocked on issue 2 readiness audit).
+  #20 / backlog Issue 10 hardware audit), rank 9 deletion semantics
+  (`mark_deleted` unverified). The rank 1/2 readiness audit is complete.
 - **Long-term foundation, not v0.4:** rank 15. Valuable, and explicitly
   deferred; building it now would be executing the wrong things in the
   right-looking order.
@@ -58,12 +61,15 @@ Blunt accounting — planned is not done:
 
 Execution order for the value-driving path:
 
-A. Readiness audit (issue 2) → B. First-run readiness (issue 3) →
-C. Model setup helper (issue 5) → D. Potato Mode defaults, after the
-hardware/resource audit (issues 10→4) → E. Document import/index guardrails
-(issue 6) → F. Storage cleanup (issue 7) → G. Noob diagnostics/redaction
-(issue 8) → H. Potato Proof smoke (issue 11) → I. v0.4 release gate
-(issue 9).
+A. **Complete:** readiness audit (issue 2; PR #23 / `27cc2b15`) →
+B. **Complete:** first-run readiness (issue 3; PR #24 / `9ec4d8d7`) →
+C. **Complete:** model setup helper (issue 5; PRs #25, #27, #28 /
+`70c6010c`, `43ef0634`, `c1fe0358`) → D. **Not reached:** Potato Mode
+defaults, after GitHub Issue #20 completes the hardware/resource audit
+(backlog issues 10→4) → E. **Not reached:** document import/index guardrails
+(issue 6) → F. **Not reached:** storage cleanup (issue 7) → G. **Not
+reached:** noob diagnostics/redaction (issue 8) → H. **Not reached:** Potato
+Proof smoke (issue 11) → I. **Not reached:** v0.4 release gate (issue 9).
 
 Why the order is not negotiable:
 
