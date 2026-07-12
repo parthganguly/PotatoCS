@@ -26,10 +26,13 @@ Support policy:
 - **P3/P4 are the easy cases.** Passing on P3 alone proves nothing about
   the Potato thesis. v0.4 must not be validated only on P3.
 
-## B. Resource budgets (proposed, unmeasured)
+## B. Resource budgets
+
+### B.1 Proposed thresholds (unmeasured)
 
 Every number here is a proposed budget until the v0.4 hardware/resource
-audit measures real values on real or simulated tier hardware.
+audit measures real values on real or simulated tier hardware. These
+thresholds are the target — they are not overwritten by §B.2 below.
 
 | Budget | P0 | P1/P2 | P3/P4 |
 |---|---|---|---|
@@ -42,13 +45,42 @@ audit measures real values on real or simulated tier hardware.
 | Time to first sourced answer (small model, 30-page PDF) | best-effort, honest slow copy | ≤ 60 s | ≤ 30 s |
 | Max document size before guardrail prompt | ~100 pages | ~300 pages | ~300 pages |
 | UI responsiveness during any background job | input echo < 200 ms | same | same |
-| Orphan sidecars after close/crash | 0 (already proved for v0.3.1) | 0 | 0 |
+| Orphan sidecars after close/crash | 0 | 0 | 0 |
 | Non-user-initiated downloads | 0, ever | 0 | 0 |
 
 Rules: budgets get measured before Potato Mode default values are locked
 (see `V04_ISSUE_BREAKDOWN.md` audit issue). A budget miss on P1/P2 blocks
 the v0.4 gate; a miss on P0 requires an honest documented degradation, not
 silent failure.
+
+### B.2 Status (v0.4 hardware/resource audit, 2026-07-12)
+
+Backend-only, P3-tier measurements from `V04_HARDWARE_AUDIT.md`
+(candidate `3cd01b55`, branch `audit/v0.4-hardware-resource-metrics`).
+Status is one of `measured-pass`, `measured-fail`, `still-proposed` per
+tier column. P3 native measurements cannot pass a P1/P2 budget by
+themselves; packaged-host/UI-scoped budgets stay `still-proposed` until
+the §7 runbook in the audit report runs on real or simulated P1/P2
+hardware. "Component measured" evidence notes what the backend-only P3
+run showed; it never upgrades a still-proposed P0/P1/P2 status. A
+measured-fail, however, carries to all tiers when the failing property
+is hardware-independent (bytes written by code on fixed input) or can
+only be worse on weaker hardware (an uncapped allocation on less RAM)
+— that a-fortiori rule is why the two fails below cover every tier.
+
+| Budget | P0 | P1/P2 | P3/P4 | Evidence |
+|---|---|---|---|---|
+| Cold launch to interactive readiness view | still-proposed | still-proposed | still-proposed | UI metric; component measured: sidecar spawn→ping median 1.22 s. Blocker: packaged-host run needs clean second Windows user / VM. |
+| Idle RAM (app + sidecar, no model) | still-proposed | still-proposed | still-proposed | Host RAM unmeasured; component: sidecar idle WS ≈ 47 MB. |
+| Idle CPU (steady state) | still-proposed | still-proposed | still-proposed | Host unmeasured; component: sidecar 0.00 %, no busy polling. |
+| Profile growth after one 30-page PDF | measured-fail | measured-fail | **measured-fail** | 17.7× vs ≤ 3× budget — fixture-ratio artifact; absolute growth ≈435 KB. Recommend restating budget with an absolute floor (e.g. "≤ 3× source size + 1 MB"). Hardware-independent (bytes on disk are determined by code + input, identical across all 3 runs; threshold is the same for every tier), measured on P3. |
+| Import/indexing CPU (bounded, cancellable) | still-proposed | still-proposed | still-proposed | No cancel path exists yet (planned v0.4.4); UI responsiveness unmeasured. Import itself completed in 1.8–7.6 s. |
+| OCR peak memory (page-at-a-time, capped) | measured-fail | measured-fail | **measured-fail** | No cap: sidecar WS ≥ 1,586 MB on a legal 2-page input, 997 MB on 1 page; page-at-a-time loop is honored but render size is uncapped (400 dpi fixed). Cap absence is structural (same code renders the same uncapped image on any tier), so the "capped" budget fails tier-independently; the WS peak values are P3 observations only. |
+| Time to first sourced answer (small model, 30-page PDF) | still-proposed | still-proposed | **measured-pass** | 16.3 s chat / 20.8 s end-to-end cold vs ≤ 30 s (n=3, model pre-installed). P1/P2 ≤ 60 s needs tier hardware. |
+| Max document size before guardrail prompt | still-proposed | still-proposed | still-proposed | Guardrail not implemented yet (Issue 6 scope). |
+| UI responsiveness during background job | still-proposed | still-proposed | still-proposed | UI unmeasured. |
+| Orphan sidecars after close/crash | still-proposed | still-proposed | still-proposed | Backend-only graceful shutdown: 10/10 pass, no audit orphan processes at final sweep. Crash path and packaged-host close/crash path not measured in this v0.4 audit. Historical v0.3.1 smoke is context only, not v0.4 proof. |
+| Non-user-initiated downloads | still-proposed | still-proposed | still-proposed | No network monitor was run in this audit; harness enforced HF offline env and nothing was pulled, but that is not proof. |
 
 ## C. Potato-specific failure modes
 
