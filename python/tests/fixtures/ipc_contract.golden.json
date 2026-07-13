@@ -7,6 +7,7 @@
     "capture_window",
     "clipboard_import_image",
     "read_profile_artifact_file",
+    "retry_backend",
     "rpc_call"
   ],
   "frontend_rpc_methods": [
@@ -112,6 +113,10 @@
     "image_evals.history",
     "image_evals.list",
     "image_evals.run",
+    "jobs.cancel",
+    "jobs.get",
+    "jobs.list",
+    "jobs.submit_import",
     "legacy.import",
     "models.capabilities",
     "models.detect_ollama",
@@ -143,6 +148,7 @@
     "capture_window",
     "clipboard_import_image",
     "read_profile_artifact_file",
+    "retry_backend",
     "rpc_call",
     "shutdown_backend"
   ]
