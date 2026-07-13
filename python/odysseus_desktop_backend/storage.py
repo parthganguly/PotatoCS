@@ -515,6 +515,11 @@ class Database:
         self.ensure_column("documents", "generated_source_label", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "scope", "TEXT NOT NULL DEFAULT 'library'")
         self.ensure_column("documents", "promoted_at", "INTEGER")
+        # Staged (not yet committed) job imports; hidden from every user
+        # surface until commit. Dedicated column, not a status value, because
+        # the mark_* helpers legitimately overwrite status fields mid-job
+        # (V04_ESSENTIAL_SEMANTICS.md §B).
+        self.ensure_column("documents", "is_staging", "INTEGER NOT NULL DEFAULT 0")
         self.ensure_column("ocr_pages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self.ensure_column("artifacts", "scope", "TEXT NOT NULL DEFAULT 'library'")
         self.ensure_column("artifacts", "promoted_at", "INTEGER")

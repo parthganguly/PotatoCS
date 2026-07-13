@@ -121,6 +121,13 @@ class SidecarApp:
         recovered_campaigns = self.campaigns.recover_interrupted_campaigns()
         if recovered_campaigns:
             logger.warning("recovered interrupted benchmark campaigns count=%s", recovered_campaigns)
+        repaired = self.documents.repair_startup_state()
+        if repaired["purged_staging"] or repaired["ocr_reset"]:
+            logger.warning(
+                "repaired startup document state purged_staging=%s ocr_reset=%s",
+                repaired["purged_staging"],
+                repaired["ocr_reset"],
+            )
         self.jobs = JobService(self.profile_dir)
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
