@@ -454,6 +454,7 @@ class DocumentJobExecutor:
 
     def _run_ocr(self, job: JobRecord, on_running: Callable[[], None]) -> None:
         from odysseus_desktop_backend.cancellation import check_cancelled
+        from odysseus_desktop_backend.services.ocr_service import OCRGuardrailError
 
         check_cancelled()
         try:
@@ -472,7 +473,10 @@ class DocumentJobExecutor:
         }
         on_running()
         check_cancelled()
-        self.services.ocr.run_document_ocr(job.document_id)
+        try:
+            self.services.ocr.run_document_ocr(job.document_id)
+        except OCRGuardrailError as exc:
+            raise JobFailure(exc.code) from exc
 
     def _build_services(self) -> Any:
         from types import SimpleNamespace

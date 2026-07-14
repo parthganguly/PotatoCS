@@ -11,6 +11,7 @@ from typing import Iterable, Protocol
 
 import numpy as np
 
+from odysseus_desktop_backend.cancellation import JobCancelledError, check_cancelled
 from odysseus_desktop_backend.logging_config import get_logger
 from odysseus_desktop_backend.storage import Database, utc_ms
 
@@ -18,6 +19,9 @@ from odysseus_desktop_backend.storage import Database, utc_ms
 LOCAL_HASH_MODEL = "local-hash-v1"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_DIMENSIONS = 384
+# Structural safety ceiling — NOT a measured Potato Mode default; Issue
+# #14/#20 own tuning.
+EMBEDDING_BATCH_SIZE = 16
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_\-']*", re.IGNORECASE)
 STOPWORDS = {
@@ -216,6 +220,8 @@ class EmbeddingService:
         provider = self._select_provider()
         try:
             return self._embed_texts_with_provider(items, provider)
+        except JobCancelledError:
+            raise
         except Exception as exc:
             if provider.backend == "lexical":
                 raise
@@ -271,32 +277,36 @@ class EmbeddingService:
                 missing_hashes.append(digest)
 
         if missing_texts:
-            vectors = provider.embed(missing_texts)
-            now = utc_ms()
-            for digest, vector in zip(missing_hashes, vectors):
-                vector = vector.astype(np.float32)
-                self.db.conn.execute(
-                    """
-                    INSERT INTO embedding_cache(
-                        content_hash, embedding_model, vector_blob, dimensions, created_at, last_used_at
+            for offset in range(0, len(missing_texts), EMBEDDING_BATCH_SIZE):
+                batch_texts = missing_texts[offset : offset + EMBEDDING_BATCH_SIZE]
+                batch_hashes = missing_hashes[offset : offset + EMBEDDING_BATCH_SIZE]
+                check_cancelled()
+                vectors = provider.embed(batch_texts)
+                now = utc_ms()
+                for digest, vector in zip(batch_hashes, vectors):
+                    vector = vector.astype(np.float32)
+                    self.db.conn.execute(
+                        """
+                        INSERT INTO embedding_cache(
+                            content_hash, embedding_model, vector_blob, dimensions, created_at, last_used_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(content_hash, embedding_model) DO UPDATE SET
+                            vector_blob = excluded.vector_blob,
+                            dimensions = excluded.dimensions,
+                            last_used_at = excluded.last_used_at
+                        """,
+                        (
+                            digest,
+                            provider.model_key,
+                            vector.tobytes(),
+                            int(vector.shape[0]),
+                            now,
+                            now,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(content_hash, embedding_model) DO UPDATE SET
-                        vector_blob = excluded.vector_blob,
-                        dimensions = excluded.dimensions,
-                        last_used_at = excluded.last_used_at
-                    """,
-                    (
-                        digest,
-                        provider.model_key,
-                        vector.tobytes(),
-                        int(vector.shape[0]),
-                        now,
-                        now,
-                    ),
-                )
-                cached[digest] = vector
-            self.db.conn.commit()
+                    cached[digest] = vector
+                self.db.conn.commit()
 
         now = utc_ms()
         for digest in hashes:

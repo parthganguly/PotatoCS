@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import os
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,14 @@ from pathlib import Path
 from typing import Any
 from typing import Protocol
 
+from pypdf import PdfReader
+
+from odysseus_desktop_backend.cancellation import (
+    JobCancelledError,
+    cancellation_requested,
+    check_cancelled,
+    shield,
+)
 from odysseus_desktop_backend.logging_config import get_logger
 from odysseus_desktop_backend.progress import emit_progress
 from odysseus_desktop_backend.services.model_service import VISION_CHAT_TIMEOUT_SECONDS
@@ -24,8 +33,15 @@ from odysseus_desktop_backend.services.rag_service import RAGService
 
 
 OCR_UNAVAILABLE_MESSAGE = "This appears scanned/low-text. OCR is not installed/enabled yet."
-OCR_SUBPROCESS_TIMEOUT_SECONDS = 60
+# Structural safety ceilings — NOT a measured Potato Mode default; Issue
+# #14/#20 own tuning.
+OCR_MAX_RENDER_PIXELS = 40_000_000
+OCR_MIN_RENDER_DPI = 120
+OCR_MAX_PAGES = 400
 OCR_PDF_RENDER_DPI = 400
+OCR_SUBPROCESS_TIMEOUT_SECONDS = 60
+OCR_CANCEL_POLL_SECONDS = 0.2
+OCR_TERMINATE_GRACE_SECONDS = 2.0
 OCR_PREPROCESSING_VERSION = "ocr-prep-v3"
 OCR_TESSERACT_PSM_MODES = (6, 11, 12)
 OCR_TESSERACT_ENHANCED_PSM_MODES = (4, 6, 11)
@@ -82,6 +98,20 @@ class OCRTimeoutError(OCRExecutionError):
     pass
 
 
+OCR_GUARDRAIL_MESSAGES = {
+    "ocr_page_too_large": "One of this document's pages is too large to read safely on this computer. Try a version of the document with smaller pages.",
+    "ocr_too_many_pages": "This document has more pages than this app will read in one go (limit: 400). Split the document and import the parts you need.",
+}
+
+
+class OCRGuardrailError(OCRExecutionError):
+    def __init__(self, code: str):
+        if code not in OCR_GUARDRAIL_MESSAGES:
+            raise ValueError("unknown OCR guardrail code")
+        self.code = code
+        super().__init__(OCR_GUARDRAIL_MESSAGES[code])
+
+
 @dataclass(frozen=True)
 class OCRImageResult:
     source_path: str
@@ -111,6 +141,81 @@ def ocr_result_stats(
 
 def subprocess_time_ms() -> int:
     return int(time.perf_counter() * 1000)
+
+
+def _page_too_large() -> OCRGuardrailError:
+    return OCRGuardrailError("ocr_page_too_large")
+
+
+def choose_render_dpi(width_in: float, height_in: float) -> int:
+    """Choose the highest safe integer render DPI for bounded page dimensions."""
+    try:
+        width = float(width_in)
+        height = float(height_in)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _page_too_large() from exc
+    max_inches = 10_000.0 / 72.0
+    if (
+        not math.isfinite(width)
+        or not math.isfinite(height)
+        or width <= 0.0
+        or height <= 0.0
+        or width > max_inches
+        or height > max_inches
+    ):
+        raise _page_too_large()
+
+    estimate = math.floor(math.sqrt(OCR_MAX_RENDER_PIXELS / (width * height)))
+    dpi = min(OCR_PDF_RENDER_DPI, estimate)
+    while dpi >= OCR_MIN_RENDER_DPI:
+        pixel_width = float(math.ceil(width * dpi))
+        pixel_height = float(math.ceil(height * dpi))
+        if pixel_width * pixel_height <= float(OCR_MAX_RENDER_PIXELS):
+            return dpi
+        dpi -= 1
+    raise _page_too_large()
+
+
+def preflight_pdf_pages(stored_path: str | Path) -> list[tuple[int, int]]:
+    """Build a safe per-page render plan without rasterizing the PDF."""
+    try:
+        reader = PdfReader(str(stored_path))
+    except OSError as exc:
+        raise OCRExecutionError("PDF file could not be opened for OCR.") from exc
+    except Exception as exc:
+        raise _page_too_large() from exc
+    try:
+        if len(reader.pages) > OCR_MAX_PAGES:
+            raise OCRGuardrailError("ocr_too_many_pages")
+        plan: list[tuple[int, int]] = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            box = page.mediabox
+            if box is None:
+                raise _page_too_large()
+            user_unit = float(page.get("/UserUnit", 1.0))
+            rotation = float(page.get("/Rotate", 0.0))
+            width_points = float(box.width) * user_unit
+            height_points = float(box.height) * user_unit
+            if (
+                not math.isfinite(user_unit)
+                or user_unit <= 0.0
+                or not math.isfinite(rotation)
+                or not math.isfinite(width_points)
+                or not math.isfinite(height_points)
+                or width_points <= 0.0
+                or height_points <= 0.0
+                or width_points > 10_000.0
+                or height_points > 10_000.0
+            ):
+                raise _page_too_large()
+            plan.append(
+                (page_number, choose_render_dpi(width_points / 72.0, height_points / 72.0))
+            )
+        return plan
+    except OCRGuardrailError:
+        raise
+    except Exception as exc:  # malformed PDF metadata is a guardrail violation
+        raise _page_too_large() from exc
 
 
 class OCREngine(Protocol):
@@ -334,28 +439,41 @@ class TesseractPdfEngine:
         status = self.status()
         if not status.available:
             raise OCRExecutionError(status.message)
+        plan = preflight_pdf_pages(stored_path)
         with tempfile.TemporaryDirectory(prefix="odysseus-ocr-") as tmp:
             emit_progress("pdf_render")
-            images = self._render_pdf(Path(stored_path), Path(tmp), status.renderer)
             pages: list[OCRPage] = []
-            for page_number, image in enumerate(images, start=1):
-                emit_progress("ocr_page", progress_current=page_number, progress_total=len(images))
-                result = self.ocr_image(str(image), source_id=f"{source_path}#page={page_number}", page_number=page_number)
-                pages.append(
-                    OCRPage(
-                        source_path=source_path,
-                        page_number=page_number,
-                        engine_name=self.name,
-                        confidence=result.confidence,
-                        text=result.text,
-                        metadata={
-                            "image_width": result.width,
-                            "image_height": result.height,
-                            "elapsed_ms": result.elapsed_ms,
-                            **result.metadata,
-                        },
+            for page_number, render_dpi in plan:
+                check_cancelled()
+                with tempfile.TemporaryDirectory(prefix=f"page-{page_number}-", dir=tmp) as page_tmp:
+                    image = self._render_pdf(
+                        Path(stored_path), Path(page_tmp), status.renderer, page_number, render_dpi
                     )
-            )
+                    self._verify_rendered_image(image)
+                    check_cancelled()
+                    emit_progress("ocr_page", progress_current=page_number, progress_total=len(plan))
+                    result = self.ocr_image(
+                        str(image),
+                        source_id=f"{source_path}#page={page_number}",
+                        page_number=page_number,
+                    )
+                    pages.append(
+                        OCRPage(
+                            source_path=source_path,
+                            page_number=page_number,
+                            engine_name=self.name,
+                            confidence=result.confidence,
+                            text=result.text,
+                            metadata={
+                                "image_width": result.width,
+                                "image_height": result.height,
+                                "elapsed_ms": result.elapsed_ms,
+                                **result.metadata,
+                                "render_dpi": render_dpi,
+                            },
+                        )
+                    )
+                    check_cancelled()
             return pages
 
     def ocr_image(self, image_path: str, *, source_id: str = "", page_number: int | None = None) -> OCRImageResult:
@@ -392,34 +510,61 @@ class TesseractPdfEngine:
             return "mutool"
         return ""
 
-    def _render_pdf(self, pdf: Path, tmp: Path, renderer: str) -> list[Path]:
+    def _render_pdf(
+        self,
+        pdf: Path,
+        tmp: Path,
+        renderer: str,
+        page_number: int,
+        render_dpi: int,
+    ) -> Path:
         if renderer == "pdftoppm":
-            prefix = tmp / "page"
+            prefix = tmp / f"page-{page_number}"
             self._run_ocr_subprocess(
-                [self.pdftoppm or "pdftoppm", "-png", "-r", str(OCR_PDF_RENDER_DPI), str(pdf), str(prefix)],
+                [
+                    self.pdftoppm or "pdftoppm", "-png", "-singlefile",
+                    "-f", str(page_number), "-l", str(page_number),
+                    "-r", str(render_dpi), str(pdf), str(prefix),
+                ],
                 "pdftoppm",
             )
-            images = sorted(tmp.glob("page-*.png"))
-            if not images:
+            image = prefix.with_suffix(".png")
+            if not image.is_file():
                 raise OCRExecutionError("pdftoppm rendered no page images.")
-            return images
+            return image
         if renderer == "mutool":
-            out_pattern = tmp / "page-%d.png"
+            image = tmp / f"page-{page_number}.png"
             self._run_ocr_subprocess(
-                [self.mutool or "mutool", "draw", "-r", str(OCR_PDF_RENDER_DPI), "-o", str(out_pattern), str(pdf)],
+                [
+                    self.mutool or "mutool", "draw", "-r", str(render_dpi),
+                    "-o", str(image), str(pdf), str(page_number),
+                ],
                 "mutool",
             )
-            images = sorted(tmp.glob("page-*.png"))
-            if not images:
+            if not image.is_file():
                 raise OCRExecutionError("mutool rendered no page images.")
-            return images
+            return image
         raise OCRExecutionError("No supported PDF renderer available.")
+
+    def _verify_rendered_image(self, image: Path) -> None:
+        try:
+            from PIL import Image
+
+            with Image.open(image) as opened:
+                width, height = opened.size
+            if float(width) * float(height) > OCR_MAX_RENDER_PIXELS * 1.1:
+                raise _page_too_large()
+        except OCRGuardrailError:
+            raise
+        except Exception as exc:
+            raise OCRExecutionError("PDF renderer produced an unreadable page image.") from exc
 
     def _run_tesseract(self, image: Path, *, page_number: int | None = None) -> tuple[str, float | None, dict[str, object]]:
         passes: list[dict[str, object]] = []
         attempted: list[dict[str, object]] = []
         for variant_name, variant_path, psm_modes in self._preprocess_variants(image):
             for psm in psm_modes:
+                check_cancelled()
                 text, confidence, metadata = self._run_tesseract_tsv(variant_path, psm)
                 metadata["preprocessing"] = variant_name
                 metadata["psm"] = psm
@@ -623,9 +768,11 @@ class TesseractPdfEngine:
         crop_passes: list[dict[str, object]] = []
         crop_evidence: list[dict[str, object]] = []
         for crop_name, crop_path, crop_metadata in self._crop_regions(image):
+            check_cancelled()
             crop_attempts: list[dict[str, object]] = []
             for variant_name, variant_path, _psm_modes in self._preprocess_crop_variants(crop_path):
                 for psm in OCR_TESSERACT_CROP_PSM_MODES:
+                    check_cancelled()
                     text, confidence, metadata = self._run_tesseract_tsv(variant_path, psm)
                     metadata["preprocessing"] = variant_name
                     metadata["psm"] = psm
@@ -789,33 +936,61 @@ class TesseractPdfEngine:
 
     def _run_ocr_subprocess(self, command: list[str], label: str) -> subprocess.CompletedProcess[str]:
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
-                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=OCR_SUBPROCESS_TIMEOUT_SECONDS,
             )
         except FileNotFoundError as exc:
             raise OCRExecutionError(f"{label} executable was not found: {command[0]}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise OCRTimeoutError(
-                f"{label} timed out after {OCR_SUBPROCESS_TIMEOUT_SECONDS}s. Try a smaller image or a shorter document."
-            ) from exc
         except OSError as exc:
             raise OCRExecutionError(f"{label} failed to start: {exc}") from exc
 
-        if proc.returncode != 0:
+        deadline = time.monotonic() + OCR_SUBPROCESS_TIMEOUT_SECONDS
+        while True:
+            if cancellation_requested():
+                self._terminate_process(proc)
+                raise JobCancelledError("job cancelled")
+            returncode = proc.poll()
+            if returncode is not None:
+                stdout, stderr = proc.communicate()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_process(proc)
+                raise OCRTimeoutError(
+                    f"{label} timed out after {OCR_SUBPROCESS_TIMEOUT_SECONDS}s. Try a smaller image or a shorter document."
+                )
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=min(OCR_CANCEL_POLL_SECONDS, remaining)
+                )
+                returncode = proc.returncode
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        completed = subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+        if completed.returncode != 0:
             detail = (
-                self._safe_subprocess_text(proc.stderr).strip()
-                or self._safe_subprocess_text(proc.stdout).strip()
-                or f"exit code {proc.returncode}"
+                self._safe_subprocess_text(completed.stderr).strip()
+                or self._safe_subprocess_text(completed.stdout).strip()
+                or f"exit code {completed.returncode}"
             )
             raise OCRExecutionError(f"{label} failed: {detail}")
-        return proc
+        return completed
+
+    def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=OCR_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     def _safe_subprocess_text(self, value: object) -> str:
         if value is None:
@@ -1129,7 +1304,10 @@ class OCRService:
             return self._skipped_result(document_id, "not_pdf")
         if not self.documents.needs_ocr(document_id):
             return self._skipped_result(document_id, "already_ready")
-        return self.run_document_ocr(document_id)
+        try:
+            return self.run_document_ocr(document_id)
+        except OCRGuardrailError as exc:
+            return self._guardrail_result(document_id, str(exc))
 
     def run_document_ocr(self, document_id: str) -> dict[str, object]:
         document = self.documents.get(document_id)
@@ -1138,9 +1316,8 @@ class OCRService:
 
         status = self.engine.status()
         logger.info(
-            "ocr requested document_id=%s file_name=%s available=%s renderer=%s",
+            "ocr requested document_id=%s available=%s renderer=%s",
             document_id,
-            document["file_name"],
             status.available,
             status.renderer,
         )
@@ -1158,13 +1335,17 @@ class OCRService:
         self.documents.mark_ocr_running(document_id, status.engine_name)
         try:
             pages = self.engine.ocr_pdf(document["stored_path"], document["source_path"])
+        except OCRGuardrailError as exc:
+            self.documents.mark_ocr_unavailable(document_id, str(exc))
+            raise
         except OCRExecutionError as exc:
             logger.warning("ocr execution failed document_id=%s error=%s", document_id, exc)
             return self._empty_result(document_id, str(exc))
         if not any(page.text.strip() for page in pages):
             message = "OCR ran, but no text was extracted."
-            self.documents.replace_ocr_pages(document_id, pages, index_status="no_text")
-            self.documents.mark_ocr_no_text(document_id, message)
+            with shield():
+                self.documents.replace_ocr_pages(document_id, pages, index_status="no_text")
+                self.documents.mark_ocr_no_text(document_id, message)
             logger.warning("ocr no_text document_id=%s pages=%s", document_id, len(pages))
             stored_pages = self.documents.ocr_pages(document_id)
             return {
@@ -1176,11 +1357,12 @@ class OCRService:
             }
 
         self.documents.mark_ocr_ready(document_id, status.engine_name)
-        self.documents.replace_pages_from_ocr(document_id, pages)
-        emit_progress("source_index")
-        indexed = self.rag.index_document(document_id)
-        self.documents.mark_ocr_indexed(document_id, status.engine_name)
-        self.documents.link_ocr_chunks(document_id)
+        with shield():
+            self.documents.replace_pages_from_ocr(document_id, pages)
+            emit_progress("source_index")
+            indexed = self.rag.index_document(document_id)
+            self.documents.mark_ocr_indexed(document_id, status.engine_name)
+            self.documents.link_ocr_chunks(document_id)
         stored_pages = self.documents.ocr_pages(document_id)
         index = {
             **indexed,
@@ -1228,5 +1410,27 @@ class OCRService:
             "ocr_status": self.status(),
             "ocr_pages": stored_pages,
             "stats": ocr_result_stats(stored_pages, None, message),
+            "index": None,
+        }
+
+    def _guardrail_result(self, document_id: str, message: str) -> dict[str, object]:
+        self.documents.mark_ocr_unavailable(document_id, message)
+        status = self.status()
+        dependencies = status.get("dependencies")
+        if isinstance(dependencies, dict):
+            status["dependencies"] = {
+                name: {
+                    **details,
+                    "path": "",
+                }
+                for name, details in dependencies.items()
+                if isinstance(details, dict)
+            }
+        pages: list[dict[str, object]] = []
+        return {
+            "document": self.documents.get(document_id),
+            "ocr_status": status,
+            "ocr_pages": pages,
+            "stats": ocr_result_stats(pages, None, message),
             "index": None,
         }
