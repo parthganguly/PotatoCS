@@ -502,6 +502,41 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_benchmark_campaign_jobs_status
                 ON benchmark_campaign_jobs(campaign_id, status, sequence);
+
+            -- Deep Local (experimental) slow-inference jobs. Persisted before
+            -- inference starts so a restart can honestly mark in-flight work
+            -- interrupted. Additive table: no SCHEMA_VERSION bump needed
+            -- (same reasoning as the documents.is_staging column).
+            CREATE TABLE IF NOT EXISTS deep_local_jobs (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'queued',
+                message_code TEXT NOT NULL DEFAULT '',
+                error_category TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT 'colibri',
+                endpoint TEXT NOT NULL DEFAULT '',
+                model_id TEXT NOT NULL DEFAULT '',
+                question TEXT NOT NULL DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                params_json TEXT NOT NULL DEFAULT '{}',
+                result_text TEXT NOT NULL DEFAULT '',
+                thinking_text TEXT NOT NULL DEFAULT '',
+                usage_json TEXT NOT NULL DEFAULT '{}',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                state_history_json TEXT NOT NULL DEFAULT '[]',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                retry_of TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_deep_local_jobs_state
+                ON deep_local_jobs(state, created_at);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_deep_local_jobs_request
+                ON deep_local_jobs(request_id) WHERE request_id != '';
             """
         )
         self.ensure_column("messages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
