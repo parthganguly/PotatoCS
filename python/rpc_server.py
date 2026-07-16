@@ -149,6 +149,8 @@ class SidecarApp:
             "models.inspect": self.models_inspect,
             "models.refresh_capabilities": self.models_refresh_capabilities,
             "deep_local.status": self.deep_local_status,
+            "deep_local.plan": self.deep_local_plan,
+            "deep_local.doctor": self.deep_local_doctor,
             "deep_local.complete_once": self.deep_local_complete_once,
             "florence.verify_pack": self.florence_verify_pack,
             "florence.unload": self.florence_unload,
@@ -345,6 +347,12 @@ class SidecarApp:
 
     def deep_local_status(self, _params: JsonDict) -> JsonDict:
         return self.deep_local.status()
+
+    def deep_local_plan(self, _params: JsonDict) -> JsonDict:
+        return self.deep_local.plan()
+
+    def deep_local_doctor(self, _params: JsonDict) -> JsonDict:
+        return self.deep_local.doctor()
 
     def deep_local_complete_once(self, params: JsonDict) -> JsonDict:
         return self.deep_local.complete_once(

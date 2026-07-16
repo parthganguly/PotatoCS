@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from odysseus_desktop_backend.logging_config import get_logger
+from odysseus_desktop_backend.services import colibri_cli
 from odysseus_desktop_backend.services.providers.base import ModelServiceError
 from odysseus_desktop_backend.services.providers.colibri import (
     COLIBRI_API_KEY_ENV,
@@ -49,6 +50,7 @@ class DeepLocalService:
             "enabled": values.get("deep_local_enabled") is True,
             "endpoint": str(values.get("deep_local_endpoint") or DEFAULT_COLIBRI_ENDPOINT),
             "cli_path": str(values.get("deep_local_cli_path") or ""),
+            "model_path": str(values.get("deep_local_model_path") or ""),
             "timeout_seconds": timeout_seconds,
         }
 
@@ -110,6 +112,20 @@ class DeepLocalService:
             len(base["models"]),
         )
         return base
+
+    def plan(self) -> dict[str, Any]:
+        """Wrap `coli plan --json`: bounded read-only readiness planning."""
+        config = self._config()
+        if not config["enabled"]:
+            return self._error("disabled", DISABLED_MESSAGE)
+        return colibri_cli.run_plan(config["cli_path"], config["model_path"])
+
+    def doctor(self) -> dict[str, Any]:
+        """Wrap `coli doctor --json`: read-only installation diagnostics."""
+        config = self._config()
+        if not config["enabled"]:
+            return self._error("disabled", DISABLED_MESSAGE)
+        return colibri_cli.run_doctor(config["cli_path"], config["model_path"])
 
     def complete_once(
         self,

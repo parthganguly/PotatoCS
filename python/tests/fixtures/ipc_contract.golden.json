@@ -94,6 +94,8 @@
     "campaigns.start",
     "chat.send",
     "deep_local.complete_once",
+    "deep_local.doctor",
+    "deep_local.plan",
     "deep_local.status",
     "diagnostics.get",
     "documents.chunks",
