@@ -51,7 +51,6 @@ import {
   ArtifactRecord,
   DiagnosticsStatus,
   DocumentEvidenceDiagnostic,
-  DocumentImportResult,
   DocumentRecord,
   EmbeddingStatus,
   EvalRun,
@@ -114,6 +113,9 @@ import { OperationProgressDiagnostics } from "./features/chat/OperationProgressD
 import type { OperationProgressEvent } from "./features/chat/chatProgress";
 import { useChatProgress } from "./features/chat/useChatProgress";
 import { ImageBenchmarkPanel } from "./features/image-evals/ImageBenchmarkPanel";
+import { JobsPanel } from "./features/jobs/JobsPanel";
+import { jobSubmissionFailureCopy } from "./features/jobs/jobModel";
+import { useImportJobs } from "./features/jobs/useImportJobs";
 import { ArtifactAnalysisCard } from "./features/multimodal-chat/ImageAttachments";
 import { ReadinessPanel } from "./features/readiness/ReadinessPanel";
 import { firstRunReadinessNeeded, readinessRows } from "./features/readiness/readinessRows";
@@ -242,6 +244,17 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [pendingUserContent, setPendingUserContent] = useState("");
   const chatProgress = useChatProgress(busy);
+  const importJobs = useImportJobs(async ({ job, refreshSources: shouldRefresh }) => {
+    if (!shouldRefresh) return;
+    await refreshSources();
+    if (job.localState === "completed" && job.target === "chat" && job.document_id) {
+      const availableSources = await listSources({ scope: "session", includeSession: true, filter: "all" });
+      const importedSource = availableSources.find(
+        (source) => source.backend_kind === "document" && source.id === job.document_id
+      );
+      if (importedSource) appendPendingSources([importedSource]);
+    }
+  });
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
@@ -1150,30 +1163,41 @@ function App() {
       if (unsupported.length > 0) setError(unsupported.map((path) => `${fileName(path)}: unsupported file type`).join("; "));
       return;
     }
+    const documentPaths = validPaths.filter(isSupportedDocumentPath);
+    const otherPaths = validPaths.filter((path) => !isSupportedDocumentPath(path));
     setBusy(true);
     setError(null);
+    let importStage: "images" | "jobs" = "images";
     try {
-      const result = await importSources({
-        paths: validPaths,
-        scope,
-        index: true,
-        sourceKind
-      });
-      const imported = sourceSummariesFromImportResult(result);
+      let imported: SourceSummary[] = [];
+      let failures: string[] = [];
+      if (otherPaths.length > 0) {
+        const result = await importSources({
+          paths: otherPaths,
+          scope,
+          index: true,
+          sourceKind
+        });
+        imported = sourceSummariesFromImportResult(result);
+        failures = failedSourceImports(result).map((item) => `${item.name}: ${item.error}`);
+      }
+      if (documentPaths.length > 0) {
+        importStage = "jobs";
+        await importJobs.submitJobs(documentPaths, scope, target);
+      }
       if (target === "chat") {
         appendPendingSources(imported);
         setActiveView("chat");
       } else {
         setActiveView("sources");
       }
-      await refreshSources();
-      const failures = failedSourceImports(result).map((item) => `${item.name}: ${item.error}`);
+      if (otherPaths.length > 0) await refreshSources();
       const unsupportedErrors = unsupported.map((path) => `${fileName(path)}: unsupported file type`);
       if (failures.length > 0 || unsupportedErrors.length > 0) {
         setError([...failures, ...unsupportedErrors].join("; "));
       }
     } catch (err) {
-      setError(readError(err));
+      setError(importStage === "jobs" ? jobSubmissionFailureCopy() : readError(err));
     } finally {
       setBusy(false);
     }
@@ -1264,16 +1288,11 @@ function App() {
     setError(null);
     setLastIndexResult(null);
     try {
-      const result = await rpc<DocumentImportResult>("documents.import", { path, index: true });
-      setLastIndexResult(result.index);
+      await importJobs.submitJobs([path], "library", "library");
       setLastOcrResult(null);
       setImportPath("");
-      await refreshDocuments();
-      if (result.document.is_low_text || result.document.index_status === "low_text") {
-        setError(formatLowTextOcrMessage(ocrStatus));
-      }
-    } catch (err) {
-      setError(readError(err));
+    } catch {
+      setError(jobSubmissionFailureCopy());
     } finally {
       setBusy(false);
     }
@@ -1801,6 +1820,9 @@ function App() {
           retrying={backendRetrying}
           onRetry={retryDegradedBackend}
         />
+        {!showReadiness && (
+          <JobsPanel jobs={importJobs.jobs} onCancel={importJobs.cancelJob} onRemove={importJobs.removeJob} />
+        )}
         {showReadiness ? (
           <ReadinessPanel
             rows={readinessRows({
@@ -4616,6 +4638,11 @@ function isSupportedImagePath(path: string): boolean {
   return SUPPORTED_IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
+function isSupportedDocumentPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return SUPPORTED_DOCUMENT_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
 function isSupportedSourcePath(path: string): boolean {
   const lower = path.toLowerCase();
   return [...SUPPORTED_DOCUMENT_EXTENSIONS, ...SUPPORTED_IMAGE_EXTENSIONS].some((extension) => lower.endsWith(extension));
@@ -4762,14 +4789,6 @@ function chunkToSnippet(chunk: RAGSearchResult, index: number): RAGSnippet {
 
 function isRagReadyDocument(document: DocumentRecord): boolean {
   return !document.is_deleted && (document.index_status === "indexed" || document.ocr_status === "indexed");
-}
-
-function formatLowTextOcrMessage(status: OCRStatus | null): string {
-  if (status?.available) {
-    const renderer = status.renderer ? ` using ${status.renderer}` : "";
-    return `PDF has little/no extractable text. OCR is available via ${status.engine_name}${renderer}.`;
-  }
-  return formatOcrUnavailableMessage(status);
 }
 
 function formatOcrUnavailableMessage(status: OCRStatus | null): string {
