@@ -16,6 +16,7 @@ from odysseus_desktop_backend.progress import progress_operation
 from odysseus_desktop_backend.services.artifact_service import ArtifactService
 from odysseus_desktop_backend.services.campaign_service import CampaignService
 from odysseus_desktop_backend.services.chat_service import ChatService
+from odysseus_desktop_backend.services.deep_local_service import DeepLocalService
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.eval_service import EvalService
@@ -107,6 +108,7 @@ class SidecarApp:
             vision=self.vision,
             ocr=self.ocr,
         )
+        self.deep_local = DeepLocalService(self.settings)
         self.evals = EvalService(self.db)
         self.image_evals = ImageEvalService(self.db, self.artifacts, self.vision)
         recovered_analyses = self.artifacts.recover_interrupted_analysis_runs()
@@ -146,6 +148,8 @@ class SidecarApp:
             "models.capabilities": self.models_capabilities,
             "models.inspect": self.models_inspect,
             "models.refresh_capabilities": self.models_refresh_capabilities,
+            "deep_local.status": self.deep_local_status,
+            "deep_local.complete_once": self.deep_local_complete_once,
             "florence.verify_pack": self.florence_verify_pack,
             "florence.unload": self.florence_unload,
             "florence.smoke_test": self.florence_smoke_test,
@@ -338,6 +342,18 @@ class SidecarApp:
 
     def models_refresh_capabilities(self, _params: JsonDict) -> list[JsonDict]:
         return self.models.refresh_capabilities()
+
+    def deep_local_status(self, _params: JsonDict) -> JsonDict:
+        return self.deep_local.status()
+
+    def deep_local_complete_once(self, params: JsonDict) -> JsonDict:
+        return self.deep_local.complete_once(
+            prompt=require_str(params, "prompt"),
+            model=optional_str(params, "model") or "",
+            max_output_tokens=optional_int(params, "max_output_tokens", 128),
+            temperature=optional_float(params, "temperature", 0.0),
+            thinking=optional_str(params, "thinking") or "off",
+        )
 
     def florence_verify_pack(self, _params: JsonDict) -> JsonDict:
         return self.florence.verify_pack()
