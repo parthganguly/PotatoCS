@@ -112,6 +112,7 @@ import { OperationTrace } from "./features/chat/OperationTrace";
 import { OperationProgressDiagnostics } from "./features/chat/OperationProgressDiagnostics";
 import type { OperationProgressEvent } from "./features/chat/chatProgress";
 import { useChatProgress } from "./features/chat/useChatProgress";
+import { DeepLocalPanel } from "./features/deepLocal/DeepLocalPanel";
 import { ImageBenchmarkPanel } from "./features/image-evals/ImageBenchmarkPanel";
 import { JobsPanel } from "./features/jobs/JobsPanel";
 import { jobSubmissionFailureCopy } from "./features/jobs/jobModel";
@@ -1823,6 +1824,9 @@ function App() {
         {!showReadiness && (
           <JobsPanel jobs={importJobs.jobs} onCancel={importJobs.cancelJob} onRemove={importJobs.removeJob} />
         )}
+        {/* Deep Local (experimental): hidden unless the maintainer-level
+            setting deep_local_enabled is set. Never first-run, never default. */}
+        {!showReadiness && settings.deep_local_enabled === true && <DeepLocalPanel />}
         {showReadiness ? (
           <ReadinessPanel
             rows={readinessRows({
