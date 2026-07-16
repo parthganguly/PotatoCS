@@ -21,6 +21,7 @@ import pytest
 from odysseus_desktop_backend.services.deep_local_service import DeepLocalService
 from odysseus_desktop_backend.services.providers.base import (
     ModelAuthError,
+    ModelInterruptedError,
     ModelConnectionError,
     ModelEmptyResponseError,
     ModelIncompatibleServerError,
@@ -35,6 +36,7 @@ from odysseus_desktop_backend.services.providers.base import (
 from odysseus_desktop_backend.services.providers.colibri import (
     COLIBRI_API_KEY_ENV,
     ColibriProvider,
+    RequestCancelHandle,
     is_loopback_endpoint,
     redact_secret,
 )
@@ -425,6 +427,65 @@ def test_multimodal_and_tool_inputs_rejected_client_side(fake_colibri: str, mess
 def test_redact_secret_helper() -> None:
     assert redact_secret("Bearer abc123 failed", "abc123") == "Bearer *** failed"
     assert redact_secret("no secret here", None) == "no secret here"
+
+
+# -- cancellable transport (RequestCancelHandle) ----------------------------
+
+
+def test_cancel_handle_interrupts_in_flight_request(fake_colibri: str) -> None:
+    """cancel() while blocked on the response raises ModelInterruptedError
+    promptly — the caller stops waiting; no claim the engine stopped."""
+    _FakeColibriHandler.behavior["chat_mode"] = "slow"
+    handle = RequestCancelHandle()
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            make_provider(fake_colibri).chat_once(
+                MODEL_ID, [{"role": "user", "content": "hi"}], cancel_handle=handle
+            )
+            outcome["result"] = "completed"
+        except ModelInterruptedError:
+            outcome["result"] = "interrupted"
+        except Exception as exc:  # noqa: BLE001 - test records the surprise
+            outcome["result"] = f"unexpected: {type(exc).__name__}"
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    time.sleep(0.3)  # request is in flight (fake handler sleeps 1.5s)
+    started = time.monotonic()
+    handle.cancel()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 2.0
+    assert outcome["result"] == "interrupted"
+
+
+def test_cancel_handle_before_request_fails_immediately(fake_colibri: str) -> None:
+    handle = RequestCancelHandle()
+    handle.cancel()
+    with pytest.raises((ModelInterruptedError, ModelConnectionError)):
+        make_provider(fake_colibri).chat_once(
+            MODEL_ID, [{"role": "user", "content": "hi"}], cancel_handle=handle
+        )
+
+
+def test_uncancelled_handle_does_not_change_result(fake_colibri: str) -> None:
+    handle = RequestCancelHandle()
+    result = make_provider(fake_colibri).chat_once(
+        MODEL_ID, [{"role": "user", "content": "hi"}], cancel_handle=handle
+    )
+    assert result.content == "Deep answer."
+    assert result.queue_wait_ms == 42
+
+
+def test_cancellable_transport_maps_http_errors_identically(fake_colibri: str) -> None:
+    _FakeColibriHandler.behavior["chat_mode"] = "queue_full"
+    with pytest.raises(ModelQueueSaturatedError) as excinfo:
+        make_provider(fake_colibri).chat_once(
+            MODEL_ID, [{"role": "user", "content": "hi"}], cancel_handle=RequestCancelHandle()
+        )
+    assert excinfo.value.retry_after_seconds == 1.0
 
 
 # -- DeepLocalService (flag-gated RPC facade) ------------------------------

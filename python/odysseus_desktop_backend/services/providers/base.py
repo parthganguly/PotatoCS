@@ -60,6 +60,17 @@ class ModelProviderDisabledError(ModelServiceError):
     category = "disabled"
 
 
+class ModelInterruptedError(ModelServiceError):
+    """The caller abandoned an in-flight request (stopped waiting).
+
+    Raised only when a cancel handle closed the connection on purpose. This
+    is not a cancellation guarantee: the server may keep generating until it
+    notices the disconnect, and possibly until the generation finishes.
+    """
+
+    category = "interrupted"
+
+
 @dataclass
 class ProviderStatus:
     """Normalized reachability/readiness snapshot for a provider endpoint."""

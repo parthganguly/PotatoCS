@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import http.client
+import io
 import ipaddress
 import json
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +18,7 @@ from odysseus_desktop_backend.services.providers.base import (
     ModelConnectionError,
     ModelEmptyResponseError,
     ModelIncompatibleServerError,
+    ModelInterruptedError,
     ModelInvalidModelError,
     ModelMalformedResponseError,
     ModelQueueSaturatedError,
@@ -48,6 +52,66 @@ def redact_secret(text: str, secret: str | None) -> str:
     if not secret:
         return text
     return text.replace(secret, "***")
+
+
+class RequestCancelHandle:
+    """Lets another thread abandon one in-flight HTTP request.
+
+    cancel() closes the underlying connection, which unblocks the thread
+    waiting on the response. Closing the socket only stops *us* from
+    waiting: the Colibri server notices the disconnect asynchronously (only
+    when its next engine data event flows) and may keep generating for a
+    long time. Callers must therefore report the outcome as "stopped
+    waiting"/interrupted, never as a confirmed engine cancellation.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._conn: http.client.HTTPConnection | None = None
+        self._cancelled = False
+
+    def attach(self, conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            self._conn = conn
+            if self._cancelled:
+                self._close_locked()
+
+    def detach(self) -> None:
+        with self._lock:
+            self._conn = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            self._close_locked()
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def _close_locked(self) -> None:
+        if self._conn is None:
+            return
+        # A blocked recv() on Windows is only released by closesocket(): both
+        # shutdown() and socket.close() leave it waiting (close() cannot drop
+        # the OS handle while the response reader holds a makefile() io-ref).
+        # detach() + socket.close(fd) closes the handle immediately and the
+        # waiting thread fails out with an OSError.
+        sock = getattr(self._conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                socket.close(sock.detach())
+            except OSError:
+                pass
+        try:
+            self._conn.close()
+        except OSError:
+            pass
 
 
 def is_loopback_endpoint(endpoint: str) -> bool:
@@ -162,11 +226,14 @@ class ColibriProvider:
         max_output_tokens: int | None = None,
         thinking: str = "off",
         timeout: float | None = None,
+        cancel_handle: RequestCancelHandle | None = None,
     ) -> ProviderChatResult:
         """One non-streaming, text-only completion.
 
-        No mid-flight cancellation is possible on this call; callers must
-        treat an abandoned request as `interrupted`, never `cancelled`.
+        With a `cancel_handle`, another thread may abandon the request
+        mid-flight (raises ModelInterruptedError here). Abandoning is not a
+        cancellation guarantee: callers must report the job as interrupted
+        ("stopped waiting"), never as `cancelled`.
         """
         clean_model = (model_id or "").strip()
         if not clean_model:
@@ -199,6 +266,7 @@ class ColibriProvider:
             "/v1/chat/completions",
             payload=payload,
             timeout=self.timeout if timeout is None else float(timeout),
+            cancel_handle=cancel_handle,
         )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
@@ -309,12 +377,51 @@ class ColibriProvider:
         payload: dict[str, Any] | None = None,
         timeout: float,
         auth: bool = True,
+        cancel_handle: RequestCancelHandle | None = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         url = f"{self.endpoint}{path}"
         headers = {"Content-Type": "application/json"}
         if auth and self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        if cancel_handle is not None:
+            raw, response_headers = self._cancellable_request(
+                method, url, path, body=body, headers=headers, timeout=timeout, handle=cancel_handle
+            )
+        else:
+            raw, response_headers = self._urllib_request(
+                method, url, body=body, headers=headers, timeout=timeout
+            )
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ModelMalformedResponseError(
+                "malformed response: the Colibri server response exceeded the size limit"
+            )
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            raise ModelEmptyResponseError(
+                "empty response: the Colibri server returned an empty body"
+            )
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ModelMalformedResponseError(
+                f"malformed response: the Colibri server did not return JSON ({exc})"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ModelMalformedResponseError(
+                "malformed response: the Colibri server response was not an object"
+            )
+        return data, response_headers
+
+    def _urllib_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes | None,
+        headers: dict[str, str],
+        timeout: float,
+    ) -> tuple[bytes, dict[str, str]]:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -340,26 +447,84 @@ class ColibriProvider:
                 "connection failure: no Colibri server is reachable at "
                 f"{self.endpoint}: {redact_secret(str(reason), self._api_key)}"
             ) from exc
-        if len(raw) > MAX_RESPONSE_BYTES:
-            raise ModelMalformedResponseError(
-                "malformed response: the Colibri server response exceeded the size limit"
+        return raw, response_headers
+
+    def _cancellable_request(
+        self,
+        method: str,
+        url: str,
+        path: str,
+        *,
+        body: bytes | None,
+        headers: dict[str, str],
+        timeout: float,
+        handle: RequestCancelHandle,
+    ) -> tuple[bytes, dict[str, str]]:
+        """http.client transport whose connection a cancel handle can close.
+
+        Behaves like `_urllib_request` (same error mapping, via a synthesized
+        HTTPError for >=400 statuses) but allows another thread to abandon
+        the wait. Abandonment surfaces as ModelInterruptedError, never as a
+        claim that the server stopped working.
+        """
+        parts = urlsplit(self.endpoint)
+        if parts.scheme == "https":
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                parts.hostname or "127.0.0.1", parts.port or 443, timeout=timeout
             )
-        text = raw.decode("utf-8", errors="replace")
-        if not text.strip():
-            raise ModelEmptyResponseError(
-                "empty response: the Colibri server returned an empty body"
+        else:
+            conn = http.client.HTTPConnection(
+                parts.hostname or "127.0.0.1", parts.port or 80, timeout=timeout
             )
+        # A cancelled (closed) connection must stay closed: without this,
+        # http.client transparently reconnects on the next request and the
+        # cancel would silently un-cancel itself.
+        conn.auto_open = 0
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ModelMalformedResponseError(
-                f"malformed response: the Colibri server did not return JSON ({exc})"
+            conn.connect()
+        except (OSError, http.client.HTTPException) as exc:
+            raise ModelConnectionError(
+                "connection failure: no Colibri server is reachable at "
+                f"{self.endpoint}: {redact_secret(str(exc), self._api_key)}"
             ) from exc
-        if not isinstance(data, dict):
-            raise ModelMalformedResponseError(
-                "malformed response: the Colibri server response was not an object"
-            )
-        return data, response_headers
+        handle.attach(conn)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            status = response.status
+            reason = str(response.reason or "")
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            response_msg = response.msg
+        except (TimeoutError, socket.timeout) as exc:
+            if handle.cancelled:
+                raise ModelInterruptedError(
+                    "stopped waiting: this request was abandoned; the Colibri "
+                    "server may keep working on it for some time"
+                ) from exc
+            raise ModelTimeoutError(
+                f"timeout: the Colibri request exceeded {timeout:g}s"
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            if handle.cancelled:
+                raise ModelInterruptedError(
+                    "stopped waiting: this request was abandoned; the Colibri "
+                    "server may keep working on it for some time"
+                ) from exc
+            raise ModelConnectionError(
+                "connection failure: no Colibri server is reachable at "
+                f"{self.endpoint}: {redact_secret(str(exc), self._api_key)}"
+            ) from exc
+        finally:
+            handle.detach()
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if status >= 400:
+            synthesized = urllib.error.HTTPError(url, status, reason, response_msg, io.BytesIO(raw))
+            raise self._map_http_error(synthesized) from None
+        response_headers = {key.lower(): value for key, value in response_msg.items()}
+        return raw, response_headers
 
     def _map_http_error(self, exc: urllib.error.HTTPError) -> ModelServiceError:
         detail = ""
