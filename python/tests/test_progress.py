@@ -179,8 +179,19 @@ def test_pdf_ocr_progress_uses_page_counts_without_paths(capsys, tmp_path: Path)
         def status(self):
             return OCREngineStatus(True, self.name, "fake-renderer", "OCR is available.")
 
-        def _render_pdf(self, _pdf: Path, tmp: Path, _renderer: str):
-            return [tmp / "page-1.png", tmp / "page-2.png", tmp / "page-3.png"]
+        def _render_pdf(
+            self,
+            _pdf: Path,
+            tmp: Path,
+            _renderer: str,
+            page_number: int,
+            _render_dpi: int,
+        ):
+            from PIL import Image
+
+            rendered = tmp / f"page-{page_number}.png"
+            Image.new("L", (100, 100), 255).save(rendered)
+            return rendered
 
         def ocr_image(self, _image_path: str, *, source_id: str = "", page_number: int | None = None):
             return OCRImageResult(
@@ -195,6 +206,13 @@ def test_pdf_ocr_progress_uses_page_counts_without_paths(capsys, tmp_path: Path)
             )
 
     private_pdf = tmp_path / "private-document-name.pdf"
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=612, height=792)
+    with private_pdf.open("wb") as stream:
+        writer.write(stream)
     with progress_operation(operation_id="ocr-pdf"):
         FakePdfEngine().ocr_pdf(str(private_pdf), str(private_pdf))
         emit_progress("crop_ocr")

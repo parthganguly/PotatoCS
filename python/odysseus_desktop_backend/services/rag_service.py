@@ -280,6 +280,7 @@ class RAGService:
                 ) AS active_documents
             FROM documents
             WHERE is_deleted = 0
+              AND COALESCE(is_staging, 0) = 0
               AND index_status = 'indexed'
             """,
             (current_key,),

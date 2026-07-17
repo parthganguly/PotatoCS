@@ -43,7 +43,14 @@ class DocumentService:
         self.documents_dir = self.db.profile_dir / "files" / "documents"
         self.documents_dir.mkdir(parents=True, exist_ok=True)
 
-    def import_document(self, path: str, *, scope: str = "library", title: str | None = None) -> dict[str, Any]:
+    def import_document(
+        self,
+        path: str,
+        *,
+        scope: str = "library",
+        title: str | None = None,
+        staging: bool = False,
+    ) -> dict[str, Any]:
         source = Path(path).expanduser().resolve()
         logger.info("document import requested path=%s", source)
         if not source.exists() or not source.is_file():
@@ -69,9 +76,9 @@ class DocumentService:
             INSERT INTO documents(
                 id, title, source_path, stored_path, file_name, file_type, content_hash,
                 size_bytes, status, index_status, is_deleted, is_low_text, error,
-                created_at, updated_at, indexed_at, scope
+                created_at, updated_at, indexed_at, scope, is_staging
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', 'pending', 0, 0, '', ?, ?, NULL, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', 'pending', 0, 0, '', ?, ?, NULL, ?, ?)
             """,
             (
                 document_id,
@@ -85,6 +92,7 @@ class DocumentService:
                 now,
                 now,
                 clean_scope,
+                1 if staging else 0,
             ),
         )
         self.db.conn.commit()
@@ -258,7 +266,10 @@ class DocumentService:
         self.db.conn.commit()
 
     def list(self, *, scope: str | None = "library", include_deleted: bool = False) -> list[dict[str, Any]]:
-        filters = ["COALESCE(is_internal, 0) = 0"]
+        # Staged (uncommitted) job imports are never listed: a staging row may
+        # legally reach index_status='indexed' before commit, so visibility
+        # must key off is_staging, not status (V04_ESSENTIAL_SEMANTICS.md §B).
+        filters = ["COALESCE(is_internal, 0) = 0", "COALESCE(is_staging, 0) = 0"]
         values: list[Any] = []
         if not include_deleted:
             filters.append("is_deleted = 0")
@@ -457,6 +468,127 @@ class DocumentService:
                 ),
             )
         self.db.conn.commit()
+
+    def commit_staging(self, document_id: str) -> dict[str, Any]:
+        """Final visibility boundary for a staged job import.
+
+        Idempotent: committing an already-committed document is a no-op
+        update. Raises KeyError if the document does not exist.
+        """
+        self.get(document_id)
+        self.db.conn.execute(
+            "UPDATE documents SET is_staging = 0, updated_at = ? WHERE id = ?",
+            (utc_ms(), document_id),
+        )
+        self.db.conn.commit()
+        logger.info("document staging committed document_id=%s", document_id)
+        return self.get(document_id)
+
+    def purge_document(self, document_id: str) -> dict[str, Any]:
+        """Hard-delete a document row, its derived rows, and its owned file copy.
+
+        Used for staged-import rollback and startup repair. Derived rows
+        (document_pages, ocr_pages, rag_chunks) are removed by ON DELETE
+        CASCADE. Idempotent: purging a missing document reports purged=False.
+        The user's original external file (source_path) is never touched.
+        """
+        row = self.db.conn.execute(
+            "SELECT stored_path FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if row is None:
+            return {
+                "purged": False,
+                "file_removed": False,
+                "file_missing": False,
+                "bytes_reclaimed": 0,
+                "document_id": document_id,
+            }
+        file_removed, bytes_reclaimed, file_missing = self._remove_owned_file(
+            str(row["stored_path"] or "")
+        )
+        self.db.conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+        self.db.conn.commit()
+        logger.info(
+            "document purged document_id=%s file_removed=%s file_missing=%s",
+            document_id,
+            file_removed,
+            file_missing,
+        )
+        return {
+            "purged": True,
+            "file_removed": file_removed,
+            "file_missing": file_missing,
+            "bytes_reclaimed": bytes_reclaimed,
+            "document_id": document_id,
+        }
+
+    def restore_status_fields(self, document_id: str, fields: dict[str, Any]) -> None:
+        """Restore previously captured status fields (OCR job rollback)."""
+        self._update_status(document_id, **fields)
+
+    def repair_startup_state(self) -> dict[str, int]:
+        """Remove staged rows/files left by a dead process; reset stuck OCR.
+
+        Runs at sidecar startup before any job can be submitted, under the
+        app's single-instance assumption (same as campaign recovery). Logs
+        fixed labels and counts only.
+        """
+        staged = self.db.conn.execute(
+            "SELECT id FROM documents WHERE COALESCE(is_staging, 0) = 1"
+        ).fetchall()
+        purged = 0
+        for row in staged:
+            try:
+                if self.purge_document(str(row["id"])).get("purged"):
+                    purged += 1
+            except Exception as exc:  # noqa: BLE001 - repair must not block startup
+                logger.error(
+                    "startup repair purge failed error_type=%s", type(exc).__name__
+                )
+        cursor = self.db.conn.execute(
+            "UPDATE documents SET ocr_status = 'needed', updated_at = ? WHERE ocr_status = 'running'",
+            (utc_ms(),),
+        )
+        self.db.conn.commit()
+        ocr_reset = max(0, cursor.rowcount)
+        if purged or ocr_reset:
+            logger.warning(
+                "startup repair purged_staging=%s ocr_reset=%s", purged, ocr_reset
+            )
+        return {"purged_staging": purged, "ocr_reset": ocr_reset}
+
+    def _remove_owned_file(self, stored_path: str) -> tuple[bool, int, bool]:
+        """Delete an app-owned file copy with fail-closed path validation.
+
+        Returns (file_removed, bytes_reclaimed, file_missing). Refuses
+        symlinks and any path that does not resolve to a direct child of the
+        profile documents directory — junction/traversal escapes resolve
+        elsewhere and are rejected by the parent check.
+        """
+        if not stored_path:
+            return False, 0, True
+        candidate = Path(stored_path)
+        try:
+            documents_root = self.documents_dir.resolve(strict=True)
+        except OSError:
+            logger.warning("owned file removal refused reason=documents_dir_unresolvable")
+            return False, 0, False
+        try:
+            if candidate.is_symlink():
+                logger.warning("owned file removal refused reason=symlink")
+                return False, 0, False
+            if not candidate.exists():
+                return False, 0, True
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != documents_root or not resolved.is_file():
+                logger.warning("owned file removal refused reason=outside_profile")
+                return False, 0, False
+            size = int(resolved.stat().st_size)
+            resolved.unlink()
+            return True, size, False
+        except OSError:
+            logger.warning("owned file removal failed reason=os_error")
+            return False, 0, False
 
     def mark_deleted(self, document_id: str) -> dict[str, Any]:
         now = utc_ms()
@@ -682,6 +814,7 @@ class DocumentService:
         item["is_deleted"] = bool(item["is_deleted"])
         item["is_low_text"] = bool(item["is_low_text"])
         item["is_internal"] = bool(item.get("is_internal", 0))
+        item["is_staging"] = bool(item.get("is_staging", 0))
         item["scope"] = str(item.get("scope") or "library")
         return item
 

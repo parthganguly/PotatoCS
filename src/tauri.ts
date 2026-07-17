@@ -16,6 +16,25 @@ export type Settings = {
   [key: string]: unknown;
 };
 
+export type JobScope = "library" | "session";
+
+export type JobRecord = {
+  job_id: string;
+  kind: string;
+  state: string;
+  message_code: string;
+  scope: JobScope;
+  document_id: string;
+  artifact_id: string;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  elapsed_ms: number;
+  queue_position: number | null;
+};
+
+export type SubmitImportJobsResult = { jobs: JobRecord[] };
+
 export type Session = {
   id: string;
   title: string;
@@ -1152,6 +1171,23 @@ export async function getAppStatus(): Promise<AppStatus> {
 
 export async function retryBackend(): Promise<void> {
   return invoke<void>("retry_backend");
+}
+
+export async function submitImportJobs(paths: string[], scope: JobScope): Promise<JobRecord[]> {
+  const result = await rpc<SubmitImportJobsResult>("jobs.submit_import", { paths, scope });
+  return result.jobs;
+}
+
+export async function getJob(jobId: string): Promise<JobRecord> {
+  return rpc<JobRecord>("jobs.get", { job_id: jobId });
+}
+
+export async function listJobs(): Promise<JobRecord[]> {
+  return rpc<JobRecord[]>("jobs.list");
+}
+
+export async function cancelJob(jobId: string): Promise<JobRecord> {
+  return rpc<JobRecord>("jobs.cancel", { job_id: jobId });
 }
 
 export async function rpc<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {

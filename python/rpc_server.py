@@ -21,6 +21,7 @@ from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.eval_service import EvalService
 from odysseus_desktop_backend.services.florence2_service import Florence2Backend
 from odysseus_desktop_backend.services.image_eval_service import ImageEvalService
+from odysseus_desktop_backend.services.job_service import JobService
 from odysseus_desktop_backend.services.legacy_import_service import LegacyImportService
 from odysseus_desktop_backend.services.model_service import ModelService
 from odysseus_desktop_backend.services.ocr_service import LocalVLMTextExtractor, OCRService
@@ -120,6 +121,14 @@ class SidecarApp:
         recovered_campaigns = self.campaigns.recover_interrupted_campaigns()
         if recovered_campaigns:
             logger.warning("recovered interrupted benchmark campaigns count=%s", recovered_campaigns)
+        repaired = self.documents.repair_startup_state()
+        if repaired["purged_staging"] or repaired["ocr_reset"]:
+            logger.warning(
+                "repaired startup document state purged_staging=%s ocr_reset=%s",
+                repaired["purged_staging"],
+                repaired["ocr_reset"],
+            )
+        self.jobs = JobService(self.profile_dir)
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
             "health.ping": self.health_ping,
@@ -165,6 +174,10 @@ class SidecarApp:
             "documents.ocr": self.documents_ocr,
             "documents.ocr_pages": self.documents_ocr_pages,
             "ocr.status": self.ocr_status,
+            "jobs.submit_import": self.jobs_submit_import,
+            "jobs.get": self.jobs_get,
+            "jobs.list": self.jobs_list,
+            "jobs.cancel": self.jobs_cancel,
             "legacy.import": self.legacy_import_folder,
             "rag.search": self.rag_search,
             "rag.health": self.rag_health,
@@ -195,6 +208,7 @@ class SidecarApp:
 
     def close(self) -> None:
         logger.info("backend shutdown profile_dir=%s", self.profile_dir)
+        self.jobs.shutdown()
         self.db.close()
 
     def dispatch(self, method: str, params: JsonDict | None) -> Any:
@@ -472,6 +486,22 @@ class SidecarApp:
 
     def ocr_status(self, _params: JsonDict) -> JsonDict:
         return self.ocr.status()
+
+    def jobs_submit_import(self, params: JsonDict) -> JsonDict:
+        paths = params.get("paths")
+        if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
+            raise RpcError(-32602, "paths must be a list of strings")
+        scope = optional_str(params, "scope") or "library"
+        return {"jobs": self.jobs.submit_import(paths, scope=scope)}
+
+    def jobs_get(self, params: JsonDict) -> JsonDict:
+        return self.jobs.get(require_str(params, "job_id"))
+
+    def jobs_list(self, _params: JsonDict) -> list[JsonDict]:
+        return self.jobs.list()
+
+    def jobs_cancel(self, params: JsonDict) -> JsonDict:
+        return self.jobs.cancel(require_str(params, "job_id"))
 
     def legacy_import_folder(self, params: JsonDict) -> JsonDict:
         return self.legacy_import.import_folder(require_str(params, "folder"))

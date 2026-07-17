@@ -146,6 +146,7 @@ class SQLiteNumPyVectorStore(VectorStore):
                 ON e.content_hash = c.embedding_hash
                 AND e.embedding_model = c.embedding_model
             WHERE c.is_deleted = 0 AND d.is_deleted = 0 AND d.index_status = 'indexed'
+              AND COALESCE(d.is_staging, 0) = 0
             {model_filter}
             """,
             ([embedding_model] if embedding_model else []),
@@ -190,7 +191,7 @@ class SQLiteNumPyVectorStore(VectorStore):
         row = self.db.conn.execute(
             """
             SELECT
-                (SELECT COUNT(*) FROM documents WHERE is_deleted = 0) AS documents,
+                (SELECT COUNT(*) FROM documents WHERE is_deleted = 0 AND COALESCE(is_staging, 0) = 0) AS documents,
                 (SELECT COUNT(*) FROM rag_chunks WHERE is_deleted = 0) AS chunks,
                 (SELECT COUNT(*) FROM embedding_cache) AS cached_embeddings
             """

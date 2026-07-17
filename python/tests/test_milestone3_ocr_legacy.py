@@ -142,16 +142,28 @@ def test_tesseract_subprocess_uses_utf8_replacement_and_handles_none_stdout(monk
     engine = TesseractPdfEngine()
     engine.tesseract = "tesseract"
 
-    def fake_run(command, **kwargs):
-        assert command[0] == "tesseract"
-        assert kwargs["stdout"] == ocr_module.subprocess.PIPE
-        assert kwargs["stderr"] == ocr_module.subprocess.PIPE
-        assert kwargs["text"] is True
-        assert kwargs["encoding"] == "utf-8"
-        assert kwargs["errors"] == "replace"
-        return ocr_module.subprocess.CompletedProcess(command, 0, stdout=None, stderr=None)
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.args = command
+            self.returncode = 0
+            assert command[0] == "tesseract"
+            assert kwargs["stdout"] == ocr_module.subprocess.PIPE
+            assert kwargs["stderr"] == ocr_module.subprocess.PIPE
+            assert kwargs["text"] is True
+            assert kwargs["encoding"] == "utf-8"
+            assert kwargs["errors"] == "replace"
 
-    monkeypatch.setattr(ocr_module.subprocess, "run", fake_run)
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return None, None
+
+    def fake_popen(command, **kwargs):
+        assert command[0] == "tesseract"
+        return FakePopen(command, **kwargs)
+
+    monkeypatch.setattr(ocr_module.subprocess, "Popen", fake_popen)
 
     text, confidence, metadata = engine._run_tesseract(Path("page.png"))
 
@@ -164,15 +176,19 @@ def test_tesseract_nonzero_surfaces_stderr_without_decode_crash(monkeypatch):
     engine = TesseractPdfEngine()
     engine.tesseract = "tesseract"
 
-    def fake_run(command, **_kwargs):
-        return ocr_module.subprocess.CompletedProcess(
-            command,
-            1,
-            stdout=None,
-            stderr=b"Error opening data file \xff",
-        )
+    class FakePopen:
+        returncode = 1
 
-    monkeypatch.setattr(ocr_module.subprocess, "run", fake_run)
+        def __init__(self, command, **_kwargs):
+            self.args = command
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return None, b"Error opening data file \xff"
+
+    monkeypatch.setattr(ocr_module.subprocess, "Popen", FakePopen)
 
     with pytest.raises(OCRExecutionError, match="Error opening data file"):
         engine._run_tesseract(Path("page.png"))
