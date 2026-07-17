@@ -11,6 +11,7 @@
     "test:backend-status": "node scripts/test-backend-status.mjs",
     "test:readiness": "node scripts/test-readiness.mjs",
     "test:jobs-ui": "node scripts/test-jobs-ui.mjs",
+    "test:storage-ui": "node scripts/test-storage-ui.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "prepare:python": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-python-runtime.ps1",
     "verify:python": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-python-runtime.ps1",
