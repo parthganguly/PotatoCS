@@ -433,23 +433,39 @@ def test_startup_repair_marks_inflight_rows_interrupted(tmp_path) -> None:
             ("j-done", "completed"),
             ("j-failed", "failed"),
         ]:
+            history = json.dumps([{"state": "queued", "at": now}, {"state": state, "at": now}])
             db.conn.execute(
-                "INSERT INTO deep_local_jobs (id, state, question, created_at, updated_at) "
-                "VALUES (?, ?, 'q', ?, ?)",
-                (job_id, state, now, now),
+                "INSERT INTO deep_local_jobs (id, state, state_history_json, question, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'q', ?, ?)",
+                (job_id, state, history, now, now),
             )
         db.conn.commit()
         service = DeepLocalJobService(tmp_path, db)
         repaired = service.repair_startup_state()
         assert repaired == 5
-        states = {
-            row["id"]: (row["state"], row["message_code"])
-            for row in db.conn.execute("SELECT * FROM deep_local_jobs").fetchall()
+        rows = {
+            row["id"]: row for row in db.conn.execute("SELECT * FROM deep_local_jobs").fetchall()
         }
-        for job_id in ["j-queued", "j-checking", "j-waiting", "j-running", "j-cancelreq"]:
-            assert states[job_id] == ("interrupted", "interrupted_by_restart")
-        assert states["j-done"] == ("completed", "")
-        assert states["j-failed"] == ("failed", "")
+        for job_id, prior_state in [
+            ("j-queued", "queued"),
+            ("j-checking", "checking_runtime"),
+            ("j-waiting", "waiting_for_provider"),
+            ("j-running", "running"),
+            ("j-cancelreq", "cancel_requested"),
+        ]:
+            row = rows[job_id]
+            assert row["state"] == "interrupted"
+            assert row["message_code"] == "interrupted_by_restart"
+            assert row["error_category"] == "interrupted"
+            # The persisted audit trail must end on the repaired state.
+            history = json.loads(row["state_history_json"])
+            assert [item["state"] for item in history] == ["queued", prior_state, "interrupted"]
+            assert history[-1]["at"] >= now
+            assert row["finished_at"] is not None
+        assert (rows["j-done"]["state"], rows["j-done"]["message_code"]) == ("completed", "")
+        assert rows["j-done"]["error_category"] == ""
+        assert json.loads(rows["j-done"]["state_history_json"])[-1]["state"] == "completed"
+        assert (rows["j-failed"]["state"], rows["j-failed"]["message_code"]) == ("failed", "")
         service.shutdown()
     finally:
         db.close()

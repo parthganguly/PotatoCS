@@ -241,6 +241,8 @@ def test_startup_repair_wired_into_sidecar(tmp_path: Path) -> None:
         snapshot = application.dispatch("deep_local.get", {"job_id": "j-stuck"})
         assert snapshot["state"] == "interrupted"
         assert snapshot["message_code"] == "interrupted_by_restart"
+        assert snapshot["error_category"] == "interrupted"
+        assert snapshot["state_history"][-1]["state"] == "interrupted"
     finally:
         application.close()
 

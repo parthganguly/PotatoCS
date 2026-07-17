@@ -166,19 +166,31 @@ class DeepLocalJobService:
         """
         now = utc_ms()
         placeholders = ",".join("?" for _ in TERMINAL_STATES)
-        cursor = self._db.conn.execute(
-            f"""
-            UPDATE deep_local_jobs
-            SET state = 'interrupted',
-                message_code = 'interrupted_by_restart',
-                finished_at = COALESCE(finished_at, ?),
-                updated_at = ?
-            WHERE state NOT IN ({placeholders})
-            """,
-            (now, now, *TERMINAL_STATES),
-        )
+        rows = self._db.conn.execute(
+            f"SELECT id, state_history_json FROM deep_local_jobs WHERE state NOT IN ({placeholders})",
+            tuple(TERMINAL_STATES),
+        ).fetchall()
+        for row in rows:
+            # The persisted audit trail must match the repaired state: append
+            # the interrupted transition rather than leaving the history
+            # ending on the pre-crash state.
+            history = _load_json(row["state_history_json"], [])
+            history.append({"state": "interrupted", "at": now})
+            self._db.conn.execute(
+                """
+                UPDATE deep_local_jobs
+                SET state = 'interrupted',
+                    message_code = 'interrupted_by_restart',
+                    error_category = 'interrupted',
+                    state_history_json = ?,
+                    finished_at = COALESCE(finished_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(history), now, now, str(row["id"])),
+            )
         self._db.conn.commit()
-        repaired = cursor.rowcount or 0
+        repaired = len(rows)
         if repaired:
             logger.warning("deep_local repaired interrupted jobs count=%s", repaired)
         return repaired
