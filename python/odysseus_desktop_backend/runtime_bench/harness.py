@@ -79,6 +79,7 @@ def run_ollama_shape(
     shape: str,
     options: dict[str, Any] | None = None,
     keep_alive: str | int | None = None,
+    think: bool | None = None,
     endpoint: str = OLLAMA_ENDPOINT,
     timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     run_index: int = 0,
@@ -97,12 +98,17 @@ def run_ollama_shape(
     }
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
+    if think is not None:
+        payload["think"] = think
 
     smi = ri._nvidia_smi_path() if sample_vram else None
+    recorded_options = dict(clean_options)
+    if think is not None:
+        recorded_options["think"] = think
     record: dict[str, Any] = {
         "run_index": run_index,
         "cold": cold,
-        "options": dict(clean_options),
+        "options": recorded_options,
         "timings_ms": {"total": None, "load": None, "prompt_eval": None, "generation": None, "first_token": None},
         "tokens": {"prompt": 0, "generated": 0, "prompt_tps": None, "generation_tps": None},
         "memory": {},
@@ -331,6 +337,7 @@ def run_ollama_batch(
     artifact_dir: str,
     options: dict[str, Any] | None = None,
     keep_alive: str | int | None = None,
+    think: bool | None = None,
     server_env: dict[str, str] | None = None,
     repeats: int = 3,
     include_cold: bool = True,
@@ -349,6 +356,7 @@ def run_ollama_batch(
                 shape=shape,
                 options=options,
                 keep_alive=keep_alive,
+                think=think,
                 timeout=timeout,
                 run_index=run_index,
                 cold=True,
@@ -362,6 +370,7 @@ def run_ollama_batch(
                 shape=shape,
                 options=options,
                 keep_alive=keep_alive,
+                think=think,
                 timeout=timeout,
                 run_index=run_index,
                 cold=False,

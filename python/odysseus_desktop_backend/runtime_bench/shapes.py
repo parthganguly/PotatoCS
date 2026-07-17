@@ -63,7 +63,13 @@ def _grounded_evidence_prompt() -> str:
 
 BENCHMARK_SHAPES: dict[str, dict] = {
     "tiny": {
-        "prompt": f"Reply with exactly this token and nothing else: {TINY_TOKEN}",
+        # Phrased as recall rather than an echo instruction: small models
+        # (llama3.2:1b at temperature 0) refuse the bare "repeat this
+        # token" form, verified live 2026-07-17.
+        "prompt": (
+            f"The harbor master's callsign is {TINY_TOKEN}. "
+            "Question: what is the harbor master's callsign? Reply with the callsign only."
+        ),
         "num_predict": 32,
         "description": "tiny prompt / short answer",
     },
