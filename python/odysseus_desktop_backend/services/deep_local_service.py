@@ -20,16 +20,17 @@ DISABLED_MESSAGE = (
     "Deep Local (experimental) is not enabled. It is optional, text-only, and "
     "requires a Colibri server that you run yourself."
 )
-# Bounded spike default: complete_once is a developer proof, not a job system.
-DEFAULT_ONCE_MAX_OUTPUT_TOKENS = 128
 
 
 class DeepLocalService:
-    """Flag-gated facade over the Colibri provider for the research spike.
+    """Flag-gated read-only facade over the Colibri provider.
 
-    Every method returns a structured dict (never a raw provider exception)
-    so nontechnical users are never shown upstream jargon. There is no UI
-    for this surface; it exists to prove the vertical slice end to end.
+    Serves status/plan/doctor only. Every method returns a structured dict
+    (never a raw provider exception) so nontechnical users are never shown
+    upstream jargon. Generation happens exclusively through the persisted
+    Deep Local job system (DeepLocalJobService) — there is deliberately no
+    synchronous completion surface, which would block the single-threaded
+    sidecar RPC loop for the duration of a slow generation.
     """
 
     def __init__(self, settings: SettingsService):
@@ -127,64 +128,3 @@ class DeepLocalService:
             return self._error("disabled", DISABLED_MESSAGE)
         return colibri_cli.run_doctor(config["cli_path"], config["model_path"])
 
-    def complete_once(
-        self,
-        *,
-        prompt: str,
-        model: str = "",
-        max_output_tokens: int = DEFAULT_ONCE_MAX_OUTPUT_TOKENS,
-        temperature: float = 0.0,
-        top_p: float | None = None,
-        thinking: str = "off",
-    ) -> dict[str, Any]:
-        """Developer-only vertical proof: one bounded text-only completion.
-
-        Synchronous: blocks the sidecar RPC loop for its full duration and
-        supports no mid-flight cancellation (an abandoned call must be
-        described as interrupted, never cancelled). The real product shape
-        is the persisted Deep Local job system (RFC section 6).
-        """
-        clean_prompt = (prompt or "").strip()
-        if not clean_prompt:
-            raise ValueError("prompt is required")
-        config = self._config()
-        provider, error = self._provider_or_error(config)
-        if provider is None:
-            return error
-        selected_model = (model or "").strip()
-        if not selected_model:
-            try:
-                models = provider.list_models()
-            except ModelServiceError as exc:
-                return self._error(exc.category, str(exc))
-            if len(models) != 1:
-                return self._error(
-                    "invalid_model",
-                    "Pass a model id: the Colibri server offered "
-                    f"{len(models)} models.",
-                    models=[item.model_id for item in models],
-                )
-            selected_model = models[0].model_id
-        try:
-            result = provider.chat_once(
-                selected_model,
-                [{"role": "user", "content": clean_prompt}],
-                temperature=temperature,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-                thinking=thinking,
-            )
-        except ModelServiceError as exc:
-            extra: dict[str, Any] = {}
-            retry_after = getattr(exc, "retry_after_seconds", None)
-            if retry_after is not None:
-                extra["retry_after_seconds"] = retry_after
-            return self._error(exc.category, str(exc), **extra)
-        logger.info(
-            "deep_local complete_once model=%s completion_tokens=%s elapsed_ms=%s queue_wait_ms=%s",
-            result.model_id,
-            result.completion_tokens,
-            result.elapsed_ms,
-            result.queue_wait_ms,
-        )
-        return {"ok": True, "result": result.to_dict()}

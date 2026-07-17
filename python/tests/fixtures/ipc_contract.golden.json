@@ -97,7 +97,6 @@
     "campaigns.start",
     "chat.send",
     "deep_local.cancel",
-    "deep_local.complete_once",
     "deep_local.doctor",
     "deep_local.get",
     "deep_local.list",

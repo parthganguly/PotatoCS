@@ -506,9 +506,12 @@ def test_deep_local_disabled_by_default(settings: SettingsService) -> None:
     assert status["ok"] is False
     assert status["enabled"] is False
     assert status["error_category"] == "disabled"
-    once = service.complete_once(prompt="hello")
-    assert once["ok"] is False
-    assert once["error_category"] == "disabled"
+
+
+def test_deep_local_service_has_no_synchronous_generation_surface(settings: SettingsService) -> None:
+    """Generation must go through the persisted job system only: a synchronous
+    completion on the facade would block the single-threaded RPC loop."""
+    assert not hasattr(DeepLocalService(settings), "complete_once")
 
 
 def test_deep_local_rejects_non_loopback_endpoint(settings: SettingsService) -> None:
@@ -529,23 +532,3 @@ def test_deep_local_status_happy_path(settings: SettingsService, fake_colibri: s
     assert status["queue"]["max_queue"] == 8
 
 
-def test_deep_local_complete_once_auto_selects_sole_model(settings: SettingsService, fake_colibri: str) -> None:
-    settings.set({"deep_local_enabled": True, "deep_local_endpoint": fake_colibri})
-    outcome = DeepLocalService(settings).complete_once(prompt="What do the sources say?")
-    assert outcome["ok"] is True
-    result = outcome["result"]
-    assert result["provider"] == "colibri"
-    assert result["model"] == MODEL_ID
-    assert result["content"] == "Deep answer."
-    assert result["completion_tokens"] == 7
-    assert result["queue_wait_ms"] == 42
-
-
-def test_deep_local_complete_once_maps_provider_errors(settings: SettingsService, fake_colibri: str) -> None:
-    settings.set({"deep_local_enabled": True, "deep_local_endpoint": fake_colibri})
-    _FakeColibriHandler.behavior["chat_mode"] = "queue_full"
-    outcome = DeepLocalService(settings).complete_once(prompt="hello", model=MODEL_ID)
-    assert outcome["ok"] is False
-    assert outcome["error_category"] == "queue_saturated"
-    assert outcome["retry_after_seconds"] == 1.0
-    assert "busy" in outcome["error"]

@@ -158,7 +158,6 @@ class SidecarApp:
             "deep_local.status": self.deep_local_status,
             "deep_local.plan": self.deep_local_plan,
             "deep_local.doctor": self.deep_local_doctor,
-            "deep_local.complete_once": self.deep_local_complete_once,
             "deep_local.submit": self.deep_local_submit,
             "deep_local.get": self.deep_local_get,
             "deep_local.list": self.deep_local_list,
@@ -396,15 +395,6 @@ class SidecarApp:
 
     def deep_local_doctor(self, _params: JsonDict) -> JsonDict:
         return self.deep_local.doctor()
-
-    def deep_local_complete_once(self, params: JsonDict) -> JsonDict:
-        return self.deep_local.complete_once(
-            prompt=require_str(params, "prompt"),
-            model=optional_str(params, "model") or "",
-            max_output_tokens=optional_int(params, "max_output_tokens", 128),
-            temperature=optional_float(params, "temperature", 0.0),
-            thinking=optional_str(params, "thinking") or "off",
-        )
 
     def florence_verify_pack(self, _params: JsonDict) -> JsonDict:
         return self.florence.verify_pack()
