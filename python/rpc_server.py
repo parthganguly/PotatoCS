@@ -16,6 +16,8 @@ from odysseus_desktop_backend.progress import progress_operation
 from odysseus_desktop_backend.services.artifact_service import ArtifactService
 from odysseus_desktop_backend.services.campaign_service import CampaignService
 from odysseus_desktop_backend.services.chat_service import ChatService
+from odysseus_desktop_backend.services.deep_local_jobs import DeepLocalJobService
+from odysseus_desktop_backend.services.deep_local_service import DeepLocalService
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.eval_service import EvalService
@@ -107,6 +109,7 @@ class SidecarApp:
             vision=self.vision,
             ocr=self.ocr,
         )
+        self.deep_local = DeepLocalService(self.settings)
         self.evals = EvalService(self.db)
         self.image_evals = ImageEvalService(self.db, self.artifacts, self.vision)
         recovered_analyses = self.artifacts.recover_interrupted_analysis_runs()
@@ -129,6 +132,12 @@ class SidecarApp:
                 repaired["ocr_reset"],
             )
         self.jobs = JobService(self.profile_dir)
+        self.deep_local_jobs = DeepLocalJobService(self.profile_dir, self.db)
+        repaired_deep_local = self.deep_local_jobs.repair_startup_state()
+        if repaired_deep_local:
+            logger.warning(
+                "repaired interrupted deep local jobs count=%s", repaired_deep_local
+            )
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
             "health.ping": self.health_ping,
@@ -146,6 +155,14 @@ class SidecarApp:
             "models.capabilities": self.models_capabilities,
             "models.inspect": self.models_inspect,
             "models.refresh_capabilities": self.models_refresh_capabilities,
+            "deep_local.status": self.deep_local_status,
+            "deep_local.plan": self.deep_local_plan,
+            "deep_local.doctor": self.deep_local_doctor,
+            "deep_local.submit": self.deep_local_submit,
+            "deep_local.get": self.deep_local_get,
+            "deep_local.list": self.deep_local_list,
+            "deep_local.cancel": self.deep_local_cancel,
+            "deep_local.retry": self.deep_local_retry,
             "florence.verify_pack": self.florence_verify_pack,
             "florence.unload": self.florence_unload,
             "florence.smoke_test": self.florence_smoke_test,
@@ -209,6 +226,7 @@ class SidecarApp:
     def close(self) -> None:
         logger.info("backend shutdown profile_dir=%s", self.profile_dir)
         self.jobs.shutdown()
+        self.deep_local_jobs.shutdown()
         self.db.close()
 
     def dispatch(self, method: str, params: JsonDict | None) -> Any:
@@ -338,6 +356,45 @@ class SidecarApp:
 
     def models_refresh_capabilities(self, _params: JsonDict) -> list[JsonDict]:
         return self.models.refresh_capabilities()
+
+    def deep_local_status(self, _params: JsonDict) -> JsonDict:
+        return self.deep_local.status()
+
+    def deep_local_submit(self, params: JsonDict) -> JsonDict:
+        evidence = params.get("evidence")
+        if evidence is not None and not isinstance(evidence, list):
+            raise RpcError(-32602, "evidence must be a list of objects")
+        top_p = params.get("top_p")
+        if top_p is not None and (isinstance(top_p, bool) or not isinstance(top_p, (int, float))):
+            raise RpcError(-32602, "top_p must be a number")
+        return self.deep_local_jobs.submit(
+            question=require_str(params, "question"),
+            evidence=evidence,
+            model=optional_str(params, "model") or "",
+            request_id=optional_str(params, "request_id") or "",
+            max_output_tokens=optional_int(params, "max_output_tokens", 512),
+            temperature=optional_float(params, "temperature", 0.0),
+            top_p=float(top_p) if top_p is not None else None,
+            thinking=optional_str(params, "thinking") or "off",
+        )
+
+    def deep_local_get(self, params: JsonDict) -> JsonDict:
+        return self.deep_local_jobs.get(require_str(params, "job_id"))
+
+    def deep_local_list(self, params: JsonDict) -> list[JsonDict]:
+        return self.deep_local_jobs.list(limit=optional_int(params, "limit", 50))
+
+    def deep_local_cancel(self, params: JsonDict) -> JsonDict:
+        return self.deep_local_jobs.cancel(require_str(params, "job_id"))
+
+    def deep_local_retry(self, params: JsonDict) -> JsonDict:
+        return self.deep_local_jobs.retry(require_str(params, "job_id"))
+
+    def deep_local_plan(self, _params: JsonDict) -> JsonDict:
+        return self.deep_local.plan()
+
+    def deep_local_doctor(self, _params: JsonDict) -> JsonDict:
+        return self.deep_local.doctor()
 
     def florence_verify_pack(self, _params: JsonDict) -> JsonDict:
         return self.florence.verify_pack()
