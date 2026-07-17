@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,6 +35,9 @@ _LEGAL_TRANSITIONS = {
 MAX_QUEUED_JOBS = 32
 MAX_RETAINED_TERMINAL_JOBS = 100
 SHUTDOWN_GRACE_SECONDS = 2.0
+# Bounded cancel-first wait before a Source deletion gives up with a fixed
+# "busy" failure (V04_ESSENTIAL_SEMANTICS.md §D; V04_STORAGE_CLEANUP_DESIGN.md §8).
+DELETE_CANCEL_WAIT_SECONDS = 5.0
 
 # Fixed message codes; the frontend maps these to fixed plain-language copy.
 # Job payloads never carry raw errors, paths, filenames, or document text.
@@ -193,6 +197,52 @@ class JobService:
     def has_active_jobs(self) -> bool:
         with self._lock:
             return any(job.state not in TERMINAL_JOB_STATES for job in self._jobs.values())
+
+    def release_source(
+        self,
+        *,
+        document_id: str = "",
+        artifact_id: str = "",
+        timeout: float = DELETE_CANCEL_WAIT_SECONDS,
+    ) -> bool:
+        """Cancel-first, bounded-wait release of a source held by active jobs.
+
+        Requests cooperative cancel on every non-terminal job owning the
+        source, then waits up to `timeout` for them to reach a terminal
+        state. Returns True when no active job holds the source; False means
+        the caller must fail with a fixed "busy" message and stay retryable.
+        """
+
+        def _matching_locked() -> list[JobRecord]:
+            return [
+                job
+                for job in self._jobs.values()
+                if job.state not in TERMINAL_JOB_STATES
+                and (
+                    (document_id and job.document_id == document_id)
+                    or (artifact_id and job.artifact_id == artifact_id)
+                )
+            ]
+
+        if not document_id and not artifact_id:
+            return True
+        with self._lock:
+            matching = _matching_locked()
+            if not matching:
+                return True
+            for job in matching:
+                job.cancel_event.set()
+                if job.state != "cancel_requested":
+                    self._set_state_locked(job, "cancel_requested")
+        logger.info("source release requested cancelled_jobs=%s", len(matching))
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not _matching_locked():
+                    return True
+            time.sleep(0.05)
+        with self._lock:
+            return not _matching_locked()
 
     def shutdown(self, timeout: float = SHUTDOWN_GRACE_SECONDS) -> None:
         """Request cancel on every non-terminal job and wait briefly.
