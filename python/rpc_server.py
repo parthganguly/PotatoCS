@@ -18,6 +18,7 @@ from odysseus_desktop_backend.services.campaign_service import CampaignService
 from odysseus_desktop_backend.services.chat_service import ChatService
 from odysseus_desktop_backend.services.deep_local_jobs import DeepLocalJobService
 from odysseus_desktop_backend.services.deep_local_service import DeepLocalService
+from odysseus_desktop_backend.services.runtime_plan_service import RuntimePlanService
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.eval_service import EvalService
@@ -110,6 +111,7 @@ class SidecarApp:
             ocr=self.ocr,
         )
         self.deep_local = DeepLocalService(self.settings)
+        self.runtime_plan = RuntimePlanService()
         self.evals = EvalService(self.db)
         self.image_evals = ImageEvalService(self.db, self.artifacts, self.vision)
         recovered_analyses = self.artifacts.recover_interrupted_analysis_runs()
@@ -155,6 +157,10 @@ class SidecarApp:
             "models.capabilities": self.models_capabilities,
             "models.inspect": self.models_inspect,
             "models.refresh_capabilities": self.models_refresh_capabilities,
+            "runtime.inventory": self.runtime_inventory,
+            "runtime.benchmarks": self.runtime_benchmarks,
+            "runtime.plan": self.runtime_plan_get,
+            "runtime.recommendations": self.runtime_recommendations,
             "deep_local.status": self.deep_local_status,
             "deep_local.plan": self.deep_local_plan,
             "deep_local.doctor": self.deep_local_doctor,
@@ -356,6 +362,19 @@ class SidecarApp:
 
     def models_refresh_capabilities(self, _params: JsonDict) -> list[JsonDict]:
         return self.models.refresh_capabilities()
+
+    def runtime_inventory(self, _params: JsonDict) -> JsonDict:
+        return self.runtime_plan.inventory()
+
+    def runtime_benchmarks(self, _params: JsonDict) -> JsonDict:
+        return self.runtime_plan.benchmarks()
+
+    def runtime_plan_get(self, params: JsonDict) -> JsonDict:
+        objective = str(params.get("objective") or "balanced")
+        return self.runtime_plan.plan(objective)
+
+    def runtime_recommendations(self, _params: JsonDict) -> JsonDict:
+        return self.runtime_plan.recommendations()
 
     def deep_local_status(self, _params: JsonDict) -> JsonDict:
         return self.deep_local.status()
