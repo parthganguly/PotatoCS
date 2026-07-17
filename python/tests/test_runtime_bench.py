@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import json
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from odysseus_desktop_backend.runtime_bench import (
+    ARTIFACT_SCHEMA_VERSION,
+    BENCHMARK_SHAPES,
+    capability,
+    quality_check,
+    redaction_violations,
+    runtime_capability_matrix,
+    validate_artifact,
+    write_artifact,
+)
+from odysseus_desktop_backend.runtime_bench import harness
+from odysseus_desktop_backend.runtime_bench.shapes import (
+    LONG_CONTEXT_CODEWORD,
+    TINY_TOKEN,
+)
+
+
+def _minimal_run(**overrides) -> dict:
+    run = {
+        "run_index": 0,
+        "cold": False,
+        "options": {"temperature": 0},
+        "timings_ms": {"total": 10.0, "load": 1.0, "prompt_eval": 2.0, "generation": 3.0, "first_token": 4.0},
+        "tokens": {"prompt": 10, "generated": 5, "prompt_tps": 100.0, "generation_tps": 50.0},
+        "memory": {"runtime_peak_rss_bytes": 1, "system_min_available_bytes": 1, "vram_peak_used_bytes": None, "sampler_interval_ms": 250},
+        "quality_check": "passed",
+        "error_category": "",
+    }
+    run.update(overrides)
+    return run
+
+
+def _minimal_artifact(**overrides) -> dict:
+    artifact = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "batch_id": "test-batch",
+        "captured_at": "2026-07-17T00:00:00Z",
+        "hardware": {"cpu": {"logical_threads": 12}, "ram": {"total_bytes": 1}},
+        "runtime": {"name": "ollama", "version": "0.31.1", "server_env": {}},
+        "model": {"tag": "llama3.2:1b", "quantization": "Q8_0"},
+        "shape": "tiny",
+        "mode": "interactive",
+        "engine_kind": "real",
+        "runs": [_minimal_run()],
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+# -- schema --------------------------------------------------------------
+
+
+def test_artifact_schema_valid_case() -> None:
+    assert validate_artifact(_minimal_artifact()) == []
+
+
+def test_artifact_schema_rejects_missing_keys() -> None:
+    bad = _minimal_artifact()
+    del bad["hardware"]
+    assert any("missing top-level" in problem for problem in validate_artifact(bad))
+
+
+def test_artifact_schema_rejects_bad_shape_and_engine_kind() -> None:
+    problems = validate_artifact(_minimal_artifact(shape="giant", engine_kind="imaginary"))
+    assert any("invalid shape" in problem for problem in problems)
+    assert any("invalid engine_kind" in problem for problem in problems)
+
+
+def test_artifact_schema_rejects_non_allowlisted_server_env() -> None:
+    artifact = _minimal_artifact()
+    artifact["runtime"]["server_env"] = {"OLLAMA_API_KEY": "secret"}
+    assert any("not allow-listed" in problem for problem in validate_artifact(artifact))
+
+
+def test_artifact_schema_rejects_embedded_prompt_or_output() -> None:
+    artifact = _minimal_artifact(runs=[_minimal_run(prompt="hello"), _minimal_run(output="world")])
+    problems = validate_artifact(artifact)
+    assert any("must not embed prompt" in problem for problem in problems)
+    assert any("must not embed output" in problem for problem in problems)
+
+
+def test_artifact_schema_rejects_passed_quality_with_error() -> None:
+    artifact = _minimal_artifact(runs=[_minimal_run(error_category="timeout")])
+    assert any("cannot both pass" in problem for problem in validate_artifact(artifact))
+
+
+def test_failed_run_is_recorded_not_skipped() -> None:
+    artifact = _minimal_artifact(
+        runs=[_minimal_run(quality_check="not_applicable", error_category="timeout")]
+    )
+    assert validate_artifact(artifact) == []
+
+
+def test_cold_flag_must_be_boolean() -> None:
+    artifact = _minimal_artifact(runs=[_minimal_run(cold="yes")])
+    assert any("cold must be boolean" in problem for problem in validate_artifact(artifact))
+
+
+# -- redaction -----------------------------------------------------------
+
+
+def test_redaction_sentinel_flags_home_directory() -> None:
+    home = os.path.expanduser("~")
+    assert redaction_violations(f"data at {home}\\models") != []
+
+
+def test_redaction_sentinel_flags_windows_user_paths() -> None:
+    assert redaction_violations(r"C:\\Users\\SomeoneElse\\secret.gguf") != []
+    assert redaction_violations(r"C:\Users\Other\file") != []
+
+
+def test_redaction_sentinel_accepts_clean_payload() -> None:
+    payload = json.dumps(_minimal_artifact())
+    assert redaction_violations(payload) == []
+
+
+def test_write_artifact_refuses_redaction_violation(tmp_path) -> None:
+    artifact = _minimal_artifact(batch_id="bad-batch")
+    artifact["notes"] = "model at " + os.path.expanduser("~")
+    with pytest.raises(ValueError, match="redaction"):
+        write_artifact(artifact, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_artifact_round_trip(tmp_path) -> None:
+    path = write_artifact(_minimal_artifact(), tmp_path)
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    assert loaded["batch_id"] == "test-batch"
+    assert validate_artifact(loaded) == []
+
+
+# -- shapes / quality ----------------------------------------------------
+
+
+def test_all_shapes_present_with_prompts() -> None:
+    assert set(BENCHMARK_SHAPES) == {"tiny", "medium", "long_context", "repeat", "grounded", "overcommit"}
+    for spec in BENCHMARK_SHAPES.values():
+        assert spec["prompt"].strip()
+        assert spec["num_predict"] > 0
+
+
+def test_shapes_are_deterministic() -> None:
+    from odysseus_desktop_backend.runtime_bench import shapes as shapes_module
+
+    assert shapes_module.BENCHMARK_SHAPES["medium"]["prompt"] == BENCHMARK_SHAPES["repeat"]["prompt"]
+    assert BENCHMARK_SHAPES["long_context"]["prompt"].count(LONG_CONTEXT_CODEWORD) == 1
+
+
+def test_quality_checks() -> None:
+    assert quality_check("tiny", f"Sure! {TINY_TOKEN}") == "passed"
+    assert quality_check("tiny", "no token here") == "failed"
+    assert quality_check("long_context", f"The codeword is {LONG_CONTEXT_CODEWORD}.") == "passed"
+    assert quality_check("long_context", "I cannot find it") == "failed"
+    assert quality_check("grounded", "The fee is 4,750 rupees per community_hall_minutes.pdf") == "passed"
+    assert quality_check("grounded", "The fee is 9,999 rupees") == "failed"
+    long_summary = "The committee prioritized lighthouse repairs and harbor dredging before winter storms arrive." * 2
+    assert quality_check("medium", long_summary) == "passed"
+    assert quality_check("overcommit", "anything") == "not_applicable"
+    with pytest.raises(ValueError):
+        quality_check("nonexistent", "text")
+
+
+# -- capability matrix ---------------------------------------------------
+
+
+def test_capability_matrix_shape() -> None:
+    matrix = runtime_capability_matrix()
+    assert set(matrix) == {"ollama", "llamacpp", "colibri"}
+    for caps in matrix.values():
+        for entry in caps.values():
+            assert entry["state"] in {"supported", "unsupported", "unknown"}
+            assert entry["evidence"] in {"binary_help", "live_probe", "measured", "unknown"}
+
+
+def test_capability_lookup_degrades_to_unknown() -> None:
+    assert capability("ollama", "speculative_decoding")["state"] == "unsupported"
+    assert capability("ollama", "made_up")["state"] == "unknown"
+    assert capability("made_up_runtime", "batch_size")["state"] == "unknown"
+
+
+def test_unknown_capabilities_have_no_fake_evidence() -> None:
+    for caps in runtime_capability_matrix().values():
+        for entry in caps.values():
+            if entry["state"] == "unknown":
+                assert entry["evidence"] == "unknown"
+
+
+# -- streaming client against a fake loopback server ---------------------
+
+
+class _FakeOllamaHandler(BaseHTTPRequestHandler):
+    behavior = "ok"
+
+    def log_message(self, *args) -> None:  # noqa: A003 - silence
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/api/ps":
+            body = json.dumps({"models": []}).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        if self.path != "/api/chat":
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        if self.behavior == "ok":
+            chunks = [
+                {"message": {"role": "assistant", "content": TINY_TOKEN}, "done": False},
+                {
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "load_duration": 1_000_000,
+                    "prompt_eval_count": 12,
+                    "prompt_eval_duration": 2_000_000,
+                    "eval_count": 4,
+                    "eval_duration": 500_000_000,
+                },
+            ]
+            for chunk in chunks:
+                self.wfile.write((json.dumps(chunk) + "\n").encode())
+        elif self.behavior == "garbage":
+            self.wfile.write(b"this is not json\n")
+
+
+@pytest.fixture()
+def fake_ollama():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_run_ollama_shape_success(fake_ollama: str) -> None:
+    _FakeOllamaHandler.behavior = "ok"
+    record = harness.run_ollama_shape(
+        model="fake-model",
+        shape="tiny",
+        endpoint=fake_ollama,
+        timeout=10,
+        cold=True,
+        sample_vram=False,
+    )
+    assert record["error_category"] == ""
+    assert record["quality_check"] == "passed"
+    assert record["cold"] is True
+    assert record["tokens"] == {"prompt": 12, "generated": 4, "prompt_tps": 6000.0, "generation_tps": 8.0}
+    assert record["timings_ms"]["first_token"] is not None
+    assert record["timings_ms"]["load"] == 1.0
+    assert record["memory"]["sampler_interval_ms"] == 250
+
+
+def test_run_ollama_shape_malformed_stream(fake_ollama: str) -> None:
+    _FakeOllamaHandler.behavior = "garbage"
+    record = harness.run_ollama_shape(
+        model="fake-model",
+        shape="tiny",
+        endpoint=fake_ollama,
+        timeout=10,
+        sample_vram=False,
+    )
+    assert record["error_category"] == harness.ERROR_MALFORMED
+    assert record["quality_check"] == "not_applicable"
+
+
+def test_run_ollama_shape_connection_refused() -> None:
+    record = harness.run_ollama_shape(
+        model="fake-model",
+        shape="tiny",
+        endpoint="http://127.0.0.1:9",  # discard port: nothing listens
+        timeout=3,
+        sample_vram=False,
+    )
+    assert record["error_category"] in {harness.ERROR_CONNECTION, harness.ERROR_TIMEOUT}
+    assert record["quality_check"] == "not_applicable"
+
+
+def test_run_record_never_contains_prompt_or_output(fake_ollama: str) -> None:
+    _FakeOllamaHandler.behavior = "ok"
+    record = harness.run_ollama_shape(
+        model="fake-model",
+        shape="tiny",
+        endpoint=fake_ollama,
+        timeout=10,
+        sample_vram=False,
+    )
+    serialized = json.dumps(record)
+    assert BENCHMARK_SHAPES["tiny"]["prompt"] not in serialized
+    assert TINY_TOKEN not in serialized
