@@ -29,6 +29,7 @@ from odysseus_desktop_backend.services.rag_service import RAGService
 from odysseus_desktop_backend.services.session_service import SessionService
 from odysseus_desktop_backend.services.source_service import SourceService
 from odysseus_desktop_backend.services.settings_service import SettingsService
+from odysseus_desktop_backend.services.storage_service import StorageService
 from odysseus_desktop_backend.services.vector_store import SQLiteNumPyVectorStore
 from odysseus_desktop_backend.services.vision_service import VisionService
 from odysseus_desktop_backend.storage import Database
@@ -129,6 +130,12 @@ class SidecarApp:
                 repaired["ocr_reset"],
             )
         self.jobs = JobService(self.profile_dir)
+        self.storage = StorageService(
+            self.db,
+            self.documents,
+            self.artifacts,
+            has_active_jobs=self.jobs.has_active_jobs,
+        )
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
             "health.ping": self.health_ping,
@@ -178,6 +185,9 @@ class SidecarApp:
             "jobs.get": self.jobs_get,
             "jobs.list": self.jobs_list,
             "jobs.cancel": self.jobs_cancel,
+            "storage.status": self.storage_status,
+            "storage.cleanup_preview": self.storage_cleanup_preview,
+            "storage.cleanup": self.storage_cleanup,
             "legacy.import": self.legacy_import_folder,
             "rag.search": self.rag_search,
             "rag.health": self.rag_health,
@@ -376,7 +386,23 @@ class SidecarApp:
         )
 
     def sources_delete(self, params: JsonDict) -> JsonDict:
-        return self.sources.delete(require_str(params, "backend_kind"), require_str(params, "source_id"))
+        backend_kind = require_str(params, "backend_kind")
+        source_id = require_str(params, "source_id")
+        self._release_source_for_delete(backend_kind, source_id)
+        return self.sources.delete(backend_kind, source_id)
+
+    def _release_source_for_delete(self, backend_kind: str, source_id: str) -> None:
+        """Cancel-first bounded wait; fixed 'source_busy' failure on timeout.
+
+        Deletion never runs concurrently with a job that owns the source
+        (V04_ESSENTIAL_SEMANTICS.md §D; V04_STORAGE_CLEANUP_DESIGN.md §8).
+        """
+        released = self.jobs.release_source(
+            document_id=source_id if backend_kind == "document" else "",
+            artifact_id=source_id if backend_kind == "artifact" else "",
+        )
+        if not released:
+            raise RpcError(-32051, "source_busy")
 
     def sources_conversation_context(self, params: JsonDict) -> list[JsonDict]:
         return self.sources.conversation_context(require_str(params, "session_id"))
@@ -468,7 +494,9 @@ class SidecarApp:
             return {"document": indexed["document"], "index": indexed}
 
     def documents_delete(self, params: JsonDict) -> JsonDict:
-        return self.rag.delete_document(require_str(params, "document_id"))
+        document_id = require_str(params, "document_id")
+        self._release_source_for_delete("document", document_id)
+        return self.rag.delete_document(document_id)
 
     def documents_reindex(self, params: JsonDict) -> JsonDict:
         return self.sources.index_document(require_str(params, "document_id"))
@@ -502,6 +530,15 @@ class SidecarApp:
 
     def jobs_cancel(self, params: JsonDict) -> JsonDict:
         return self.jobs.cancel(require_str(params, "job_id"))
+
+    def storage_status(self, _params: JsonDict) -> JsonDict:
+        return self.storage.status()
+
+    def storage_cleanup_preview(self, _params: JsonDict) -> JsonDict:
+        return self.storage.cleanup_preview()
+
+    def storage_cleanup(self, _params: JsonDict) -> JsonDict:
+        return self.storage.cleanup()
 
     def legacy_import_folder(self, params: JsonDict) -> JsonDict:
         return self.legacy_import.import_folder(require_str(params, "folder"))
