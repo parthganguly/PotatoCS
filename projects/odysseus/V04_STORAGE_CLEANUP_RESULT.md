@@ -8,7 +8,7 @@ for independent review. Design authority: `V04_STORAGE_CLEANUP_DESIGN.md`
 ## Commits
 
 - Base: `3bbe44512af8cf156bc044dc43e5a4f04a264879` (Merge PR #32)
-- Head: `HEAD_SHA_PLACEHOLDER`
+- Head: `92318dcc40eb12cccafe7c497d4aa5d7141a56dd` + this SHA-stamp amendment
 
 Checkpoints: design (`8d110540`), backend (`be6cae7b`), UI + Rust contracts
 (`adadaba8`), tests (`163d1588`), report (this commit).
