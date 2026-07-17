@@ -85,18 +85,31 @@ def _run(
             f"The Colibri readiness check did not finish within {timeout:g} seconds.",
         )
     except OSError as exc:
-        logger.warning("colibri cli launch failed subcommand=%s error=%s", subcommand, exc)
+        # Never log the exception text: OSError messages embed the argv,
+        # which contains the CLI (and possibly model) path.
+        logger.warning(
+            "colibri cli launch failed subcommand=%s error_type=%s",
+            subcommand,
+            type(exc).__name__,
+        )
         return _error("unavailable", "The configured Colibri command-line tool could not be started.")
     stdout = completed.stdout[:MAX_CLI_OUTPUT_BYTES].decode("utf-8", errors="replace")
     stderr = completed.stderr[:MAX_CLI_OUTPUT_BYTES].decode("utf-8", errors="replace")
     if stderr.strip():
-        # stderr stays in developer logs only; it can contain paths.
-        logger.info("colibri %s stderr: %s", subcommand, stderr.strip().splitlines()[0])
+        # stderr routinely contains CLI/model directories and other machine
+        # detail. It is never logged and never leaves this module; only its
+        # presence and size are observable.
+        logger.info(
+            "colibri %s wrote stderr bytes=%s exit_code=%s",
+            subcommand,
+            len(completed.stderr),
+            completed.returncode,
+        )
     return {
         "ok": True,
         "exit_code": completed.returncode,
         "stdout": stdout,
-        "stderr": stderr,
+        "stderr_present": bool(stderr.strip()),
     }
 
 
@@ -145,12 +158,14 @@ def run_plan(cli_path: str, model_path: str = "", *, timeout: float = CLI_TIMEOU
         return outcome
     if outcome["exit_code"] != 0:
         # Upstream cmd_plan sys.exit()s with a plain-text message on failure;
-        # there is no JSON to parse on this path.
-        first_line = (outcome["stderr"].strip() or outcome["stdout"].strip() or "unknown error").splitlines()[0]
+        # there is no JSON on this path, and the message routinely embeds the
+        # model directory — so it is never returned or logged. Fixed code and
+        # plain-language copy only.
         return _error(
             "plan_failed",
-            "Colibri could not build a resource plan for this model directory.",
-            detail=first_line,
+            "Colibri could not build a resource plan for this model folder. "
+            "Check that the folder exists and contains the model's config.json "
+            "and safetensors files.",
         )
     plan = _parse_json(outcome["stdout"])
     if plan is None:

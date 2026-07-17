@@ -56,6 +56,14 @@ def main() -> int:
     if MODE == "plan_error":
         print("cannot create resource plan: no safetensors shards: /bad/path", file=sys.stderr)
         return 1
+    if MODE == "hostile":
+        # Adversarial failure: stderr and stdout stuffed with everything the
+        # wrapper must never surface — paths, usernames, keys, env contents.
+        hostile = os.environ.get("FAKE_COLI_HOSTILE_TEXT", "HOSTILE")
+        env_dump = json.dumps(dict(os.environ))
+        print(f"scanning {hostile} as user {hostile}\n{env_dump}", file=sys.stderr)
+        print(f"fatal: cannot read {hostile}", file=sys.stdout)
+        return 1
     if MODE == "plan_unknown_version":
         plan = json.loads((HERE / "plan_v2.json").read_text(encoding="utf-8"))
         plan["version"] = 99

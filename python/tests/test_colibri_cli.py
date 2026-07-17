@@ -94,7 +94,10 @@ def test_plan_failure_exit_code_is_not_json(monkeypatch: pytest.MonkeyPatch) -> 
     outcome = colibri_cli.run_plan(FAKE_COLI, "")
     assert outcome["ok"] is False
     assert outcome["error_category"] == "plan_failed"
-    assert "safetensors" in outcome["detail"]
+    # Fixed plain-language copy only: upstream's failure text (which embeds
+    # the model directory) must never surface as RPC-visible detail.
+    assert "detail" not in outcome
+    assert "model folder" in outcome["error"]
 
 
 def test_plan_unknown_version_fails_safely(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,6 +150,76 @@ def test_doctor_invalid_arguments_exit_2(monkeypatch: pytest.MonkeyPatch) -> Non
     assert outcome["overall"] == "invalid_arguments"
     assert outcome["exit_code"] == 2
     assert outcome["checks"][0]["id"] == "config.arguments"
+
+
+# -- hostile-output privacy sentinels ----------------------------------------
+
+# Values the wrapper must never surface, whether the CLI echoes them itself
+# or they ride along in launch errors / environment dumps.
+SENTINEL_MODEL_PATH = "C:/SENTINEL-MODELS/glm52-secret-project"
+SENTINEL_USERNAME = "SENTINEL-USER-carlos"
+SENTINEL_API_KEY = "SENTINEL-HOSTILE-KEY-77aa"
+
+
+def _assert_clean(payload: str, log_text: str, *, cli_path: str) -> None:
+    for sentinel in (SENTINEL_MODEL_PATH, SENTINEL_USERNAME, SENTINEL_API_KEY, cli_path):
+        assert sentinel not in payload, f"sentinel leaked into RPC-visible result: {sentinel}"
+        assert sentinel not in log_text, f"sentinel leaked into logs: {sentinel}"
+
+
+@pytest.fixture()
+def hostile_env(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Hostile CLI mode: stderr/stdout stuffed with the model path, a fake
+    username, and a full environment dump (which would include the API key
+    were it not stripped from the child environment)."""
+    set_mode(monkeypatch, "hostile")
+    hostile_text = f"{SENTINEL_MODEL_PATH} {SENTINEL_USERNAME}"
+    monkeypatch.setenv("FAKE_COLI_HOSTILE_TEXT", hostile_text)
+    monkeypatch.setenv("COLI_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setenv("ODYSSEUS_COLIBRI_API_KEY", SENTINEL_API_KEY)
+    return hostile_text
+
+
+def test_plan_failure_leaks_nothing_hostile(
+    hostile_env: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        outcome = colibri_cli.run_plan(FAKE_COLI, SENTINEL_MODEL_PATH)
+    assert outcome["ok"] is False
+    assert outcome["error_category"] == "plan_failed"
+    _assert_clean(json.dumps(outcome), caplog.text, cli_path=FAKE_COLI)
+
+
+def test_doctor_hostile_output_leaks_nothing(
+    hostile_env: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        outcome = colibri_cli.run_doctor(FAKE_COLI, SENTINEL_MODEL_PATH)
+    assert outcome["ok"] is False
+    # Hostile stdout is not JSON, so the doctor path fails as malformed.
+    assert outcome["error_category"] == "malformed_response"
+    _assert_clean(json.dumps(outcome), caplog.text, cli_path=FAKE_COLI)
+
+
+def test_launch_failure_never_logs_cli_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolvable file that cannot execute raises OSError whose message
+    embeds the argv; only the error type may be logged."""
+    import logging
+
+    monkeypatch.setenv("ODYSSEUS_COLIBRI_API_KEY", SENTINEL_API_KEY)
+    broken = tmp_path / "SENTINEL-USER-carlos-coli.exe"
+    broken.write_bytes(b"MZ not a real executable")
+    with caplog.at_level(logging.DEBUG):
+        outcome = colibri_cli.run_plan(str(broken), SENTINEL_MODEL_PATH)
+    assert outcome["ok"] is False
+    assert outcome["error_category"] == "unavailable"
+    _assert_clean(json.dumps(outcome), caplog.text, cli_path=str(broken))
 
 
 # -- DeepLocalService wiring -------------------------------------------------
