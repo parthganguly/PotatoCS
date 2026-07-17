@@ -1,0 +1,190 @@
+{
+ "batch_id": "llamacpp-b10064-llama32-1b-tiny-cpu6t",
+ "captured_at": "2026-07-17T20:21:05Z",
+ "engine_kind": "real",
+ "file_cache_state": "unknown_warmish",
+ "hardware": {
+  "captured_at_ms": 1784319665702,
+  "cpu": {
+   "isa": {
+    "avx": true,
+    "avx2": true,
+    "avx512f": false,
+    "sse4_1": true,
+    "sse4_2": true,
+    "ssse3": true
+   },
+   "logical_threads": 12,
+   "physical_cores": 6,
+   "physical_cores_source": "measured"
+  },
+  "gpus": [
+   {
+    "driver_version": "596.36",
+    "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "source": "nvidia-smi",
+    "vendor": "nvidia",
+    "vram_free_bytes": 195035136,
+    "vram_total_bytes": 4294967296
+   }
+  ],
+  "npu": "none_detected",
+  "os": {
+   "arch": "AMD64",
+   "name": "Windows",
+   "version": "10.0.26200"
+  },
+  "ram": {
+   "available_bytes": 368078848,
+   "total_bytes": 16556589056
+  },
+  "schema_version": 1,
+  "storage": {
+   "kind": "unknown",
+   "model_store_disk_free_bytes": 46057336832,
+   "profile_disk_free_bytes": null
+  }
+ },
+ "mode": "interactive",
+ "model": {
+  "disk_bytes": 1321082688,
+  "format": "gguf",
+  "parameter_size": "1.2B",
+  "quantization": "Q8_0",
+  "tag": "llama3.2:1b (same GGUF blob as Ollama)"
+ },
+ "notes": "llama-server CPU build, -c 8192 -t 6, same blob as Ollama; server-side cache_prompt on",
+ "runs": [
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1992044544,
+    "sampler_interval_ms": 250,
+    "samples": 1,
+    "system_min_available_bytes": 393953280,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 32,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 0,
+   "timings_ms": {
+    "first_token": 3168.3,
+    "generation": 356.3,
+    "load": null,
+    "prompt_eval": 673.1,
+    "total": 5596.7
+   },
+   "tokens": {
+    "generated": 6,
+    "generation_tps": 16.84,
+    "prompt": 31,
+    "prompt_tps": 46.06
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1992077312,
+    "sampler_interval_ms": 250,
+    "samples": 2,
+    "system_min_available_bytes": 389550080,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 32,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 1,
+   "timings_ms": {
+    "first_token": 71.1,
+    "generation": 325.3,
+    "load": null,
+    "prompt_eval": 68.0,
+    "total": 397.3
+   },
+   "tokens": {
+    "generated": 6,
+    "generation_tps": 18.44,
+    "prompt": 1,
+    "prompt_tps": 14.7
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1992097792,
+    "sampler_interval_ms": 250,
+    "samples": 2,
+    "system_min_available_bytes": 381231104,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 32,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 2,
+   "timings_ms": {
+    "first_token": 72.2,
+    "generation": 325.4,
+    "load": null,
+    "prompt_eval": 69.4,
+    "total": 398.0
+   },
+   "tokens": {
+    "generated": 6,
+    "generation_tps": 18.44,
+    "prompt": 1,
+    "prompt_tps": 14.41
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1992118272,
+    "sampler_interval_ms": 250,
+    "samples": 2,
+    "system_min_available_bytes": 372428800,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 32,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 3,
+   "timings_ms": {
+    "first_token": 72.8,
+    "generation": 347.9,
+    "load": null,
+    "prompt_eval": 70.4,
+    "total": 421.5
+   },
+   "tokens": {
+    "generated": 6,
+    "generation_tps": 17.24,
+    "prompt": 1,
+    "prompt_tps": 14.2
+   }
+  }
+ ],
+ "runtime": {
+  "name": "llamacpp",
+  "server_env": {},
+  "version": "b10064 (86d86ed4)"
+ },
+ "schema_version": 1,
+ "shape": "tiny"
+}

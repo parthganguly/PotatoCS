@@ -1,0 +1,218 @@
+{
+ "batch_id": "ollama-0311-llama32-3b-medium-flashkv",
+ "captured_at": "2026-07-17T20:12:08Z",
+ "engine_kind": "real",
+ "file_cache_state": "unknown_warmish",
+ "hardware": {
+  "captured_at_ms": 1784319128253,
+  "cpu": {
+   "isa": {
+    "avx": true,
+    "avx2": true,
+    "avx512f": false,
+    "sse4_1": true,
+    "sse4_2": true,
+    "ssse3": true
+   },
+   "logical_threads": 12,
+   "physical_cores": 6,
+   "physical_cores_source": "measured"
+  },
+  "gpus": [
+   {
+    "driver_version": "596.36",
+    "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "source": "nvidia-smi",
+    "vendor": "nvidia",
+    "vram_free_bytes": 89128960,
+    "vram_total_bytes": 4294967296
+   }
+  ],
+  "npu": "none_detected",
+  "os": {
+   "arch": "AMD64",
+   "name": "Windows",
+   "version": "10.0.26200"
+  },
+  "ram": {
+   "available_bytes": 479977472,
+   "total_bytes": 16556589056
+  },
+  "schema_version": 1,
+  "storage": {
+   "kind": "unknown",
+   "model_store_disk_free_bytes": 61103054848,
+   "profile_disk_free_bytes": null
+  }
+ },
+ "mode": "interactive",
+ "model": {
+  "disk_bytes": 2019393189,
+  "format": "gguf",
+  "parameter_size": "3.2B",
+  "quantization": "Q4_K_M",
+  "tag": "llama3.2:latest"
+ },
+ "notes": "flash attention + q8_0 KV cache",
+ "runs": [
+  {
+   "cold": true,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 348372992,
+    "sampler_interval_ms": 250,
+    "samples": 93,
+    "system_min_available_bytes": 461115392,
+    "vram_peak_used_bytes": 4088397824
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.847,
+    "size_bytes": 2702652209,
+    "size_vram_bytes": 2289209180
+   },
+   "run_index": 0,
+   "timings_ms": {
+    "first_token": 14580.7,
+    "generation": 13921.5,
+    "load": 12438.8,
+    "prompt_eval": 2122.0,
+    "total": 28499.7
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 7.61,
+    "prompt": 480,
+    "prompt_tps": 226.2
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 97685504,
+    "sampler_interval_ms": 250,
+    "samples": 18,
+    "system_min_available_bytes": 553435136,
+    "vram_peak_used_bytes": 4069523456
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.847,
+    "size_bytes": 2702652209,
+    "size_vram_bytes": 2289209180
+   },
+   "run_index": 1,
+   "timings_ms": {
+    "first_token": 371.4,
+    "generation": 4723.6,
+    "load": 320.7,
+    "prompt_eval": 42.1,
+    "total": 5095.0
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 22.44,
+    "prompt": 480,
+    "prompt_tps": 11411.18
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 99282944,
+    "sampler_interval_ms": 250,
+    "samples": 18,
+    "system_min_available_bytes": 542240768,
+    "vram_peak_used_bytes": 4069523456
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.847,
+    "size_bytes": 2702652209,
+    "size_vram_bytes": 2289209180
+   },
+   "run_index": 2,
+   "timings_ms": {
+    "first_token": 365.0,
+    "generation": 4729.6,
+    "load": 315.2,
+    "prompt_eval": 41.6,
+    "total": 5095.2
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 22.41,
+    "prompt": 480,
+    "prompt_tps": 11529.59
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 101298176,
+    "sampler_interval_ms": 250,
+    "samples": 19,
+    "system_min_available_bytes": 401477632,
+    "vram_peak_used_bytes": 4085252096
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.847,
+    "size_bytes": 2702652209,
+    "size_vram_bytes": 2289209180
+   },
+   "run_index": 3,
+   "timings_ms": {
+    "first_token": 538.0,
+    "generation": 5397.1,
+    "load": 476.4,
+    "prompt_eval": 48.5,
+    "total": 5935.5
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 19.64,
+    "prompt": 480,
+    "prompt_tps": 9886.71
+   }
+  }
+ ],
+ "runtime": {
+  "name": "ollama",
+  "server_env": {
+   "OLLAMA_FLASH_ATTENTION": "1",
+   "OLLAMA_KV_CACHE_TYPE": "q8_0",
+   "OLLAMA_NO_CLOUD": "1"
+  },
+  "version": "0.31.1"
+ },
+ "schema_version": 1,
+ "shape": "medium"
+}

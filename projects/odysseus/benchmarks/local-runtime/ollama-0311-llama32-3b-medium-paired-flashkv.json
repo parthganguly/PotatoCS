@@ -1,0 +1,209 @@
+{
+ "batch_id": "ollama-0311-llama32-3b-medium-paired-flashkv",
+ "captured_at": "2026-07-17T20:19:03Z",
+ "engine_kind": "real",
+ "file_cache_state": "unknown_warmish",
+ "hardware": {
+  "captured_at_ms": 1784319543165,
+  "cpu": {
+   "isa": {
+    "avx": true,
+    "avx2": true,
+    "avx512f": false,
+    "sse4_1": true,
+    "sse4_2": true,
+    "ssse3": true
+   },
+   "logical_threads": 12,
+   "physical_cores": 6,
+   "physical_cores_source": "measured"
+  },
+  "gpus": [],
+  "npu": "none_detected",
+  "os": {
+   "arch": "AMD64",
+   "name": "Windows",
+   "version": "10.0.26200"
+  },
+  "ram": {
+   "available_bytes": 53059584,
+   "total_bytes": 16556589056
+  },
+  "schema_version": 1,
+  "storage": {
+   "kind": "unknown",
+   "model_store_disk_free_bytes": 46056914944,
+   "profile_disk_free_bytes": null
+  }
+ },
+ "mode": "interactive",
+ "model": {
+  "disk_bytes": 2019393189,
+  "format": "gguf",
+  "parameter_size": "3.2B",
+  "quantization": "Q4_K_M",
+  "tag": "llama3.2:latest"
+ },
+ "notes": "paired arm B: flash attention + q8_0 KV, same ambient VRAM as default arm",
+ "runs": [
+  {
+   "cold": true,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 5741559808,
+    "sampler_interval_ms": 250,
+    "samples": 61,
+    "system_min_available_bytes": 28577792,
+    "vram_peak_used_bytes": 4024434688
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 1.0,
+    "size_bytes": 2334591548,
+    "size_vram_bytes": 2334591548
+   },
+   "run_index": 0,
+   "timings_ms": {
+    "first_token": 32123.6,
+    "generation": 4564.4,
+    "load": 30046.1,
+    "prompt_eval": 2053.6,
+    "total": 36742.4
+   },
+   "tokens": {
+    "generated": 108,
+    "generation_tps": 23.66,
+    "prompt": 480,
+    "prompt_tps": 233.74
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 5192212480,
+    "sampler_interval_ms": 250,
+    "samples": 19,
+    "system_min_available_bytes": 176603136,
+    "vram_peak_used_bytes": 4018143232
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 1.0,
+    "size_bytes": 2334591548,
+    "size_vram_bytes": 2334591548
+   },
+   "run_index": 1,
+   "timings_ms": {
+    "first_token": 1240.2,
+    "generation": 4475.1,
+    "load": 1191.1,
+    "prompt_eval": 41.4,
+    "total": 5715.8
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 23.69,
+    "prompt": 480,
+    "prompt_tps": 11597.56
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 4995268608,
+    "sampler_interval_ms": 250,
+    "samples": 16,
+    "system_min_available_bytes": 38678528,
+    "vram_peak_used_bytes": 4018143232
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 1.0,
+    "size_bytes": 2334591548,
+    "size_vram_bytes": 2334591548
+   },
+   "run_index": 2,
+   "timings_ms": {
+    "first_token": 347.4,
+    "generation": 4570.0,
+    "load": 296.2,
+    "prompt_eval": 40.5,
+    "total": 4917.8
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 23.19,
+    "prompt": 480,
+    "prompt_tps": 11855.36
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 4600352768,
+    "sampler_interval_ms": 250,
+    "samples": 20,
+    "system_min_available_bytes": 16580608,
+    "vram_peak_used_bytes": 4018143232
+   },
+   "options": {
+    "num_predict": 256,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 1.0,
+    "size_bytes": 2334591548,
+    "size_vram_bytes": 2334591548
+   },
+   "run_index": 3,
+   "timings_ms": {
+    "first_token": 5887.4,
+    "generation": 4476.4,
+    "load": 5539.2,
+    "prompt_eval": 322.3,
+    "total": 10364.0
+   },
+   "tokens": {
+    "generated": 106,
+    "generation_tps": 23.68,
+    "prompt": 480,
+    "prompt_tps": 1489.14
+   }
+  }
+ ],
+ "runtime": {
+  "name": "ollama",
+  "server_env": {
+   "OLLAMA_FLASH_ATTENTION": "1",
+   "OLLAMA_KV_CACHE_TYPE": "q8_0",
+   "OLLAMA_NO_CLOUD": "1"
+  },
+  "version": "0.31.1"
+ },
+ "schema_version": 1,
+ "shape": "medium"
+}

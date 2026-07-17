@@ -101,6 +101,8 @@ def run_ollama_shape(
     if think is not None:
         payload["think"] = think
 
+    # "llama" matches ollama.exe, "ollama app.exe", AND Ollama's runner
+    # subprocess llama-server.exe (which carries the model weights).
     smi = ri._nvidia_smi_path() if sample_vram else None
     recorded_options = dict(clean_options)
     if think is not None:
@@ -120,7 +122,7 @@ def run_ollama_shape(
     first_token_ms: float | None = None
     final_stats: dict[str, Any] = {}
     started = time.perf_counter()
-    with ResourceSampler(exe_substring="ollama", smi_path=smi) as sampler:
+    with ResourceSampler(exe_substring="llama", smi_path=smi) as sampler:
         try:
             with _post_stream(f"{endpoint}/api/chat", payload, timeout) as resp:
                 for raw_line in resp:

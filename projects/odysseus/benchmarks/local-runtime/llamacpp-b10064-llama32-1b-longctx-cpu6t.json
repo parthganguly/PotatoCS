@@ -1,0 +1,190 @@
+{
+ "batch_id": "llamacpp-b10064-llama32-1b-longctx-cpu6t",
+ "captured_at": "2026-07-17T20:22:55Z",
+ "engine_kind": "real",
+ "file_cache_state": "unknown_warmish",
+ "hardware": {
+  "captured_at_ms": 1784319775647,
+  "cpu": {
+   "isa": {
+    "avx": true,
+    "avx2": true,
+    "avx512f": false,
+    "sse4_1": true,
+    "sse4_2": true,
+    "ssse3": true
+   },
+   "logical_threads": 12,
+   "physical_cores": 6,
+   "physical_cores_source": "measured"
+  },
+  "gpus": [
+   {
+    "driver_version": "596.36",
+    "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "source": "nvidia-smi",
+    "vendor": "nvidia",
+    "vram_free_bytes": 195035136,
+    "vram_total_bytes": 4294967296
+   }
+  ],
+  "npu": "none_detected",
+  "os": {
+   "arch": "AMD64",
+   "name": "Windows",
+   "version": "10.0.26200"
+  },
+  "ram": {
+   "available_bytes": 253394944,
+   "total_bytes": 16556589056
+  },
+  "schema_version": 1,
+  "storage": {
+   "kind": "unknown",
+   "model_store_disk_free_bytes": 46057369600,
+   "profile_disk_free_bytes": null
+  }
+ },
+ "mode": "interactive",
+ "model": {
+  "disk_bytes": 1321082688,
+  "format": "gguf",
+  "parameter_size": "1.2B",
+  "quantization": "Q8_0",
+  "tag": "llama3.2:1b (same GGUF blob as Ollama)"
+ },
+ "notes": "llama-server CPU build, -c 8192 -t 6, same blob as Ollama; server-side cache_prompt on",
+ "runs": [
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1909698560,
+    "sampler_interval_ms": 250,
+    "samples": 268,
+    "system_min_available_bytes": 43941888,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 64,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 0,
+   "timings_ms": {
+    "first_token": 70579.3,
+    "generation": 1178.9,
+    "load": null,
+    "prompt_eval": 70558.5,
+    "total": 71772.2
+   },
+   "tokens": {
+    "generated": 10,
+    "generation_tps": 8.48,
+    "prompt": 5114,
+    "prompt_tps": 72.48
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1787052032,
+    "sampler_interval_ms": 250,
+    "samples": 4,
+    "system_min_available_bytes": 114655232,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 64,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 1,
+   "timings_ms": {
+    "first_token": 121.6,
+    "generation": 924.1,
+    "load": null,
+    "prompt_eval": 110.6,
+    "total": 1046.7
+   },
+   "tokens": {
+    "generated": 10,
+    "generation_tps": 10.82,
+    "prompt": 1,
+    "prompt_tps": 9.04
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1740410880,
+    "sampler_interval_ms": 250,
+    "samples": 6,
+    "system_min_available_bytes": 187740160,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 64,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 2,
+   "timings_ms": {
+    "first_token": 589.2,
+    "generation": 919.1,
+    "load": null,
+    "prompt_eval": 96.6,
+    "total": 1509.5
+   },
+   "tokens": {
+    "generated": 10,
+    "generation_tps": 10.88,
+    "prompt": 1,
+    "prompt_tps": 10.36
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 1740464128,
+    "sampler_interval_ms": 250,
+    "samples": 4,
+    "system_min_available_bytes": 252530688,
+    "vram_peak_used_bytes": null
+   },
+   "options": {
+    "n_predict": 64,
+    "seed": 42,
+    "temperature": 0
+   },
+   "quality_check": "passed",
+   "run_index": 3,
+   "timings_ms": {
+    "first_token": 107.8,
+    "generation": 923.6,
+    "load": null,
+    "prompt_eval": 100.9,
+    "total": 1032.1
+   },
+   "tokens": {
+    "generated": 10,
+    "generation_tps": 10.83,
+    "prompt": 1,
+    "prompt_tps": 9.91
+   }
+  }
+ ],
+ "runtime": {
+  "name": "llamacpp",
+  "server_env": {},
+  "version": "b10064 (86d86ed4)"
+ },
+ "schema_version": 1,
+ "shape": "long_context"
+}
