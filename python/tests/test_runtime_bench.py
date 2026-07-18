@@ -175,6 +175,10 @@ def test_write_artifact_target_must_stay_inside_directory(tmp_path) -> None:
         "/home/user/model.gguf",
         "/Users/someone/Documents/x",
         "E:/other/drive/path",
+        "/opt/private/model.gguf",
+        "/srv/models/x.gguf",
+        "/data/user/x",
+        "/custom-root/nested/file.bin",
     ],
 )
 def test_pathlike_content_rejected_in_notes(hostile, tmp_path) -> None:
@@ -227,6 +231,10 @@ def test_redaction_sentinel_catches_any_drive_and_unc_and_unix() -> None:
     assert "windows_absolute_path" in redaction_violations(json.dumps({"x": "E:/other/path"}))
     assert "unc_path" in redaction_violations(json.dumps({"x": r"\\server\share"}))
     assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/home/user/model.gguf"}))
+    # ALL absolute POSIX roots, not an allowlist (review round 2).
+    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/opt/private/model.gguf"}))
+    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/srv/models/x.gguf"}))
+    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/data/user/x"}))
     assert redaction_violations(json.dumps({"x": "llama3.2:1b", "t": "2026-07-17T00:00:00Z"})) == []
 
 

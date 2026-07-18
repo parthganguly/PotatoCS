@@ -204,6 +204,38 @@ def test_unknown_geometry_never_claims_fit() -> None:
     assert plan["rejected_alternatives"][0]["reason_code"] == rp.REJECT_UNKNOWN_KV_GEOMETRY
 
 
+# -- unknown weight size (review round 2, finding 5) ---------------------
+
+
+def test_known_geometry_zero_disk_unknown_params_is_rejected() -> None:
+    model = _model(disk=0, params="")  # geometry known, weights unknowable
+    fit, estimate = rp.classify_fit(model, _hardware(), 4096)
+    assert fit == "unknown_weight_size"
+    assert estimate["weights_known"] is False
+    plan = _plan(models=[model])
+    assert plan["model"] is None
+    assert plan["rejected_alternatives"][0]["reason_code"] == rp.REJECT_UNKNOWN_WEIGHT_SIZE
+
+
+def test_missing_disk_size_with_known_params_estimates_high() -> None:
+    model = _model(disk=0, params="1.2B")
+    estimate = rp.estimate_memory_bytes(model, 4096)
+    assert estimate["weights_known"] is True
+    assert estimate["weights"] >= int(1.2 * 1024**3)  # 8-bit-class upper estimate
+    fit, _ = rp.classify_fit(model, _hardware(), 4096)
+    assert fit != "unknown_weight_size"
+
+
+@pytest.mark.parametrize("bad_size", [-1, -5_000_000_000, "not-a-number", None])
+def test_malformed_disk_sizes_never_produce_zero_weight_fit(bad_size) -> None:
+    model = _model(disk=bad_size, params="")
+    fit, estimate = rp.classify_fit(model, _hardware(), 4096)
+    assert fit == "unknown_weight_size"
+    assert estimate["weights_known"] is False
+    plan = _plan(models=[model])
+    assert plan["model"] is None
+
+
 # -- basic contract ------------------------------------------------------
 
 
@@ -322,12 +354,15 @@ def test_unmeasured_plan_has_no_numeric_speed_claims() -> None:
     assert plan["confidence"] == "derived"
 
 
-def test_unmeasured_configuration_is_never_interactive() -> None:
+def test_unmeasured_configuration_is_performance_unknown() -> None:
     # A tiny model that WOULD be fast is still not classifiable as
-    # interactive without a compatible measurement.
+    # interactive OR slow_interactive without a compatible measurement:
+    # memory fit and usability are separate facts.
     plan = _plan(models=[_model()], evidence=[])
-    assert plan["execution_class"] != "interactive"
-    assert plan["execution_class"] == "slow_interactive"
+    assert plan["execution_class"] == "performance_unknown"
+    assert plan["fit_class"] == "fits_gpu_full"
+    assert rp.WARN_SLOW_CLASS not in plan["warnings"]
+    assert rp.WARN_SPEED_UNMEASURED in plan["warnings"]
 
 
 def test_derived_score_is_ranking_only() -> None:

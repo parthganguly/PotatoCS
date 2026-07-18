@@ -87,12 +87,16 @@ _REQUIRED_TIMING_KEYS = {"total", "load", "prompt_eval", "generation", "first_to
 _REQUIRED_TOKEN_KEYS = {"prompt", "generated", "prompt_tps", "generation_tps"}
 
 # Path-like content is forbidden in every string an artifact carries:
-# Windows drive paths on ANY drive, UNC paths, and Unix absolute paths
-# under user/system roots.
+# Windows drive paths on ANY drive, UNC paths, and ALL absolute POSIX
+# paths (any root — /opt, /srv, /data, ... — not an allowlist).
+_POSIX_PREFIX = r"(?:^|[\s\"'=:,(])"
 _PATHLIKE_PATTERNS = (
     re.compile(r"[A-Za-z]:[\\/]"),
     re.compile(r"\\\\[A-Za-z0-9._$-]"),
-    re.compile(r"(?:^|[\s\"'=:,(])/(?:home|Users|root|mnt|tmp|var|etc|usr)(?:/|$)"),
+    # Any multi-segment absolute path: /root/anything...
+    re.compile(_POSIX_PREFIX + r"/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~-]+)+"),
+    # Single-segment forms of well-known roots (e.g. a bare "/tmp").
+    re.compile(_POSIX_PREFIX + r"/(?:home|Users|root|mnt|tmp|var|etc|usr|opt|srv|data|media|dev|proc)(?:/|$|[\s\"'),])"),
 )
 
 
@@ -220,7 +224,9 @@ def redaction_violations(payload: str) -> list[str]:
         violations.append("windows_absolute_path")
     if re.search(r"(\\\\){2}[A-Za-z0-9._$-]|\\\\[A-Za-z0-9._$-]+\\", payload):
         violations.append("unc_path")
-    if re.search(r"(?:[\s\"'=:,(])/(?:home|Users|root|mnt|tmp|var|etc|usr)(?:/|\")", payload):
+    if re.search(r"(?:[\s\"'=:,(])/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~-]+)+", payload) or re.search(
+        r"(?:[\s\"'=:,(])/(?:home|Users|root|mnt|tmp|var|etc|usr|opt|srv|data|media|dev|proc)(?:/|\")", payload
+    ):
         violations.append("unix_absolute_path")
     return violations
 

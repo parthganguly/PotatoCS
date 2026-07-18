@@ -75,6 +75,7 @@ REJECT_NOT_TEXT_MODEL = "not_a_text_generation_model"
 REJECT_RUNTIME_UNAVAILABLE = "runtime_unavailable"
 REJECT_RANKED_BELOW_SELECTED = "ranked_below_selected"
 REJECT_UNKNOWN_KV_GEOMETRY = "unknown_kv_geometry"
+REJECT_UNKNOWN_WEIGHT_SIZE = "unknown_weight_size"
 
 _FIT_PLACEMENT_BAND = {
     "fits_gpu_full": "full_gpu",
@@ -110,13 +111,22 @@ def kv_cache_bytes(geometry: dict[str, Any] | None, context_tokens: int, dtype_b
 def estimate_memory_bytes(model: dict[str, Any], context_tokens: int) -> dict[str, Any]:
     """Weights + architecture-aware KV cache + runtime overhead.
 
-    Unknown sizes estimate high, never low; `kv_geometry_known: False`
-    means no fit class may be claimed from this estimate.
+    Unknown sizes estimate high, never low. `kv_geometry_known: False`
+    or `weights_known: False` means no fit class may be claimed from
+    this estimate — fit is never computed from zero bytes of weights.
     """
-    weights = int(model.get("disk_bytes") or 0)
-    params_b = _parse_param_billions(model.get("parameter_size") or "")
-    if weights <= 0 and params_b > 0:
-        weights = int(params_b * 1.05 * 1024**3)  # assume 8-bit-class weights when size unknown
+    try:
+        weights = int(model.get("disk_bytes") or 0)
+    except (TypeError, ValueError):
+        weights = 0
+    if weights < 0:
+        weights = 0  # malformed size: treated as unknown, never negative
+    weights_known = weights > 0
+    if not weights_known:
+        params_b = _parse_param_billions(model.get("parameter_size") or "")
+        if params_b > 0:
+            weights = int(params_b * 1.05 * 1024**3)  # 8-bit-class upper estimate
+            weights_known = True
     kv, geometry_known = kv_cache_bytes(model.get("kv_geometry"), context_tokens)
     total = weights + kv + RUNTIME_OVERHEAD_BYTES
     return {
@@ -124,6 +134,7 @@ def estimate_memory_bytes(model: dict[str, Any], context_tokens: int) -> dict[st
         "kv_cache": kv,
         "total": total,
         "kv_geometry_known": geometry_known,
+        "weights_known": weights_known,
     }
 
 
@@ -164,6 +175,8 @@ def classify_fit(
     RAM with margins after other applications release memory — an
     Ollama-honest state, NOT a Deep Local claim."""
     estimate = estimate_memory_bytes(model, context_tokens)
+    if not estimate["weights_known"]:
+        return "unknown_weight_size", estimate
     if not estimate["kv_geometry_known"]:
         return "unknown_kv_geometry", estimate
     vram_budget = _vram_budget(hardware)
@@ -194,11 +207,16 @@ def classify_execution(ttft_ms: float | None, tps: float | None) -> str:
 
 
 def _conservative_execution_class(fit: str) -> str:
-    """Class for configurations with no compatible measurement: never
-    `interactive`."""
-    if fit in ("fits_gpu_full", "fits_gpu_partial", "fits_cpu_ram"):
-        return "slow_interactive"
-    return "persisted_job"
+    """Class for configurations with no compatible measurement.
+
+    Memory fit and performance usability are separate facts: an
+    unmeasured configuration is `performance_unknown` (never
+    `interactive` or `slow_interactive`), except the memory-reclaim
+    state which is `persisted_job` by construction.
+    """
+    if fit == "reachable_after_memory_reclaim":
+        return "persisted_job"
+    return "performance_unknown"
 
 
 # -- evidence fingerprint compatibility ----------------------------------
@@ -418,6 +436,15 @@ def build_plan(
             rejected.append({"model": tag, "reason_code": REJECT_NOT_TEXT_MODEL, "detail_numbers": {}})
             continue
         fit, estimate = classify_fit(model, hardware, context_tokens)
+        if fit == "unknown_weight_size":
+            rejected.append(
+                {
+                    "model": tag,
+                    "reason_code": REJECT_UNKNOWN_WEIGHT_SIZE,
+                    "detail_numbers": {},
+                }
+            )
+            continue
         if fit == "unknown_kv_geometry":
             rejected.append(
                 {
@@ -530,7 +557,10 @@ def build_plan(
         execution_class = _conservative_execution_class(selected["fit"])
         estimates_basis = "unmeasured"
         warnings.append(WARN_SPEED_UNMEASURED)
-    if execution_class != "interactive":
+    # "Expect slow" is itself a measured claim: only measured
+    # slow/persisted classes carry it. performance_unknown carries the
+    # speed_unmeasured warning instead.
+    if execution_class in ("slow_interactive", "persisted_job"):
         warnings.append(WARN_SLOW_CLASS)
     if selected["fit"] == "reachable_after_memory_reclaim":
         warnings.append(WARN_MEMORY_RECLAIM)
