@@ -354,11 +354,27 @@ and with no snapshot the fixed copy says a sidecar restart is required.
 `close()` waits a bounded margin and reports `worker_stopped` vs
 `worker_still_running` honestly (a timeout-ignoring probe is never
 claimed terminated; it can never publish after close and dies with the
-process). The evidence index validates every decoded artifact with
-`validate_artifact()` before it becomes listing or planner evidence,
-counts skipped malformed/invalid/oversized/non-regular files, enforces
-file-count and byte limits against actual bytes read, refuses symlinks
-outside the evidence root, and reports fixed truncation reasons.
+process).
+
+The evidence index is **authoritative for planning** (round 5):
+`runtime.plan`/`runtime.recommendations` return fixed
+`evidence_refreshing` when no completed index exists (a missing index
+is never treated as an empty evidence set), `restart_required` when
+the evidence worker is hung with no index, and serve a stale index
+with explicit `evidence_state`/`evidence_index_age_ms`/
+`evidence_restart_required` while refreshing or hung. The index pass
+validates every decoded artifact with `validate_artifact()` (now
+including finite-numeric/integer/range checks over sizes, timings,
+tokens, memory, residency, options, and timestamps — booleans, NaN,
+and infinity rejected), isolates per-artifact failures, counts
+`total_bytes_read` immediately after every chunked read (malformed,
+invalid, and oversized bytes all consume the 16 MiB budget) separately
+from `total_parsed_bytes`, stops enumeration at the file cap plus one
+sentinel, marks oversized files as `partial_oversized` truncation,
+refuses symlinks outside the evidence root, and reports fixed
+truncation reasons. The one-second pass deadline is best effort
+between operations: a blocked filesystem read cannot be interrupted
+and surfaces through `refresh_hung`/restart-required.
 Detail probes carry per-model fixed statuses
 (`complete|timeout|failed|incomplete_metadata|not_probed|
 probe_cap_reached|detail_worker_busy`) and `details_complete` is true

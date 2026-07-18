@@ -1,12 +1,12 @@
 # Local Runtime Acceleration — Fable Implementation Result
 
 Status: research/engineering track on `feat/local-runtime-acceleration`
-(stacked on `feat/deep-local-fable`); four independent review rounds
+(stacked on `feat/deep-local-fable`); five independent review rounds
 (PR #35, 2026-07-17/18) addressed. Backend-only; no UI, no settings
 mutation, no chat-routing change, no change to `main`, the installer,
 release assets, or the v0.4 gate.
 
-Date: 2026-07-17/18, updated after review round 4, 2026-07-18.
+Date: 2026-07-17/18, updated after review round 5, 2026-07-18.
 Author: Claude Code (Fable).
 
 ## Commits
@@ -30,8 +30,12 @@ Author: Claude Code (Fable).
   evidence → `43df6c09` closed schema + separator-free strings
   (31 artifacts migrated: `notes` removed) → `428ed2c2` docs.
 - **Review-response commits, round 4 (2026-07-18):** `6d3983ee`
-  background evidence index + honest refresh/shutdown state → this
-  report update (final head in the PR).
+  background evidence index + honest refresh/shutdown state →
+  `1aa8b598` docs.
+- **Review-response commits, round 5 (2026-07-18):** `7c51f5d1`
+  complete numeric/structural artifact validation → `053283d7`
+  authoritative evidence state + work-accounted evidence limits +
+  fixed collector tests → this report update (final head in the PR).
 - **Upstream runtimes:** Ollama **0.31.1** (probed live); llama.cpp
   release **b10064** (`86d86ed43`), official Windows x64 CPU zip,
   SHA256 `C9B770B5…099E` (CUDA zip archived `D3DF8C73…34B`, unused);
@@ -79,6 +83,14 @@ Author: Claude Code (Fable).
 |---|---|---|
 | 1 | Evidence discovery/validation/parsing/summarization still ran synchronously on the dispatcher (directory scan + stat + parse per call; the round-3 "cache" still paid the miss on-thread) | **Fixed** (`6d3983ee`): a second persistent background worker owns the evidence index. RPCs never scan/stat/read/parse: cold → fixed `evidence_refreshing`; completed index served immutably with `index_age_ms`; stale index served while one refresh runs; empty-evidence case published eagerly with no thread. The index pass gates every decoded object through `validate_artifact()` (schema-invalid and malformed JSON are counted, never raised), enforces `MAX_EVIDENCE_FILES` and per-file/total byte limits against actual bytes read, skips symlinks/reparse points and any file resolving outside the evidence root, and reports `stats` (files seen/parsed, per-category skip counts, total parsed bytes) plus fixed truncation reasons (`file_count`/`byte_budget`/`time_budget`). Plans/recommendations consume only the last completed index. 11 new tests incl. slow-read RPC responsiveness and single-worker guarantees. |
 | 2 | Refresh/shutdown state dishonest: hung refresh still said "Retry shortly"; `close()` claimed nothing about whether the worker actually stopped | **Fixed** (`6d3983ee`): states `idle/refreshing/refresh_hung/closed` with `refresh_age_ms`; past `REFRESH_HUNG_THRESHOLD_SECONDS` (~14 s worst case + 6 s margin) the state is `refresh_hung`, the copy says runtime inventory cannot refresh again until the sidecar restarts (no "retry shortly"), the last completed snapshot keeps being served, and no-snapshot returns fixed `restart_required` copy. `close()` waits `CLOSE_WAIT_MARGIN_SECONDS` and returns `worker_stopped` vs `worker_still_running` per worker — a timeout-ignoring probe is reported still-running, never claimed terminated (it can never publish post-close; generation + closed checks). `SidecarApp.close()` remains bounded (≤ 2 × margin). 4 new tests incl. in-flight-close and hung-with/without-snapshot flows. |
+
+## Review findings (PR #35, fifth round) and resolutions
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | `runtime.plan`/`recommendations` treated a missing evidence index as an empty completed evidence set (cold plans could silently change derived → measured after publication; hung evidence went unreported in planning) | **Fixed** (`053283d7`): evidence state is authoritative for planning. No completed index → fixed `evidence_refreshing`; hung worker with no index → fixed `restart_required` copy; stale/hung with an old index → the old index is served with explicit `evidence_state`, `evidence_index_age_ms`, and `evidence_restart_required` in every planning response (and in `benchmarks`). Behavioral tests cover cold, hung-no-index, and hung-old-index flows for all three RPCs. |
+| 2 | Evidence limits not enforced against actual work (`total_parsed_bytes` only counted valid files; enumeration collected every name before capping; oversized skips didn't mark truncation; 1 s pass presented as a hard bound) | **Fixed** (`053283d7`): `total_bytes_read` increments immediately after every chunked (256 KiB) read and includes malformed/invalid/oversized bytes; `total_parsed_bytes` counts valid evidence only; enumeration stops at `MAX_EVIDENCE_FILES` qualifying entries + one sentinel (no unbounded name list); oversized files add `partial_oversized` to truncation reasons; byte/time budgets are checked between chunks; the docs state a blocked filesystem read cannot be interrupted and surfaces via `refresh_hung`. Hostile test: 40 oversized+malformed files → actual bytes read ≤ budget + one chunk. |
+| 3 | Schema validation not type/range complete (`disk_bytes: "not-a-number"` passed, then raised inside `evidence_fingerprint` and failed the whole refresh); slow-collector tests were false positives (monkeypatched attribute after the bound method was captured) | **Fixed** (`7c51f5d1`, `053283d7`): finite numeric/integer/range validation across model bytes, hardware counts/memory/timestamps, timings, tokens/TPS, memory samples, residency (incl. `gpu_fraction` 0..1), and numeric options; booleans/NaN/infinity rejected; validation and summarization failures isolated per artifact (`skipped_invalid_schema`, never a poisoned refresh). Worker tests now swap `_collect_fn` directly with entered/release events proving the replacement collector genuinely ran while RPCs stayed responsive and only the last completed index was served. |
 
 ## Corrected memory-estimation examples (geometry verified live)
 
@@ -196,7 +208,7 @@ bytes and 1 s wall time per pass, with fixed truncation reasons.
 
 | Command | Result |
 |---|---|
-| `python -m pytest python\tests` | **681 passed, 8 skipped** (7 = env-gated Colibrì E2E, as on base; 1 = symlink-exclusion test on accounts without symlink permission) |
+| `python -m pytest python\tests` | **695 passed, 8 skipped** (7 = env-gated Colibrì E2E, as on base; 1 = symlink-exclusion test on accounts without symlink permission) |
 | `npm run test:backend-status` | pass (`backend-status-tests-ok`) |
 | `npm run test:progress` | pass (`chat-progress-tests-ok`) |
 | `npm run test:readiness` | pass (readiness row mapping tests passed) |
@@ -206,9 +218,10 @@ bytes and 1 s wall time per pass, with fixed truncation reasons.
 | `cargo test --manifest-path src-tauri\Cargo.toml` | pass (24 passed, 4 ignored) |
 | `git diff --check` | clean |
 
-Focused suites (post review round 4): inventory 27, harness/artifacts
-55, planner 47, RPC service 49 — **178 focused tests** (78 → 126 →
-148 → 167 → 178), plus the 109 preserved Deep Local/Colibrì tests.
+Focused suites (post review round 5): inventory 27, harness/artifacts
+64, planner 47, RPC service 54 — **192 focused tests** (78 → 126 →
+148 → 167 → 178 → 192), plus the 109 preserved Deep Local/Colibrì
+tests.
 
 ## Privacy / no-egress status
 
