@@ -87,6 +87,7 @@ REFRESH_CLOSED = "closed"
 TRUNCATION_FILE_COUNT = "file_count"
 TRUNCATION_BYTE_BUDGET = "byte_budget"
 TRUNCATION_TIME_BUDGET = "time_budget"
+TRUNCATION_OVERSIZED = "partial_oversized"
 
 # Server-env keys that do not affect performance and are stripped from
 # fingerprints (OLLAMA_NO_CLOUD only disables remote features the
@@ -426,11 +427,27 @@ class RuntimePlanService:
 
     def _build_evidence_index(self) -> dict[str, Any]:
         """Discover, validate, parse, and summarize evidence artifacts;
-        runs ONLY on the evidence refresher thread. Every enforcement is
-        performed while reading: symlinks/reparse points are skipped,
-        per-file and total byte limits are checked against actual bytes
-        read, schema validation gates every decoded object, and one bad
-        artifact can never abort the pass."""
+        runs ONLY on the evidence refresher thread.
+
+        Limits are enforced against ACTUAL WORK:
+        - `total_bytes_read` increments immediately after every read —
+          malformed, schema-invalid, and oversized bytes all consume
+          the total-byte budget;
+        - `total_parsed_bytes` counts only bytes that became valid
+          evidence;
+        - enumeration stops at MAX_EVIDENCE_FILES qualifying entries
+          plus one sentinel (which only proves count truncation); no
+          unlimited filename list is collected;
+        - files are read in bounded chunks with time/byte checks
+          between chunks;
+        - an oversized file adds `partial_oversized` to the truncation
+          reasons in addition to its skip count.
+
+        The time budget is best effort between operations: a single
+        blocked filesystem read cannot be interrupted, and such a hang
+        surfaces through the worker's `refresh_hung` state (restart
+        required), not through this deadline.
+        """
         import os
 
         from odysseus_desktop_backend.runtime_bench.artifacts import validate_artifact
@@ -443,9 +460,16 @@ class RuntimePlanService:
             "skipped_oversized": 0,
             "skipped_not_regular": 0,
             "skipped_unreadable": 0,
+            "total_bytes_read": 0,
             "total_parsed_bytes": 0,
             "truncation_reasons": [],
         }
+        reasons: list[str] = stats["truncation_reasons"]
+
+        def add_reason(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
         artifacts: list[dict[str, Any]] = []
         root = self.evidence_dir
         if root is not None and root.is_dir():
@@ -464,48 +488,100 @@ class RuntimePlanService:
                         except OSError:
                             stats["skipped_unreadable"] += 1
                             continue
+                        if len(names) >= MAX_EVIDENCE_FILES:
+                            # Sentinel entry: proves more qualifying files
+                            # exist; enumeration stops here.
+                            add_reason(TRUNCATION_FILE_COUNT)
+                            break
                         names.append(entry.name)
             except OSError:
                 names = []
             names.sort()
-            if len(names) > MAX_EVIDENCE_FILES:
-                names = names[:MAX_EVIDENCE_FILES]
-                stats["truncation_reasons"].append(TRUNCATION_FILE_COUNT)
             deadline = time.monotonic() + EVIDENCE_TIME_BUDGET_SECONDS
+            chunk_size = 256 * 1024
             for name in names:
                 if time.monotonic() > deadline:
-                    stats["truncation_reasons"].append(TRUNCATION_TIME_BUDGET)
+                    add_reason(TRUNCATION_TIME_BUDGET)
+                    break
+                if stats["total_bytes_read"] >= EVIDENCE_TOTAL_BYTE_BUDGET:
+                    add_reason(TRUNCATION_BYTE_BUDGET)
                     break
                 path = root / name
+                data = b""
+                oversized = False
+                aborted = False
                 try:
                     if path.resolve().parent != root_resolved:
                         stats["skipped_not_regular"] += 1
                         continue
                     with open(path, "rb") as handle:
-                        data = handle.read(MAX_EVIDENCE_FILE_BYTES + 1)
+                        # Chunked bounded read: byte/time limits are
+                        # checked between chunks, and every chunk is
+                        # counted the moment it is read.
+                        while True:
+                            chunk = handle.read(chunk_size)
+                            if not chunk:
+                                break
+                            stats["total_bytes_read"] += len(chunk)
+                            data += chunk
+                            if len(data) > MAX_EVIDENCE_FILE_BYTES:
+                                oversized = True
+                                break
+                            if stats["total_bytes_read"] >= EVIDENCE_TOTAL_BYTE_BUDGET:
+                                aborted = True
+                                break
+                            if time.monotonic() > deadline:
+                                aborted = True
+                                break
                 except OSError:
                     stats["skipped_unreadable"] += 1
                     continue
-                if len(data) > MAX_EVIDENCE_FILE_BYTES:
+                if oversized:
                     stats["skipped_oversized"] += 1
+                    add_reason(TRUNCATION_OVERSIZED)
                     continue
-                if stats["total_parsed_bytes"] + len(data) > EVIDENCE_TOTAL_BYTE_BUDGET:
-                    stats["truncation_reasons"].append(TRUNCATION_BYTE_BUDGET)
+                if aborted:
+                    if stats["total_bytes_read"] >= EVIDENCE_TOTAL_BYTE_BUDGET:
+                        add_reason(TRUNCATION_BYTE_BUDGET)
+                    else:
+                        add_reason(TRUNCATION_TIME_BUDGET)
                     break
                 try:
                     decoded = json.loads(data.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     stats["skipped_malformed"] += 1
                     continue
-                if not isinstance(decoded, dict) or validate_artifact(decoded):
+                try:
+                    invalid = not isinstance(decoded, dict) or bool(validate_artifact(decoded))
+                except Exception:  # noqa: BLE001 - one bad artifact never poisons the pass
+                    invalid = True
+                if invalid:
                     stats["skipped_invalid_schema"] += 1
                     continue
                 stats["total_parsed_bytes"] += len(data)
                 stats["files_parsed"] += 1
                 artifacts.append(decoded)
+        # Summarization is also isolated per pass: an artifact that
+        # passed validation but still trips summarization is dropped
+        # rather than failing the refresh.
+        try:
+            listing = _benchmark_listing(artifacts)
+            summaries = summarize_artifacts(artifacts)
+        except Exception:  # noqa: BLE001
+            survivors = []
+            for artifact in artifacts:
+                try:
+                    _benchmark_listing([artifact])
+                    summarize_artifacts([artifact])
+                    survivors.append(artifact)
+                except Exception:  # noqa: BLE001
+                    stats["skipped_invalid_schema"] += 1
+                    stats["files_parsed"] -= 1
+            listing = _benchmark_listing(survivors)
+            summaries = summarize_artifacts(survivors)
         return {
-            "listing": _benchmark_listing(artifacts),
-            "summaries": summarize_artifacts(artifacts),
+            "listing": listing,
+            "summaries": summaries,
             "stats": stats,
             "captured_at_ms": utc_ms(),
         }
@@ -597,14 +673,7 @@ class RuntimePlanService:
         observed = self._observe_evidence()
         index = observed["index"]
         if index is None:
-            return {
-                "ok": False,
-                "status": "evidence_refreshing",
-                "error_category": ERROR_EVIDENCE_REFRESHING,
-                "error": "The benchmark evidence index is being built in the background.",
-                "refresh_state": observed["refresh_state"],
-                "last_success_at_ms": observed["last_success_at_ms"],
-            }
+            return self._evidence_unavailable(observed)
         return {
             "ok": True,
             "available": bool(index["listing"]),
@@ -614,16 +683,40 @@ class RuntimePlanService:
             "truncated": bool(index["stats"]["truncation_reasons"]),
             "index_age_ms": observed["age_ms"],
             "index_captured_at_ms": index["captured_at_ms"],
-            "refresh_state": observed["refresh_state"],
+            "evidence_state": observed["refresh_state"],
+            "evidence_restart_required": observed["refresh_state"] == REFRESH_HUNG,
         }
 
-    def _evidence_summaries_snapshot(self) -> list[dict[str, Any]]:
-        """Planner evidence from the LAST COMPLETED index only — never
-        computed on the request path. No index yet = no evidence (the
-        planner degrades to derived confidence honestly)."""
-        observed = self._observe_evidence()
-        index = observed["index"]
-        return index["summaries"] if index is not None else []
+    def _evidence_unavailable(self, observed: dict[str, Any]) -> dict[str, Any]:
+        """Fixed result when no completed evidence index exists.
+
+        The evidence state is AUTHORITATIVE for planning: a missing
+        index is never treated as an empty completed evidence set,
+        because that would let the same cold request silently change
+        from derived to measured after publication."""
+        if observed["refresh_state"] == REFRESH_HUNG:
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "error_category": ERROR_RESTART_REQUIRED,
+                "error": (
+                    "The benchmark evidence indexer is stuck and cannot refresh "
+                    "again until the app is restarted. No evidence index is "
+                    "available."
+                ),
+                "evidence_state": observed["refresh_state"],
+                "evidence_refresh_age_ms": observed["refresh_age_ms"],
+                "last_success_at_ms": observed["last_success_at_ms"],
+            }
+        return {
+            "ok": False,
+            "status": "evidence_refreshing",
+            "error_category": ERROR_EVIDENCE_REFRESHING,
+            "error": "The benchmark evidence index is being built in the background.",
+            "evidence_state": observed["refresh_state"],
+            "evidence_refresh_age_ms": observed["refresh_age_ms"],
+            "last_success_at_ms": observed["last_success_at_ms"],
+        }
 
     def plan(self, objective: str) -> dict[str, Any]:
         if objective not in rp.OBJECTIVES:
@@ -636,12 +729,16 @@ class RuntimePlanService:
         snapshot = observed["snapshot"]
         if snapshot is None:
             return self._unavailable(observed)
+        evidence_observed = self._observe_evidence()
+        index = evidence_observed["index"]
+        if index is None:
+            return self._evidence_unavailable(evidence_observed)
         plan = rp.build_plan(
             objective=objective,
             hardware=snapshot["hardware"],
             models=snapshot["models"],
             runtimes=snapshot["runtimes"],
-            evidence=self._evidence_summaries_snapshot(),
+            evidence=index["summaries"],
             now_ms=utc_ms(),
         )
         logger.info(
@@ -658,6 +755,9 @@ class RuntimePlanService:
             "inventory_partial": not snapshot["details_complete"],
             "inventory_cache_age_ms": observed["cache_age_ms"],
             "refresh_state": observed["refresh_state"],
+            "evidence_state": evidence_observed["refresh_state"],
+            "evidence_index_age_ms": evidence_observed["age_ms"],
+            "evidence_restart_required": evidence_observed["refresh_state"] == REFRESH_HUNG,
         }
 
     def recommendations(self) -> dict[str, Any]:
@@ -665,7 +765,11 @@ class RuntimePlanService:
         snapshot = observed["snapshot"]
         if snapshot is None:
             return self._unavailable(observed)
-        evidence = self._evidence_summaries_snapshot()
+        evidence_observed = self._observe_evidence()
+        index = evidence_observed["index"]
+        if index is None:
+            return self._evidence_unavailable(evidence_observed)
+        evidence = index["summaries"]
         now = utc_ms()
         plans = {
             objective: rp.build_plan(
@@ -687,6 +791,9 @@ class RuntimePlanService:
             "inventory_partial": not snapshot["details_complete"],
             "inventory_cache_age_ms": observed["cache_age_ms"],
             "refresh_state": observed["refresh_state"],
+            "evidence_state": evidence_observed["refresh_state"],
+            "evidence_index_age_ms": evidence_observed["age_ms"],
+            "evidence_restart_required": evidence_observed["refresh_state"] == REFRESH_HUNG,
             "note": (
                 "Estimates, not guarantees. Plans are recommendations only; "
                 "nothing is applied automatically. Findings marked "

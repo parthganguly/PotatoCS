@@ -821,16 +821,23 @@ def test_malformed_and_invalid_artifacts_are_counted_not_raised(tmp_path) -> Non
     (tmp_path / "malformed.json").write_text("{not json", encoding="utf-8")
     # Parseable JSON, schema-invalid (missing required keys).
     (tmp_path / "invalid.json").write_text(json.dumps({"schema_version": 1, "prompt": "x"}), encoding="utf-8")
-    # Valid JSON with malformed numeric model fields -> schema-invalid.
+    # Valid path-free JSON with a malformed numeric model field: caught
+    # by NUMERIC validation (review round 5), not the separator rule.
     bad_numeric = _artifact(batch_id="badnum")
-    bad_numeric["model"]["disk_bytes"] = "not-a-number/with/slash"
+    bad_numeric["model"]["disk_bytes"] = "not-a-number"
     (tmp_path / "badnum.json").write_text(json.dumps(bad_numeric), encoding="utf-8")
+    # Malformed numeric hardware field, also path-free.
+    bad_hw = _artifact(batch_id="badhw")
+    bad_hw["hardware"]["ram"]["total_bytes"] = "secret"
+    (tmp_path / "badhw.json").write_text(json.dumps(bad_hw), encoding="utf-8")
     service = RuntimePlanService(tmp_path)
     ready = _await_benchmarks(service)
     assert [item["batch_id"] for item in ready["artifacts"]] == ["good"]
     assert ready["stats"]["skipped_malformed"] == 1
-    assert ready["stats"]["skipped_invalid_schema"] == 2
-    assert ready["stats"]["files_seen"] == 4
+    assert ready["stats"]["skipped_invalid_schema"] == 3
+    assert ready["stats"]["files_seen"] == 5
+    # Actual read work is counted even for rejected files.
+    assert ready["stats"]["total_bytes_read"] > ready["stats"]["total_parsed_bytes"]
     # Plans consume the same index without raising.
     result = service.plan("fast")
     assert "error" not in result or result.get("error_category") != "internal"
@@ -847,13 +854,19 @@ def test_file_count_truncation_reported(tmp_path, monkeypatch) -> None:
     assert ready["truncated"] is True
 
 
-def test_oversized_files_counted_and_skipped(tmp_path, monkeypatch) -> None:
+def test_oversized_files_counted_and_marked_truncated(tmp_path, monkeypatch) -> None:
     write_artifact(_artifact(batch_id="normal"), tmp_path)
     monkeypatch.setattr(rps, "MAX_EVIDENCE_FILE_BYTES", 64)
     service = RuntimePlanService(tmp_path)
     ready = _await_benchmarks(service)
     assert ready["artifacts"] == []
     assert ready["stats"]["skipped_oversized"] == 1
+    # Oversized evidence is surfaced as partial/truncated, not silent.
+    assert rps.TRUNCATION_OVERSIZED in ready["stats"]["truncation_reasons"]
+    assert ready["truncated"] is True
+    # The oversized read still consumed real bytes (bounded at cap+chunk).
+    assert 64 < ready["stats"]["total_bytes_read"] <= 64 + 256 * 1024
+    assert ready["stats"]["total_parsed_bytes"] == 0
 
 
 def test_byte_budget_truncation_reported(tmp_path, monkeypatch) -> None:
@@ -864,46 +877,103 @@ def test_byte_budget_truncation_reported(tmp_path, monkeypatch) -> None:
     ready = _await_benchmarks(service)
     assert ready["artifacts"] == []
     assert rps.TRUNCATION_BYTE_BUDGET in ready["stats"]["truncation_reasons"]
+    # Only one bounded chunk was read before the budget stopped the pass.
+    assert ready["stats"]["total_bytes_read"] <= 256 * 1024
 
 
-def test_slow_file_reads_never_block_rpc_calls(tmp_path, monkeypatch) -> None:
-    """Deliberately slow reads on the evidence worker: benchmarks/plan
-    keep answering instantly with the fixed refreshing result."""
+def test_hostile_many_malformed_files_bound_actual_reads(tmp_path, monkeypatch) -> None:
+    """Hostile case (review round 5): hundreds of malformed/oversized
+    files must not make the worker read unbounded bytes. Total bytes
+    actually read stay within budget + one chunk of slack, and every
+    read is counted."""
+    monkeypatch.setattr(rps, "MAX_EVIDENCE_FILES", 20)
+    monkeypatch.setattr(rps, "MAX_EVIDENCE_FILE_BYTES", 4096)
+    monkeypatch.setattr(rps, "EVIDENCE_TOTAL_BYTE_BUDGET", 16 * 1024)
+    for index in range(40):
+        (tmp_path / f"junk-{index:03d}.json").write_bytes(b"x" * 8192)  # oversized AND malformed
+    service = RuntimePlanService(tmp_path)
+    ready = _await_benchmarks(service)
+    stats = ready["stats"]
+    assert ready["artifacts"] == []
+    # Enumeration stopped at the cap (+ sentinel), not 40 files.
+    assert stats["skipped_oversized"] + stats["skipped_malformed"] <= 21
+    assert rps.TRUNCATION_FILE_COUNT in stats["truncation_reasons"]
+    # Actual bytes read never exceed budget + one chunk allowance.
+    assert stats["total_bytes_read"] <= 16 * 1024 + 256 * 1024
+    assert stats["total_parsed_bytes"] == 0
+
+
+def test_enumeration_stops_at_cap_plus_sentinel(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rps, "MAX_EVIDENCE_FILES", 3)
+    for index in range(10):
+        write_artifact(_artifact(batch_id=f"cap-{index:02d}"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    ready = _await_benchmarks(service)
+    assert len(ready["artifacts"]) == 3
+    assert rps.TRUNCATION_FILE_COUNT in ready["stats"]["truncation_reasons"]
+    # files_seen proves enumeration stopped early: cap + 1 sentinel,
+    # not all 10 entries.
+    assert ready["stats"]["files_seen"] == 4
+
+
+def _swap_evidence_collector(service: RuntimePlanService, replacement):
+    """Replace the evidence worker's collector where the worker actually
+    reads it (review round 5, finding: _PersistentRefresher captures the
+    bound method at construction, so patching the service attribute is a
+    no-op)."""
+    with service._evidence._lock:
+        service._evidence._collect_fn = replacement
+
+
+def test_slow_file_reads_never_block_rpc_calls(tmp_path) -> None:
+    """Deliberately slow evidence collection: benchmarks keeps answering
+    instantly with the fixed refreshing result. entered/release events
+    prove the slow collector genuinely ran."""
     write_artifact(_artifact(batch_id="slowread"), tmp_path)
     service = RuntimePlanService(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
     original_build = service._build_evidence_index
 
     def slow_build():
-        time.sleep(30)
+        entered.set()
+        release.wait(30)
         return original_build()
 
-    monkeypatch.setattr(service, "_build_evidence_index", slow_build)
-    started = time.perf_counter()
-    for _ in range(10):
-        result = service.benchmarks()
-        assert result["ok"] is False
-        assert result["error_category"] == rps.ERROR_EVIDENCE_REFRESHING
-    elapsed = time.perf_counter() - started
-    assert elapsed < 0.5, f"RPC path blocked {elapsed:.2f}s on slow evidence reads"
+    _swap_evidence_collector(service, slow_build)
+    try:
+        started = time.perf_counter()
+        for _ in range(10):
+            result = service.benchmarks()
+            assert result["ok"] is False
+            assert result["error_category"] == rps.ERROR_EVIDENCE_REFRESHING
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.5, f"RPC path blocked {elapsed:.2f}s on slow evidence reads"
+        assert entered.wait(2), "slow collector was never entered"
+    finally:
+        release.set()
+        service.close()
 
 
 def test_plan_uses_only_last_completed_evidence_index(monkeypatch, tmp_path) -> None:
     """While a slow re-index runs, plans keep using the previous
-    completed index — never partial work."""
+    completed index — never partial collector state."""
     _patch_inventories(monkeypatch)
     write_artifact(_artifact(batch_id="ev-a"), tmp_path)
     service = RuntimePlanService(tmp_path)
     _await_snapshot(service)
     ready = _await_benchmarks(service)
     assert ready["stats"]["files_parsed"] == 1
-    block = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
     original_build = service._build_evidence_index
 
     def blocking_build():
-        block.wait(30)
+        entered.set()
+        release.wait(30)
         return original_build()
 
-    monkeypatch.setattr(service, "_build_evidence_index", blocking_build)
+    _swap_evidence_collector(service, blocking_build)
     write_artifact(_artifact(batch_id="ev-b"), tmp_path)
     with service._evidence._lock:
         service._evidence._published_at = 0.0  # stale: triggers re-index
@@ -912,10 +982,123 @@ def test_plan_uses_only_last_completed_evidence_index(monkeypatch, tmp_path) -> 
         # Old completed index still served while the slow rebuild runs.
         assert result["ok"] is True
         assert [item["batch_id"] for item in result["artifacts"]] == ["ev-a"]
+        assert entered.wait(2), "blocking collector was never entered"
+        # Still only the old index — no partial state published mid-collect.
+        result = service.benchmarks()
+        assert [item["batch_id"] for item in result["artifacts"]] == ["ev-a"]
         plan_result = service.plan("fast")
         assert plan_result["ok"] is True
+        assert plan_result["evidence_state"] in {rps.REFRESH_RUNNING, rps.REFRESH_HUNG}
+        assert plan_result["evidence_index_age_ms"] is not None
     finally:
-        block.set()
+        release.set()
+        service.close()
+
+
+def test_plan_returns_evidence_refreshing_until_index_exists(monkeypatch, tmp_path) -> None:
+    """Review round 5, finding 1: a missing evidence index is never
+    treated as an empty completed evidence set — plan/recommendations
+    return the fixed evidence_refreshing result instead of a derived
+    plan that would silently upgrade to measured after publication."""
+    _patch_inventories(monkeypatch)
+    write_artifact(_artifact(batch_id="pending"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    _await_snapshot(service)
+    entered = threading.Event()
+    release = threading.Event()
+    original_build = service._build_evidence_index
+
+    def blocking_build():
+        entered.set()
+        release.wait(30)
+        return original_build()
+
+    _swap_evidence_collector(service, blocking_build)
+    try:
+        for call in (lambda: service.plan("fast"), service.recommendations):
+            result = call()
+            assert result["ok"] is False
+            assert result["status"] == "evidence_refreshing"
+            assert result["error_category"] == rps.ERROR_EVIDENCE_REFRESHING
+            assert "evidence_state" in result
+        assert entered.wait(2), "collector never entered"
+    finally:
+        release.set()
+    # After the index publishes, the same call becomes a real plan with
+    # explicit evidence state.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = service.plan("fast")
+        if result.get("ok"):
+            break
+        time.sleep(0.02)
+    assert result["ok"] is True
+    assert result["evidence_state"] in {rps.REFRESH_IDLE, rps.REFRESH_RUNNING}
+    assert result["evidence_restart_required"] is False
+    service.close()
+
+
+def test_hung_evidence_worker_no_index_returns_restart_required(monkeypatch, tmp_path) -> None:
+    _patch_inventories(monkeypatch)
+    write_artifact(_artifact(batch_id="never"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    _await_snapshot(service)
+    release = threading.Event()
+
+    def stuck_build():
+        release.wait(120)
+        return {"listing": [], "summaries": [], "stats": {}, "captured_at_ms": 1}
+
+    _swap_evidence_collector(service, stuck_build)
+    monkeypatch.setattr(rps, "REFRESH_HUNG_THRESHOLD_SECONDS", 0.2)
+    try:
+        service.benchmarks()  # signals the evidence refresh; worker hangs
+        time.sleep(0.5)
+        for call in (service.benchmarks, lambda: service.plan("fast"), service.recommendations):
+            result = call()
+            assert result["ok"] is False, call
+            assert result["error_category"] == rps.ERROR_RESTART_REQUIRED
+            assert result["evidence_state"] == rps.REFRESH_HUNG
+            assert "restart" in result["error"].lower()
+    finally:
+        release.set()
+
+
+def test_hung_evidence_worker_with_old_index_serves_it_marked(monkeypatch, tmp_path) -> None:
+    """Stale index + hung refresh: the old index keeps being served,
+    explicitly marked hung/restart-required."""
+    _patch_inventories(monkeypatch)
+    write_artifact(_artifact(batch_id="old-index"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    _await_snapshot(service)
+    _await_benchmarks(service)
+    release = threading.Event()
+
+    def stuck_build():
+        release.wait(120)
+        return {"listing": [], "summaries": [], "stats": {}, "captured_at_ms": 1}
+
+    _swap_evidence_collector(service, stuck_build)
+    monkeypatch.setattr(rps, "REFRESH_HUNG_THRESHOLD_SECONDS", 0.2)
+    try:
+        with service._evidence._lock:
+            service._evidence._published_at = 0.0  # stale -> refresh starts
+        service.benchmarks()
+        time.sleep(0.5)
+        bench = service.benchmarks()
+        assert bench["ok"] is True
+        assert [item["batch_id"] for item in bench["artifacts"]] == ["old-index"]
+        assert bench["evidence_state"] == rps.REFRESH_HUNG
+        assert bench["evidence_restart_required"] is True
+        plan_result = service.plan("fast")
+        assert plan_result["ok"] is True
+        assert plan_result["evidence_state"] == rps.REFRESH_HUNG
+        assert plan_result["evidence_restart_required"] is True
+        recommendations = service.recommendations()
+        assert recommendations["ok"] is True
+        assert recommendations["evidence_restart_required"] is True
+    finally:
+        release.set()
 
 
 def test_single_evidence_worker_across_repeated_calls(tmp_path, monkeypatch) -> None:
