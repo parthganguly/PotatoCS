@@ -56,8 +56,16 @@ ERROR_PROBE_FAILED = "probe_failed"
 DETAIL_COMPLETE = "complete"
 DETAIL_TIMEOUT = "timeout"
 DETAIL_FAILED = "failed"
+DETAIL_INCOMPLETE_METADATA = "incomplete_metadata"
 DETAIL_NOT_PROBED = "not_probed"
 DETAIL_PROBE_CAP_REACHED = "probe_cap_reached"
+DETAIL_WORKER_BUSY = "detail_worker_busy"
+
+# At most ONE detail-probe worker may be alive process-wide. If a
+# previous worker is stuck on a timeout-ignoring probe, new inventory
+# passes skip detail probing (statuses report detail_worker_busy)
+# instead of stacking another hidden thread.
+_DETAIL_WORKER_GUARD = threading.BoundedSemaphore(1)
 
 # Documented IsProcessorFeaturePresent constants, verified live on the
 # dev machine (AVX2 true / AVX512F false on Zen 2, as expected).
@@ -483,6 +491,33 @@ def extract_kv_geometry(model_info: dict[str, Any]) -> dict[str, int] | None:
     }
 
 
+def _detail_outcome(data: dict[str, Any]) -> dict[str, Any]:
+    """Classify one successful `/api/show` response.
+
+    `complete` requires the metadata the planner actually needs: a
+    positive native context length, a non-empty capability list, and —
+    for text-generation models — a full KV geometry. A 200 response
+    missing any of these is `incomplete_metadata`, never complete.
+    """
+    if not isinstance(data, dict):
+        return {"detail_status": DETAIL_INCOMPLETE_METADATA}
+    model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
+    context = _model_info_int(model_info, ".context_length")
+    capabilities = [str(cap).lower() for cap in data.get("capabilities") or [] if isinstance(cap, str)]
+    geometry = extract_kv_geometry(model_info)
+    outcome = {
+        "context_length_native": context,
+        "capabilities": capabilities,
+        "kv_geometry": geometry,
+    }
+    is_text_model = bool({"completion", "chat", "generate"} & set(capabilities))
+    if context <= 0 or not capabilities or (is_text_model and geometry is None):
+        outcome["detail_status"] = DETAIL_INCOMPLETE_METADATA
+    else:
+        outcome["detail_status"] = DETAIL_COMPLETE
+    return outcome
+
+
 def _default_post_json(url: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -548,56 +583,63 @@ def model_inventory(
         for entry in models[max_detail_models:]:
             entry["detail_status"] = DETAIL_PROBE_CAP_REACHED
 
-        # The worker writes ONLY into this private dict, guarded by a
-        # lock and an abandoned flag. It never touches the `models`
-        # list that the caller returns, so a timeout-ignoring probe can
-        # never mutate a result already handed to the RPC caller.
-        results: dict[str, dict[str, Any]] = {}
-        results_lock = threading.Lock()
-        abandoned = threading.Event()
-
-        def probe_details() -> None:
-            deadline = time.monotonic() + detail_budget_seconds
+        if not _DETAIL_WORKER_GUARD.acquire(blocking=False):
+            # A previous detail worker is still alive (stuck on a
+            # timeout-ignoring probe). Do not stack another thread.
             for entry in targets:
-                tag = entry["tag"]
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
-                try:
-                    data = post_json(
-                        f"{OLLAMA_ENDPOINT}/api/show",
-                        {"model": tag},
-                        timeout=min(remaining, HTTP_TIMEOUT_SECONDS),
-                    )
-                except Exception:  # noqa: BLE001 - recorded as a failed probe
-                    outcome = {"detail_status": DETAIL_FAILED}
-                else:
-                    model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
-                    outcome = {
-                        "detail_status": DETAIL_COMPLETE,
-                        "context_length_native": _model_info_int(model_info, ".context_length"),
-                        "capabilities": [
-                            str(cap).lower() for cap in data.get("capabilities") or [] if isinstance(cap, str)
-                        ],
-                        "kv_geometry": extract_kv_geometry(model_info),
-                    }
-                with results_lock:
-                    if abandoned.is_set():
-                        return  # late result from an obsolete pass: discard
-                    results[tag] = outcome
+                entry["detail_status"] = DETAIL_WORKER_BUSY
+        else:
+            # The worker writes ONLY into this private dict, guarded by
+            # a lock and an abandoned flag. It never touches the
+            # `models` list the caller returns, so a timeout-ignoring
+            # probe can never mutate an already-returned result.
+            results: dict[str, dict[str, Any]] = {}
+            results_lock = threading.Lock()
+            abandoned = threading.Event()
 
-        worker = threading.Thread(target=probe_details, name="model-detail-probe", daemon=True)
-        worker.start()
-        worker.join(timeout=detail_budget_seconds + 0.5)
-        with results_lock:
-            abandoned.set()  # anything arriving after this line is discarded
-            merged = dict(results)
-        for entry in targets:
-            outcome = merged.get(entry["tag"])
-            if outcome is None:
-                entry["detail_status"] = DETAIL_TIMEOUT
-            else:
-                entry.update(outcome)
+            def probe_details() -> None:
+                try:
+                    deadline = time.monotonic() + detail_budget_seconds
+                    for entry in targets:
+                        tag = entry["tag"]
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return
+                        try:
+                            data = post_json(
+                                f"{OLLAMA_ENDPOINT}/api/show",
+                                {"model": tag},
+                                timeout=min(remaining, HTTP_TIMEOUT_SECONDS),
+                            )
+                        except (TimeoutError, socket.timeout):
+                            outcome = {"detail_status": DETAIL_TIMEOUT}
+                        except urllib.error.URLError as exc:
+                            reason = getattr(exc, "reason", None)
+                            timed_out = isinstance(reason, (TimeoutError, socket.timeout))
+                            outcome = {"detail_status": DETAIL_TIMEOUT if timed_out else DETAIL_FAILED}
+                        except Exception:  # noqa: BLE001 - recorded as a failed probe
+                            outcome = {"detail_status": DETAIL_FAILED}
+                        else:
+                            outcome = _detail_outcome(data)
+                        with results_lock:
+                            if abandoned.is_set():
+                                return  # late result from an obsolete pass: discard
+                            results[tag] = outcome
+                finally:
+                    _DETAIL_WORKER_GUARD.release()
+
+            worker = threading.Thread(target=probe_details, name="model-detail-probe", daemon=True)
+            worker.start()
+            worker.join(timeout=detail_budget_seconds + 0.5)
+            with results_lock:
+                abandoned.set()  # anything arriving after this line is discarded
+                merged = dict(results)
+            for entry in targets:
+                outcome = merged.get(entry["tag"])
+                if outcome is None:
+                    entry["detail_status"] = DETAIL_TIMEOUT
+                else:
+                    entry.update(outcome)
 
     # Complete means every model's metadata was successfully populated —
     # a failed, timed-out, skipped, capped, or never-attempted probe is

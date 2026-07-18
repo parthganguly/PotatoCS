@@ -217,11 +217,36 @@ def test_known_geometry_zero_disk_unknown_params_is_rejected() -> None:
     assert plan["rejected_alternatives"][0]["reason_code"] == rp.REJECT_UNKNOWN_WEIGHT_SIZE
 
 
-def test_missing_disk_size_with_known_params_estimates_high() -> None:
-    model = _model(disk=0, params="1.2B")
+def test_missing_disk_size_with_known_params_estimates_by_quantization() -> None:
+    model = _model(disk=0, params="1.2B", quant="Q8_0")
     estimate = rp.estimate_memory_bytes(model, 4096)
     assert estimate["weights_known"] is True
-    assert estimate["weights"] >= int(1.2 * 1024**3)  # 8-bit-class upper estimate
+    assert estimate["weights"] >= int(1.2 * 1.35 * 1024**3)
+    fit, _ = rp.classify_fit(model, _hardware(), 4096)
+    assert fit != "unknown_weight_size"
+
+
+def test_fp16_fallback_estimates_much_higher_than_q4() -> None:
+    """Review round 3, finding 3: the fallback must be quantization-
+    aware — an FP16 model is ~3x a Q4 model per parameter."""
+    fp16 = rp.estimate_memory_bytes(_model(disk=0, params="8B", quant="F16"), 4096)
+    q4 = rp.estimate_memory_bytes(_model(disk=0, params="8B", quant="Q4_K_M"), 4096)
+    assert fp16["weights_known"] and q4["weights_known"]
+    assert fp16["weights"] >= int(8 * 2.6 * 1024**3)  # >= 2x nominal fp16 bytes
+    assert fp16["weights"] > 2.5 * q4["weights"]
+    # An 8B FP16 model must not fit this 16 GB machine.
+    fit, _ = rp.classify_fit(_model(disk=0, params="8B", quant="F16", geometry=GEOM_QWEN3_8B), _hardware(), 4096)
+    assert fit in {"reachable_after_memory_reclaim", "not_runnable"}
+
+
+def test_unknown_quantization_without_disk_size_is_rejected() -> None:
+    for quant in ("", "IQ_MYSTERY", "custom4bit"):
+        model = _model(disk=0, params="8B", quant=quant)
+        fit, estimate = rp.classify_fit(model, _hardware(), 4096)
+        assert fit == "unknown_weight_size", quant
+        assert estimate["weights_known"] is False
+    # With a real disk size, unknown quantization is fine (size wins).
+    model = _model(disk=5 * GB, params="8B", quant="IQ_MYSTERY", geometry=GEOM_QWEN3_8B)
     fit, _ = rp.classify_fit(model, _hardware(), 4096)
     assert fit != "unknown_weight_size"
 

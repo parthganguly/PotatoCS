@@ -372,6 +372,54 @@ def test_model_inventory_mixed_outcomes_have_per_model_status() -> None:
     assert inventory["details_complete"] is False
 
 
+def test_successful_but_empty_show_is_incomplete_metadata() -> None:
+    """A 200 response missing required metadata is NOT complete
+    (review round 3, finding 2)."""
+
+    def empty_show(url, payload, **kw):
+        return {}
+
+    inventory = ri.model_inventory(get_json=_fake_tags, post_json=empty_show)
+    assert all(
+        model["detail_status"] == ri.DETAIL_INCOMPLETE_METADATA for model in inventory["models"]
+    )
+    assert inventory["details_complete"] is False
+
+
+def test_text_model_without_kv_geometry_is_incomplete() -> None:
+    def show_no_geometry(url, payload, **kw):
+        return {
+            "model_info": {"llama.context_length": 131072},
+            "capabilities": ["completion"],
+        }
+
+    inventory = ri.model_inventory(get_json=_fake_tags, post_json=show_no_geometry)
+    assert all(
+        model["detail_status"] == ri.DETAIL_INCOMPLETE_METADATA for model in inventory["models"]
+    )
+
+
+def test_embedding_model_without_kv_geometry_can_be_complete() -> None:
+    def show_embed(url, payload, **kw):
+        return {
+            "model_info": {"bert.context_length": 8192},
+            "capabilities": ["embedding"],
+        }
+
+    inventory = ri.model_inventory(get_json=_fake_tags, post_json=show_embed)
+    assert all(model["detail_status"] == ri.DETAIL_COMPLETE for model in inventory["models"])
+    assert inventory["details_complete"] is True
+
+
+def test_timeout_probe_is_classified_timeout_not_failed() -> None:
+    def timeout_show(url, payload, **kw):
+        raise TimeoutError("probe timed out")
+
+    inventory = ri.model_inventory(get_json=_fake_tags, post_json=timeout_show)
+    assert all(model["detail_status"] == ri.DETAIL_TIMEOUT for model in inventory["models"])
+    assert inventory["details_complete"] is False
+
+
 def test_model_inventory_details_disabled_is_not_probed_and_incomplete() -> None:
     inventory = ri.model_inventory(
         get_json=_fake_tags,

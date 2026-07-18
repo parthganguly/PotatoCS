@@ -89,6 +89,36 @@ def _parse_param_billions(parameter_size: str) -> float:
     return float(match.group(1)) if match else 0.0
 
 
+# Conservative bytes-per-parameter by quantization family, used ONLY
+# when disk size is absent. Each value is the nominal dtype/quant width
+# plus ~25-30% overhead (embeddings, norms, output head) so the
+# fallback over-reserves rather than under-reserves. Unknown or missing
+# quantization with no disk size is not estimable at all.
+_QUANT_BYTES_PER_PARAM = {
+    "q2": 0.6,
+    "q3": 0.7,
+    "q4": 0.85,
+    "q5": 0.95,
+    "q6": 1.1,
+    "q8": 1.35,
+    "f16": 2.6,
+    "fp16": 2.6,
+    "bf16": 2.6,
+    "f32": 5.2,
+    "fp32": 5.2,
+}
+
+
+def _quant_bytes_per_param(quantization: str) -> float | None:
+    clean = str(quantization or "").strip().lower()
+    if not clean:
+        return None
+    for prefix, bytes_per_param in _QUANT_BYTES_PER_PARAM.items():
+        if clean.startswith(prefix):
+            return bytes_per_param
+    return None  # unknown/unsupported quantization: not estimable
+
+
 def kv_cache_bytes(geometry: dict[str, Any] | None, context_tokens: int, dtype_bytes: int = KV_DTYPE_BYTES) -> tuple[int, bool]:
     """Architecture-aware KV-cache size: K and V tensors per layer.
 
@@ -123,9 +153,13 @@ def estimate_memory_bytes(model: dict[str, Any], context_tokens: int) -> dict[st
         weights = 0  # malformed size: treated as unknown, never negative
     weights_known = weights > 0
     if not weights_known:
+        # Quantization-aware fallback: parameter count alone is not
+        # enough — an FP16 model is ~3x a Q4 model. Unknown quantization
+        # with no disk size is rejected as unknown weight size.
         params_b = _parse_param_billions(model.get("parameter_size") or "")
-        if params_b > 0:
-            weights = int(params_b * 1.05 * 1024**3)  # 8-bit-class upper estimate
+        bytes_per_param = _quant_bytes_per_param(model.get("quantization") or "")
+        if params_b > 0 and bytes_per_param is not None:
+            weights = int(params_b * bytes_per_param * 1024**3)
             weights_known = True
     kv, geometry_known = kv_cache_bytes(model.get("kv_geometry"), context_tokens)
     total = weights + kv + RUNTIME_OVERHEAD_BYTES
