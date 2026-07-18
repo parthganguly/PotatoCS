@@ -1,12 +1,12 @@
 # Local Runtime Acceleration — Fable Implementation Result
 
 Status: research/engineering track on `feat/local-runtime-acceleration`
-(stacked on `feat/deep-local-fable`); two independent review rounds
+(stacked on `feat/deep-local-fable`); three independent review rounds
 (PR #35, 2026-07-17/18) addressed. Backend-only; no UI, no settings
 mutation, no chat-routing change, no change to `main`, the installer,
 release assets, or the v0.4 gate.
 
-Date: 2026-07-17/18, updated after review round 2, 2026-07-18.
+Date: 2026-07-17/18, updated after review round 3, 2026-07-18.
 Author: Claude Code (Fable).
 
 ## Commits
@@ -23,7 +23,13 @@ Author: Claude Code (Fable).
 - **Review-response commits, round 2 (2026-07-18):** `f6a756d7`
   non-blocking background inventory refresher + honest completeness →
   `49e40094` performance_unknown class, unknown-weight rejection, full
-  POSIX path guard → this report update (final head in the PR).
+  POSIX path guard → `8bfb8d70` docs.
+- **Review-response commits, round 3 (2026-07-18):** `dc330be8` strict
+  detail completeness + bounded detail workers + quant-aware fallback →
+  `30897bd7` persistent single refresher + clean shutdown + cached
+  evidence → `43df6c09` closed schema + separator-free strings
+  (31 artifacts migrated: `notes` removed) → this report update (final
+  head in the PR).
 - **Upstream runtimes:** Ollama **0.31.1** (probed live); llama.cpp
   release **b10064** (`86d86ed43`), official Windows x64 CPU zip,
   SHA256 `C9B770B5…099E` (CUDA zip archived `D3DF8C73…34B`, unused);
@@ -53,6 +59,17 @@ Author: Claude Code (Fable).
 | 4 | Unmeasured configs still labeled `slow_interactive` | **Fixed** (`49e40094`): unmeasured configurations are `performance_unknown` (memory-reclaim state stays `persisted_job` by construction); `expect_slow_generation` is emitted only for measured slow/persisted classes; memory fit and usability are separate facts. |
 | 5 | Unknown weight size could yield a fit from 0 weight bytes | **Fixed** (`49e40094`): missing disk size + missing/unusable parameter count (including malformed/negative sizes) → `unknown_weight_size` rejection; fit is never computed from zero weights; params-only models estimate high (8-bit-class upper bound). |
 | 6 | POSIX path guard was a root allowlist; fingerprints mixed first-run options with last-run placement | **Fixed** (`49e40094`): all absolute POSIX paths rejected (any root, multi-segment; `/opt`, `/srv`, `/data` tested) in validator and serialized-payload sentinel; fingerprints are built per warm run and artifacts whose contributing runs disagree on context/tuning/placement are rejected as heterogeneous (mixed-options, mixed-placement, mixed-context, lost-residency tests). All 31 committed artifacts still validate unchanged. |
+
+## Review findings (PR #35, third round) and resolutions
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Hung workers unbounded (56 s supersede spawned replacements; detail threads could stack) | **Fixed** (`30897bd7`, `dc330be8`): ONE persistent refresher thread per service lifetime — refresh requests are a level-triggered event signal, never a new thread; a hung worker is never replaced (at most one unkillable daemon thread, dies with the process); `close()` stops the loop, blocks post-close publishes via the generation check, and is wired into `SidecarApp.close()`. Detail probes carry a process-wide bounded guard: while one worker is stuck, later passes skip details with the fixed `detail_worker_busy` status. Tests: 25 request cycles past any hung threshold leave exactly one refresh thread; repeated inventory passes with a stuck probe leave ≤ 1 detail thread; close test joins the worker and proves no post-close publish. |
+| 2 | `detail_status=complete` did not require required metadata | **Fixed** (`dc330be8`): complete requires positive native context, non-empty capabilities, and full KV geometry for text-generation models; a 200-with-missing-fields response is `incomplete_metadata`; real timeouts classify as `timeout`, not `failed`. Embedding models without KV geometry can still be complete. |
+| 3 | Parameter-count weight fallback not conservative (Q8-class for everything) | **Fixed** (`dc330be8`): quantization-aware bytes/param (Q4 0.85 → Q8 1.35 → FP16 2.6 → FP32 5.2 GiB/B, each with overhead); unknown/missing quantization without a disk size → `unknown_weight_size` rejection. FP16 and unknown-quantization tests added; an 8B FP16 model no longer "fits" the 16 GB machine. |
+| 4 | Artifact schema open to arbitrary private text | **Fixed** (`43df6c09`): schema closed at EVERY level (top-level, runs, timings/tokens/memory/residency/options, model, runtime, hardware incl. nested os/cpu/isa/ram/storage/gpus and fixed error categories); free-form `notes` removed from schema, harness, and CLI; the 31 artifacts migrated (notes stripped — provenance stays in the batch-id slug). Hostile tests: top-level prompt/output/secret, run-level extras, nested hardware/memory/options extras. |
+| 5 | "All absolute POSIX paths" evadable (single-segment, spaces, Unicode) | **Fixed** (`43df6c09`): no artifact string or key may contain a path separator, control character, or quote at all — no pattern to evade; the payload sentinel flags any separator byte. `/secret`, `/opt/private model/x.gguf`, and Unicode path segments tested. |
+| 6 | Evidence loading could block the dispatcher (200 × 4 MiB parses per call) | **Fixed** (`30897bd7`): evidence listing + summaries cached by directory-stat key (name/size/mtime) under strict budgets (16 MiB total bytes, 1 s wall time) with truncation surfaced as an explicit flag; repeat calls cost one directory scan. Tests: 60-artifact responsiveness + sub-200 ms cache hit, time- and byte-budget truncation, invalidation on new files. |
 
 ## Corrected memory-estimation examples (geometry verified live)
 
@@ -166,7 +183,7 @@ discarded by generation check.
 
 | Command | Result |
 |---|---|
-| `python -m pytest python\tests` | **652 passed, 7 skipped** (skips = env-gated Colibrì E2E, as on base) |
+| `python -m pytest python\tests` | **671 passed, 7 skipped** (skips = env-gated Colibrì E2E, as on base) |
 | `npm run test:backend-status` | pass (`backend-status-tests-ok`) |
 | `npm run test:progress` | pass (`chat-progress-tests-ok`) |
 | `npm run test:readiness` | pass (readiness row mapping tests passed) |
@@ -176,9 +193,9 @@ discarded by generation check.
 | `cargo test --manifest-path src-tauri\Cargo.toml` | pass (24 passed, 4 ignored) |
 | `git diff --check` | clean |
 
-Focused suites (post review round 2): inventory 23, harness/artifacts
-49, planner 45, RPC service 31 — **148 focused tests** (78 → 126 →
-148), plus the 109 preserved Deep Local/Colibrì tests.
+Focused suites (post review round 3): inventory 27, harness/artifacts
+55, planner 47, RPC service 38 — **167 focused tests** (78 → 126 →
+148 → 167), plus the 109 preserved Deep Local/Colibrì tests.
 
 ## Privacy / no-egress status
 
