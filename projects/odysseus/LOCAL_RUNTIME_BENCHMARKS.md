@@ -80,11 +80,12 @@ Same model (llama3.2:1b), same prompt, `num_ctx: 8192`
 | Warm total | 0.37 s | 0.40 s | ≈ neutral (prompt cache, §4) |
 | Gen tok/s | ~200 (on wrong context) | 103–107 | tok/s on the *correct* context |
 
-Bounded rule for the planner (shipped): context must be sized to the
-task's evidence length up to the memory-safe ceiling; a truncated
-prompt is a correctness failure, not an acceptable speed win. The
-planner already sizes `num_ctx` by objective and charges the KV cost in
-its memory estimate.
+Status: **research finding (measured_exploratory).** The planner does
+NOT emit evidence-length-driven context sizing; it emits a fixed
+objective-sized `num_ctx` and charges the architecture-aware KV cost in
+its memory estimate. Sizing context to actual evidence length is a
+candidate for a future reviewed phase; a truncated prompt is a
+correctness failure, not an acceptable speed win.
 
 ## 3. Keep-alive: the cost of not keeping the model resident (measured)
 
@@ -98,10 +99,11 @@ warm path (default `keep_alive` 5 m):
 | default keep-alive (warm) | 0.46–0.49 s | 0.34–0.38 s |
 
 **A dropped keep-alive costs ~13–18× per turn on the 3b default
-model.** Bounded rule: never recommend `keep_alive: 0` for interactive
-chat; for RAM-pressured machines the honest trade is a smaller resident
-model, not a big model reloaded every turn. (Server default 5 m is
-already sane; the rule guards against "free memory" folk tuning.)
+model.** Status: **research finding (measured_exploratory)** on one
+machine. The planner emits no keep-alive recommendation; the finding
+documents why `keep_alive: 0` "free memory" folk tuning would be
+harmful (the server default of 5 m is already sane), and any future
+recommendation field must carry its own safety gates.
 
 ## 4. Prompt-cache reuse (measured, existing behavior)
 
@@ -150,13 +152,13 @@ the 4 GB card between batches), which confounds prompt-eval placement.
 Verdict: **inconclusive; no rule ships.** A clean re-measurement needs
 a machine with stable free VRAM.
 
-## 8. Flash attention + q8_0 KV cache: conditional, large, and real (paired measurement)
+## 8. Flash attention + q8_0 KV cache: measured_exploratory, NOT a recommendation
 
 First pass produced a spurious "regression" traced to ambient VRAM
 drift (desktop apps had consumed the card between batches; the
 artifact's own hardware snapshot showed 85 MB free at capture and 84.7 %
-offload). The paired re-run holds ambient conditions equal
-(both arms ~180 MiB free VRAM, same batch, back-to-back server
+offload). The paired re-run held ambient VRAM roughly equal
+(both arms ~180 MiB free before the batch, back-to-back server
 restarts, `ollama-0311-llama32-3b-medium-paired-*`):
 
 | Arm (llama3.2:3b, medium, warm) | GPU placement | Gen tok/s |
@@ -164,18 +166,35 @@ restarts, `ollama-0311-llama32-3b-medium-paired-*`):
 | default env | 19.7 % of layers | 10.04–10.21 |
 | `OLLAMA_FLASH_ATTENTION=1` + `OLLAMA_KV_CACHE_TYPE=q8_0` | 100 % | 23.19–23.69 |
 
-**2.3× generation speedup under VRAM pressure**, mechanism visible in
-the residency data: halving KV size lets llama.cpp's memory fit place
-all layers instead of 20 %. Quality checks pass in both arms. Where
-VRAM is ample (1b fully resident), the same env is neutral-to-noise
-(98–99 vs 103–107 tok/s on long-context; within run variance plus
-ambient drift); on the CPU-bound 8b it is neutral (4.6–4.8 vs 4.6).
+The 2.3× generation delta under VRAM pressure is a real observation
+with a visible mechanism (halving KV size let the memory fit place all
+layers instead of 20 %), and quality checks passed in both arms. Where
+VRAM was ample (1b fully resident) the same env was neutral-to-noise;
+on the CPU-bound 8b it was neutral (4.6–4.8 vs 4.6).
 
-Bounded rule (shipped as recommendation only, never auto-applied):
-recommend flash attention + q8_0 KV cache **when the planner estimates
-partial GPU offload** (weights + KV > free VRAM but a GPU exists);
-make no claim when the model fully fits or no GPU is present. Fallback:
-absent env vars = today's behavior.
+**Status: `measured_exploratory`. This is not a shipped or
+production-ready recommendation, and the planner emits nothing based on
+it.** Two defects in the comparison forbid promotion:
+
+1. the optimized arm's warm runs reached critically low minimum
+   available system RAM (~16–177 MB vs ~1.3–2.1 GB in the default arm)
+   — the arms were not equivalent in system-memory conditions and the
+   optimized arm itself ran close to destabilizing the machine;
+2. the optimized arm's hardware snapshot failed to enumerate the GPU at
+   capture time, so its ambient-VRAM record is incomplete.
+
+Safety acceptance criteria that must ALL hold before this can become a
+recommendation:
+
+- a minimum available-system-RAM floor maintained during every run in
+  both arms;
+- stable GPU detection in every hardware snapshot;
+- comparable ambient VRAM across arms, recorded per run;
+- multiple alternating A/B rounds (A,B,A,B,…), not one A batch then one
+  B batch;
+- no hidden model reload inside measured warm samples;
+- quality checks pass in all arms;
+- no increase in failures or timeouts.
 
 ## 9. llama.cpp b10064 vs Ollama 0.31.1, same GGUF blob (measured — parity)
 
@@ -212,17 +231,23 @@ configuration; the benchmark records what happens without it.
 
 ## 11. Experiment outcome summary
 
-| Experiment | Verdict | Shipped rule |
+Nothing in this table is a shipped rule. Every row is a research
+finding at `measured_exploratory` status (one P3 machine), except where
+marked neutral/inconclusive. The planner emits only an objective-sized
+`num_ctx`; it makes no keep-alive, context-sizing, offload, or
+flash-KV recommendations.
+
+| Experiment | Verdict | Status |
 |---|---|---|
-| Keep-alive vs reload-every-turn | **13–18× per-turn cost measured** | never drop keep-alive for interactive use |
-| Context sizing on long documents | **correctness fix** (0/12 → 4/4 pass) | size num_ctx to evidence length within memory margins |
-| Prompt-cache reuse | **~73× prompt-eval speedup on repeat** (built-in) | keep conversation prefixes stable; no change |
-| Thread count | neutral (bandwidth-bound) | no rule; conservative default only |
-| GPU offload (partial vs CPU-only, minority offload) | +6–13 % only | no manual rule; runtime placement left alone |
-| num_batch 128 vs 1024 | inconclusive (ambient confound) | no rule |
-| Flash attention + q8_0 KV | **2.3× under VRAM pressure (paired)**; neutral otherwise | conditional recommendation when partial offload predicted |
-| llama.cpp vs Ollama same model (CPU) | parity ±10 % | no rule |
-| Overcommit (forced full offload > VRAM) | runs but crushes system RAM to 0.7 GB free | planner margin rule blocks this configuration |
+| Keep-alive vs reload-every-turn | 13–18× per-turn cost measured | measured_exploratory |
+| Context sizing on long documents | correctness effect (0/12 → 4/4 pass at num_ctx 8192) | measured_exploratory |
+| Prompt-cache reuse | ~73× prompt-eval speedup on repeat (built-in runtime behavior) | measured_exploratory |
+| Thread count | neutral (bandwidth-bound) | neutral; no finding |
+| GPU offload (partial vs CPU-only, minority offload) | +6–13 % only | measured_exploratory |
+| num_batch 128 vs 1024 | inconclusive (ambient confound) | inconclusive; no finding |
+| Flash attention + q8_0 KV | 2.3× under VRAM pressure in ONE paired batch; §8 defects block promotion | measured_exploratory |
+| llama.cpp vs Ollama same model (CPU) | parity ±10 % | measured_exploratory |
+| Overcommit (forced full offload > VRAM) | runs but crushes system RAM to 0.7 GB free | measured failure case; the planner margin rule (which IS implemented) forbids planning it |
 
 ## 12. Measurement limitations
 

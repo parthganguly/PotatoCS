@@ -300,15 +300,41 @@ Fail-safe rules (each carries a test in Phase 3):
   names, not magic inline numbers;
 - unsupported flags for the selected runtime/version are omitted, never
   guessed;
-- benchmark evidence older than 30 days or from different hardware
-  (mismatched §3 snapshot) demotes confidence `measured → derived`;
-  absent evidence yields `conservative_default` with Ollama defaults;
+- `measured` confidence requires a **full evidence-fingerprint match**
+  (amended per the PR #35 review): runtime name+version; model tag +
+  quantization + digest (byte-size fallback); CPU arch/ISA/physical+
+  logical cores; GPU identity + total VRAM; RAM total; context; tuning
+  options; server env; placement band; benchmark shape. Free RAM/VRAM
+  are compared through the measured placement band (full_gpu /
+  partial_gpu / cpu). Compatible evidence older than 30 days demotes
+  `measured → derived`; incompatible evidence is ignored entirely;
+  model tag + thread count alone can never grant `measured`;
+- **without compatible measured evidence a plan carries no numeric
+  TTFT/TPS and is never classified `interactive`** — derived scores
+  rank candidates only, and `estimates.basis` states which case
+  applies; absent hardware knowledge yields `conservative_default`;
+- KV-cache memory is **architecture-aware** ((K_len + V_len) × kv_heads
+  × layers × dtype bytes × context tokens, geometry from `/api/show`
+  model_info); unknown geometry uses a documented conservative upper
+  bound (512 KiB/token) and forbids any fit claim;
 - unknown hardware fields (no GPU probe, unknown storage) always shrink
   the allowed envelope, never grow it;
 - `persisted_job` classification can never be routed to `chat.send`
   (regression test), mirroring the Deep Local rule;
+- the planner only ever plans the Ollama runtime and never uses Deep
+  Local terminology; its total-RAM state is
+  `reachable_after_memory_reclaim` (persisted_job class + reclaim
+  warning). Genuine Deep Local planning remains the Colibrì surface's
+  job (`deep_local.plan`/`deep_local.doctor`);
 - the planner is **pure**: same inputs → same plan (deterministic
   ordering of alternatives), no I/O beyond its inputs, no settings writes.
+
+Runtime RPC latency contract (amended per review): every probe is
+individually bounded; model-detail probes run under a 2 s total
+worker-thread budget (one hanging model never multiplies across the
+list); a completed snapshot is cached for 60 s with explicit
+`cache_age_ms`/`partial` fields; the declared worst-case cold ceiling
+is **15 s** (arithmetic in `runtime_plan_service.py`).
 
 ## 7. Runtime capability matrix
 
@@ -338,15 +364,19 @@ until the measurement exists.
 Classes, from fastest to furthest reach:
 
 1. `fits_gpu_full` — weights + KV fit in free VRAM with margin;
-2. `fits_gpu_partial` — partial offload; interactive if measured tok/s
-   clears the interactive floor;
+2. `fits_gpu_partial` — partial offload; interactive only if measured
+   tok/s clears the interactive floor;
 3. `fits_cpu_ram` — CPU-only within RAM margin;
-4. `reachable_deep_local` — exceeds interactive envelopes but a
-   persisted-job path exists (Colibrì-class, or measured
-   pathological-but-completing configurations explicitly classed
-   `persisted_job`);
-5. `not_runnable` — exceeds even the deep envelope on this hardware;
-   stated plainly.
+4. `reachable_after_memory_reclaim` (renamed from `reachable_deep_local`
+   per the PR #35 review) — exceeds currently-available RAM but fits
+   total RAM with margins after other applications release memory; an
+   **Ollama-honest** state carrying `persisted_job` class and a
+   `requires_memory_reclaim` warning. This is NOT a Deep Local claim:
+   genuine Deep Local (Colibrì) planning happens only through
+   `deep_local.plan`/`deep_local.doctor` and always identifies runtime
+   `colibri` with `persisted_job` execution;
+5. `not_runnable` — exceeds even the total-RAM envelope on this
+   hardware; stated plainly.
 
 Reach claims require proof: a class 1–3 claim needs a completed
 controlled task (shape 1 minimum) on that exact configuration; class 4
