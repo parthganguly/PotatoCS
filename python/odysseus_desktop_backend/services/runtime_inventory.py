@@ -52,6 +52,13 @@ ERROR_PROBE_TIMEOUT = "probe_timeout"
 ERROR_PROBE_UNAVAILABLE = "probe_unavailable"
 ERROR_PROBE_FAILED = "probe_failed"
 
+# Fixed per-model detail-probe statuses.
+DETAIL_COMPLETE = "complete"
+DETAIL_TIMEOUT = "timeout"
+DETAIL_FAILED = "failed"
+DETAIL_NOT_PROBED = "not_probed"
+DETAIL_PROBE_CAP_REACHED = "probe_cap_reached"
+
 # Documented IsProcessorFeaturePresent constants, verified live on the
 # dev machine (AVX2 true / AVX512F false on Zen 2, as expected).
 _PF_FEATURES = {
@@ -531,43 +538,75 @@ def model_inventory(
                 "context_length_native": 0,
                 "capabilities": [],
                 "kv_geometry": None,
+                "detail_status": DETAIL_NOT_PROBED,
             }
         )
+    models.sort(key=lambda entry: entry["tag"])
 
-    details_complete = not include_details or not models
     if include_details and models:
-        targets = sorted(models, key=lambda entry: entry["tag"])[:max_detail_models]
-        done_count = {"value": 0}
+        targets = models[:max_detail_models]
+        for entry in models[max_detail_models:]:
+            entry["detail_status"] = DETAIL_PROBE_CAP_REACHED
+
+        # The worker writes ONLY into this private dict, guarded by a
+        # lock and an abandoned flag. It never touches the `models`
+        # list that the caller returns, so a timeout-ignoring probe can
+        # never mutate a result already handed to the RPC caller.
+        results: dict[str, dict[str, Any]] = {}
+        results_lock = threading.Lock()
+        abandoned = threading.Event()
 
         def probe_details() -> None:
             deadline = time.monotonic() + detail_budget_seconds
             for entry in targets:
+                tag = entry["tag"]
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return
                 try:
                     data = post_json(
                         f"{OLLAMA_ENDPOINT}/api/show",
-                        {"model": entry["tag"]},
+                        {"model": tag},
                         timeout=min(remaining, HTTP_TIMEOUT_SECONDS),
                     )
-                except Exception:  # noqa: BLE001 - detail probes are best-effort
-                    done_count["value"] += 1
-                    continue
-                model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
-                entry["context_length_native"] = _model_info_int(model_info, ".context_length")
-                entry["capabilities"] = [
-                    str(cap).lower() for cap in data.get("capabilities") or [] if isinstance(cap, str)
-                ]
-                entry["kv_geometry"] = extract_kv_geometry(model_info)
-                done_count["value"] += 1
+                except Exception:  # noqa: BLE001 - recorded as a failed probe
+                    outcome = {"detail_status": DETAIL_FAILED}
+                else:
+                    model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
+                    outcome = {
+                        "detail_status": DETAIL_COMPLETE,
+                        "context_length_native": _model_info_int(model_info, ".context_length"),
+                        "capabilities": [
+                            str(cap).lower() for cap in data.get("capabilities") or [] if isinstance(cap, str)
+                        ],
+                        "kv_geometry": extract_kv_geometry(model_info),
+                    }
+                with results_lock:
+                    if abandoned.is_set():
+                        return  # late result from an obsolete pass: discard
+                    results[tag] = outcome
 
         worker = threading.Thread(target=probe_details, name="model-detail-probe", daemon=True)
         worker.start()
         worker.join(timeout=detail_budget_seconds + 0.5)
-        # A probe that ignores its timeout is abandoned in the daemon
-        # thread; the RPC path proceeds with whatever completed.
-        details_complete = not worker.is_alive() and done_count["value"] >= len(targets) and len(models) <= max_detail_models
+        with results_lock:
+            abandoned.set()  # anything arriving after this line is discarded
+            merged = dict(results)
+        for entry in targets:
+            outcome = merged.get(entry["tag"])
+            if outcome is None:
+                entry["detail_status"] = DETAIL_TIMEOUT
+            else:
+                entry.update(outcome)
+
+    # Complete means every model's metadata was successfully populated —
+    # a failed, timed-out, skipped, capped, or never-attempted probe is
+    # NOT complete. An empty list is complete only when the tags probe
+    # itself succeeded (nothing was missing).
+    if models:
+        details_complete = all(entry["detail_status"] == DETAIL_COMPLETE for entry in models)
+    else:
+        details_complete = not error_category
 
     logger.info(
         "model inventory models=%s details_complete=%s error=%s",
@@ -578,7 +617,7 @@ def model_inventory(
     return {
         "schema_version": MODEL_SCHEMA_VERSION,
         "runtime": "ollama",
-        "models": sorted(models, key=lambda entry: entry["tag"]),
+        "models": models,
         "details_complete": details_complete,
         "error_category": error_category,
         "captured_at_ms": utc_ms(),

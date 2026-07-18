@@ -278,6 +278,7 @@ def test_model_inventory_parses_and_sorts() -> None:
     assert first["context_length_native"] == 131072
     assert first["capabilities"] == ["completion", "tools"]
     assert first["kv_geometry"] == {"layers": 16, "kv_heads": 8, "key_length": 64, "value_length": 64}
+    assert first["detail_status"] == ri.DETAIL_COMPLETE
 
 
 def test_extract_kv_geometry_qwen_prefix() -> None:
@@ -324,21 +325,24 @@ def test_model_inventory_tags_failure_uses_fixed_category() -> None:
     assert "someuser" not in json.dumps(inventory)
 
 
-def test_model_inventory_detail_failure_is_best_effort() -> None:
+def test_model_inventory_failed_probes_are_not_complete() -> None:
+    """Attempted is not complete (review round 2, finding 3): failed
+    probes carry a fixed per-model status and the snapshot is partial."""
+
     def explode(url, payload, **kw):
         raise RuntimeError("show failed")
 
     inventory = ri.model_inventory(get_json=_fake_tags, post_json=explode)
     assert [model["tag"] for model in inventory["models"]] == ["llama3.2:1b", "qwen3:8b"]
     assert all(model["context_length_native"] == 0 for model in inventory["models"])
-    # Failed probes still count as attempted: the pass is complete.
-    assert inventory["details_complete"] is True
+    assert all(model["detail_status"] == ri.DETAIL_FAILED for model in inventory["models"])
+    assert inventory["details_complete"] is False
 
 
-def test_model_inventory_probe_cap_marks_incomplete() -> None:
+def test_model_inventory_probe_cap_marks_incomplete_with_status() -> None:
     many = {
         "models": [
-            {"name": f"m{i}:latest", "digest": f"sha256:{i}", "size": 1, "details": {}} for i in range(12)
+            {"name": f"m{i:02d}:latest", "digest": f"sha256:{i}", "size": 1, "details": {}} for i in range(12)
         ]
     }
     inventory = ri.model_inventory(
@@ -348,12 +352,33 @@ def test_model_inventory_probe_cap_marks_incomplete() -> None:
     )
     assert len(inventory["models"]) == 12
     assert inventory["details_complete"] is False
+    statuses = [model["detail_status"] for model in inventory["models"]]
+    assert statuses[:4] == [ri.DETAIL_COMPLETE] * 4
+    assert statuses[4:] == [ri.DETAIL_PROBE_CAP_REACHED] * 8
 
 
-def test_model_inventory_skips_details_when_disabled() -> None:
+def test_model_inventory_mixed_outcomes_have_per_model_status() -> None:
+    calls = {"count": 0}
+
+    def flaky(url, payload, **kw):
+        calls["count"] += 1
+        if payload["model"] == "llama3.2:1b":
+            return _fake_show(url, payload, **kw)
+        raise RuntimeError("boom")
+
+    inventory = ri.model_inventory(get_json=_fake_tags, post_json=flaky)
+    by_tag = {model["tag"]: model["detail_status"] for model in inventory["models"]}
+    assert by_tag == {"llama3.2:1b": ri.DETAIL_COMPLETE, "qwen3:8b": ri.DETAIL_FAILED}
+    assert inventory["details_complete"] is False
+
+
+def test_model_inventory_details_disabled_is_not_probed_and_incomplete() -> None:
     inventory = ri.model_inventory(
         get_json=_fake_tags,
         post_json=lambda url, payload, **kw: pytest.fail("must not be called"),
         include_details=False,
     )
-    assert len(inventory["models"]) == 2
+    assert all(model["detail_status"] == ri.DETAIL_NOT_PROBED for model in inventory["models"])
+    assert inventory["details_complete"] is False
+
+
