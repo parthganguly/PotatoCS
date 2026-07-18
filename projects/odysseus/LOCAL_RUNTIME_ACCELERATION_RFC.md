@@ -310,13 +310,22 @@ Fail-safe rules (each carries a test in Phase 3):
   `measured → derived`; incompatible evidence is ignored entirely;
   model tag + thread count alone can never grant `measured`;
 - **without compatible measured evidence a plan carries no numeric
-  TTFT/TPS and is never classified `interactive`** — derived scores
-  rank candidates only, and `estimates.basis` states which case
-  applies; absent hardware knowledge yields `conservative_default`;
+  TTFT/TPS and its execution class is `performance_unknown`** (or
+  `persisted_job` for the memory-reclaim state) — never `interactive`
+  or `slow_interactive`; memory fit and usability are separate facts;
+  derived scores rank candidates only, and `estimates.basis` states
+  which case applies; absent hardware knowledge yields
+  `conservative_default`;
 - KV-cache memory is **architecture-aware** ((K_len + V_len) × kv_heads
   × layers × dtype bytes × context tokens, geometry from `/api/show`
   model_info); unknown geometry uses a documented conservative upper
-  bound (512 KiB/token) and forbids any fit claim;
+  bound (512 KiB/token) and forbids any fit claim; **unknown weight
+  size** (no disk bytes and no usable parameter count, including
+  malformed sizes) is rejected as `unknown_weight_size` — fit is never
+  computed from zero bytes of weights;
+- evidence fingerprints are built **per warm run** and artifacts whose
+  contributing runs disagree on context, tuning options, or placement
+  band are rejected as heterogeneous — mixed measurements never combine;
 - unknown hardware fields (no GPU probe, unknown storage) always shrink
   the allowed envelope, never grow it;
 - `persisted_job` classification can never be routed to `chat.send`
@@ -329,12 +338,21 @@ Fail-safe rules (each carries a test in Phase 3):
 - the planner is **pure**: same inputs → same plan (deterministic
   ordering of alternatives), no I/O beyond its inputs, no settings writes.
 
-Runtime RPC latency contract (amended per review): every probe is
-individually bounded; model-detail probes run under a 2 s total
-worker-thread budget (one hanging model never multiplies across the
-list); a completed snapshot is cached for 60 s with explicit
-`cache_age_ms`/`partial` fields; the declared worst-case cold ceiling
-is **15 s** (arithmetic in `runtime_plan_service.py`).
+Runtime RPC dispatcher contract (amended per review rounds 1–2): **the
+RPC request path never probes.** Requests answer immediately from the
+latest published snapshot (explicit `cache_age_ms`, `partial`,
+`refresh_state`, `last_success_at_ms`), or return a fixed
+`refreshing`/`snapshot_unavailable` result while a single guarded
+background refresher runs. The refresher builds privately, publishes
+immutable generation-checked snapshots (hung/obsolete workers can never
+publish or mutate a returned result), and is itself bounded by the
+per-probe budgets (worst case ~14 s, `REFRESH_WORST_CASE_SECONDS`);
+detail probes carry per-model fixed statuses
+(`complete|timeout|failed|not_probed|probe_cap_reached`) and
+`details_complete` is true only when every model's metadata was
+successfully populated. Worst-case dispatcher blocking is cache/file
+read time (milliseconds), proven by an integration test with every
+probe hanging.
 
 ## 7. Runtime capability matrix
 

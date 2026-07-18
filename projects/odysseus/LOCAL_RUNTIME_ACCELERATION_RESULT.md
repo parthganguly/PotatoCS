@@ -1,12 +1,12 @@
 # Local Runtime Acceleration — Fable Implementation Result
 
 Status: research/engineering track on `feat/local-runtime-acceleration`
-(stacked on `feat/deep-local-fable`); first independent review round
-(PR #35, 2026-07-17) addressed. Backend-only; no UI, no settings
+(stacked on `feat/deep-local-fable`); two independent review rounds
+(PR #35, 2026-07-17/18) addressed. Backend-only; no UI, no settings
 mutation, no chat-routing change, no change to `main`, the installer,
 release assets, or the v0.4 gate.
 
-Date: 2026-07-17/18, updated after review 2026-07-18.
+Date: 2026-07-17/18, updated after review round 2, 2026-07-18.
 Author: Claude Code (Fable).
 
 ## Commits
@@ -16,11 +16,14 @@ Author: Claude Code (Fable).
   `0f667d0c` benchmark harness → `546af85e` planner → `61f57831`
   `runtime.*` RPCs → `a65d54a6` measured evidence (31 artifacts) →
   `aa45ec19` first report.
-- **Review-response commits (2026-07-18):** `869e75c2` architecture-
-  aware KV estimation + planner honesty → `d73ae33b` evidence
-  fingerprints + bounded cached RPCs → `e556d34e` artifact-writer
-  hardening → this report update + doc honesty pass (final head in the
-  PR).
+- **Review-response commits, round 1 (2026-07-18):** `869e75c2`
+  architecture-aware KV estimation + planner honesty → `d73ae33b`
+  evidence fingerprints + bounded cached RPCs → `e556d34e`
+  artifact-writer hardening → `64732a5a` doc honesty pass.
+- **Review-response commits, round 2 (2026-07-18):** `f6a756d7`
+  non-blocking background inventory refresher + honest completeness →
+  `49e40094` performance_unknown class, unknown-weight rejection, full
+  POSIX path guard → this report update (final head in the PR).
 - **Upstream runtimes:** Ollama **0.31.1** (probed live); llama.cpp
   release **b10064** (`86d86ed43`), official Windows x64 CPU zip,
   SHA256 `C9B770B5…099E` (CUDA zip archived `D3DF8C73…34B`, unused);
@@ -39,6 +42,17 @@ Author: Claude Code (Fable).
 | 6 | Flash-KV comparison not a safe recommendation (optimized arm at ~16–177 MB min system RAM; GPU missing from its snapshot) | **Downgraded** (this commit): preserved as exploratory evidence with both defects stated; safety acceptance criteria added (min system-RAM floor, stable GPU detection, comparable ambient VRAM, alternating A/B rounds, no hidden reloads, quality pass, no failure increase); no recommendation exists in code or docs until met. |
 | 7 | Artifact writer path escape + narrow redaction | **Hardened** (`e556d34e`): safe-slug batch ids, resolved-parent containment proof, nested field allowlists, server-env value validation, bounded notes, recursive rejection of Windows-any-drive/UNC/Unix absolute paths in every string, matching serialized-payload sentinel patterns; hostile tests for `../../escape`, `D:\…`, UNC, `/home/…`, and paths embedded in notes/model/env fields. All 31 committed artifacts still validate byte-unchanged. |
 | 8 | Unmeasured-speed fallback could label unmeasured configs interactive | **Fixed** (`869e75c2`): no numeric TTFT/TPS without compatible evidence (`estimates.basis: unmeasured`, values null, `speed_unmeasured` warning); unmeasured configurations are never `interactive`; the derived score ranks candidates only. |
+
+## Review findings (PR #35, second round) and resolutions
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Cold `runtime.*` calls still probed synchronously on the dispatcher thread (15 s ceiling ≠ responsive) | **Fixed** (`f6a756d7`): the request path never probes. Requests answer immediately from the latest published snapshot or return a fixed `refreshing`/`snapshot_unavailable` result while a single guarded background refresher runs. State machine: idle+none → start+refreshing; idle+fresh → serve; idle+stale → serve stale age + start; refreshing → observe, never duplicate; hung (> `REFRESH_HUNG_SECONDS` = 56 s) → supersede, old generation discarded. Integration test: `SidecarApp` `runtime.inventory` + `health.ping` + `runtime.plan` all answer < 2 s while every probe hangs 60 s. |
+| 2 | Abandoned detail worker could leak and mutate returned results; repeated calls could spawn unbounded workers | **Fixed** (`f6a756d7`): detail probes write only into a lock-guarded private dict with an abandoned flag (late results discarded); the service publishes immutable deep-copied snapshots, generation-stamped so obsolete workers never publish; one in-flight refresher enforced under a lock. Tests: repeated calls with a hanging refresher keep exactly one worker; published snapshots proven unchanged after later refreshes; obsolete-generation publish discarded. |
+| 3 | `details_complete` was true when all probes failed ("attempted ≠ complete") | **Fixed** (`f6a756d7`): per-model fixed statuses (`complete/timeout/failed/not_probed/probe_cap_reached`); `details_complete` true only when every model's metadata was successfully populated; the test pinning the old behavior replaced with tests for failed, mixed, capped, and disabled outcomes. |
+| 4 | Unmeasured configs still labeled `slow_interactive` | **Fixed** (`49e40094`): unmeasured configurations are `performance_unknown` (memory-reclaim state stays `persisted_job` by construction); `expect_slow_generation` is emitted only for measured slow/persisted classes; memory fit and usability are separate facts. |
+| 5 | Unknown weight size could yield a fit from 0 weight bytes | **Fixed** (`49e40094`): missing disk size + missing/unusable parameter count (including malformed/negative sizes) → `unknown_weight_size` rejection; fit is never computed from zero weights; params-only models estimate high (8-bit-class upper bound). |
+| 6 | POSIX path guard was a root allowlist; fingerprints mixed first-run options with last-run placement | **Fixed** (`49e40094`): all absolute POSIX paths rejected (any root, multi-segment; `/opt`, `/srv`, `/data` tested) in validator and serialized-payload sentinel; fingerprints are built per warm run and artifacts whose contributing runs disagree on context/tuning/placement are rejected as heterogeneous (mixed-options, mixed-placement, mixed-context, lost-residency tests). All 31 committed artifacts still validate unchanged. |
 
 ## Corrected memory-estimation examples (geometry verified live)
 
@@ -80,9 +94,11 @@ review response.
    and no `interactive` class without measurements; Deep Local
    vocabulary excluded from Ollama plans.
 4. **RPCs** (read-only): `runtime.inventory/benchmarks/plan/
-   recommendations` with a declared 15 s worst-case cold ceiling, 60 s
-   snapshot cache, explicit cache-age/partial state, evidence summaries
-   with sample counts/ranges/batch ids, and `research_findings` marked
+   recommendations` — non-blocking by construction (round 2): the
+   request path never probes; a single guarded background refresher
+   publishes immutable generation-checked snapshots; explicit
+   cache-age/partial/refresh state; evidence summaries with sample
+   counts/ranges/batch ids; `research_findings` marked
    `measured_exploratory` throughout.
 
 ## Measured results — all `measured_exploratory` (one P3 machine)
@@ -116,10 +132,11 @@ nothing from them:
 - **fast** → llama3.2:1b, `fits_gpu_full`, `interactive`, confidence
   **measured** (fingerprint-compatible baseline: 291 ms TTFT / 103
   tok/s median, n=3, batch `ollama-0311-llama32-1b-medium-baseline`).
-- **balanced** → llama3.2:3b, `fits_gpu_full`, `slow_interactive`,
+- **balanced** → llama3.2:3b, `fits_gpu_full`, `performance_unknown`,
   confidence **derived** — the 8192-context configuration has no
-  compatible evidence, so the plan carries **no numeric speed claims**
-  (`speed_unmeasured`).
+  compatible evidence, so the plan carries **no numeric speed claims
+  and no usability class** (`speed_unmeasured`); memory fit and
+  usability are separate facts.
 - **deep** → qwen3:8b, `reachable_after_memory_reclaim`,
   `persisted_job`, confidence derived, `requires_memory_reclaim` —
   an honest Ollama statement, not a Deep Local claim.
@@ -133,19 +150,23 @@ beyond this machine's tier; the real Colibrì engine has still never
 generated a token here; balanced/deep configurations are fit-classified
 but speed-unmeasured.
 
-## Maximum runtime-RPC latency
+## Maximum runtime-RPC latency (dispatcher)
 
-Declared worst-case cold ceiling: **15 s** (arithmetic: nvidia-smi 3.0
-+ tcp 0.5 + Ollama version 2.5 + llama-server --version 3.0 + tags 2.5
-+ detail budget 2.0 + 0.5 join slack = 14.0 s, +1 s margin). Cached
-calls answer from the 60 s snapshot without probing. The
-32-hanging-model test pins the detail phase.
+The RPC request path performs **no probing** (round 2): worst-case
+dispatcher blocking is snapshot/evidence file-read time — measured
+< 2 s in the integration test even with every probe hanging, typically
+milliseconds. The background refresher (not the dispatcher) is bounded
+by per-probe budgets at ~14 s worst case (`REFRESH_WORST_CASE_SECONDS`:
+nvidia-smi 3.0 + tcp 0.5 + Ollama version 2.5 + llama-server --version
+3.0 + tags 2.5 + detail budget 2.0 + 0.5 join slack); a refresher alive
+past 4× that (56 s) is presumed hung and superseded, its late result
+discarded by generation check.
 
 ## Tests run and exact results (post-review head)
 
 | Command | Result |
 |---|---|
-| `python -m pytest python\tests` | **630 passed, 7 skipped** (skips = env-gated Colibrì E2E, as on base) |
+| `python -m pytest python\tests` | **652 passed, 7 skipped** (skips = env-gated Colibrì E2E, as on base) |
 | `npm run test:backend-status` | pass (`backend-status-tests-ok`) |
 | `npm run test:progress` | pass (`chat-progress-tests-ok`) |
 | `npm run test:readiness` | pass (readiness row mapping tests passed) |
@@ -155,9 +176,9 @@ calls answer from the 60 s snapshot without probing. The
 | `cargo test --manifest-path src-tauri\Cargo.toml` | pass (24 passed, 4 ignored) |
 | `git diff --check` | clean |
 
-Focused suites (post-review): inventory 22, harness/artifacts 45,
-planner 39, RPC service 20 — **126 focused tests** (78 → 126), plus
-the 109 preserved Deep Local/Colibrì tests.
+Focused suites (post review round 2): inventory 23, harness/artifacts
+49, planner 45, RPC service 31 — **148 focused tests** (78 → 126 →
+148), plus the 109 preserved Deep Local/Colibrì tests.
 
 ## Privacy / no-egress status
 
