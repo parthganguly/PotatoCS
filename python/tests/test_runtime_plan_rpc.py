@@ -269,24 +269,29 @@ def evidence_dir(tmp_path):
 
 def test_benchmarks_lists_artifacts_and_summaries(evidence_dir) -> None:
     service = RuntimePlanService(evidence_dir)
-    result = service.benchmarks()
+    result = _await_benchmarks(service)
     assert result["ok"] is True
     assert [item["batch_id"] for item in result["artifacts"]] == ["batch-a", "batch-stub"]
     assert [item["model_tag"] for item in result["evidence_summaries"]] == ["llama3.2:1b"]
 
 
-def test_no_evidence_dir_yields_empty_benchmarks() -> None:
+def test_no_evidence_dir_yields_empty_benchmarks_without_worker() -> None:
     service = RuntimePlanService(None)
-    result = service.benchmarks()
+    result = service.benchmarks()  # empty index is known eagerly, no thread
+    assert result["ok"] is True
     assert result["available"] is False
     assert result["artifacts"] == []
     assert result["evidence_summaries"] == []
+    with service._evidence._lock:
+        assert service._evidence._thread is None
 
 
 def test_malformed_artifact_files_are_skipped(tmp_path) -> None:
     (tmp_path / "junk.json").write_text("not json", encoding="utf-8")
     service = RuntimePlanService(tmp_path)
-    assert service.benchmarks()["artifacts"] == []
+    result = _await_benchmarks(service)
+    assert result["artifacts"] == []
+    assert result["stats"]["skipped_malformed"] == 1
 
 
 def test_plan_rejects_invalid_objective() -> None:
@@ -454,12 +459,12 @@ def test_single_refresh_worker_despite_repeated_calls(monkeypatch) -> None:
         assert started_workers["count"] == 1
         # The service holds exactly one persistent worker thread; every
         # repeated call signaled it instead of starting another.
-        with service._lock:
-            worker = service._worker
+        with service._inventory._lock:
+            worker = service._inventory._thread
         assert worker is not None and worker.is_alive()
         service.inventory()
-        with service._lock:
-            assert service._worker is worker
+        with service._inventory._lock:
+            assert service._inventory._thread is worker
     finally:
         release.set()
         service.close()
@@ -487,8 +492,8 @@ def test_published_snapshot_never_mutated_by_late_worker(monkeypatch) -> None:
             "captured_at_ms": 2,
         },
     )
-    with service._lock:
-        service._published_at = 0.0  # make the snapshot stale
+    with service._inventory._lock:
+        service._inventory._published_at = 0.0  # make the snapshot stale
     service.inventory()  # starts refresh with new data
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -506,13 +511,14 @@ def test_obsolete_generation_result_is_discarded(monkeypatch) -> None:
     service = RuntimePlanService(None)
     ready = _await_snapshot(service)
     assert ready["ok"] is True
-    with service._lock:
-        stale_generation = service._generation
-        service._generation += 1  # supersede
-    service._collect_and_publish(stale_generation)  # runs to completion…
-    with service._lock:
+    refresher = service._inventory
+    with refresher._lock:
+        stale_generation = refresher._generation
+        refresher._generation += 1  # supersede
+    refresher._finish_collect(stale_generation, {"x": 1}, "")  # completes…
+    with refresher._lock:
         # …but did not publish: last_success timestamp unchanged.
-        assert service._last_success_at_ms == ready["last_success_at_ms"]
+        assert refresher._last_success_at_ms == ready["last_success_at_ms"]
 
 
 def test_repeated_hung_periods_never_stack_workers(monkeypatch) -> None:
@@ -542,20 +548,136 @@ def test_repeated_hung_periods_never_stack_workers(monkeypatch) -> None:
 
 
 def test_close_stops_worker_and_blocks_publish(monkeypatch) -> None:
+    """Close during idle: the worker exits and close() says so."""
     _patch_inventories(monkeypatch)
     service = RuntimePlanService(None)
     ready = _await_snapshot(service)
-    with service._lock:
-        worker = service._worker
-    service.close()
-    assert worker is not None
-    worker.join(timeout=2)
-    assert not worker.is_alive()
+    with service._inventory._lock:
+        worker = service._inventory._thread
+    result = service.close()
+    assert result["inventory_worker"]["worker_stopped"] is True
+    assert result["all_stopped"] is True
+    assert worker is not None and not worker.is_alive()
     # A collect finishing after close never publishes.
-    service._collect_and_publish(service._generation)
+    refresher = service._inventory
+    refresher._finish_collect(refresher._generation, {"x": 1}, "")
     inventory_after = service.inventory()
     assert inventory_after["ok"] is True  # old snapshot still served
     assert inventory_after["last_success_at_ms"] == ready["last_success_at_ms"]
+
+
+def test_close_during_normal_inflight_refresh_completes(monkeypatch) -> None:
+    """Close while a NORMAL bounded collect is in flight: the worker
+    finishes within the wait margin and close reports worker_stopped."""
+    from odysseus_desktop_backend.services import runtime_inventory as ri
+
+    entered = threading.Event()
+
+    def brief_hw(**kw):
+        entered.set()
+        time.sleep(0.3)  # normal, bounded work
+        return _hardware_snapshot()
+
+    _patch_inventories(monkeypatch)
+    monkeypatch.setattr(ri, "hardware_inventory", brief_hw)
+    service = RuntimePlanService(None)
+    service.inventory()  # start refresh
+    assert entered.wait(2)
+    result = service.close()
+    assert result["inventory_worker"]["worker_stopped"] is True
+    # The in-flight collect was invalidated by close: nothing published.
+    assert service.inventory()["ok"] is False
+
+
+def test_close_reports_worker_still_running_honestly(monkeypatch) -> None:
+    """Close with a timeout-ignoring probe in flight: close must NOT
+    claim clean termination."""
+    from odysseus_desktop_backend.services import runtime_inventory as ri
+
+    release = threading.Event()
+
+    def stuck_hw(**kw):
+        release.wait(60)
+        return _hardware_snapshot()
+
+    monkeypatch.setattr(ri, "hardware_inventory", stuck_hw)
+    monkeypatch.setattr(rps, "CLOSE_WAIT_MARGIN_SECONDS", 0.3)
+    service = RuntimePlanService(None)
+    try:
+        service.inventory()  # start refresh; worker gets stuck
+        time.sleep(0.1)
+        result = service.close()
+        assert result["inventory_worker"]["worker_stopped"] is False
+        assert result["inventory_worker"]["worker_still_running"] is True
+        assert result["all_stopped"] is False
+    finally:
+        release.set()
+
+
+def test_hung_refresh_reports_refresh_hung_with_restart_copy(monkeypatch) -> None:
+    """A collect older than the hung threshold: refresh_hung state, no
+    'retry shortly' language, restart-required category, and no
+    replacement thread."""
+    from odysseus_desktop_backend.services import runtime_inventory as ri
+
+    release = threading.Event()
+
+    def stuck_hw(**kw):
+        release.wait(120)
+        return _hardware_snapshot()
+
+    monkeypatch.setattr(ri, "hardware_inventory", stuck_hw)
+    monkeypatch.setattr(rps, "REFRESH_HUNG_THRESHOLD_SECONDS", 0.2)
+    service = RuntimePlanService(None)
+    try:
+        service.inventory()  # start refresh; worker hangs
+        with service._inventory._lock:
+            worker = service._inventory._thread
+        time.sleep(0.5)  # exceed the (patched) hung threshold
+        result = service.inventory()
+        assert result["ok"] is False
+        assert result["status"] == "unavailable"
+        assert result["error_category"] == rps.ERROR_RESTART_REQUIRED
+        assert result["refresh_state"] == rps.REFRESH_HUNG
+        assert "restart" in result["error"].lower()
+        assert "retry shortly" not in result["error"].lower()
+        assert result["refresh_age_ms"] >= 200
+        # No replacement thread: the hung worker is still THE worker.
+        with service._inventory._lock:
+            assert service._inventory._thread is worker
+        assert worker.is_alive()
+    finally:
+        release.set()
+        service.close()
+
+
+def test_stale_snapshot_still_served_while_hung(monkeypatch) -> None:
+    """A hung refresher must not take away the last completed snapshot."""
+    from odysseus_desktop_backend.services import runtime_inventory as ri
+
+    _patch_inventories(monkeypatch)
+    service = RuntimePlanService(None)
+    ready = _await_snapshot(service)
+
+    release = threading.Event()
+
+    def stuck_hw(**kw):
+        release.wait(120)
+        return _hardware_snapshot()
+
+    monkeypatch.setattr(ri, "hardware_inventory", stuck_hw)
+    monkeypatch.setattr(rps, "REFRESH_HUNG_THRESHOLD_SECONDS", 0.2)
+    try:
+        with service._inventory._lock:
+            service._inventory._published_at = 0.0  # stale -> refresh starts
+        service.inventory()
+        time.sleep(0.5)
+        result = service.inventory()
+        assert result["ok"] is True  # stale snapshot still served
+        assert result["models"] == ready["models"]
+        assert result["refresh_state"] == rps.REFRESH_HUNG
+    finally:
+        release.set()
 
 
 def test_detail_worker_guard_bounds_threads_across_repeated_calls() -> None:
@@ -653,52 +775,212 @@ def test_no_settings_mutation_surface() -> None:
     assert sorted(public) == ["benchmarks", "close", "evidence_dir", "inventory", "plan", "recommendations"]
 
 
-# -- cached bounded evidence loading (review round 3, finding 6) ---------
+# -- background evidence index (review round 4, finding 1) ---------------
 
 
-def test_large_evidence_dir_stays_responsive_and_caches(tmp_path) -> None:
+def _await_benchmarks(service: RuntimePlanService, timeout: float = 5.0) -> dict:
+    """Poll the non-blocking surface until the evidence index publishes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = service.benchmarks()
+        if result.get("ok"):
+            return result
+        assert result["error_category"] == rps.ERROR_EVIDENCE_REFRESHING
+        time.sleep(0.02)
+    pytest.fail("evidence index never published")
+
+
+def test_cold_benchmarks_returns_evidence_refreshing_then_index(tmp_path) -> None:
+    write_artifact(_artifact(batch_id="one"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    first = service.benchmarks()
+    assert first["ok"] is False
+    assert first["status"] == "evidence_refreshing"
+    ready = _await_benchmarks(service)
+    assert len(ready["artifacts"]) == 1
+    assert ready["stats"]["files_parsed"] == 1
+    assert ready["index_age_ms"] >= 0
+
+
+def test_large_evidence_dir_stays_responsive(tmp_path) -> None:
     for index in range(60):
         write_artifact(_artifact(batch_id=f"bulk-{index:03d}"), tmp_path)
     service = RuntimePlanService(tmp_path)
+    ready = _await_benchmarks(service)
+    assert len(ready["artifacts"]) == 60
     started = time.perf_counter()
-    first = service.benchmarks()
-    first_elapsed = time.perf_counter() - started
-    assert first["ok"] is True
-    assert len(first["artifacts"]) == 60
-    assert first_elapsed < rps.EVIDENCE_TIME_BUDGET_SECONDS + 1.0
-    started = time.perf_counter()
-    second = service.benchmarks()
-    cached_elapsed = time.perf_counter() - started
-    assert second["artifacts"] == first["artifacts"]
-    assert cached_elapsed < 0.2, f"cache hit took {cached_elapsed:.3f}s"
+    for _ in range(10):
+        again = service.benchmarks()
+    elapsed = time.perf_counter() - started
+    assert again["artifacts"] == ready["artifacts"]
+    assert elapsed < 0.5, f"10 indexed calls took {elapsed:.3f}s"
 
 
-def test_evidence_time_budget_truncates_honestly(tmp_path, monkeypatch) -> None:
-    for index in range(10):
-        write_artifact(_artifact(batch_id=f"slow-{index:03d}"), tmp_path)
+def test_malformed_and_invalid_artifacts_are_counted_not_raised(tmp_path) -> None:
+    write_artifact(_artifact(batch_id="good"), tmp_path)
+    (tmp_path / "malformed.json").write_text("{not json", encoding="utf-8")
+    # Parseable JSON, schema-invalid (missing required keys).
+    (tmp_path / "invalid.json").write_text(json.dumps({"schema_version": 1, "prompt": "x"}), encoding="utf-8")
+    # Valid JSON with malformed numeric model fields -> schema-invalid.
+    bad_numeric = _artifact(batch_id="badnum")
+    bad_numeric["model"]["disk_bytes"] = "not-a-number/with/slash"
+    (tmp_path / "badnum.json").write_text(json.dumps(bad_numeric), encoding="utf-8")
     service = RuntimePlanService(tmp_path)
-    monkeypatch.setattr(rps, "EVIDENCE_TIME_BUDGET_SECONDS", 0.0)
-    result = service.benchmarks()
-    assert result["truncated"] is True
-    assert len(result["artifacts"]) < 10
+    ready = _await_benchmarks(service)
+    assert [item["batch_id"] for item in ready["artifacts"]] == ["good"]
+    assert ready["stats"]["skipped_malformed"] == 1
+    assert ready["stats"]["skipped_invalid_schema"] == 2
+    assert ready["stats"]["files_seen"] == 4
+    # Plans consume the same index without raising.
+    result = service.plan("fast")
+    assert "error" not in result or result.get("error_category") != "internal"
 
 
-def test_evidence_byte_budget_truncates_honestly(tmp_path, monkeypatch) -> None:
-    for index in range(10):
-        write_artifact(_artifact(batch_id=f"big-{index:03d}"), tmp_path)
+def test_file_count_truncation_reported(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rps, "MAX_EVIDENCE_FILES", 5)
+    for index in range(8):
+        write_artifact(_artifact(batch_id=f"many-{index:03d}"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    ready = _await_benchmarks(service)
+    assert len(ready["artifacts"]) == 5
+    assert rps.TRUNCATION_FILE_COUNT in ready["stats"]["truncation_reasons"]
+    assert ready["truncated"] is True
+
+
+def test_oversized_files_counted_and_skipped(tmp_path, monkeypatch) -> None:
+    write_artifact(_artifact(batch_id="normal"), tmp_path)
+    monkeypatch.setattr(rps, "MAX_EVIDENCE_FILE_BYTES", 64)
+    service = RuntimePlanService(tmp_path)
+    ready = _await_benchmarks(service)
+    assert ready["artifacts"] == []
+    assert ready["stats"]["skipped_oversized"] == 1
+
+
+def test_byte_budget_truncation_reported(tmp_path, monkeypatch) -> None:
+    for index in range(4):
+        write_artifact(_artifact(batch_id=f"budget-{index}"), tmp_path)
     monkeypatch.setattr(rps, "EVIDENCE_TOTAL_BYTE_BUDGET", 1)
     service = RuntimePlanService(tmp_path)
-    result = service.benchmarks()
-    assert result["truncated"] is True
-    assert result["artifacts"] == []
+    ready = _await_benchmarks(service)
+    assert ready["artifacts"] == []
+    assert rps.TRUNCATION_BYTE_BUDGET in ready["stats"]["truncation_reasons"]
 
 
-def test_evidence_cache_invalidates_on_new_file(tmp_path) -> None:
+def test_slow_file_reads_never_block_rpc_calls(tmp_path, monkeypatch) -> None:
+    """Deliberately slow reads on the evidence worker: benchmarks/plan
+    keep answering instantly with the fixed refreshing result."""
+    write_artifact(_artifact(batch_id="slowread"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    original_build = service._build_evidence_index
+
+    def slow_build():
+        time.sleep(30)
+        return original_build()
+
+    monkeypatch.setattr(service, "_build_evidence_index", slow_build)
+    started = time.perf_counter()
+    for _ in range(10):
+        result = service.benchmarks()
+        assert result["ok"] is False
+        assert result["error_category"] == rps.ERROR_EVIDENCE_REFRESHING
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"RPC path blocked {elapsed:.2f}s on slow evidence reads"
+
+
+def test_plan_uses_only_last_completed_evidence_index(monkeypatch, tmp_path) -> None:
+    """While a slow re-index runs, plans keep using the previous
+    completed index — never partial work."""
+    _patch_inventories(monkeypatch)
+    write_artifact(_artifact(batch_id="ev-a"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    _await_snapshot(service)
+    ready = _await_benchmarks(service)
+    assert ready["stats"]["files_parsed"] == 1
+    block = threading.Event()
+    original_build = service._build_evidence_index
+
+    def blocking_build():
+        block.wait(30)
+        return original_build()
+
+    monkeypatch.setattr(service, "_build_evidence_index", blocking_build)
+    write_artifact(_artifact(batch_id="ev-b"), tmp_path)
+    with service._evidence._lock:
+        service._evidence._published_at = 0.0  # stale: triggers re-index
+    try:
+        result = service.benchmarks()
+        # Old completed index still served while the slow rebuild runs.
+        assert result["ok"] is True
+        assert [item["batch_id"] for item in result["artifacts"]] == ["ev-a"]
+        plan_result = service.plan("fast")
+        assert plan_result["ok"] is True
+    finally:
+        block.set()
+
+
+def test_single_evidence_worker_across_repeated_calls(tmp_path, monkeypatch) -> None:
+    before = sum(1 for t in threading.enumerate() if t.name == "evidence-index-refresh")
+    write_artifact(_artifact(batch_id="single"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    try:
+        _await_benchmarks(service)
+        with service._evidence._lock:
+            worker = service._evidence._thread
+            service._evidence._published_at = 0.0
+        for _ in range(20):
+            service.benchmarks()
+        after = sum(1 for t in threading.enumerate() if t.name == "evidence-index-refresh")
+        assert after - before == 1  # exactly this service's one worker
+        with service._evidence._lock:
+            assert service._evidence._thread is worker
+    finally:
+        service.close()
+
+
+def test_evidence_index_updates_after_file_changes(tmp_path) -> None:
     write_artifact(_artifact(batch_id="first"), tmp_path)
     service = RuntimePlanService(tmp_path)
-    assert len(service.benchmarks()["artifacts"]) == 1
+    ready = _await_benchmarks(service)
+    assert [item["batch_id"] for item in ready["artifacts"]] == ["first"]
     write_artifact(_artifact(batch_id="second"), tmp_path)
-    assert len(service.benchmarks()["artifacts"]) == 2
+    with service._evidence._lock:
+        service._evidence._published_at = 0.0  # expire TTL deterministically
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = service.benchmarks()
+        if result.get("ok") and len(result["artifacts"]) == 2:
+            break
+        time.sleep(0.02)
+    assert [item["batch_id"] for item in result["artifacts"]] == ["first", "second"]
+    # Removal invalidates too.
+    (tmp_path / "first.json").unlink()
+    with service._evidence._lock:
+        service._evidence._published_at = 0.0
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = service.benchmarks()
+        if result.get("ok") and len(result["artifacts"]) == 1:
+            break
+        time.sleep(0.02)
+    assert [item["batch_id"] for item in result["artifacts"]] == ["second"]
+
+
+def test_symlinks_outside_evidence_root_are_skipped(tmp_path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    write_artifact(_artifact(batch_id="inside"), evidence)
+    target = outside / "secret.json"
+    target.write_text(json.dumps(_artifact(batch_id="outside-secret")), encoding="utf-8")
+    try:
+        (evidence / "link.json").symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this account")
+    service = RuntimePlanService(evidence)
+    ready = _await_benchmarks(service)
+    assert [item["batch_id"] for item in ready["artifacts"]] == ["inside"]
+    assert ready["stats"]["skipped_not_regular"] == 1
 
 
 def test_dispatcher_stays_responsive_while_probes_hang(monkeypatch, tmp_path) -> None:

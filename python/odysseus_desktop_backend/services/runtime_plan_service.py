@@ -49,12 +49,13 @@ logger = get_logger("runtime_plan")
 
 MAX_EVIDENCE_FILES = 200
 MAX_EVIDENCE_FILE_BYTES = 4 * 1024 * 1024
-# Strict budgets for one evidence load pass (review round 3): total
-# bytes parsed and wall-clock time are both capped; exceeding either
-# stops the pass and marks the result truncated. Results are cached by
-# a directory-stat key so repeat RPC calls do no parsing at all.
+# Strict budgets for one background evidence-index pass: total bytes
+# parsed and wall-clock time are both capped; exceeding either stops
+# the pass with an explicit truncation reason. Per-file and total byte
+# limits are enforced WHILE reading, not only from a pre-read stat.
 EVIDENCE_TOTAL_BYTE_BUDGET = 16 * 1024 * 1024
 EVIDENCE_TIME_BUDGET_SECONDS = 1.0
+EVIDENCE_INDEX_TTL_SECONDS = 60.0
 
 INVENTORY_CACHE_TTL_SECONDS = 60.0
 
@@ -64,12 +65,28 @@ INVENTORY_CACHE_TTL_SECONDS = 60.0
 # tags 2.5s + detail budget 2.0s (+0.5s join slack) = 14.0s. This bounds
 # the refresher thread, NOT the dispatcher: RPC calls never wait for it.
 REFRESH_WORST_CASE_SECONDS = 14.0
+# A collection older than worst case + margin is presumed hung: the
+# state machine reports `refresh_hung`, no replacement thread is ever
+# started, and honest copy says a sidecar restart is required for
+# future refreshes.
+REFRESH_HUNG_THRESHOLD_SECONDS = REFRESH_WORST_CASE_SECONDS + 6.0
+# close() waits through the bounded ceiling plus margin for a live
+# collection before reporting worker_still_running.
+CLOSE_WAIT_MARGIN_SECONDS = 2.0
 
 ERROR_SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
 ERROR_REFRESH_FAILED = "refresh_failed"
+ERROR_RESTART_REQUIRED = "restart_required"
+ERROR_EVIDENCE_REFRESHING = "evidence_refreshing"
 
 REFRESH_IDLE = "idle"
 REFRESH_RUNNING = "refreshing"
+REFRESH_HUNG = "refresh_hung"
+REFRESH_CLOSED = "closed"
+
+TRUNCATION_FILE_COUNT = "file_count"
+TRUNCATION_BYTE_BUDGET = "byte_budget"
+TRUNCATION_TIME_BUDGET = "time_budget"
 
 # Server-env keys that do not affect performance and are stripped from
 # fingerprints (OLLAMA_NO_CLOUD only disables remote features the
@@ -231,104 +248,170 @@ def summarize_artifacts(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]
     return summaries
 
 
-class RuntimePlanService:
-    """Refresh state machine (ONE persistent background worker for the
-    service lifetime — threads are never replaced or stacked):
+class _PersistentRefresher:
+    """One persistent daemon worker (never replaced, never stacked).
 
-        idle + no snapshot   --request--> signal refresh, reply `refreshing`
-        idle + fresh         --request--> reply from snapshot
-        idle + stale         --request--> signal refresh, reply stale+age
-        refreshing           --request--> reply snapshot/`refreshing`;
-                                          the signal is level-triggered,
-                                          no second worker ever starts
-        refresh done         --publish--> immutable deep-copied snapshot,
-                                          generation-checked (a collect
-                                          superseded by close() never
-                                          publishes)
-        worker hung          --request--> requests keep answering from
-                                          the last snapshot; at most this
-                                          one unkillable daemon thread
-                                          exists for the process lifetime
-        close()              ----------> worker loop exits at the next
-                                          wakeup; no further publishes
+    State machine:
+
+        idle + no result   --observe--> signal refresh, report refreshing
+        idle + fresh       --observe--> serve result
+        idle + stale       --observe--> serve result + age, signal refresh
+        refreshing         --observe--> serve result/`refreshing`; the
+                                        signal is level-triggered, no
+                                        second thread ever starts
+        collect done       --publish--> immutable deep-copied result,
+                                        generation-checked (a collect
+                                        superseded by close() never
+                                        publishes)
+        collect older than REFRESH_HUNG_THRESHOLD_SECONDS
+                           --observe--> `refresh_hung`: no replacement
+                                        thread, no more signals; honest
+                                        copy says a sidecar restart is
+                                        required; the last completed
+                                        result keeps being served
+        close()            ----------> loop exits at next wakeup; close
+                                        reports worker_stopped vs
+                                        worker_still_running honestly
     """
+
+    def __init__(self, name: str, collect):
+        self._name = name
+        self._collect_fn = collect
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._requested = threading.Event()
+        self._closed = threading.Event()
+        self._collecting = False
+        self._collect_started_at = 0.0
+        self._generation = 0
+        self._published: dict[str, Any] | None = None
+        self._published_at = 0.0
+        self._last_success_at_ms = 0
+        self._failure_category = ""
+
+    def _finish_collect(self, generation: int, result: dict[str, Any] | None, failure: str) -> None:
+        with self._lock:
+            self._collecting = False
+            if generation != self._generation or self._closed.is_set():
+                return  # superseded (close): never publish
+            if result is not None:
+                # Publish an immutable private copy; the collector's own
+                # references are dropped here and never touched again.
+                self._published = copy.deepcopy(result)
+                self._published_at = time.monotonic()
+                self._last_success_at_ms = utc_ms()
+                self._failure_category = ""
+            else:
+                self._failure_category = failure
+
+    def _loop(self) -> None:
+        while not self._closed.is_set():
+            self._requested.wait()
+            if self._closed.is_set():
+                return
+            self._requested.clear()
+            with self._lock:
+                self._generation += 1
+                generation = self._generation
+                self._collecting = True
+                self._collect_started_at = time.monotonic()
+            try:
+                result = self._collect_fn()
+                failure = ""
+            except Exception:  # noqa: BLE001 - fixed category, no raw detail
+                result = None
+                failure = ERROR_REFRESH_FAILED
+            self._finish_collect(generation, result, failure)
+
+    def request_refresh(self) -> None:
+        with self._lock:
+            if self._closed.is_set():
+                return
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, name=self._name, daemon=True)
+                self._thread.start()
+            self._requested.set()
+
+    def publish(self, result: dict[str, Any]) -> None:
+        """Eagerly publish a known result without a worker (used for the
+        trivial empty-evidence case so no thread is needed)."""
+        with self._lock:
+            self._published = copy.deepcopy(result)
+            self._published_at = time.monotonic()
+            self._last_success_at_ms = utc_ms()
+
+    def observe(self, ttl_seconds: float) -> dict[str, Any]:
+        """Non-blocking observation; may signal one refresh. Never scans,
+        reads, or parses anything on the caller's thread."""
+        with self._lock:
+            now = time.monotonic()
+            published = self._published
+            age_seconds = (now - self._published_at) if published is not None else None
+            collecting = self._collecting
+            collect_age = (now - self._collect_started_at) if collecting else None
+            closed = self._closed.is_set()
+            hung = bool(collecting and collect_age is not None and collect_age > REFRESH_HUNG_THRESHOLD_SECONDS)
+            result_copy = copy.deepcopy(published) if published is not None else None
+            last_success = self._last_success_at_ms
+            failure = self._failure_category
+        if closed:
+            state = REFRESH_CLOSED
+        elif hung:
+            state = REFRESH_HUNG
+        elif collecting or self._requested.is_set():
+            state = REFRESH_RUNNING
+        else:
+            state = REFRESH_IDLE
+        stale = published is None or (age_seconds is not None and age_seconds > ttl_seconds)
+        if stale and state == REFRESH_IDLE:
+            self.request_refresh()
+            state = REFRESH_RUNNING
+        return {
+            "result": result_copy,
+            "age_ms": int(age_seconds * 1000) if age_seconds is not None else None,
+            "refresh_state": state,
+            "refresh_age_ms": int(collect_age * 1000) if collect_age is not None else None,
+            "last_success_at_ms": last_success,
+            "failure_category": ERROR_RESTART_REQUIRED if hung else failure,
+        }
+
+    def close(self) -> dict[str, Any]:
+        """Stop the loop. Waits CLOSE_WAIT_MARGIN_SECONDS and then
+        reports honestly: a worker mid-collect may legitimately outlive
+        close (it can never publish afterwards — generation + closed
+        checks); a timeout-ignoring probe is reported as
+        worker_still_running, never claimed terminated."""
+        with self._lock:
+            self._closed.set()
+            self._generation += 1  # invalidate any in-flight collect
+            self._requested.set()  # wake the loop so it exits
+            thread = self._thread
+        if thread is None:
+            return {"worker_stopped": True, "worker_still_running": False}
+        thread.join(timeout=CLOSE_WAIT_MARGIN_SECONDS)
+        stopped = not thread.is_alive()
+        return {"worker_stopped": stopped, "worker_still_running": not stopped}
+
+
+class RuntimePlanService:
+    """Two persistent background workers — inventory probes and the
+    evidence index — with a never-probing, never-parsing RPC path."""
 
     def __init__(self, evidence_dir: str | Path | None = None):
         # Research phase: benchmark evidence is a dev-machine artifact
         # directory; production profiles have none and the planner
         # degrades to derived/conservative confidence by design.
         self.evidence_dir = Path(evidence_dir) if evidence_dir else None
-        self._lock = threading.Lock()
-        self._published: dict[str, Any] | None = None
-        self._published_at: float = 0.0
-        self._last_success_at_ms: int = 0
-        self._last_failure_category: str = ""
-        self._worker: threading.Thread | None = None
-        self._refresh_requested = threading.Event()
-        self._collecting = False
-        self._closed = threading.Event()
-        self._generation: int = 0
-        self._evidence_cache_lock = threading.Lock()
-        self._evidence_cache_key: tuple | None = None
-        self._evidence_cache: dict[str, Any] | None = None
+        self._inventory = _PersistentRefresher("runtime-inventory-refresh", self._collect_snapshot)
+        self._evidence = _PersistentRefresher("evidence-index-refresh", self._build_evidence_index)
+        if self.evidence_dir is None:
+            # No evidence source: the empty index is known without I/O.
+            self._evidence.publish(_empty_evidence_index())
 
-    # -- evidence (cached, strictly budgeted) ----------------------------
-
-    def _evidence_dir_key(self) -> tuple | None:
-        """Cheap directory identity: (name, size, mtime_ns) per file."""
-        if self.evidence_dir is None or not self.evidence_dir.is_dir():
-            return None
-        entries = []
-        try:
-            for path in sorted(self.evidence_dir.glob("*.json"))[:MAX_EVIDENCE_FILES]:
-                stat = path.stat()
-                entries.append((path.name, stat.st_size, stat.st_mtime_ns))
-        except OSError:
-            return None
-        return tuple(entries)
-
-    def _evidence_state(self) -> dict[str, Any]:
-        """Listing + summaries under strict byte/time budgets, cached by
-        the directory-stat key. A cache hit costs one directory scan
-        (milliseconds); a miss parses at most EVIDENCE_TOTAL_BYTE_BUDGET
-        bytes or EVIDENCE_TIME_BUDGET_SECONDS, whichever ends first."""
-        key = self._evidence_dir_key()
-        with self._evidence_cache_lock:
-            if self._evidence_cache_key == key and self._evidence_cache is not None:
-                return self._evidence_cache
-        artifacts: list[dict[str, Any]] = []
-        truncated = False
-        if key is not None:
-            bytes_read = 0
-            deadline = time.monotonic() + EVIDENCE_TIME_BUDGET_SECONDS
-            for name, size, _mtime in key:
-                if time.monotonic() > deadline or bytes_read + size > EVIDENCE_TOTAL_BYTE_BUDGET:
-                    truncated = True
-                    break
-                if size > MAX_EVIDENCE_FILE_BYTES:
-                    continue
-                try:
-                    artifacts.append(json.loads((self.evidence_dir / name).read_text(encoding="utf-8")))
-                    bytes_read += size
-                except (OSError, json.JSONDecodeError):
-                    continue
-        state = {
-            "listing": _benchmark_listing(artifacts),
-            "summaries": summarize_artifacts(artifacts),
-            "truncated": truncated,
-        }
-        with self._evidence_cache_lock:
-            self._evidence_cache_key = key
-            self._evidence_cache = state
-        return state
-
-    def _evidence_summaries(self) -> list[dict[str, Any]]:
-        return self._evidence_state()["summaries"]
-
-    # -- background snapshot refresher ----------------------------------
+    # -- background collectors (worker threads only) ---------------------
 
     def _collect_snapshot(self) -> dict[str, Any]:
-        """Probe sequence; runs ONLY on the refresher thread."""
+        """Probe sequence; runs ONLY on the inventory refresher thread."""
         hardware = ri.hardware_inventory()
         runtimes = ri.runtime_inventory()
         models = ri.model_inventory()
@@ -341,94 +424,151 @@ class RuntimePlanService:
             "captured_at_ms": utc_ms(),
         }
 
-    def _collect_and_publish(self, generation: int) -> None:
-        try:
-            snapshot = self._collect_snapshot()
-            failure = ""
-        except Exception:  # noqa: BLE001 - fixed category, no raw detail
-            snapshot = None
-            failure = ERROR_REFRESH_FAILED
-        with self._lock:
-            if generation != self._generation or self._closed.is_set():
-                return  # superseded (close) — never publish
-            if snapshot is not None:
-                # Publish an immutable private copy; the collector's own
-                # references are dropped here and never touched again.
-                self._published = copy.deepcopy(snapshot)
-                self._published_at = time.monotonic()
-                self._last_success_at_ms = int(snapshot["captured_at_ms"])
-                self._last_failure_category = ""
-            else:
-                self._last_failure_category = failure
+    def _build_evidence_index(self) -> dict[str, Any]:
+        """Discover, validate, parse, and summarize evidence artifacts;
+        runs ONLY on the evidence refresher thread. Every enforcement is
+        performed while reading: symlinks/reparse points are skipped,
+        per-file and total byte limits are checked against actual bytes
+        read, schema validation gates every decoded object, and one bad
+        artifact can never abort the pass."""
+        import os
 
-    def _worker_loop(self) -> None:
-        while not self._closed.is_set():
-            self._refresh_requested.wait()
-            if self._closed.is_set():
-                return
-            self._refresh_requested.clear()
-            with self._lock:
-                self._generation += 1
-                generation = self._generation
-                self._collecting = True
+        from odysseus_desktop_backend.runtime_bench.artifacts import validate_artifact
+
+        stats = {
+            "files_seen": 0,
+            "files_parsed": 0,
+            "skipped_malformed": 0,
+            "skipped_invalid_schema": 0,
+            "skipped_oversized": 0,
+            "skipped_not_regular": 0,
+            "skipped_unreadable": 0,
+            "total_parsed_bytes": 0,
+            "truncation_reasons": [],
+        }
+        artifacts: list[dict[str, Any]] = []
+        root = self.evidence_dir
+        if root is not None and root.is_dir():
+            root_resolved = root.resolve()
+            names: list[str] = []
             try:
-                self._collect_and_publish(generation)
-            finally:
-                with self._lock:
-                    self._collecting = False
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        if not entry.name.endswith(".json"):
+                            continue
+                        stats["files_seen"] += 1
+                        try:
+                            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                                stats["skipped_not_regular"] += 1
+                                continue
+                        except OSError:
+                            stats["skipped_unreadable"] += 1
+                            continue
+                        names.append(entry.name)
+            except OSError:
+                names = []
+            names.sort()
+            if len(names) > MAX_EVIDENCE_FILES:
+                names = names[:MAX_EVIDENCE_FILES]
+                stats["truncation_reasons"].append(TRUNCATION_FILE_COUNT)
+            deadline = time.monotonic() + EVIDENCE_TIME_BUDGET_SECONDS
+            for name in names:
+                if time.monotonic() > deadline:
+                    stats["truncation_reasons"].append(TRUNCATION_TIME_BUDGET)
+                    break
+                path = root / name
+                try:
+                    if path.resolve().parent != root_resolved:
+                        stats["skipped_not_regular"] += 1
+                        continue
+                    with open(path, "rb") as handle:
+                        data = handle.read(MAX_EVIDENCE_FILE_BYTES + 1)
+                except OSError:
+                    stats["skipped_unreadable"] += 1
+                    continue
+                if len(data) > MAX_EVIDENCE_FILE_BYTES:
+                    stats["skipped_oversized"] += 1
+                    continue
+                if stats["total_parsed_bytes"] + len(data) > EVIDENCE_TOTAL_BYTE_BUDGET:
+                    stats["truncation_reasons"].append(TRUNCATION_BYTE_BUDGET)
+                    break
+                try:
+                    decoded = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    stats["skipped_malformed"] += 1
+                    continue
+                if not isinstance(decoded, dict) or validate_artifact(decoded):
+                    stats["skipped_invalid_schema"] += 1
+                    continue
+                stats["total_parsed_bytes"] += len(data)
+                stats["files_parsed"] += 1
+                artifacts.append(decoded)
+        return {
+            "listing": _benchmark_listing(artifacts),
+            "summaries": summarize_artifacts(artifacts),
+            "stats": stats,
+            "captured_at_ms": utc_ms(),
+        }
 
-    def _request_refresh_locked(self) -> None:
-        """Signal the persistent worker; caller must hold the lock. The
-        signal is level-triggered — no second thread is ever created,
-        even if the worker is hung inside a probe."""
-        if self._closed.is_set():
-            return
-        if self._worker is None:
-            self._worker = threading.Thread(
-                target=self._worker_loop,
-                name="runtime-inventory-refresh",
-                daemon=True,
-            )
-            self._worker.start()
-        self._refresh_requested.set()
+    # -- lifecycle -------------------------------------------------------
 
-    def close(self) -> None:
-        """Stop the refresher with the sidecar. A worker hung inside a
-        probe cannot be killed (daemon thread; dies with the process),
-        but it can never publish after close."""
-        with self._lock:
-            self._closed.set()
-            self._generation += 1  # invalidate any in-flight collect
-            self._refresh_requested.set()  # wake the loop so it exits
-        if self._worker is not None:
-            self._worker.join(timeout=2)
+    def close(self) -> dict[str, Any]:
+        """Stop both workers; returns per-worker stopped state honestly.
+        Bounded: at most 2 x CLOSE_WAIT_MARGIN_SECONDS. A worker stuck
+        in a timeout-ignoring probe is reported worker_still_running —
+        it can never publish after close, and it dies with the process."""
+        inventory_result = self._inventory.close()
+        evidence_result = self._evidence.close()
+        result = {
+            "inventory_worker": inventory_result,
+            "evidence_worker": evidence_result,
+            "all_stopped": inventory_result["worker_stopped"] and evidence_result["worker_stopped"],
+        }
+        logger.info(
+            "runtime plan service closed inventory_stopped=%s evidence_stopped=%s",
+            inventory_result["worker_stopped"],
+            evidence_result["worker_stopped"],
+        )
+        return result
+
+    # -- observation helpers ---------------------------------------------
 
     def _observe(self) -> dict[str, Any]:
-        """Non-blocking snapshot observation; may signal one refresh."""
-        with self._lock:
-            snapshot = self._published
-            age_seconds = (time.monotonic() - self._published_at) if snapshot is not None else None
-            if snapshot is None or age_seconds > INVENTORY_CACHE_TTL_SECONDS:
-                self._request_refresh_locked()
-            refreshing = self._collecting or self._refresh_requested.is_set()
-            return {
-                "snapshot": copy.deepcopy(snapshot) if snapshot is not None else None,
-                "cache_age_ms": int(age_seconds * 1000) if age_seconds is not None else None,
-                "refresh_state": REFRESH_RUNNING if refreshing else REFRESH_IDLE,
-                "last_success_at_ms": self._last_success_at_ms,
-                "failure_category": self._last_failure_category,
-            }
+        observed = self._inventory.observe(INVENTORY_CACHE_TTL_SECONDS)
+        observed["snapshot"] = observed.pop("result")
+        observed["cache_age_ms"] = observed.pop("age_ms")
+        return observed
+
+    def _observe_evidence(self) -> dict[str, Any]:
+        observed = self._evidence.observe(EVIDENCE_INDEX_TTL_SECONDS)
+        observed["index"] = observed.pop("result")
+        return observed
 
     def _unavailable(self, observed: dict[str, Any]) -> dict[str, Any]:
+        if observed["refresh_state"] == REFRESH_HUNG:
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "error_category": ERROR_RESTART_REQUIRED,
+                "error": (
+                    "The runtime inventory refresher is stuck and cannot refresh "
+                    "again until the app is restarted. No inventory snapshot is "
+                    "available."
+                ),
+                "refresh_state": observed["refresh_state"],
+                "refresh_age_ms": observed["refresh_age_ms"],
+                "last_success_at_ms": observed["last_success_at_ms"],
+            }
         return {
             "ok": False,
             "status": "refreshing",
             "error_category": observed["failure_category"] or ERROR_SNAPSHOT_UNAVAILABLE,
             "error": (
                 "The runtime inventory snapshot is not ready yet; a background "
-                "refresh is in progress. Retry shortly."
+                "refresh is in progress."
             ),
             "refresh_state": observed["refresh_state"],
+            "refresh_age_ms": observed["refresh_age_ms"],
             "last_success_at_ms": observed["last_success_at_ms"],
         }
 
@@ -448,19 +588,42 @@ class RuntimePlanService:
             "model_error_category": snapshot["model_error_category"],
             "cache_age_ms": observed["cache_age_ms"],
             "refresh_state": observed["refresh_state"],
+            "refresh_age_ms": observed["refresh_age_ms"],
             "last_success_at_ms": observed["last_success_at_ms"],
             "captured_at_ms": snapshot["captured_at_ms"],
         }
 
     def benchmarks(self) -> dict[str, Any]:
-        state = self._evidence_state()
+        observed = self._observe_evidence()
+        index = observed["index"]
+        if index is None:
+            return {
+                "ok": False,
+                "status": "evidence_refreshing",
+                "error_category": ERROR_EVIDENCE_REFRESHING,
+                "error": "The benchmark evidence index is being built in the background.",
+                "refresh_state": observed["refresh_state"],
+                "last_success_at_ms": observed["last_success_at_ms"],
+            }
         return {
             "ok": True,
-            "available": bool(state["listing"]),
-            "artifacts": state["listing"],
-            "evidence_summaries": state["summaries"],
-            "truncated": state["truncated"],
+            "available": bool(index["listing"]),
+            "artifacts": index["listing"],
+            "evidence_summaries": index["summaries"],
+            "stats": index["stats"],
+            "truncated": bool(index["stats"]["truncation_reasons"]),
+            "index_age_ms": observed["age_ms"],
+            "index_captured_at_ms": index["captured_at_ms"],
+            "refresh_state": observed["refresh_state"],
         }
+
+    def _evidence_summaries_snapshot(self) -> list[dict[str, Any]]:
+        """Planner evidence from the LAST COMPLETED index only — never
+        computed on the request path. No index yet = no evidence (the
+        planner degrades to derived confidence honestly)."""
+        observed = self._observe_evidence()
+        index = observed["index"]
+        return index["summaries"] if index is not None else []
 
     def plan(self, objective: str) -> dict[str, Any]:
         if objective not in rp.OBJECTIVES:
@@ -478,7 +641,7 @@ class RuntimePlanService:
             hardware=snapshot["hardware"],
             models=snapshot["models"],
             runtimes=snapshot["runtimes"],
-            evidence=self._evidence_summaries(),
+            evidence=self._evidence_summaries_snapshot(),
             now_ms=utc_ms(),
         )
         logger.info(
@@ -502,7 +665,7 @@ class RuntimePlanService:
         snapshot = observed["snapshot"]
         if snapshot is None:
             return self._unavailable(observed)
-        evidence = self._evidence_summaries()
+        evidence = self._evidence_summaries_snapshot()
         now = utc_ms()
         plans = {
             objective: rp.build_plan(
@@ -553,6 +716,25 @@ def _benchmark_listing(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return sorted(listing, key=lambda item: item["batch_id"])
+
+
+def _empty_evidence_index() -> dict[str, Any]:
+    return {
+        "listing": [],
+        "summaries": [],
+        "stats": {
+            "files_seen": 0,
+            "files_parsed": 0,
+            "skipped_malformed": 0,
+            "skipped_invalid_schema": 0,
+            "skipped_oversized": 0,
+            "skipped_not_regular": 0,
+            "skipped_unreadable": 0,
+            "total_parsed_bytes": 0,
+            "truncation_reasons": [],
+        },
+        "captured_at_ms": utc_ms(),
+    }
 
 
 def _capability_matrix() -> dict[str, Any]:
