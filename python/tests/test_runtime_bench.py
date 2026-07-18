@@ -258,6 +258,90 @@ def test_nested_hardware_and_run_extras_rejected() -> None:
     assert any("run 0 options keys" in problem for problem in validate_artifact(artifact3))
 
 
+# -- numeric type/range validation (review round 5) ----------------------
+
+
+def test_string_in_numeric_model_field_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["model"]["disk_bytes"] = "not-a-number"
+    assert any("model.disk_bytes must be a finite number" in problem for problem in validate_artifact(artifact))
+
+
+def test_string_in_tps_field_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["runs"][0]["tokens"]["generation_tps"] = "secret"
+    problems = validate_artifact(artifact)
+    assert any("tokens.generation_tps must be a finite number" in problem for problem in problems)
+
+
+def test_nan_and_infinity_rejected() -> None:
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        artifact = _minimal_artifact()
+        artifact["runs"][0]["timings_ms"]["total"] = bad
+        problems = validate_artifact(artifact)
+        assert any("timings_ms.total must be a finite number" in problem for problem in problems), bad
+
+
+def test_negative_values_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["hardware"]["ram"] = {"total_bytes": -1, "available_bytes": 4}
+    assert any("ram.total_bytes must be >= 0" in problem for problem in validate_artifact(artifact))
+    artifact2 = _minimal_artifact()
+    artifact2["runs"][0]["tokens"]["generated"] = -5
+    assert any("tokens.generated must be >= 0" in problem for problem in validate_artifact(artifact2))
+    artifact3 = _minimal_artifact()
+    artifact3["runs"][0]["residency"] = {
+        "size_bytes": -100,
+        "size_vram_bytes": 0,
+        "gpu_fraction": 0.5,
+        "context_length": 4096,
+    }
+    assert any("residency.size_bytes must be >= 0" in problem for problem in validate_artifact(artifact3))
+
+
+def test_gpu_fraction_outside_unit_interval_rejected() -> None:
+    for bad in (-0.1, 1.5, 99):
+        artifact = _minimal_artifact()
+        artifact["runs"][0]["residency"] = {
+            "size_bytes": 100,
+            "size_vram_bytes": 100,
+            "gpu_fraction": bad,
+            "context_length": 4096,
+        }
+        problems = validate_artifact(artifact)
+        assert any("gpu_fraction" in problem for problem in problems), bad
+
+
+def test_booleans_rejected_in_numeric_fields() -> None:
+    artifact = _minimal_artifact()
+    artifact["model"]["disk_bytes"] = True
+    assert any("model.disk_bytes must be a finite number" in problem for problem in validate_artifact(artifact))
+    artifact2 = _minimal_artifact()
+    artifact2["runs"][0]["tokens"]["prompt"] = False
+    assert any("tokens.prompt must be a finite number" in problem for problem in validate_artifact(artifact2))
+    artifact3 = _minimal_artifact()
+    artifact3["hardware"]["cpu"]["logical_threads"] = True
+    assert any("cpu.logical_threads must be a finite number" in problem for problem in validate_artifact(artifact3))
+
+
+def test_float_where_integer_expected_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["model"]["disk_bytes"] = 1.5
+    assert any("model.disk_bytes must be an integer" in problem for problem in validate_artifact(artifact))
+
+
+def test_malformed_hardware_timestamp_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["hardware"]["captured_at_ms"] = "yesterday"
+    assert any("hardware.captured_at_ms must be a finite number" in problem for problem in validate_artifact(artifact))
+
+
+def test_numeric_options_validated() -> None:
+    artifact = _minimal_artifact()
+    artifact["runs"][0]["options"]["num_ctx"] = "big"
+    assert any("options.num_ctx must be a finite number" in problem for problem in validate_artifact(artifact))
+
+
 def test_redaction_sentinel_rejects_any_path_separator() -> None:
     assert "windows_absolute_path" in redaction_violations(json.dumps({"x": r"D:\private\models\x.gguf"}))
     for hostile in (

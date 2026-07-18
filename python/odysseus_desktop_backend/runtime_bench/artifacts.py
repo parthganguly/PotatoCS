@@ -158,6 +158,49 @@ def _check_closed(obj: Any, allowlist: set[str], where: str, problems: list[str]
     return True
 
 
+def _is_finite_number(value: Any) -> bool:
+    """True for int/float that are finite. Booleans are NOT numbers."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return value == value and value not in (float("inf"), float("-inf"))
+    return False
+
+
+def _check_number(
+    obj: dict[str, Any],
+    key: str,
+    where: str,
+    problems: list[str],
+    *,
+    integer: bool = False,
+    minimum: float | None = 0,
+    maximum: float | None = None,
+    nullable: bool = False,
+) -> None:
+    """Finite numeric/range validation for one field. Missing keys are
+    the closed-schema checks' concern; this validates present values."""
+    if key not in obj:
+        return
+    value = obj[key]
+    if value is None:
+        if not nullable:
+            problems.append(f"{where}.{key} must not be null")
+        return
+    if not _is_finite_number(value):
+        problems.append(f"{where}.{key} must be a finite number")
+        return
+    if integer and not isinstance(value, int):
+        problems.append(f"{where}.{key} must be an integer")
+        return
+    if minimum is not None and value < minimum:
+        problems.append(f"{where}.{key} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        problems.append(f"{where}.{key} must be <= {maximum}")
+
+
 def validate_artifact(artifact: dict[str, Any]) -> list[str]:
     """Return a list of schema problems; empty list means valid.
 
@@ -203,6 +246,7 @@ def validate_artifact(artifact: dict[str, Any]) -> list[str]:
     if _check_closed(model, MODEL_KEY_ALLOWLIST, "model", problems):
         if not model.get("tag"):
             problems.append("model must include tag")
+        _check_number(model, "disk_bytes", "model", problems, integer=True)
 
     hardware = artifact.get("hardware")
     if _check_closed(hardware, HARDWARE_KEY_ALLOWLIST, "hardware", problems):
@@ -223,6 +267,24 @@ def validate_artifact(artifact: dict[str, Any]) -> list[str]:
             for key, value in errors.items():
                 if value not in {"probe_timeout", "probe_unavailable", "probe_failed"}:
                     problems.append(f"hardware.errors.{key} is not a fixed category")
+        cpu = hardware.get("cpu")
+        if isinstance(cpu, dict):
+            _check_number(cpu, "logical_threads", "hardware.cpu", problems, integer=True)
+            _check_number(cpu, "physical_cores", "hardware.cpu", problems, integer=True)
+        ram = hardware.get("ram")
+        if isinstance(ram, dict):
+            _check_number(ram, "total_bytes", "hardware.ram", problems, integer=True)
+            _check_number(ram, "available_bytes", "hardware.ram", problems, integer=True)
+        if isinstance(gpus, list):
+            for gpu_index, gpu in enumerate(gpus):
+                if isinstance(gpu, dict):
+                    _check_number(gpu, "vram_total_bytes", f"hardware.gpus[{gpu_index}]", problems, integer=True)
+                    _check_number(gpu, "vram_free_bytes", f"hardware.gpus[{gpu_index}]", problems, integer=True)
+        storage = hardware.get("storage")
+        if isinstance(storage, dict):
+            _check_number(storage, "profile_disk_free_bytes", "hardware.storage", problems, integer=True, nullable=True)
+            _check_number(storage, "model_store_disk_free_bytes", "hardware.storage", problems, integer=True, nullable=True)
+        _check_number(hardware, "captured_at_ms", "hardware", problems, integer=True)
 
     file_cache_state = artifact.get("file_cache_state")
     if file_cache_state is not None and file_cache_state not in {"unknown_warmish", "cold_verified", "warm_verified"}:
@@ -259,6 +321,36 @@ def validate_artifact(artifact: dict[str, Any]) -> list[str]:
             problems.append(f"run {index} invalid quality_check: {run['quality_check']}")
         if run["error_category"] and run["quality_check"] == "passed":
             problems.append(f"run {index} cannot both pass quality and carry an error")
+
+        # Numeric type/range validation (review round 5): finite
+        # numbers only, no booleans, sensible non-negative ranges.
+        _check_number(run, "run_index", f"run {index}", problems, integer=True)
+        if isinstance(timings, dict):
+            for key in _REQUIRED_TIMING_KEYS:
+                _check_number(timings, key, f"run {index} timings_ms", problems, nullable=True)
+        if isinstance(tokens, dict):
+            _check_number(tokens, "prompt", f"run {index} tokens", problems, integer=True)
+            _check_number(tokens, "generated", f"run {index} tokens", problems, integer=True)
+            _check_number(tokens, "prompt_tps", f"run {index} tokens", problems, nullable=True)
+            _check_number(tokens, "generation_tps", f"run {index} tokens", problems, nullable=True)
+        memory = run["memory"]
+        if isinstance(memory, dict):
+            _check_number(memory, "runtime_peak_rss_bytes", f"run {index} memory", problems, integer=True)
+            _check_number(memory, "system_min_available_bytes", f"run {index} memory", problems, integer=True)
+            _check_number(memory, "vram_peak_used_bytes", f"run {index} memory", problems, integer=True, nullable=True)
+            _check_number(memory, "sampler_interval_ms", f"run {index} memory", problems, integer=True)
+            _check_number(memory, "samples", f"run {index} memory", problems, integer=True)
+        options = run["options"]
+        if isinstance(options, dict):
+            for key in ("seed", "num_predict", "num_ctx", "num_thread", "num_gpu", "num_batch", "n_predict"):
+                _check_number(options, key, f"run {index} options", problems, integer=True)
+            _check_number(options, "temperature", f"run {index} options", problems)
+        residency = run.get("residency")
+        if isinstance(residency, dict):
+            _check_number(residency, "size_bytes", f"run {index} residency", problems, integer=True)
+            _check_number(residency, "size_vram_bytes", f"run {index} residency", problems, integer=True)
+            _check_number(residency, "context_length", f"run {index} residency", problems, integer=True)
+            _check_number(residency, "gpu_fraction", f"run {index} residency", problems, maximum=1, nullable=True)
 
     _string_violations(artifact, "artifact", problems)
     return problems
