@@ -1,0 +1,182 @@
+{
+ "batch_id": "ollama-0311-qwen3-8b-medium-threads6",
+ "captured_at": "2026-07-17T20:02:29Z",
+ "engine_kind": "real",
+ "file_cache_state": "unknown_warmish",
+ "hardware": {
+  "captured_at_ms": 1784318549456,
+  "cpu": {
+   "isa": {
+    "avx": true,
+    "avx2": true,
+    "avx512f": false,
+    "sse4_1": true,
+    "sse4_2": true,
+    "ssse3": true
+   },
+   "logical_threads": 12,
+   "physical_cores": 6,
+   "physical_cores_source": "measured"
+  },
+  "gpus": [
+   {
+    "driver_version": "596.36",
+    "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "source": "nvidia-smi",
+    "vendor": "nvidia",
+    "vram_free_bytes": 1366294528,
+    "vram_total_bytes": 4294967296
+   }
+  ],
+  "npu": "none_detected",
+  "os": {
+   "arch": "AMD64",
+   "name": "Windows",
+   "version": "10.0.26200"
+  },
+  "ram": {
+   "available_bytes": 377819136,
+   "total_bytes": 16556589056
+  },
+  "schema_version": 1,
+  "storage": {
+   "kind": "unknown",
+   "model_store_disk_free_bytes": 61132496896,
+   "profile_disk_free_bytes": null
+  }
+ },
+ "mode": "interactive",
+ "model": {
+  "disk_bytes": 5225388164,
+  "format": "gguf",
+  "parameter_size": "8.2B",
+  "quantization": "Q4_K_M",
+  "tag": "qwen3:8b"
+ },
+ "runs": [
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 350588928,
+    "sampler_interval_ms": 250,
+    "samples": 118,
+    "system_min_available_bytes": 47943680,
+    "vram_peak_used_bytes": 2791309312
+   },
+   "options": {
+    "num_predict": 256,
+    "num_thread": 6,
+    "seed": 42,
+    "temperature": 0,
+    "think": false
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.387,
+    "size_bytes": 5961385243,
+    "size_vram_bytes": 2307150314
+   },
+   "run_index": 0,
+   "timings_ms": {
+    "first_token": 18503.4,
+    "generation": 17324.2,
+    "load": 14971.6,
+    "prompt_eval": 3505.9,
+    "total": 35822.6
+   },
+   "tokens": {
+    "generated": 84,
+    "generation_tps": 4.85,
+    "prompt": 471,
+    "prompt_tps": 134.35
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 88592384,
+    "sampler_interval_ms": 250,
+    "samples": 64,
+    "system_min_available_bytes": 565051392,
+    "vram_peak_used_bytes": 2791309312
+   },
+   "options": {
+    "num_predict": 256,
+    "num_thread": 6,
+    "seed": 42,
+    "temperature": 0,
+    "think": false
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.387,
+    "size_bytes": 5961385243,
+    "size_vram_bytes": 2307150314
+   },
+   "run_index": 1,
+   "timings_ms": {
+    "first_token": 499.3,
+    "generation": 18593.8,
+    "load": 263.6,
+    "prompt_eval": 225.9,
+    "total": 19093.3
+   },
+   "tokens": {
+    "generated": 86,
+    "generation_tps": 4.63,
+    "prompt": 471,
+    "prompt_tps": 2085.37
+   }
+  },
+  {
+   "cold": false,
+   "error_category": "",
+   "memory": {
+    "runtime_peak_rss_bytes": 88592384,
+    "sampler_interval_ms": 250,
+    "samples": 66,
+    "system_min_available_bytes": 326987776,
+    "vram_peak_used_bytes": 2791309312
+   },
+   "options": {
+    "num_predict": 256,
+    "num_thread": 6,
+    "seed": 42,
+    "temperature": 0,
+    "think": false
+   },
+   "quality_check": "passed",
+   "residency": {
+    "context_length": 4096,
+    "gpu_fraction": 0.387,
+    "size_bytes": 5961385243,
+    "size_vram_bytes": 2307150314
+   },
+   "run_index": 2,
+   "timings_ms": {
+    "first_token": 533.2,
+    "generation": 19656.4,
+    "load": 253.6,
+    "prompt_eval": 243.4,
+    "total": 20189.8
+   },
+   "tokens": {
+    "generated": 86,
+    "generation_tps": 4.38,
+    "prompt": 471,
+    "prompt_tps": 1935.24
+   }
+  }
+ ],
+ "runtime": {
+  "name": "ollama",
+  "server_env": {},
+  "version": "0.31.1"
+ },
+ "schema_version": 1,
+ "shape": "medium"
+}
