@@ -253,7 +253,14 @@ def _fake_tags(url: str, **kw) -> dict:
 def _fake_show(url: str, payload: dict, **kw) -> dict:
     assert url.endswith("/api/show")
     return {
-        "model_info": {"llama.context_length": 131072},
+        "model_info": {
+            "llama.context_length": 131072,
+            "llama.block_count": 16,
+            "llama.attention.head_count": 32,
+            "llama.attention.head_count_kv": 8,
+            "llama.attention.key_length": 64,
+            "llama.attention.value_length": 64,
+        },
         "capabilities": ["completion", "Tools"],
     }
 
@@ -262,6 +269,7 @@ def test_model_inventory_parses_and_sorts() -> None:
     inventory = ri.model_inventory(get_json=_fake_tags, post_json=_fake_show)
     assert inventory["schema_version"] == ri.MODEL_SCHEMA_VERSION
     assert inventory["error_category"] == ""
+    assert inventory["details_complete"] is True
     tags = [model["tag"] for model in inventory["models"]]
     assert tags == ["llama3.2:1b", "qwen3:8b"]
     first = inventory["models"][0]
@@ -269,6 +277,41 @@ def test_model_inventory_parses_and_sorts() -> None:
     assert first["disk_bytes"] == 1_321_098_329
     assert first["context_length_native"] == 131072
     assert first["capabilities"] == ["completion", "tools"]
+    assert first["kv_geometry"] == {"layers": 16, "kv_heads": 8, "key_length": 64, "value_length": 64}
+
+
+def test_extract_kv_geometry_qwen_prefix() -> None:
+    geometry = ri.extract_kv_geometry(
+        {
+            "qwen3.block_count": 36,
+            "qwen3.attention.head_count": 32,
+            "qwen3.attention.head_count_kv": 8,
+            "qwen3.attention.key_length": 128,
+            "qwen3.attention.value_length": 128,
+        }
+    )
+    assert geometry == {"layers": 36, "kv_heads": 8, "key_length": 128, "value_length": 128}
+
+
+def test_extract_kv_geometry_head_dim_fallback() -> None:
+    geometry = ri.extract_kv_geometry(
+        {
+            "llama.block_count": 28,
+            "llama.attention.head_count": 24,
+            "llama.attention.head_count_kv": 8,
+            "llama.embedding_length": 3072,
+        }
+    )
+    assert geometry == {"layers": 28, "kv_heads": 8, "key_length": 128, "value_length": 128}
+
+
+def test_extract_kv_geometry_partial_metadata_is_none() -> None:
+    assert ri.extract_kv_geometry({}) is None
+    assert ri.extract_kv_geometry({"llama.block_count": 16}) is None
+    assert (
+        ri.extract_kv_geometry({"llama.block_count": 16, "llama.attention.head_count_kv": 8}) is None
+    )
+    assert ri.extract_kv_geometry("not a dict") is None
 
 
 def test_model_inventory_tags_failure_uses_fixed_category() -> None:
@@ -288,6 +331,23 @@ def test_model_inventory_detail_failure_is_best_effort() -> None:
     inventory = ri.model_inventory(get_json=_fake_tags, post_json=explode)
     assert [model["tag"] for model in inventory["models"]] == ["llama3.2:1b", "qwen3:8b"]
     assert all(model["context_length_native"] == 0 for model in inventory["models"])
+    # Failed probes still count as attempted: the pass is complete.
+    assert inventory["details_complete"] is True
+
+
+def test_model_inventory_probe_cap_marks_incomplete() -> None:
+    many = {
+        "models": [
+            {"name": f"m{i}:latest", "digest": f"sha256:{i}", "size": 1, "details": {}} for i in range(12)
+        ]
+    }
+    inventory = ri.model_inventory(
+        get_json=lambda url, **kw: many,
+        post_json=_fake_show,
+        max_detail_models=4,
+    )
+    assert len(inventory["models"]) == 12
+    assert inventory["details_complete"] is False
 
 
 def test_model_inventory_skips_details_when_disabled() -> None:

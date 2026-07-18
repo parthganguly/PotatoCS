@@ -20,6 +20,8 @@ import platform
 import shutil
 import socket
 import subprocess
+import threading
+import time
 import urllib.request
 from typing import Any, Callable
 
@@ -36,8 +38,13 @@ OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 OLLAMA_HOST = "127.0.0.1"
 OLLAMA_PORT = 11434
 
-PROBE_TIMEOUT_SECONDS = 5.0
-HTTP_TIMEOUT_SECONDS = 5.0
+# Bounded probe budgets. The worst-case cold path (every probe at its
+# cap) must stay within RUNTIME_RPC_LATENCY_CEILING_SECONDS declared in
+# runtime_plan_service; keep these in sync with that arithmetic.
+PROBE_TIMEOUT_SECONDS = 3.0
+HTTP_TIMEOUT_SECONDS = 2.5
+MODEL_DETAIL_BUDGET_SECONDS = 2.0
+MAX_DETAIL_MODELS = 8
 
 # Fixed error categories (RFC section 3): nothing else may appear in the
 # `error_category` fields this module emits.
@@ -424,6 +431,51 @@ def runtime_inventory(
 # -- installed models ----------------------------------------------------
 
 
+def _model_info_int(model_info: dict[str, Any], key_suffix: str) -> int:
+    """Read an int from architecture-prefixed model_info keys
+    (e.g. `llama.block_count`, `qwen3.block_count`)."""
+    for key, value in model_info.items():
+        if str(key).endswith(key_suffix):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def extract_kv_geometry(model_info: dict[str, Any]) -> dict[str, int] | None:
+    """Extract the KV-cache geometry needed for memory estimation.
+
+    Returns None unless every required field is present and positive —
+    a partial geometry must never masquerade as a known one. Verified
+    live against Ollama 0.31.1 `/api/show` for llama and qwen3
+    architectures (2026-07-18).
+    """
+    if not isinstance(model_info, dict):
+        return None
+    layers = _model_info_int(model_info, ".block_count")
+    kv_heads = _model_info_int(model_info, ".attention.head_count_kv")
+    key_length = _model_info_int(model_info, ".attention.key_length")
+    value_length = _model_info_int(model_info, ".attention.value_length")
+    if not (key_length and value_length):
+        # Fall back to embedding_length / head_count for architectures
+        # that omit explicit per-head lengths.
+        heads = _model_info_int(model_info, ".attention.head_count")
+        embedding = _model_info_int(model_info, ".embedding_length")
+        if heads > 0 and embedding > 0:
+            head_dim = embedding // heads
+            key_length = key_length or head_dim
+            value_length = value_length or head_dim
+    if layers <= 0 or kv_heads <= 0 or key_length <= 0 or value_length <= 0:
+        return None
+    return {
+        "layers": layers,
+        "kv_heads": kv_heads,
+        "key_length": key_length,
+        "value_length": value_length,
+    }
+
+
 def _default_post_json(url: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -441,12 +493,16 @@ def model_inventory(
     get_json: Callable[..., dict[str, Any]] = _default_get_json,
     post_json: Callable[..., dict[str, Any]] = _default_post_json,
     include_details: bool = True,
-    max_detail_models: int = 32,
+    max_detail_models: int = MAX_DETAIL_MODELS,
+    detail_budget_seconds: float = MODEL_DETAIL_BUDGET_SECONDS,
 ) -> dict[str, Any]:
     """List installed Ollama models with sizes/quantization/context.
 
-    Read-only over the local API. `context_length_native` needs one
-    `/api/show` per model, bounded by `max_detail_models`.
+    Read-only over the local API. Detail probes (`/api/show` per model,
+    for native context + KV geometry) run in a worker thread under a
+    hard total wall-clock budget: one hanging model can never multiply
+    across the model list, and the caller gets partial results with
+    `details_complete: false` instead of a stalled RPC loop.
     """
     models: list[dict[str, Any]] = []
     error_category = ""
@@ -474,34 +530,56 @@ def model_inventory(
                 "disk_bytes": int(item.get("size") or 0),
                 "context_length_native": 0,
                 "capabilities": [],
+                "kv_geometry": None,
             }
         )
 
-    if include_details:
-        for entry in models[:max_detail_models]:
-            try:
-                data = post_json(f"{OLLAMA_ENDPOINT}/api/show", {"model": entry["tag"]})
-            except Exception:  # noqa: BLE001 - detail probes are best-effort
-                continue
-            model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
-            context = 0
-            for key, value in model_info.items():
-                if str(key).endswith(".context_length"):
-                    try:
-                        context = int(value)
-                    except (TypeError, ValueError):
-                        context = 0
-                    break
-            entry["context_length_native"] = context
-            entry["capabilities"] = [
-                str(cap).lower() for cap in data.get("capabilities") or [] if isinstance(cap, str)
-            ]
+    details_complete = not include_details or not models
+    if include_details and models:
+        targets = sorted(models, key=lambda entry: entry["tag"])[:max_detail_models]
+        done_count = {"value": 0}
 
-    logger.info("model inventory models=%s error=%s", len(models), error_category)
+        def probe_details() -> None:
+            deadline = time.monotonic() + detail_budget_seconds
+            for entry in targets:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    data = post_json(
+                        f"{OLLAMA_ENDPOINT}/api/show",
+                        {"model": entry["tag"]},
+                        timeout=min(remaining, HTTP_TIMEOUT_SECONDS),
+                    )
+                except Exception:  # noqa: BLE001 - detail probes are best-effort
+                    done_count["value"] += 1
+                    continue
+                model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
+                entry["context_length_native"] = _model_info_int(model_info, ".context_length")
+                entry["capabilities"] = [
+                    str(cap).lower() for cap in data.get("capabilities") or [] if isinstance(cap, str)
+                ]
+                entry["kv_geometry"] = extract_kv_geometry(model_info)
+                done_count["value"] += 1
+
+        worker = threading.Thread(target=probe_details, name="model-detail-probe", daemon=True)
+        worker.start()
+        worker.join(timeout=detail_budget_seconds + 0.5)
+        # A probe that ignores its timeout is abandoned in the daemon
+        # thread; the RPC path proceeds with whatever completed.
+        details_complete = not worker.is_alive() and done_count["value"] >= len(targets) and len(models) <= max_detail_models
+
+    logger.info(
+        "model inventory models=%s details_complete=%s error=%s",
+        len(models),
+        details_complete,
+        error_category,
+    )
     return {
         "schema_version": MODEL_SCHEMA_VERSION,
         "runtime": "ollama",
         "models": sorted(models, key=lambda entry: entry["tag"]),
+        "details_complete": details_complete,
         "error_category": error_category,
         "captured_at_ms": utc_ms(),
     }
