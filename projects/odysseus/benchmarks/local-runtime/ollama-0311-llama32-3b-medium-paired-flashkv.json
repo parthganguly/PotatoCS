@@ -44,7 +44,6 @@
   "quantization": "Q4_K_M",
   "tag": "llama3.2:latest"
  },
- "notes": "paired arm B: flash attention + q8_0 KV, same ambient VRAM as default arm",
  "runs": [
   {
    "cold": true,

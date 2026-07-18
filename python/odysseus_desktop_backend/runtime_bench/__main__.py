@@ -29,7 +29,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--keep-alive", default=None)
     parser.add_argument("--think", choices=["on", "off"], default=None)
-    parser.add_argument("--notes", default="")
     parser.add_argument(
         "--options-json",
         default="{}",
@@ -61,7 +60,6 @@ def main(argv: list[str] | None = None) -> int:
         repeats=args.repeats,
         include_cold=not args.no_cold,
         timeout=args.timeout,
-        notes=args.notes,
     )
     summary = {
         "batch_id": artifact["batch_id"],

@@ -53,7 +53,6 @@
   "quantization": "Q8_0",
   "tag": "llama3.2:1b"
  },
- "notes": "CPU-only arm for llama.cpp cross-runtime comparison",
  "runs": [
   {
    "cold": false,

@@ -84,8 +84,8 @@ def test_artifact_schema_rejects_non_allowlisted_server_env() -> None:
 def test_artifact_schema_rejects_embedded_prompt_or_output() -> None:
     artifact = _minimal_artifact(runs=[_minimal_run(prompt="hello"), _minimal_run(output="world")])
     problems = validate_artifact(artifact)
-    assert any("must not embed prompt" in problem for problem in problems)
-    assert any("must not embed output" in problem for problem in problems)
+    assert any("run 0 keys not allow-listed" in problem for problem in problems)
+    assert any("run 1 keys not allow-listed" in problem for problem in problems)
 
 
 def test_artifact_schema_rejects_passed_quality_with_error() -> None:
@@ -125,10 +125,10 @@ def test_redaction_sentinel_accepts_clean_payload() -> None:
 
 def test_write_artifact_refuses_home_directory_content(tmp_path) -> None:
     artifact = _minimal_artifact(batch_id="bad-batch")
-    artifact["notes"] = "model at " + os.path.expanduser("~")
-    # Rejected at the schema layer (path-like) or the redaction layer
-    # (home directory) — either way nothing is written.
-    with pytest.raises(ValueError, match="path-like|redaction"):
+    artifact["model"]["format"] = "model at " + os.path.expanduser("~")
+    # Rejected at the schema layer (forbidden separators) or the
+    # redaction layer (home directory) — either way nothing is written.
+    with pytest.raises(ValueError, match="forbidden|redaction"):
         write_artifact(artifact, tmp_path)
     assert list(tmp_path.iterdir()) == []
 
@@ -179,21 +179,24 @@ def test_write_artifact_target_must_stay_inside_directory(tmp_path) -> None:
         "/srv/models/x.gguf",
         "/data/user/x",
         "/custom-root/nested/file.bin",
+        "/secret",
+        "/opt/private model/x.gguf",
+        "/データ/秘密/モデル.gguf",
     ],
 )
-def test_pathlike_content_rejected_in_notes(hostile, tmp_path) -> None:
+def test_pathlike_content_rejected_in_any_string_field(hostile, tmp_path) -> None:
     artifact = _minimal_artifact()
-    artifact["notes"] = f"model loaded from {hostile}"
+    artifact["model"]["format"] = f"loaded from {hostile}"
     problems = validate_artifact(artifact)
-    assert any("path-like" in problem for problem in problems), hostile
+    assert any("forbidden characters" in problem for problem in problems), hostile
     with pytest.raises(ValueError):
         write_artifact(artifact, tmp_path)
 
 
-def test_pathlike_content_rejected_in_model_fields(tmp_path) -> None:
+def test_pathlike_content_rejected_in_model_tag(tmp_path) -> None:
     artifact = _minimal_artifact()
     artifact["model"]["tag"] = r"D:\private\models\x.gguf"
-    assert any("path-like" in problem for problem in validate_artifact(artifact))
+    assert any("forbidden characters" in problem for problem in validate_artifact(artifact))
     with pytest.raises(ValueError):
         write_artifact(artifact, tmp_path)
 
@@ -202,10 +205,33 @@ def test_pathlike_and_illegal_server_env_values_rejected(tmp_path) -> None:
     artifact = _minimal_artifact()
     artifact["runtime"]["server_env"] = {"OLLAMA_KV_CACHE_TYPE": r"\\unc\share\x"}
     problems = validate_artifact(artifact)
-    assert any("server_env value" in problem or "path-like" in problem for problem in problems)
+    assert any("server_env value" in problem or "forbidden" in problem for problem in problems)
     artifact2 = _minimal_artifact()
     artifact2["runtime"]["server_env"] = {"OLLAMA_KEEP_ALIVE": "5m; rm -rf ~ && echo " + "x" * 40}
     assert any("server_env value" in problem for problem in validate_artifact(artifact2))
+
+
+def test_notes_field_is_no_longer_accepted() -> None:
+    artifact = _minimal_artifact()
+    artifact["notes"] = "free-form provenance text"
+    assert any("top-level keys not allow-listed" in problem for problem in validate_artifact(artifact))
+
+
+def test_top_level_prompt_output_secret_rejected() -> None:
+    """The schema is closed: arbitrary top-level keys can never ride
+    along (review round 3, finding 4)."""
+    for key in ("prompt", "output", "secret", "user_document"):
+        artifact = _minimal_artifact()
+        artifact[key] = "private text that must not be storable"
+        problems = validate_artifact(artifact)
+        assert any("top-level keys not allow-listed" in problem for problem in problems), key
+
+
+def test_run_level_extras_rejected() -> None:
+    for key in ("prompt", "output", "content", "messages", "secret"):
+        artifact = _minimal_artifact(runs=[_minimal_run(**{key: "x"})])
+        problems = validate_artifact(artifact)
+        assert any(f"run 0 keys not allow-listed" in problem for problem in problems), key
 
 
 def test_unknown_nested_keys_rejected() -> None:
@@ -220,21 +246,31 @@ def test_unknown_nested_keys_rejected() -> None:
     assert any("hardware keys" in problem for problem in validate_artifact(artifact3))
 
 
-def test_oversized_notes_rejected() -> None:
+def test_nested_hardware_and_run_extras_rejected() -> None:
     artifact = _minimal_artifact()
-    artifact["notes"] = "n" * 500
-    assert any("notes" in problem for problem in validate_artifact(artifact))
+    artifact["hardware"]["cpu"]["serial_number"] = "x"
+    assert any("hardware.cpu keys" in problem for problem in validate_artifact(artifact))
+    artifact2 = _minimal_artifact()
+    artifact2["runs"][0]["memory"]["heap_dump"] = "x"
+    assert any("run 0 memory keys" in problem for problem in validate_artifact(artifact2))
+    artifact3 = _minimal_artifact()
+    artifact3["runs"][0]["options"]["system_prompt"] = "x"
+    assert any("run 0 options keys" in problem for problem in validate_artifact(artifact3))
 
 
-def test_redaction_sentinel_catches_any_drive_and_unc_and_unix() -> None:
+def test_redaction_sentinel_rejects_any_path_separator() -> None:
     assert "windows_absolute_path" in redaction_violations(json.dumps({"x": r"D:\private\models\x.gguf"}))
-    assert "windows_absolute_path" in redaction_violations(json.dumps({"x": "E:/other/path"}))
-    assert "unc_path" in redaction_violations(json.dumps({"x": r"\\server\share"}))
-    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/home/user/model.gguf"}))
-    # ALL absolute POSIX roots, not an allowlist (review round 2).
-    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/opt/private/model.gguf"}))
-    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/srv/models/x.gguf"}))
-    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/data/user/x"}))
+    for hostile in (
+        "E:/other/path",
+        r"\\server\share",
+        "/home/user/model.gguf",
+        "/opt/private/model.gguf",
+        "/srv/models/x.gguf",
+        "/data/user/x",
+        "/secret",
+        "/opt/private model/x.gguf",
+    ):
+        assert "path_separator" in redaction_violations(json.dumps({"x": hostile})), hostile
     assert redaction_violations(json.dumps({"x": "llama3.2:1b", "t": "2026-07-17T00:00:00Z"})) == []
 
 

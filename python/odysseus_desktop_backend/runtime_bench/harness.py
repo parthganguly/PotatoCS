@@ -292,7 +292,6 @@ def build_artifact(
     runs: list[dict[str, Any]],
     mode: str = "interactive",
     engine_kind: str = "real",
-    notes: str = "",
 ) -> dict[str, Any]:
     hardware = ri.hardware_inventory()
     hardware.pop("errors", None)
@@ -311,7 +310,6 @@ def build_artifact(
         "mode": mode,
         "engine_kind": engine_kind,
         "file_cache_state": "unknown_warmish",
-        "notes": notes,
         "runs": runs,
     }
 
@@ -344,7 +342,6 @@ def run_ollama_batch(
     repeats: int = 3,
     include_cold: bool = True,
     timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    notes: str = "",
 ) -> dict[str, Any]:
     """Run one model/shape cell: optional cold run + N warm runs; write artifact."""
     version = ri.detect_ollama_runtime()["version"]
@@ -387,7 +384,6 @@ def run_ollama_batch(
         model=model_descriptor(model),
         shape=shape,
         runs=runs,
-        notes=notes,
     )
     write_artifact(artifact, artifact_dir)
     return artifact

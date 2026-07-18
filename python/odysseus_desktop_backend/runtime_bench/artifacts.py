@@ -27,8 +27,6 @@ VALID_QUALITY = {"passed", "failed", "not_applicable"}
 # no traversal, bounded length.
 _SAFE_BATCH_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 
-MAX_NOTES_CHARS = 200
-
 # Only these server env keys may be recorded in artifacts; values are
 # validated too (tuning flags are short tokens, never paths or secrets).
 SERVER_ENV_ALLOWLIST = {
@@ -44,7 +42,9 @@ SERVER_ENV_ALLOWLIST = {
 }
 _SAFE_ENV_VALUE = re.compile(r"^[A-Za-z0-9._-]{0,32}$")
 
-# Nested-field allowlists: unknown keys are rejected rather than carried.
+# CLOSED schema: unknown keys are rejected at EVERY level. There is no
+# free-form text field anywhere in an artifact ("notes" was removed —
+# provenance lives in the batch_id slug).
 MODEL_KEY_ALLOWLIST = {"tag", "digest", "format", "quantization", "parameter_size", "disk_bytes"}
 RUNTIME_KEY_ALLOWLIST = {"name", "version", "server_env"}
 HARDWARE_KEY_ALLOWLIST = {
@@ -58,6 +58,14 @@ HARDWARE_KEY_ALLOWLIST = {
     "errors",
     "captured_at_ms",
 }
+_HW_NESTED_ALLOWLIST: dict[str, set[str]] = {
+    "os": {"name", "version", "arch"},
+    "cpu": {"logical_threads", "physical_cores", "physical_cores_source", "isa"},
+    "ram": {"total_bytes", "available_bytes"},
+    "storage": {"profile_disk_free_bytes", "model_store_disk_free_bytes", "kind"},
+}
+_HW_ISA_ALLOWLIST = {"ssse3", "sse4_1", "sse4_2", "avx", "avx2", "avx512f"}
+_HW_GPU_ALLOWLIST = {"vendor", "name", "vram_total_bytes", "vram_free_bytes", "driver_version", "source"}
 
 _REQUIRED_TOP_LEVEL = {
     "schema_version",
@@ -71,6 +79,8 @@ _REQUIRED_TOP_LEVEL = {
     "engine_kind",
     "runs",
 }
+_OPTIONAL_TOP_LEVEL = {"file_cache_state"}
+TOP_LEVEL_ALLOWLIST = _REQUIRED_TOP_LEVEL | _OPTIONAL_TOP_LEVEL
 
 _REQUIRED_RUN_KEYS = {
     "run_index",
@@ -82,48 +92,91 @@ _REQUIRED_RUN_KEYS = {
     "quality_check",
     "error_category",
 }
+_OPTIONAL_RUN_KEYS = {"residency"}
+RUN_KEY_ALLOWLIST = _REQUIRED_RUN_KEYS | _OPTIONAL_RUN_KEYS
 
 _REQUIRED_TIMING_KEYS = {"total", "load", "prompt_eval", "generation", "first_token"}
 _REQUIRED_TOKEN_KEYS = {"prompt", "generated", "prompt_tps", "generation_tps"}
+_MEMORY_KEY_ALLOWLIST = {
+    "runtime_peak_rss_bytes",
+    "system_min_available_bytes",
+    "vram_peak_used_bytes",
+    "sampler_interval_ms",
+    "samples",
+}
+_RESIDENCY_KEY_ALLOWLIST = {"size_bytes", "size_vram_bytes", "gpu_fraction", "context_length"}
+_OPTIONS_KEY_ALLOWLIST = {
+    "temperature",
+    "seed",
+    "num_predict",
+    "num_ctx",
+    "num_thread",
+    "num_gpu",
+    "num_batch",
+    "n_predict",
+    "think",
+}
 
-# Path-like content is forbidden in every string an artifact carries:
-# Windows drive paths on ANY drive, UNC paths, and ALL absolute POSIX
-# paths (any root — /opt, /srv, /data, ... — not an allowlist).
-_POSIX_PREFIX = r"(?:^|[\s\"'=:,(])"
-_PATHLIKE_PATTERNS = (
-    re.compile(r"[A-Za-z]:[\\/]"),
-    re.compile(r"\\\\[A-Za-z0-9._$-]"),
-    # Any multi-segment absolute path: /root/anything...
-    re.compile(_POSIX_PREFIX + r"/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~-]+)+"),
-    # Single-segment forms of well-known roots (e.g. a bare "/tmp").
-    re.compile(_POSIX_PREFIX + r"/(?:home|Users|root|mnt|tmp|var|etc|usr|opt|srv|data|media|dev|proc)(?:/|$|[\s\"'),])"),
-)
+# No artifact string may contain a path separator AT ALL. This is the
+# robust form of "reject all absolute paths": it needs no root
+# allowlist and cannot be evaded by single-segment paths (`/secret`),
+# spaces (`/opt/private model/x`), or Unicode segments — every known
+# artifact string (tags, quantizations, versions, ISO timestamps,
+# fixed enums) is separator-free by construction. Control characters
+# and quotes are equally forbidden.
+_FORBIDDEN_STRING_CHARS = ("/", "\\", "\n", "\r", "\t", '"')
 
 
 def contains_pathlike(text: str) -> bool:
-    return any(pattern.search(text) for pattern in _PATHLIKE_PATTERNS)
+    return any(char in text for char in _FORBIDDEN_STRING_CHARS)
 
 
 def _string_violations(value: Any, where: str, problems: list[str]) -> None:
-    """Recursively reject path-like content in every string field."""
+    """Recursively reject separator/control characters in every string
+    (keys included)."""
     if isinstance(value, str):
         if contains_pathlike(value):
-            problems.append(f"path-like content in {where}")
+            problems.append(f"forbidden characters in {where}")
     elif isinstance(value, dict):
         for key, item in value.items():
+            if isinstance(key, str) and contains_pathlike(key):
+                problems.append(f"forbidden characters in key under {where}")
             _string_violations(item, f"{where}.{key}", problems)
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _string_violations(item, f"{where}[{index}]", problems)
 
 
+def _check_closed(obj: Any, allowlist: set[str], where: str, problems: list[str]) -> bool:
+    if not isinstance(obj, dict):
+        problems.append(f"{where} must be an object")
+        return False
+    illegal = set(obj) - allowlist
+    if illegal:
+        problems.append(f"{where} keys not allow-listed: {sorted(illegal)}")
+        return False
+    return True
+
+
 def validate_artifact(artifact: dict[str, Any]) -> list[str]:
-    """Return a list of schema problems; empty list means valid."""
+    """Return a list of schema problems; empty list means valid.
+
+    The schema is CLOSED at every level: any key outside the explicit
+    allowlists — top level, runs, timings/tokens/memory/residency/
+    options, model, runtime, hardware and its nested objects — is a
+    validation failure, so arbitrary text (prompts, secrets, private
+    metadata) cannot ride along anywhere.
+    """
     problems: list[str] = []
+    if not isinstance(artifact, dict):
+        return ["artifact must be an object"]
     missing = _REQUIRED_TOP_LEVEL - set(artifact)
     if missing:
         problems.append(f"missing top-level keys: {sorted(missing)}")
         return problems
+    illegal_top = set(artifact) - TOP_LEVEL_ALLOWLIST
+    if illegal_top:
+        problems.append(f"top-level keys not allow-listed: {sorted(illegal_top)}")
     if artifact["schema_version"] != ARTIFACT_SCHEMA_VERSION:
         problems.append(f"unsupported schema_version: {artifact['schema_version']}")
     batch_id = artifact.get("batch_id")
@@ -136,49 +189,51 @@ def validate_artifact(artifact: dict[str, Any]) -> list[str]:
     if artifact["engine_kind"] not in VALID_ENGINE_KINDS:
         problems.append(f"invalid engine_kind: {artifact['engine_kind']}")
 
-    runtime = artifact.get("runtime") or {}
-    if not isinstance(runtime, dict) or not runtime.get("name") or not runtime.get("version"):
-        problems.append("runtime must include name and version")
-    if isinstance(runtime, dict):
-        illegal_runtime = set(runtime) - RUNTIME_KEY_ALLOWLIST
-        if illegal_runtime:
-            problems.append(f"runtime keys not allow-listed: {sorted(illegal_runtime)}")
+    runtime = artifact.get("runtime")
+    if _check_closed(runtime, RUNTIME_KEY_ALLOWLIST, "runtime", problems):
+        if not runtime.get("name") or not runtime.get("version"):
+            problems.append("runtime must include name and version")
         env = runtime.get("server_env")
-        if isinstance(env, dict):
-            illegal = set(env) - SERVER_ENV_ALLOWLIST
-            if illegal:
-                problems.append(f"server_env keys not allow-listed: {sorted(illegal)}")
+        if env is not None and _check_closed(env, SERVER_ENV_ALLOWLIST, "server_env", problems):
             for key, value in env.items():
                 if not isinstance(value, str) or not _SAFE_ENV_VALUE.match(value):
                     problems.append(f"server_env value not allow-listed for {key}")
 
-    model = artifact.get("model") or {}
-    if not isinstance(model, dict) or not model.get("tag"):
-        problems.append("model must include tag")
-    if isinstance(model, dict):
-        illegal_model = set(model) - MODEL_KEY_ALLOWLIST
-        if illegal_model:
-            problems.append(f"model keys not allow-listed: {sorted(illegal_model)}")
+    model = artifact.get("model")
+    if _check_closed(model, MODEL_KEY_ALLOWLIST, "model", problems):
+        if not model.get("tag"):
+            problems.append("model must include tag")
 
-    hardware = artifact.get("hardware") or {}
-    if not isinstance(hardware, dict) or "cpu" not in hardware or "ram" not in hardware:
-        problems.append("hardware snapshot must include cpu and ram")
-    if isinstance(hardware, dict):
-        illegal_hw = set(hardware) - HARDWARE_KEY_ALLOWLIST
-        if illegal_hw:
-            problems.append(f"hardware keys not allow-listed: {sorted(illegal_hw)}")
+    hardware = artifact.get("hardware")
+    if _check_closed(hardware, HARDWARE_KEY_ALLOWLIST, "hardware", problems):
+        if "cpu" not in hardware or "ram" not in hardware:
+            problems.append("hardware snapshot must include cpu and ram")
+        for section, allowed in _HW_NESTED_ALLOWLIST.items():
+            if section in hardware and isinstance(hardware[section], dict):
+                _check_closed(hardware[section], allowed, f"hardware.{section}", problems)
+        isa = (hardware.get("cpu") or {}).get("isa") if isinstance(hardware.get("cpu"), dict) else None
+        if isinstance(isa, dict):
+            _check_closed(isa, _HW_ISA_ALLOWLIST, "hardware.cpu.isa", problems)
+        gpus = hardware.get("gpus")
+        if isinstance(gpus, list):
+            for gpu_index, gpu in enumerate(gpus):
+                _check_closed(gpu, _HW_GPU_ALLOWLIST, f"hardware.gpus[{gpu_index}]", problems)
+        errors = hardware.get("errors")
+        if isinstance(errors, dict):
+            for key, value in errors.items():
+                if value not in {"probe_timeout", "probe_unavailable", "probe_failed"}:
+                    problems.append(f"hardware.errors.{key} is not a fixed category")
 
-    notes = artifact.get("notes", "")
-    if not isinstance(notes, str) or len(notes) > MAX_NOTES_CHARS:
-        problems.append(f"notes must be a string of at most {MAX_NOTES_CHARS} characters")
+    file_cache_state = artifact.get("file_cache_state")
+    if file_cache_state is not None and file_cache_state not in {"unknown_warmish", "cold_verified", "warm_verified"}:
+        problems.append("file_cache_state must be a fixed enum value")
 
     runs = artifact.get("runs")
     if not isinstance(runs, list) or not runs:
         problems.append("runs must be a non-empty list")
         return problems
     for index, run in enumerate(runs):
-        if not isinstance(run, dict):
-            problems.append(f"run {index} is not an object")
+        if not _check_closed(run, RUN_KEY_ALLOWLIST, f"run {index}", problems):
             continue
         missing_run = _REQUIRED_RUN_KEYS - set(run)
         if missing_run:
@@ -187,26 +242,38 @@ def validate_artifact(artifact: dict[str, Any]) -> list[str]:
         if not isinstance(run["cold"], bool):
             problems.append(f"run {index} cold must be boolean")
         timings = run["timings_ms"]
-        if not isinstance(timings, dict) or _REQUIRED_TIMING_KEYS - set(timings):
+        if not _check_closed(timings, _REQUIRED_TIMING_KEYS, f"run {index} timings_ms", problems) or (
+            _REQUIRED_TIMING_KEYS - set(timings)
+        ):
             problems.append(f"run {index} timings_ms incomplete")
         tokens = run["tokens"]
-        if not isinstance(tokens, dict) or _REQUIRED_TOKEN_KEYS - set(tokens):
+        if not _check_closed(tokens, _REQUIRED_TOKEN_KEYS, f"run {index} tokens", problems) or (
+            _REQUIRED_TOKEN_KEYS - set(tokens)
+        ):
             problems.append(f"run {index} tokens incomplete")
+        _check_closed(run["memory"], _MEMORY_KEY_ALLOWLIST, f"run {index} memory", problems)
+        _check_closed(run["options"], _OPTIONS_KEY_ALLOWLIST, f"run {index} options", problems)
+        if "residency" in run:
+            _check_closed(run["residency"], _RESIDENCY_KEY_ALLOWLIST, f"run {index} residency", problems)
         if run["quality_check"] not in VALID_QUALITY:
             problems.append(f"run {index} invalid quality_check: {run['quality_check']}")
         if run["error_category"] and run["quality_check"] == "passed":
             problems.append(f"run {index} cannot both pass quality and carry an error")
-        for forbidden in ("prompt", "output", "content", "messages"):
-            if forbidden in run:
-                problems.append(f"run {index} must not embed {forbidden}")
 
     _string_violations(artifact, "artifact", problems)
     return problems
 
 
 def redaction_violations(payload: str) -> list[str]:
-    """Byte-level sentinel over the serialized artifact: local
-    identifiers and path-like content that must never be stored."""
+    """Byte-level sentinel over the serialized artifact.
+
+    Because no legitimate artifact string contains a path separator,
+    the serialized JSON contains no `/` and no `\\` at all (JSON's own
+    syntax uses neither outside strings). Any separator byte in the
+    payload is therefore a violation — this subsumes Windows drive
+    paths, UNC paths, and every POSIX absolute path including
+    single-segment (`/secret`), spaced, and Unicode forms.
+    """
     violations: list[str] = []
     home = os.path.expanduser("~")
     candidates = {home, home.replace("\\", "/"), home.replace("\\", "\\\\")}
@@ -218,16 +285,10 @@ def redaction_violations(payload: str) -> list[str]:
         if candidate and candidate not in ("~", "/") and candidate in payload:
             violations.append("local_identifier")
             break
-    # JSON escapes backslashes, so a drive path serializes as `D:\\` and
-    # a UNC prefix as `\\\\`; match both serialized and plain forms.
-    if re.search(r"[A-Za-z]:(\\\\|\\|/)", payload):
+    if "/" in payload or "\\" in payload:
+        violations.append("path_separator")
+    if re.search(r"[A-Za-z]:(\\|/)", payload):
         violations.append("windows_absolute_path")
-    if re.search(r"(\\\\){2}[A-Za-z0-9._$-]|\\\\[A-Za-z0-9._$-]+\\", payload):
-        violations.append("unc_path")
-    if re.search(r"(?:[\s\"'=:,(])/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~-]+)+", payload) or re.search(
-        r"(?:[\s\"'=:,(])/(?:home|Users|root|mnt|tmp|var|etc|usr|opt|srv|data|media|dev|proc)(?:/|\")", payload
-    ):
-        violations.append("unix_absolute_path")
     return violations
 
 

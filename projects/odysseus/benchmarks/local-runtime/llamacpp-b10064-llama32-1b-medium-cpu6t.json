@@ -53,7 +53,6 @@
   "quantization": "Q8_0",
   "tag": "llama3.2:1b (same GGUF blob as Ollama)"
  },
- "notes": "llama-server CPU build, -c 8192 -t 6, same blob as Ollama; server-side cache_prompt on",
  "runs": [
   {
    "cold": false,
