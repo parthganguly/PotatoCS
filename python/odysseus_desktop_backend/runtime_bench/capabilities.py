@@ -56,6 +56,40 @@ _MATRIX: dict[str, dict[str, dict[str, str]]] = {
 
 VALID_EVIDENCE = {"binary_help", "live_probe", "measured", "unknown"}
 
+# Research findings from the 2026-07 benchmark session. Every entry is
+# `measured_exploratory`: a real measurement on one P3 machine that has
+# NOT met the safety acceptance criteria for a production
+# recommendation (minimum system-RAM headroom in every run, stable GPU
+# detection, comparable ambient VRAM, multiple alternating A/B rounds,
+# no hidden reload in warm samples, quality pass, no failure increase).
+# Nothing in this table is emitted as a plan recommendation.
+MEASURED_FINDINGS: dict[str, dict[str, str]] = {
+    "keep_alive_reload_cost": {
+        "status": "measured_exploratory",
+        "summary": "keep_alive=0 cost 6.2-8.7s per turn vs ~0.4s warm (llama3.2:3b, one machine)",
+        "evidence": "ollama-0311-llama32-3b-tiny-keepalive0 vs tiny baseline",
+    },
+    "context_truncation_correctness": {
+        "status": "measured_exploratory",
+        "summary": "default context truncated a ~5k-token document (quality 0/12); num_ctx 8192 passed 4/4",
+        "evidence": "ollama-0311-llama32-1b-longctx-baseline vs -ctx8192",
+    },
+    "flash_attention_q8_kv_under_vram_pressure": {
+        "status": "measured_exploratory",
+        "summary": "one paired A/B batch showed 10.1 -> 23.5 tok/s under ambient VRAM pressure; optimized arm ran at critically low system RAM and its snapshot missed the GPU — not a safe recommendation yet",
+        "evidence": "ollama-0311-llama32-3b-medium-paired-default vs -paired-flashkv",
+    },
+    "prompt_cache_reuse": {
+        "status": "measured_exploratory",
+        "summary": "repeat-prompt eval 880ms -> 12ms (existing runtime behavior, pinned by measurement)",
+        "evidence": "ollama-0311-llama32-1b-longctx-ctx8192",
+    },
+}
+
+
+def measured_findings() -> dict[str, dict[str, str]]:
+    return {name: dict(entry) for name, entry in MEASURED_FINDINGS.items()}
+
 
 def runtime_capability_matrix() -> dict[str, dict[str, dict[str, str]]]:
     return {runtime: {key: dict(value) for key, value in caps.items()} for runtime, caps in _MATRIX.items()}

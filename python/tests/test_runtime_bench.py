@@ -123,10 +123,12 @@ def test_redaction_sentinel_accepts_clean_payload() -> None:
     assert redaction_violations(payload) == []
 
 
-def test_write_artifact_refuses_redaction_violation(tmp_path) -> None:
+def test_write_artifact_refuses_home_directory_content(tmp_path) -> None:
     artifact = _minimal_artifact(batch_id="bad-batch")
     artifact["notes"] = "model at " + os.path.expanduser("~")
-    with pytest.raises(ValueError, match="redaction"):
+    # Rejected at the schema layer (path-like) or the redaction layer
+    # (home directory) — either way nothing is written.
+    with pytest.raises(ValueError, match="path-like|redaction"):
         write_artifact(artifact, tmp_path)
     assert list(tmp_path.iterdir()) == []
 
@@ -136,6 +138,96 @@ def test_write_artifact_round_trip(tmp_path) -> None:
     loaded = json.loads(path.read_text(encoding="utf-8"))
     assert loaded["batch_id"] == "test-batch"
     assert validate_artifact(loaded) == []
+
+
+# -- hostile inputs (review finding 7 / brief item 8) --------------------
+
+
+def test_batch_id_traversal_is_rejected(tmp_path) -> None:
+    artifact = _minimal_artifact(batch_id="../../escape")
+    with pytest.raises(ValueError, match="schema invalid"):
+        write_artifact(artifact, tmp_path)
+    assert list(tmp_path.parent.glob("escape*")) == []
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../../escape", "..", "a/b", "a\\b", "C:evil", "UPPER", "sp ace", "a" * 120, "", ".hidden".upper()],
+)
+def test_unsafe_batch_ids_rejected(bad_id) -> None:
+    problems = validate_artifact(_minimal_artifact(batch_id=bad_id))
+    assert any("batch_id" in problem for problem in problems), bad_id
+
+
+def test_write_artifact_target_must_stay_inside_directory(tmp_path) -> None:
+    # Even if validation were bypassed, the writer re-proves containment.
+    artifact = _minimal_artifact()
+    artifact["batch_id"] = "ok-slug"
+    path = write_artifact(artifact, tmp_path)
+    assert path.parent == tmp_path.resolve()
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        r"D:\private\models\x.gguf",
+        r"\\fileserver\share\model.gguf",
+        "/home/user/model.gguf",
+        "/Users/someone/Documents/x",
+        "E:/other/drive/path",
+    ],
+)
+def test_pathlike_content_rejected_in_notes(hostile, tmp_path) -> None:
+    artifact = _minimal_artifact()
+    artifact["notes"] = f"model loaded from {hostile}"
+    problems = validate_artifact(artifact)
+    assert any("path-like" in problem for problem in problems), hostile
+    with pytest.raises(ValueError):
+        write_artifact(artifact, tmp_path)
+
+
+def test_pathlike_content_rejected_in_model_fields(tmp_path) -> None:
+    artifact = _minimal_artifact()
+    artifact["model"]["tag"] = r"D:\private\models\x.gguf"
+    assert any("path-like" in problem for problem in validate_artifact(artifact))
+    with pytest.raises(ValueError):
+        write_artifact(artifact, tmp_path)
+
+
+def test_pathlike_and_illegal_server_env_values_rejected(tmp_path) -> None:
+    artifact = _minimal_artifact()
+    artifact["runtime"]["server_env"] = {"OLLAMA_KV_CACHE_TYPE": r"\\unc\share\x"}
+    problems = validate_artifact(artifact)
+    assert any("server_env value" in problem or "path-like" in problem for problem in problems)
+    artifact2 = _minimal_artifact()
+    artifact2["runtime"]["server_env"] = {"OLLAMA_KEEP_ALIVE": "5m; rm -rf ~ && echo " + "x" * 40}
+    assert any("server_env value" in problem for problem in validate_artifact(artifact2))
+
+
+def test_unknown_nested_keys_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["model"]["private_path"] = "x"
+    assert any("model keys" in problem for problem in validate_artifact(artifact))
+    artifact2 = _minimal_artifact()
+    artifact2["runtime"]["command_line"] = "x"
+    assert any("runtime keys" in problem for problem in validate_artifact(artifact2))
+    artifact3 = _minimal_artifact()
+    artifact3["hardware"]["hostname"] = "x"
+    assert any("hardware keys" in problem for problem in validate_artifact(artifact3))
+
+
+def test_oversized_notes_rejected() -> None:
+    artifact = _minimal_artifact()
+    artifact["notes"] = "n" * 500
+    assert any("notes" in problem for problem in validate_artifact(artifact))
+
+
+def test_redaction_sentinel_catches_any_drive_and_unc_and_unix() -> None:
+    assert "windows_absolute_path" in redaction_violations(json.dumps({"x": r"D:\private\models\x.gguf"}))
+    assert "windows_absolute_path" in redaction_violations(json.dumps({"x": "E:/other/path"}))
+    assert "unc_path" in redaction_violations(json.dumps({"x": r"\\server\share"}))
+    assert "unix_absolute_path" in redaction_violations(json.dumps({"x": "/home/user/model.gguf"}))
+    assert redaction_violations(json.dumps({"x": "llama3.2:1b", "t": "2026-07-17T00:00:00Z"})) == []
 
 
 # -- shapes / quality ----------------------------------------------------
