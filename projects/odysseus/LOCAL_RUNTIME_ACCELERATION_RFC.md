@@ -338,21 +338,34 @@ Fail-safe rules (each carries a test in Phase 3):
 - the planner is **pure**: same inputs → same plan (deterministic
   ordering of alternatives), no I/O beyond its inputs, no settings writes.
 
-Runtime RPC dispatcher contract (amended per review rounds 1–2): **the
-RPC request path never probes.** Requests answer immediately from the
-latest published snapshot (explicit `cache_age_ms`, `partial`,
-`refresh_state`, `last_success_at_ms`), or return a fixed
-`refreshing`/`snapshot_unavailable` result while a single guarded
-background refresher runs. The refresher builds privately, publishes
-immutable generation-checked snapshots (hung/obsolete workers can never
-publish or mutate a returned result), and is itself bounded by the
-per-probe budgets (worst case ~14 s, `REFRESH_WORST_CASE_SECONDS`);
-detail probes carry per-model fixed statuses
-(`complete|timeout|failed|not_probed|probe_cap_reached`) and
-`details_complete` is true only when every model's metadata was
-successfully populated. Worst-case dispatcher blocking is cache/file
-read time (milliseconds), proven by an integration test with every
-probe hanging.
+Runtime RPC dispatcher contract (amended per review rounds 1–4): **the
+RPC request path never probes, scans, reads, or parses.** Two
+persistent background workers — inventory probes and the benchmark
+evidence index — publish immutable generation-checked results;
+requests answer immediately from the latest completed result (explicit
+age, `refresh_state`, `last_success_at_ms`), or return fixed
+`snapshot_unavailable`/`evidence_refreshing` copy while a refresh runs.
+Refresh states are `idle | refreshing | refresh_hung | closed` with
+`refresh_age_ms`: a collection older than
+`REFRESH_HUNG_THRESHOLD_SECONDS` (bounded worst case ~14 s + margin)
+reports `refresh_hung` with restart-required copy — no replacement
+thread is ever spawned, the last completed snapshot keeps being served,
+and with no snapshot the fixed copy says a sidecar restart is required.
+`close()` waits a bounded margin and reports `worker_stopped` vs
+`worker_still_running` honestly (a timeout-ignoring probe is never
+claimed terminated; it can never publish after close and dies with the
+process). The evidence index validates every decoded artifact with
+`validate_artifact()` before it becomes listing or planner evidence,
+counts skipped malformed/invalid/oversized/non-regular files, enforces
+file-count and byte limits against actual bytes read, refuses symlinks
+outside the evidence root, and reports fixed truncation reasons.
+Detail probes carry per-model fixed statuses
+(`complete|timeout|failed|incomplete_metadata|not_probed|
+probe_cap_reached|detail_worker_busy`) and `details_complete` is true
+only when every model's required metadata was successfully populated.
+Worst-case dispatcher blocking is deep-copy time on cached results
+(milliseconds), proven by integration tests with every probe hanging
+and with deliberately slow evidence reads.
 
 ## 7. Runtime capability matrix
 

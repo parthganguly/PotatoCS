@@ -1,12 +1,12 @@
 # Local Runtime Acceleration — Fable Implementation Result
 
 Status: research/engineering track on `feat/local-runtime-acceleration`
-(stacked on `feat/deep-local-fable`); three independent review rounds
+(stacked on `feat/deep-local-fable`); four independent review rounds
 (PR #35, 2026-07-17/18) addressed. Backend-only; no UI, no settings
 mutation, no chat-routing change, no change to `main`, the installer,
 release assets, or the v0.4 gate.
 
-Date: 2026-07-17/18, updated after review round 3, 2026-07-18.
+Date: 2026-07-17/18, updated after review round 4, 2026-07-18.
 Author: Claude Code (Fable).
 
 ## Commits
@@ -28,8 +28,10 @@ Author: Claude Code (Fable).
   detail completeness + bounded detail workers + quant-aware fallback →
   `30897bd7` persistent single refresher + clean shutdown + cached
   evidence → `43df6c09` closed schema + separator-free strings
-  (31 artifacts migrated: `notes` removed) → this report update (final
-  head in the PR).
+  (31 artifacts migrated: `notes` removed) → `428ed2c2` docs.
+- **Review-response commits, round 4 (2026-07-18):** `6d3983ee`
+  background evidence index + honest refresh/shutdown state → this
+  report update (final head in the PR).
 - **Upstream runtimes:** Ollama **0.31.1** (probed live); llama.cpp
   release **b10064** (`86d86ed43`), official Windows x64 CPU zip,
   SHA256 `C9B770B5…099E` (CUDA zip archived `D3DF8C73…34B`, unused);
@@ -69,7 +71,14 @@ Author: Claude Code (Fable).
 | 3 | Parameter-count weight fallback not conservative (Q8-class for everything) | **Fixed** (`dc330be8`): quantization-aware bytes/param (Q4 0.85 → Q8 1.35 → FP16 2.6 → FP32 5.2 GiB/B, each with overhead); unknown/missing quantization without a disk size → `unknown_weight_size` rejection. FP16 and unknown-quantization tests added; an 8B FP16 model no longer "fits" the 16 GB machine. |
 | 4 | Artifact schema open to arbitrary private text | **Fixed** (`43df6c09`): schema closed at EVERY level (top-level, runs, timings/tokens/memory/residency/options, model, runtime, hardware incl. nested os/cpu/isa/ram/storage/gpus and fixed error categories); free-form `notes` removed from schema, harness, and CLI; the 31 artifacts migrated (notes stripped — provenance stays in the batch-id slug). Hostile tests: top-level prompt/output/secret, run-level extras, nested hardware/memory/options extras. |
 | 5 | "All absolute POSIX paths" evadable (single-segment, spaces, Unicode) | **Fixed** (`43df6c09`): no artifact string or key may contain a path separator, control character, or quote at all — no pattern to evade; the payload sentinel flags any separator byte. `/secret`, `/opt/private model/x.gguf`, and Unicode path segments tested. |
-| 6 | Evidence loading could block the dispatcher (200 × 4 MiB parses per call) | **Fixed** (`30897bd7`): evidence listing + summaries cached by directory-stat key (name/size/mtime) under strict budgets (16 MiB total bytes, 1 s wall time) with truncation surfaced as an explicit flag; repeat calls cost one directory scan. Tests: 60-artifact responsiveness + sub-200 ms cache hit, time- and byte-budget truncation, invalidation on new files. |
+| 6 | Evidence loading could block the dispatcher (200 × 4 MiB parses per call) | **Fixed** (`30897bd7`, superseded by round 4 `6d3983ee`): evidence work moved fully off the dispatcher — see the round-4 table. |
+
+## Review findings (PR #35, fourth round) and resolutions
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Evidence discovery/validation/parsing/summarization still ran synchronously on the dispatcher (directory scan + stat + parse per call; the round-3 "cache" still paid the miss on-thread) | **Fixed** (`6d3983ee`): a second persistent background worker owns the evidence index. RPCs never scan/stat/read/parse: cold → fixed `evidence_refreshing`; completed index served immutably with `index_age_ms`; stale index served while one refresh runs; empty-evidence case published eagerly with no thread. The index pass gates every decoded object through `validate_artifact()` (schema-invalid and malformed JSON are counted, never raised), enforces `MAX_EVIDENCE_FILES` and per-file/total byte limits against actual bytes read, skips symlinks/reparse points and any file resolving outside the evidence root, and reports `stats` (files seen/parsed, per-category skip counts, total parsed bytes) plus fixed truncation reasons (`file_count`/`byte_budget`/`time_budget`). Plans/recommendations consume only the last completed index. 11 new tests incl. slow-read RPC responsiveness and single-worker guarantees. |
+| 2 | Refresh/shutdown state dishonest: hung refresh still said "Retry shortly"; `close()` claimed nothing about whether the worker actually stopped | **Fixed** (`6d3983ee`): states `idle/refreshing/refresh_hung/closed` with `refresh_age_ms`; past `REFRESH_HUNG_THRESHOLD_SECONDS` (~14 s worst case + 6 s margin) the state is `refresh_hung`, the copy says runtime inventory cannot refresh again until the sidecar restarts (no "retry shortly"), the last completed snapshot keeps being served, and no-snapshot returns fixed `restart_required` copy. `close()` waits `CLOSE_WAIT_MARGIN_SECONDS` and returns `worker_stopped` vs `worker_still_running` per worker — a timeout-ignoring probe is reported still-running, never claimed terminated (it can never publish post-close; generation + closed checks). `SidecarApp.close()` remains bounded (≤ 2 × margin). 4 new tests incl. in-flight-close and hung-with/without-snapshot flows. |
 
 ## Corrected memory-estimation examples (geometry verified live)
 
@@ -169,21 +178,25 @@ but speed-unmeasured.
 
 ## Maximum runtime-RPC latency (dispatcher)
 
-The RPC request path performs **no probing** (round 2): worst-case
-dispatcher blocking is snapshot/evidence file-read time — measured
-< 2 s in the integration test even with every probe hanging, typically
-milliseconds. The background refresher (not the dispatcher) is bounded
-by per-probe budgets at ~14 s worst case (`REFRESH_WORST_CASE_SECONDS`:
-nvidia-smi 3.0 + tcp 0.5 + Ollama version 2.5 + llama-server --version
-3.0 + tags 2.5 + detail budget 2.0 + 0.5 join slack); a refresher alive
-past 4× that (56 s) is presumed hung and superseded, its late result
-discarded by generation check.
+The RPC request path performs **no probing, no directory scanning, no
+file reads, and no JSON parsing** (rounds 2–4): worst-case dispatcher
+blocking is deep-copying a cached result — measured < 0.5 s for ten
+consecutive calls in the hostile tests (every probe hanging;
+deliberately slow evidence reads), typically milliseconds. The
+inventory refresher (background) is bounded by per-probe budgets at
+~14 s worst case (`REFRESH_WORST_CASE_SECONDS`: nvidia-smi 3.0 + tcp
+0.5 + Ollama version 2.5 + llama-server --version 3.0 + tags 2.5 +
+detail budget 2.0 + 0.5 join slack); alive past that + 6 s margin it is
+reported `refresh_hung` — never superseded by a new thread — with
+restart-required copy, while the last completed snapshot keeps being
+served. The evidence index worker is bounded by 16 MiB total parsed
+bytes and 1 s wall time per pass, with fixed truncation reasons.
 
 ## Tests run and exact results (post-review head)
 
 | Command | Result |
 |---|---|
-| `python -m pytest python\tests` | **671 passed, 7 skipped** (skips = env-gated Colibrì E2E, as on base) |
+| `python -m pytest python\tests` | **681 passed, 8 skipped** (7 = env-gated Colibrì E2E, as on base; 1 = symlink-exclusion test on accounts without symlink permission) |
 | `npm run test:backend-status` | pass (`backend-status-tests-ok`) |
 | `npm run test:progress` | pass (`chat-progress-tests-ok`) |
 | `npm run test:readiness` | pass (readiness row mapping tests passed) |
@@ -193,9 +206,9 @@ discarded by generation check.
 | `cargo test --manifest-path src-tauri\Cargo.toml` | pass (24 passed, 4 ignored) |
 | `git diff --check` | clean |
 
-Focused suites (post review round 3): inventory 27, harness/artifacts
-55, planner 47, RPC service 38 — **167 focused tests** (78 → 126 →
-148 → 167), plus the 109 preserved Deep Local/Colibrì tests.
+Focused suites (post review round 4): inventory 27, harness/artifacts
+55, planner 47, RPC service 49 — **178 focused tests** (78 → 126 →
+148 → 167 → 178), plus the 109 preserved Deep Local/Colibrì tests.
 
 ## Privacy / no-egress status
 
