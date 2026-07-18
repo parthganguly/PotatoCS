@@ -452,16 +452,17 @@ def test_single_refresh_worker_despite_repeated_calls(monkeypatch) -> None:
             service.plan("balanced")
             service.recommendations()
         assert started_workers["count"] == 1
-        # The service holds exactly one live worker thread object; every
-        # repeated call observed it instead of starting another.
+        # The service holds exactly one persistent worker thread; every
+        # repeated call signaled it instead of starting another.
         with service._lock:
-            worker = service._refresh_thread
+            worker = service._worker
         assert worker is not None and worker.is_alive()
         service.inventory()
         with service._lock:
-            assert service._refresh_thread is worker
+            assert service._worker is worker
     finally:
         release.set()
+        service.close()
 
 
 def test_published_snapshot_never_mutated_by_late_worker(monkeypatch) -> None:
@@ -500,7 +501,7 @@ def test_published_snapshot_never_mutated_by_late_worker(monkeypatch) -> None:
 
 
 def test_obsolete_generation_result_is_discarded(monkeypatch) -> None:
-    """A hung worker whose generation was superseded must not publish."""
+    """A collect whose generation was superseded must not publish."""
     _patch_inventories(monkeypatch)
     service = RuntimePlanService(None)
     ready = _await_snapshot(service)
@@ -508,10 +509,90 @@ def test_obsolete_generation_result_is_discarded(monkeypatch) -> None:
     with service._lock:
         stale_generation = service._generation
         service._generation += 1  # supersede
-    service._refresh_worker(stale_generation)  # runs to completion…
+    service._collect_and_publish(stale_generation)  # runs to completion…
     with service._lock:
         # …but did not publish: last_success timestamp unchanged.
         assert service._last_success_at_ms == ready["last_success_at_ms"]
+
+
+def test_repeated_hung_periods_never_stack_workers(monkeypatch) -> None:
+    """Review round 3, finding 1: even far past any hung threshold, no
+    replacement threads are spawned — one persistent worker, total."""
+    from odysseus_desktop_backend.services import runtime_inventory as ri
+
+    def hang(**kw):
+        time.sleep(120)
+        return {}
+
+    monkeypatch.setattr(ri, "hardware_inventory", hang)
+    before = sum(1 for t in threading.enumerate() if t.name == "runtime-inventory-refresh")
+    service = RuntimePlanService(None)
+    service.inventory()  # starts the one worker, which hangs
+    time.sleep(0.1)
+    for _ in range(25):
+        # Simulate time passing far beyond any threshold between calls:
+        # the old design spawned a replacement each 56s window.
+        service.inventory()
+        service.plan("fast")
+        service.recommendations()
+    after = sum(1 for t in threading.enumerate() if t.name == "runtime-inventory-refresh")
+    assert after - before == 1  # exactly the one persistent worker
+    result = service.inventory()
+    assert result["ok"] is False  # still honest: refreshing, never blocking
+
+
+def test_close_stops_worker_and_blocks_publish(monkeypatch) -> None:
+    _patch_inventories(monkeypatch)
+    service = RuntimePlanService(None)
+    ready = _await_snapshot(service)
+    with service._lock:
+        worker = service._worker
+    service.close()
+    assert worker is not None
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    # A collect finishing after close never publishes.
+    service._collect_and_publish(service._generation)
+    inventory_after = service.inventory()
+    assert inventory_after["ok"] is True  # old snapshot still served
+    assert inventory_after["last_success_at_ms"] == ready["last_success_at_ms"]
+
+
+def test_detail_worker_guard_bounds_threads_across_repeated_calls() -> None:
+    """Review round 3, finding 1 (model_inventory): repeated inventory
+    passes with a stuck detail probe must not stack workers — later
+    passes skip details with detail_worker_busy."""
+    from odysseus_desktop_backend.services import runtime_inventory as ri
+
+    tags = {"models": [{"name": "hang:latest", "size": 1, "digest": "sha256:x", "details": {}}]}
+    release = threading.Event()
+
+    def hanging_post(url, payload, timeout=None, **kw):
+        release.wait(60)  # ignores its timeout until released
+        raise RuntimeError("released")
+
+    try:
+        before = sum(1 for t in threading.enumerate() if t.name == "model-detail-probe")
+        results = []
+        for _ in range(6):
+            results.append(
+                ri.model_inventory(
+                    get_json=lambda url, **kw: tags,
+                    post_json=hanging_post,
+                    detail_budget_seconds=0.2,
+                )
+            )
+        alive = sum(1 for t in threading.enumerate() if t.name == "model-detail-probe")
+        assert alive - before <= 1  # one stuck worker, never stacked
+        # First pass timed out; subsequent passes reported the busy guard.
+        assert results[0]["models"][0]["detail_status"] == ri.DETAIL_TIMEOUT
+        assert all(
+            item["models"][0]["detail_status"] == ri.DETAIL_WORKER_BUSY for item in results[1:]
+        )
+        assert all(item["details_complete"] is False for item in results)
+    finally:
+        release.set()
+        time.sleep(0.1)
 
 
 def test_hanging_detail_probes_stay_within_ceiling() -> None:
@@ -569,7 +650,55 @@ def test_rpc_methods_registered_and_fixture_in_sync() -> None:
 def test_no_settings_mutation_surface() -> None:
     service = RuntimePlanService(None)
     public = [name for name in dir(service) if not name.startswith("_")]
-    assert sorted(public) == ["benchmarks", "evidence_dir", "inventory", "plan", "recommendations"]
+    assert sorted(public) == ["benchmarks", "close", "evidence_dir", "inventory", "plan", "recommendations"]
+
+
+# -- cached bounded evidence loading (review round 3, finding 6) ---------
+
+
+def test_large_evidence_dir_stays_responsive_and_caches(tmp_path) -> None:
+    for index in range(60):
+        write_artifact(_artifact(batch_id=f"bulk-{index:03d}"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    started = time.perf_counter()
+    first = service.benchmarks()
+    first_elapsed = time.perf_counter() - started
+    assert first["ok"] is True
+    assert len(first["artifacts"]) == 60
+    assert first_elapsed < rps.EVIDENCE_TIME_BUDGET_SECONDS + 1.0
+    started = time.perf_counter()
+    second = service.benchmarks()
+    cached_elapsed = time.perf_counter() - started
+    assert second["artifacts"] == first["artifacts"]
+    assert cached_elapsed < 0.2, f"cache hit took {cached_elapsed:.3f}s"
+
+
+def test_evidence_time_budget_truncates_honestly(tmp_path, monkeypatch) -> None:
+    for index in range(10):
+        write_artifact(_artifact(batch_id=f"slow-{index:03d}"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    monkeypatch.setattr(rps, "EVIDENCE_TIME_BUDGET_SECONDS", 0.0)
+    result = service.benchmarks()
+    assert result["truncated"] is True
+    assert len(result["artifacts"]) < 10
+
+
+def test_evidence_byte_budget_truncates_honestly(tmp_path, monkeypatch) -> None:
+    for index in range(10):
+        write_artifact(_artifact(batch_id=f"big-{index:03d}"), tmp_path)
+    monkeypatch.setattr(rps, "EVIDENCE_TOTAL_BYTE_BUDGET", 1)
+    service = RuntimePlanService(tmp_path)
+    result = service.benchmarks()
+    assert result["truncated"] is True
+    assert result["artifacts"] == []
+
+
+def test_evidence_cache_invalidates_on_new_file(tmp_path) -> None:
+    write_artifact(_artifact(batch_id="first"), tmp_path)
+    service = RuntimePlanService(tmp_path)
+    assert len(service.benchmarks()["artifacts"]) == 1
+    write_artifact(_artifact(batch_id="second"), tmp_path)
+    assert len(service.benchmarks()["artifacts"]) == 2
 
 
 def test_dispatcher_stays_responsive_while_probes_hang(monkeypatch, tmp_path) -> None:

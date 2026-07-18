@@ -233,6 +233,7 @@ class SidecarApp:
         logger.info("backend shutdown profile_dir=%s", self.profile_dir)
         self.jobs.shutdown()
         self.deep_local_jobs.shutdown()
+        self.runtime_plan.close()
         self.db.close()
 
     def dispatch(self, method: str, params: JsonDict | None) -> Any:
