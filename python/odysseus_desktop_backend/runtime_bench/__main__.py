@@ -166,11 +166,17 @@ def _attest_main(argv: list[str]) -> int:
     parser.add_argument(
         "--approved-g-iso-0",
         action="store_true",
-        help="human approval gate for a real empty-store launch",
+        help=(
+            "human approval gate for a real empty-store launch; the resolved executable "
+            "must also have a committed reviewed dialect"
+        ),
     )
     parser.add_argument("--executable", default="ollama.exe")
     parser.add_argument("--user-overrides-json", default="{}")
     parser.add_argument("--startup-timeout", type=float, default=30.0)
+    parser.add_argument("--attestation-timeout", type=float, default=10.0)
+    parser.add_argument("--version-timeout", type=float, default=10.0)
+    parser.add_argument("--launch-attempts", type=int, default=3)
     args = parser.parse_args(argv)
     try:
         overrides = json.loads(args.user_overrides_json)
@@ -185,6 +191,9 @@ def _attest_main(argv: list[str]) -> int:
             result = build_dry_run_plan(
                 user_overrides=overrides,
                 startup_timeout_seconds=args.startup_timeout,
+                attestation_timeout_seconds=args.attestation_timeout,
+                version_timeout_seconds=args.version_timeout,
+                launch_attempts=args.launch_attempts,
             )
             print(json.dumps(result, indent=1, sort_keys=True))
             return 0
@@ -194,6 +203,9 @@ def _attest_main(argv: list[str]) -> int:
             args.executable,
             user_overrides=overrides,
             startup_timeout_seconds=args.startup_timeout,
+            attestation_timeout_seconds=args.attestation_timeout,
+            version_timeout_seconds=args.version_timeout,
+            launch_attempts=args.launch_attempts,
         ).run()
     except Phase1ContractError as exc:
         parser.error(str(exc))
