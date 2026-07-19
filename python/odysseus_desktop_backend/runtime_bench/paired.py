@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -67,18 +68,79 @@ def _now_iso() -> str:
 
 
 def require_loopback_endpoint(endpoint: str) -> None:
+    if not isinstance(endpoint, str):
+        raise ValueError("paired benchmark endpoint must be a string")
     parsed = urllib.parse.urlparse(endpoint)
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("paired benchmarks require a loopback HTTP endpoint")
+
+
+def validate_execution_controls(
+    *,
+    context_limit: Any,
+    repeats: Any,
+    timeout: Any,
+    cancel_probe: Any,
+    cancel_after_ms: Any,
+    endpoint: Any,
+) -> None:
+    """Fail before inventory or network work on unsafe execution controls."""
+    if isinstance(context_limit, bool) or not isinstance(context_limit, int) or context_limit < 1:
+        raise ValueError("context_limit must be an integer >= 1")
+    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
+        raise ValueError("repeats must be an integer >= 3")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be finite and > 0")
+    if (
+        isinstance(cancel_after_ms, bool)
+        or not isinstance(cancel_after_ms, int)
+        or cancel_after_ms < 0
+    ):
+        raise ValueError("cancel_after_ms must be an integer >= 0")
+    if not isinstance(cancel_probe, bool):
+        raise ValueError("cancel_probe must be boolean")
+    if cancel_probe and cancel_after_ms >= timeout * 1000:
+        raise ValueError("cancel_after_ms must be less than the arm timeout")
+    require_loopback_endpoint(endpoint)
 
 
 def safety_floor_bytes(total_ram_bytes: int) -> int:
     return max(RAM_SAFETY_FLOOR_BYTES, int(total_ram_bytes * RAM_SAFETY_FRACTION))
 
 
-def _parameter_count(parameter_size: str) -> int | None:
-    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*B\s*", parameter_size or "", re.I)
-    return int(float(match.group(1)) * 1_000_000_000) if match else None
+def _parameter_count(parameter_size: Any) -> tuple[int | None, bool]:
+    """Return (count, malformed); absent metadata is unknown, not malformed."""
+    if parameter_size is None:
+        return None, False
+    if isinstance(parameter_size, bool) or not isinstance(parameter_size, str):
+        return None, True
+    if not parameter_size.strip():
+        return None, True
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*B\s*", parameter_size, re.I)
+    if match is None:
+        return None, True
+    billions = float(match.group(1))
+    if not math.isfinite(billions) or billions <= 0:
+        return None, True
+    count = int(billions * 1_000_000_000)
+    return (count, False) if count > 0 else (None, True)
+
+
+def _positive_integral_metadata(value: Any) -> tuple[int | None, bool]:
+    """Parse a positive integral JSON number without bool/string coercion."""
+    if value is None:
+        return None, False
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, True
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None, True
+    parsed = int(value)
+    return (parsed, False) if parsed > 0 else (None, True)
 
 
 def _quant_bytes_per_param(quantization: Any) -> float | None:
@@ -92,43 +154,31 @@ def _quant_bytes_per_param(quantization: Any) -> float | None:
 def estimate_required_memory_bytes(model: dict[str, Any], context_limit: int) -> dict[str, Any]:
     """Mirror PR #35's known/unknown estimator and expose rejection state."""
     malformed = False
-    raw_disk = model.get("disk_bytes")
-    try:
-        weights = int(raw_disk or 0)
-    except (TypeError, ValueError):
-        weights = 0
-        malformed = raw_disk not in (None, "")
-    if weights < 0:
-        weights = 0
-        malformed = True
-    weights_known = weights > 0
+    weights_value, disk_malformed = _positive_integral_metadata(model.get("disk_bytes"))
+    malformed |= disk_malformed
+    weights = weights_value or 0
+    weights_known = weights_value is not None
     if not weights_known and not malformed:
-        parameter_size = str(model.get("parameter_size") or "")
-        parameters = _parameter_count(parameter_size)
+        parameters, parameter_malformed = _parameter_count(model.get("parameter_size"))
+        malformed |= parameter_malformed
         bytes_per_parameter = _quant_bytes_per_param(model.get("quantization"))
-        if parameters is not None and bytes_per_parameter is not None:
+        if not malformed and parameters is not None and parameters > 0 and bytes_per_parameter is not None:
             weights = int((parameters / 1_000_000_000) * bytes_per_parameter * 1024**3)
-            weights_known = True
+            weights_known = weights > 0
 
     geometry = model.get("kv_geometry")
-    values: list[int] = []
+    values: list[int | None] = []
     if geometry is not None and not isinstance(geometry, dict):
         malformed = True
         geometry = {}
     for key in ("layers", "kv_heads", "key_length", "value_length"):
-        raw = (geometry or {}).get(key)
-        try:
-            value = int(raw or 0)
-        except (TypeError, ValueError):
-            value = 0
-            malformed = True
-        if value < 0:
-            value = 0
-            malformed = True
+        value, value_malformed = _positive_integral_metadata((geometry or {}).get(key))
+        malformed |= value_malformed
         values.append(value)
-    kv_geometry_known = all(value > 0 for value in values)
+    kv_geometry_known = all(value is not None for value in values)
     if kv_geometry_known:
         layers, kv_heads, key_length, value_length = values
+        assert all(value is not None for value in values)
         kv = (key_length + value_length) * kv_heads * layers * KV_DTYPE_BYTES * context_limit
     else:
         kv = UNKNOWN_KV_BYTES_PER_TOKEN * context_limit
@@ -204,7 +254,8 @@ def model_descriptor_v2(tag: str, *, endpoint: str = OLLAMA_ENDPOINT) -> tuple[d
     identities = _ollama_show_identity(tag, endpoint)
     family = str(entry.get("family") or "").lower()
     architecture = "moe" if "moe" in family else "dense" if family else "unknown"
-    total_parameters = _parameter_count(str(entry.get("parameter_size") or ""))
+    total_parameters, _ = _parameter_count(entry.get("parameter_size"))
+    descriptor_disk_bytes, _ = _positive_integral_metadata(entry.get("disk_bytes"))
     active_parameters = total_parameters if architecture == "dense" else None
     digest = str(entry.get("digest") or "unavailable").lower()
     descriptor = {
@@ -216,7 +267,7 @@ def model_descriptor_v2(tag: str, *, endpoint: str = OLLAMA_ENDPOINT) -> tuple[d
         "architecture": architecture,
         "total_parameters": total_parameters,
         "active_parameters": active_parameters,
-        "disk_bytes": int(entry.get("disk_bytes") or 0),
+        "disk_bytes": descriptor_disk_bytes or 0,
         "tokenizer_identity": identities["tokenizer"],
         "chat_template_identity": identities["template"],
     }
@@ -663,7 +714,14 @@ def run_paired_ollama_batch(
     execute_arm: Callable[..., dict[str, Any]] = execute_ollama_arm,
 ) -> dict[str, Any]:
     """Execute and persist two arm artifacts; return evidence and abort state."""
-    require_loopback_endpoint(endpoint)
+    validate_execution_controls(
+        context_limit=context_limit,
+        repeats=repeats,
+        timeout=timeout,
+        cancel_probe=cancel_probe,
+        cancel_after_ms=cancel_after_ms,
+        endpoint=endpoint,
+    )
     spec = BENCHMARK_SHAPES[shape]
     protected = {
         "temperature": 0,

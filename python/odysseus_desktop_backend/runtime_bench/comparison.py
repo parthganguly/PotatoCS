@@ -40,6 +40,10 @@ INVALID_REASONS = {
     "duplicate_execution_order",
     "unbalanced_execution_order",
     "repetition_set_mismatch",
+    "file_identity_missing",
+    "tokenizer_identity_missing",
+    "template_identity_missing",
+    "runtime_identity_missing",
 }
 
 POLICY_KEYS = {
@@ -89,12 +93,18 @@ def _protected_reasons(baseline: dict[str, Any], candidate: dict[str, Any]) -> s
         reasons.add("model_mismatch")
     if bmodel["digest"] != cmodel["digest"] or "unavailable" in {bmodel["digest"], cmodel["digest"]}:
         reasons.add("model_digest_mismatch")
+    if any(_identity_missing(model["file_identity"]) for model in (bmodel, cmodel)):
+        reasons.add("file_identity_missing")
     if baseline["fixture"] != candidate["fixture"] or baseline["shape"] != candidate["shape"]:
         reasons.add("prompt_fixture_mismatch")
     if bmodel["tokenizer_identity"] != cmodel["tokenizer_identity"]:
         reasons.add("tokenizer_mismatch")
+    if any(_identity_missing(model["tokenizer_identity"]) for model in (bmodel, cmodel)):
+        reasons.add("tokenizer_identity_missing")
     if bmodel["chat_template_identity"] != cmodel["chat_template_identity"]:
         reasons.add("template_mismatch")
+    if any(_identity_missing(model["chat_template_identity"]) for model in (bmodel, cmodel)):
+        reasons.add("template_identity_missing")
     breq, creq = baseline["requirements"], candidate["requirements"]
     if breq["context_limit"] != creq["context_limit"]:
         reasons.add("context_mismatch")
@@ -105,6 +115,12 @@ def _protected_reasons(baseline: dict[str, Any], candidate: dict[str, Any]) -> s
     bruntime, cruntime = baseline["runtime"], candidate["runtime"]
     if (bruntime["name"], bruntime["version"]) != (cruntime["name"], cruntime["version"]):
         reasons.add("runtime_version_mismatch")
+    if any(
+        _identity_missing(runtime[field])
+        for runtime in (bruntime, cruntime)
+        for field in ("name", "version")
+    ):
+        reasons.add("runtime_identity_missing")
     if baseline["engine_kind"] != candidate["engine_kind"] or baseline["mode"] != candidate["mode"]:
         reasons.add("engine_kind_mismatch")
     if baseline["placement"]["state"] != "recorded" or candidate["placement"]["state"] != "recorded":
@@ -114,6 +130,10 @@ def _protected_reasons(baseline: dict[str, Any], candidate: dict[str, Any]) -> s
     if bhardware is None or chardware is None or bhardware != chardware:
         reasons.add("hardware_snapshot_missing")
     return reasons
+
+
+def _identity_missing(value: Any) -> bool:
+    return not isinstance(value, str) or not value.strip() or value.strip().lower() == "unavailable"
 
 
 def _performance_runs(artifact: dict[str, Any]) -> list[dict[str, Any]]:
