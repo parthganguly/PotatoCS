@@ -133,7 +133,8 @@ configuration, record under identical shapes/sampling:
 ```
 B = { ttft_warm_ms, ttft_cold_ms, prompt_tps, gen_tps,
       max_verified_context, peak_ram_bytes, peak_vram_bytes,
-      min_system_available_ram_bytes, cancel_latency_ms,
+      min_system_available_ram_bytes, client_stream_closed_ms,
+      runtime_idle_ms, process_completion_ms,
       quality_pass_vector (per shape) }
 ```
 
@@ -684,8 +685,8 @@ BUILD exactly this, dev-only, stdlib-only, loopback-only:
    system_memory_samples (system-wide available RAM from
    GlobalMemoryStatusEx via ctypes, sampled on the existing sampler
    cadence), min_system_available_ram_bytes, and
-   cancel_probe {enabled, cancel_issued_at_ms, runtime_idle_at_ms,
-   cancel_latency_ms} on at most one designated run per arm
+   cancel_probe {enabled, request_to_cancel_ms, client_stream_closed_ms,
+   runtime_idle_ms, process_completion_ms} on at most one designated run per arm
    (cancel = close the streaming HTTP response, then poll /api/ps
    until the model reports idle or 30 s). validate_artifact() gains
    the v2 branch; v1 artifacts must still validate. The redaction

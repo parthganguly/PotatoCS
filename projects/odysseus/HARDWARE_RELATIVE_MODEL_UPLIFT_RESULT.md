@@ -21,7 +21,8 @@ and SHA-256, tokenizer and chat-template identity, protected context/output/
 sampling requirements, backend options, process-local server environment
 evidence, placement and residency state, timings and token counts, quality
 evidence, bounded RAM/pagefile/process/GPU/disk observations, fixed failure and
-truncation states, and optional cancellation measurements.
+truncation states, explicit preflight rejection categories, ambient CPU/RAM/GPU
+observations, and optional cancellation measurements.
 
 The artifact schema remains closed at every object level. Unknown fields,
 non-finite or out-of-range numbers, booleans used as numbers, malformed
@@ -34,6 +35,15 @@ order as `baseline → candidate`, then `candidate → baseline`. It requires at
 least three warm repetitions. Temperature, seed, output-token limit, context,
 and fixture are protected across arms.
 
+Before building a lookup map or aggregate, comparison requires exactly one
+non-cancellation cold run and at least three non-cancellation warm runs per arm,
+unique run indexes within each arm, unique global execution orders, identical
+`(cold, repetition_index)` sets, and contiguous performance orders beginning at
+zero. Cold order is baseline then candidate; warm repetitions alternate B/C,
+C/B, B/C thereafter. Cancellation probes must be appended after performance
+and cannot satisfy performance counts. The paired CLI always includes cold
+runs and has no `--no-cold` escape hatch.
+
 The comparison command validates every input independently, groups arm files
 by pair, excludes invalid pairs from every aggregate, and reports cold and warm
 distributions separately. It emits absolute candidate-minus-baseline
@@ -41,6 +51,14 @@ differences and candidate/baseline ratios for TTFT, prompt processing,
 generation, wall-clock completion, load duration, available-RAM floor,
 process RSS, VRAM use, and disk reads. Cancellation is reported separately.
 No materiality threshold or promotion verdict is applied by default.
+
+Ambient drift is always reported as baseline, candidate, and absolute paired
+distributions for pre-arm CPU, available RAM, GPU used/free bytes, elapsed arm
+gaps, and during-run mean CPU. Default comparison invents no universal
+interference threshold. A caller may supply a closed schema-v1 JSON policy with
+nullable limits for CPU, RAM, GPU-used, and elapsed-gap differences. Only that
+explicit policy can produce `system_interference`; an unavailable required CPU
+or GPU probe produces `incomplete_run`.
 
 ## Comparability rules
 
@@ -69,6 +87,12 @@ equal. Fixed invalid reasons are:
 - `malformed_artifact`
 - `unsupported_schema`
 - `engine_kind_mismatch`
+- `insufficient_cold_runs`
+- `insufficient_warm_runs`
+- `duplicate_run`
+- `duplicate_execution_order`
+- `unbalanced_execution_order`
+- `repetition_set_mismatch`
 
 GPU unavailability is represented as an explicit fixed state with null byte
 measurements. It is never silently converted to zero. A malformed input is
@@ -80,23 +104,43 @@ The harness reuses the reviewed PR #35 RAM policy by exact value:
 
 `safety floor = max(1.5 GiB, 12% of total physical RAM)`
 
-The pre-arm fit estimate uses the same weights + architecture-aware KV cache +
-600 MiB runtime-overhead calculation. If available memory, including safely
+The pre-arm estimator mirrors PR #35 known/unknown semantics. A positive disk
+size is known; otherwise a valid parameter count uses the reviewed Q2, Q3, Q4,
+Q5, Q6, Q8, F16/FP16/BF16, or F32/FP32 multiplier. Complete positive KV
+geometry uses the architecture formula; partial geometry uses the conservative
+512 KiB/token value but remains unknown. It records `weights_bytes`,
+`kv_cache_bytes`, `total_bytes`, `weights_known`, `kv_geometry_known`, and a
+fixed rejection category: empty, `unknown_weight_size`, `unknown_kv_geometry`,
+or `malformed_model_metadata`. Budget and probe rejection use
+`insufficient_memory_budget` and `memory_probe_unavailable`.
+
+If available memory, including safely
 reclaimable residency for the target model, cannot satisfy the estimate plus
 the floor, no inference request is launched. A
 `preflight_safety_abort` artifact run is retained and the paired command exits
 nonzero.
 
 During execution, the sampler checks the same floor on its bounded 250 ms
-cadence. A crossing closes the streaming response first, then uses the existing
+cadence. CPU uses `GetSystemTimes` on that cadence; pre-arm CPU uses one bounded
+100 ms sample. GPU sampling remains at 1000 ms, each `nvidia-smi` subprocess is
+bounded to 4 seconds, and no more than 256 system samples are retained per arm.
+A crossing closes the streaming response first, then uses the existing
 bounded unload/poll controls. The run is recorded as `safety_abort`, completed
 evidence is retained, remaining arms are stopped, and comparison metrics are
 withheld.
 
+The request timeout is a hard per-arm wall-clock deadline backed by one
+watchdog, not an inactivity timeout. It closes a stream even while chunks keep
+arriving, records `timeout`, performs bounded cleanup, and joins timer/sampler
+threads.
+
 The explicit cancellation probe is not run inside every normal arm. When
-enabled, at most one warm run per arm records request-to-cancel,
-acknowledgement, process-completion, final state, resource release, and runtime
-responsiveness. Cancellation runs are excluded from performance aggregates.
+enabled, one appended run per arm records `request_to_cancel_ms`,
+`client_stream_closed_ms`, nullable `runtime_idle_ms` (only after `/api/ps`
+confirms the model is absent), `process_completion_ms`, final state, resource
+release, and runtime responsiveness. Cancellation runs are excluded from
+performance aggregates. No field calls client-stream closure a runtime
+acknowledgement.
 
 ## Synthetic validation
 
@@ -107,21 +151,24 @@ Deterministic local tests cover:
 - all protected-field mismatches;
 - generated-token shortening and prompt truncation;
 - explicit unavailable GPU evidence;
-- pre-launch low-RAM abort;
+- estimator known/unknown cases and pre-launch low-RAM/unknown-state aborts;
 - bounded cancellation on a sampled floor crossing;
-- cancellation-latency reporting;
+- honest cancellation milestone reporting;
+- hard deadline against an endlessly chunking loopback response;
+- duplicate, cherry-picked, and unbalanced paired-design rejection;
+- ambient drift reporting with optional policy enforcement;
 - malformed-input isolation and privacy-safe CLI output;
 - valid-pair-only aggregation;
 - separate cold and warm results; and
 - absence of hardcoded comparison thresholds.
 
-Focused result: **87 passed** across the legacy and paired benchmark test
-modules, including **23 paired-test cases**.
+Focused result: **101 passed** across the legacy and paired benchmark test
+modules, including **37 paired-test cases**.
 
 ## Validation matrix
 
-- `python -m pytest python\tests`: **718 passed, 8 skipped**, 1 existing
-  Pillow decompression-size warning; 726 collected.
+- `python -m pytest python\tests`: **732 passed, 8 skipped**, 1 existing
+  Pillow decompression-size warning; 740 collected.
 - `npm run test:backend-status`: `backend-status-tests-ok`.
 - `npm run test:progress`: `chat-progress-tests-ok`.
 - `npm run test:readiness`: readiness row mapping tests passed.
