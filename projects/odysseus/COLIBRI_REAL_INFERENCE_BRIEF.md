@@ -1,169 +1,157 @@
 # Colibrì Compiled-Engine Proof Brief
 
-Status: approved Phase 0/1 plan for `research/colibri-olmoe-real-inference`.
+Status: implemented Phase 0/1 proof for
+`research/colibri-olmoe-real-inference`.
 
-Date: 2026-07-18.
+Date: 2026-07-19.
 
-## Scope
+## Scope and claim boundary
 
-This phase proves that the current official Colibrì native CPU toolchain works
-on the target Windows machine. It pins upstream, compiles the real GLM-5.2
-engine source, and runs the smallest dependency-free native engine-core oracle
-that upstream runs in its own CI. PotatoCS receives only a developer-only,
-environment-gated subprocess harness and pytest.
+This phase proves that the pinned official Colibrì native CPU source builds
+reproducibly with the target Windows toolchain and that its dependency-free
+integer-dot oracle selects and validates the exact AVX2 kernel and driver. It is
+a compiled engine-core proof, not model inference or language generation.
 
-The proof target is `tests/test_idot.exe`. Its official source fixture includes
-`glm.c` directly and compares the selected SIMD integer-dot kernels and batched
-drivers against scalar reference implementations bit-for-bit. The expected
-stdout markers are:
+The proof is bound to three separate regular files before any child process is
+created:
+
+| Role | Exact name | Expected SHA-256 |
+| --- | --- | --- |
+| Engine executable | `glm.exe` | `e9b4157fc2356c5fe7b348a826c37dc9b1dbf219b14bc0bd58388e7ff6af690c` |
+| Oracle executable | `test_idot.exe` | `d41b8de17cebc44d5ba82a42c0eccc27179eddde2509dffcfe4ffbc475cfd0a5` |
+| Source fixture | `test_idot.c` | `5c80caf2fa4a3f22f1497e0eacacf9025d28d5c2ece191cc4a0e966c049768dc` |
+
+`test_idot.c` includes the real `glm.c` engine core and compares the selected
+SIMD integer-dot kernels and batched drivers against scalar reference
+implementations bit-for-bit. The only accepted stdout is the exact 68-byte
+Windows CRLF sequence:
 
 ```text
 idot kernel exactness (avx2): ok
 idot driver exactness (avx2): ok
 ```
 
-The parenthesized kernel identity is machine/build dependent; both fixed
-prefix/suffix criteria and exit status 0 must match.
-
-Upstream also documents a stronger 2.4 MB random-weight model oracle whose
-teacher-forcing criterion is `32/32 positions`. Generating it requires Torch,
-Transformers, and Safetensors, which are not present on this machine. Those
-packages will not be installed in this phase. Passing the native oracle is not
-represented as model-level token-generation correctness.
+Scalar, fake, AVX-512, mismatched kernel/driver labels, LF-only text, and any
+extra output are rejected. Exit status must be 0 and stderr must be empty.
 
 ## Non-goals
 
-- No OLMoE or GLM-5.2 weights, language generation, or quality claim.
-- No converter run, model downloader, runtime server, production RPC, UI, or
+- No OLMoE or GLM-5.2 weights, model forward pass, token generation, or quality
+  claim.
+- No converter, downloader, runtime server, production RPC, UI, routing, or
   settings change.
-- No automatic compiler invocation from PotatoCS tests.
+- No automatic compiler invocation from normal PotatoCS tests.
 - No CUDA/MSVC work, packaging, upstream vendoring, or committed binary.
-- No changes to PR #33 or PR #35.
+- No changes to PR #33 or PR #35, and no merge.
 
-## Pinned upstream and reconciliation
+Upstream documents a stronger random-weight model oracle whose teacher-forcing
+criterion is `32/32 positions`. It requires Torch, Transformers, and
+Safetensors, which are outside this phase and were not installed.
+
+## Pinned upstream and toolchain
 
 - Repository: `https://github.com/JustVugg/colibri`
-- Pinned current commit: `72d3d37231e922a6fa9afca16e08fa45842d5eb4`
-- Previously audited commit: `550ddcba83afd27a892dba92c587bfcc1d30f020`
+- Commit: `72d3d37231e922a6fa9afca16e08fa45842d5eb4`
+- Commit epoch: `1784223580`
 - License: Apache-2.0
-- Source checkout size observed: 3.94 MiB plus 1.53 MiB of Git packs.
+- Platform: Windows 11 Home, 64-bit
+- CPU ISA used by this proof: AVX2
+- Compiler: MSYS2 UCRT64 GCC 16.1.0, target `x86_64-w64-mingw32`
+- Build tool: GNU Make 4.4.1
+- Configuration: `ARCH=x86-64-v3`, CPU-only, static MinGW link
 
-The current commit still supplies the contracts used by PR #33: the Python
-`coli` CLI, `plan` and `doctor`, the text-only OpenAI-compatible server,
-`GET /v1/models`, `GET /v1/models/{model}`, and chat/completions endpoints.
-The PotatoCS adapter remains deliberately text-only, so upstream feature work
-outside that subset does not invalidate it.
+MSYS2 is invoked through `C:\msys64\msys2_shell.cmd` with `-ucrt64`. The
+global Windows PATH, registry, and profiles are not modified.
 
-Compared with the previous audit, current upstream adds or strengthens native
-Windows defaults, compiler-target detection, MinGW linkage, Windows CPU
-inventory, environment-default tests, and CI on `main`. None of the relevant
-provider or CLI files were removed. The resource-plan JSON contract remains
-version 2 and doctor remains schema version 1.
+## Reproducibility gate
 
-## Privacy-safe machine and toolchain inventory
+Two independent clean directories must be checked out at the pinned commit and
+built with:
 
-- OS: Windows 11 Home, build 26200, 64-bit.
-- CPU: AMD Ryzen 5 4600H, x86-64, 6 physical/12 logical cores.
-- ISA: AVX, AVX2, and FMA present; no AVX-VNNI claim.
-- RAM: 15.4 GiB installed; free RAM is transient and is not an acceptance
-  input.
-- Intended build drive: more than 70 GiB free at preflight.
-- Git: 2.46.0.windows.1.
-- Compiler: MSYS2 UCRT64 GCC 16.1.0, target `x86_64-w64-mingw32`.
-- Build tool: GNU Make 4.4.1.
-- Python: CPython 3.13.12 for the PotatoCS test suite.
-- Rust: rustc/cargo 1.96.0.
-- CMake and Ninja: absent and not required by upstream's Makefile path.
+```text
+SOURCE_DATE_EPOCH=1784223580
+make glm.exe ARCH=x86-64-v3
+make tests/test_idot.exe ARCH=x86-64-v3
+```
 
-The toolchain is invoked through a process-local UCRT64 environment. The
-global Windows PATH, registry, profiles, and system configuration must not be
-changed.
+The epoch is derived from `git show -s --format=%ct` for the pinned commit. It
+stabilizes the PE COFF timestamp and checksum; GNU ld's
+`--no-insert-timestamp` is not required and is not part of the accepted recipe.
+The two `glm.exe` files and two `test_idot.exe` files must have identical sizes
+and SHA-256 values. Both oracles must independently produce the exact result
+above with exit 0 and zero stderr. A practical strings inspection must find no
+embedded absolute build-root path.
 
-## Expected network and storage work
+The developer-only verifier performs that two-build gate and is never run by
+normal tests:
 
-- Network: one shallow/filtering Git clone plus one shallow fetch for the old
-  audited commit. Observed repository data is under 6 MiB locally.
-- Build outputs: `glm.exe`, `tests/test_idot.exe`, and compiler intermediates,
-  expected to remain well below 100 MiB total.
-- Model downloads: exactly zero bytes.
-- Tracked artifacts: Markdown, a small Python harness, and tests only.
+```powershell
+& .\scripts\verify-colibri-native-repro.ps1 `
+  -SourceRoot $env:ODYSSEUS_COLIBRI_SOURCE_ROOT `
+  -BuildRoot $env:ODYSSEUS_COLIBRI_REPRO_ROOT `
+  -Msys2Root 'C:\msys64'
+```
 
-The upstream clone and all executables stay in an out-of-tree dependency
-directory. No individual download may exceed 100 MB.
+Both `build-a` and `build-b` must be absent before invocation. The script does
+not delete or overwrite them, download source or models, install dependencies,
+or alter the global PATH.
 
-## Acceptance criteria
+## Harness security and privacy contract
 
-1. `glm.exe` builds from the pinned current commit with UCRT64 GCC 16.1.0.
-2. `tests/test_idot.exe` builds from the same checkout and exits 0.
-3. Both exactness markers end in `: ok`; raw external stderr is not persisted.
-4. The report records upstream, compiler, configuration, executable and
-   fixture SHA-256 values, duration, exit status, and a fixed result category.
-5. Reproduction uses only explicit, out-of-tree paths and a process-local
-   UCRT64 environment.
-6. No model weight, binary, cloned upstream source, username, absolute path,
-   secret, or raw external stderr is committed.
-7. The developer E2E test skips when its two path variables are absent.
-8. Normal PotatoCS application and test execution have no external-toolchain
-   dependency.
+The environment-gated harness accepts exactly:
 
-## Fixed failure categories
+- `ODYSSEUS_COLIBRI_PROOF_ENGINE`
+- `ODYSSEUS_COLIBRI_PROOF_ORACLE`
+- `ODYSSEUS_COLIBRI_PROOF_FIXTURE`
 
-- `passed`: exit 0 and both exactness markers match.
-- `not_configured`: required environment paths are absent; pytest skips.
-- `invalid_executable`: executable path is absent, not a regular file, or not
-  an `.exe`.
-- `invalid_fixture`: fixture path is absent, not a regular file, or its name is
-  not `test_idot.c`.
-- `launch_failed`: process creation fails; no raw operating-system text leaves
-  the harness.
-- `timeout`: the fixed deadline expires and the child is terminated.
-- `nonzero_exit`: the child completes unsuccessfully.
-- `output_mismatch`: exit 0 without both fixed correctness markers.
+It resolves all three regular files, requires all three exact basenames, and
+hashes all three before launch. Any unrecognized oracle hash is rejected before
+the subprocess function is called, even if an unrelated program could print the
+expected output. Only the recognized oracle is launched, with an explicit argv,
+`shell=False`, and a four-variable child environment allow-list.
 
-Result details may contain only fixed copy, exit code, elapsed milliseconds,
-SHA-256 digests, stdout/stderr byte counts, and the normalized kernel identity.
+Stdout and stderr are read concurrently into separate bounded captures. At
+most 4096 bytes per stream are retained. Timeout or either stream overflowing
+causes termination, followed by kill if necessary. The result exposes only
+fixed categories, fixed detail text, hashes, exit code, elapsed milliseconds,
+bounded retained byte counts, and the fixed `avx2` identity. It never exposes
+paths or raw child output and never logs child output.
+
+Fixed result categories are:
+
+- `passed`
+- `invalid_engine`, `invalid_oracle`, `invalid_fixture`
+- `engine_hash_mismatch`, `oracle_hash_mismatch`, `fixture_hash_mismatch`
+- `launch_failed`, `timeout`, `output_overflow`
+- `nonzero_exit`, `stderr_present`, `output_mismatch`
+
+With no proof paths configured, the developer E2E pytest skips. Partial
+configuration fails. Normal application and test execution has no external
+toolchain dependency.
+
+## Running the bound proof
+
+After a successful reproducibility run, select either clean build and set the
+three session-only inputs:
+
+```powershell
+$env:ODYSSEUS_COLIBRI_PROOF_ENGINE = `
+  "$env:ODYSSEUS_COLIBRI_REPRO_ROOT\build-a\c\glm.exe"
+$env:ODYSSEUS_COLIBRI_PROOF_ORACLE = `
+  "$env:ODYSSEUS_COLIBRI_REPRO_ROOT\build-a\c\tests\test_idot.exe"
+$env:ODYSSEUS_COLIBRI_PROOF_FIXTURE = `
+  "$env:ODYSSEUS_COLIBRI_REPRO_ROOT\build-a\c\tests\test_idot.c"
+python -m pytest python\tests\test_colibri_native_proof.py
+```
+
+No path, binary, fixture copy, upstream checkout, model file, secret, or raw
+external output may be committed.
 
 ## Stage 2 OLMoE prerequisites
 
-Stage 2 remains blocked until independent review accepts this compiled-engine
-proof. A later OLMoE phase additionally requires:
-
-- a separately approved model/license and provenance review;
-- explicit approval for the multi-gigabyte OLMoE checkpoint download;
-- substantially more free disk than this phase uses;
-- an audited local conversion plan and hashes for every source artifact;
-- Torch, Transformers, Safetensors, and Hugging Face tooling installed by the
-  human in an isolated environment;
-- an OLMoE reference oracle and acceptance criterion agreed before execution;
-- privacy, cancellation, timeout, and cleanup plans for long-running inference.
-
-No Stage 2 prerequisite authorizes an automatic download in this phase.
-
-## Reproducibility commands
-
-The human supplies privacy-safe session variables. `ODYSSEUS_MSYS2_ROOT`
-identifies the MSYS2 installation and `ODYSSEUS_COLIBRI_DEP_ROOT` identifies an
-out-of-tree dependency directory.
-
-```powershell
-$env:MSYSTEM = 'UCRT64'
-$env:CHERE_INVOKING = '1'
-$env:PATH = "$env:ODYSSEUS_MSYS2_ROOT\ucrt64\bin;$env:ODYSSEUS_MSYS2_ROOT\usr\bin;$env:PATH"
-
-git clone --filter=blob:none --no-checkout --depth 1 --branch main `
-  https://github.com/JustVugg/colibri.git $env:ODYSSEUS_COLIBRI_DEP_ROOT
-git -C $env:ODYSSEUS_COLIBRI_DEP_ROOT checkout --detach `
-  72d3d37231e922a6fa9afca16e08fa45842d5eb4
-
-Push-Location "$env:ODYSSEUS_COLIBRI_DEP_ROOT\c"
-make.exe glm.exe ARCH=x86-64-v3
-make.exe tests/test_idot.exe ARCH=x86-64-v3
-.\tests\test_idot.exe
-Pop-Location
-
-$env:ODYSSEUS_COLIBRI_PROOF_EXECUTABLE = `
-  "$env:ODYSSEUS_COLIBRI_DEP_ROOT\c\tests\test_idot.exe"
-$env:ODYSSEUS_COLIBRI_PROOF_FIXTURE = `
-  "$env:ODYSSEUS_COLIBRI_DEP_ROOT\c\tests\test_idot.c"
-python -m pytest python\tests\test_colibri_native_proof.py
-```
+Stage 2 remains blocked until independent review accepts this compiled proof.
+A later OLMoE phase still requires separate model/license and provenance
+review, explicit checkpoint-download approval, sufficient storage, an audited
+conversion plan and hashes, human-installed isolated dependencies, an agreed
+reference oracle, and privacy/cancellation/timeout/cleanup plans. Nothing in
+this proof authorizes those downloads or changes.
