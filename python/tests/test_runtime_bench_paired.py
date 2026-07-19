@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,8 @@ from odysseus_desktop_backend.runtime_bench.comparison import compare_artifacts,
 from odysseus_desktop_backend.runtime_bench.paired import (
     arm_fits_preflight,
     balanced_execution_plan,
+    estimate_required_memory_bytes,
+    execute_ollama_arm,
     require_loopback_endpoint,
     run_paired_ollama_batch,
 )
@@ -23,6 +27,7 @@ def _gpu_snapshot(state: str = "available") -> dict:
     return {
         "state": state,
         "used_bytes": 256 if state == "available" else None,
+        "free_bytes": 768 if state == "available" else None,
         "total_bytes": 1024 if state == "available" else None,
     }
 
@@ -42,7 +47,6 @@ def _run(*, cold: bool, repetition: int, order: int, generated: int = 32) -> dic
                 "state": "available",
                 "system_cpu_percent": 10.0,
                 "memory_load_percent": 50,
-                "detected": False,
             },
         },
         "options": {"temperature": 0, "seed": 42, "top_p": 1, "top_k": 0, "num_predict": 32, "num_ctx": 4096},
@@ -65,14 +69,19 @@ def _run(*, cold: bool, repetition: int, order: int, generated: int = 32) -> dic
             "sampling_state": "available",
             "sampling_failure_category": "",
             "system_memory_samples": [
-                {"elapsed_ms": 0, "available_ram_bytes": 7_000, "memory_load_percent": 50, "pagefile_used_bytes": 1_000}
+                {"elapsed_ms": 0, "available_ram_bytes": 7_000, "memory_load_percent": 50, "pagefile_used_bytes": 1_000, "system_cpu_percent": 12.0}
             ],
             "safety_floor_bytes": 1_500,
             "safety_floor_crossed": False,
+            "system_cpu_peak_percent": 12.0,
+            "system_cpu_mean_percent": 12.0,
+            "cpu_sampling_state": "available",
+            "cpu_sampling_failure_category": "",
         },
         "gpu": {
             "pre": _gpu_snapshot(),
             "during_peak_used_bytes": 500,
+            "during_min_free_bytes": 524,
             "post": _gpu_snapshot(),
             "sampling_state": "available",
             "sampling_failure_category": "",
@@ -90,13 +99,14 @@ def _run(*, cold: bool, repetition: int, order: int, generated: int = 32) -> dic
         "cancellation": {
             "tested": False,
             "request_to_cancel_ms": None,
-            "cancel_acknowledgement_ms": None,
-            "cancel_latency_ms": None,
+            "client_stream_closed_ms": None,
+            "runtime_idle_ms": None,
             "process_completion_ms": None,
             "final_state": "not_tested",
             "resources_released": None,
             "runtime_responsive": None,
         },
+        "preflight_rejection_category": "",
         "error_category": "",
         "truncation_state": "complete",
         "evidence_state": "complete",
@@ -104,7 +114,7 @@ def _run(*, cold: bool, repetition: int, order: int, generated: int = 32) -> dic
 
 
 def _artifact(role: str, *, pair_id: str = "pair-1") -> dict:
-    return {
+    artifact = {
         "schema_version": 2,
         "batch_id": f"batch-{role}",
         "captured_at": "2026-07-19T00:00:00Z",
@@ -166,6 +176,9 @@ def _artifact(role: str, *, pair_id: str = "pair-1") -> dict:
         "runs": [_run(cold=True, repetition=0, order=0 if role == "baseline" else 1)]
         + [_run(cold=False, repetition=i, order=2 + i * 2 + (0 if (i % 2 == 0) == (role == "baseline") else 1)) for i in range(3)],
     }
+    for run_index, run in enumerate(artifact["runs"]):
+        run["run_index"] = run_index
+    return artifact
 
 
 def test_schema_v2_is_closed_and_validates_ranges() -> None:
@@ -213,6 +226,44 @@ def test_preflight_reuses_reviewed_gpu_and_ram_budgets() -> None:
     assert not arm_fits_preflight(status=status, estimated_required_bytes=2 * gib, resident=None, pre_gpu=gpu, options={"num_gpu": 0})
 
 
+def test_preflight_estimator_mirrors_known_unknown_semantics() -> None:
+    geometry = {"layers": 2, "kv_heads": 4, "key_length": 8, "value_length": 8}
+    known = estimate_required_memory_bytes(
+        {"disk_bytes": 1234, "kv_geometry": geometry}, 100
+    )
+    assert known["weights_bytes"] == 1234
+    assert known["kv_cache_bytes"] == (8 + 8) * 4 * 2 * 2 * 100
+    assert known["weights_known"] is True
+    assert known["kv_geometry_known"] is True
+    assert known["rejection_category"] == ""
+
+    for quantization, width in (("Q4_K_M", 0.85), ("Q8_0", 1.35), ("FP16", 2.6), ("FP32", 5.2)):
+        estimate = estimate_required_memory_bytes(
+            {
+                "disk_bytes": 0, "parameter_size": "1.2B",
+                "quantization": quantization, "kv_geometry": geometry,
+            },
+            100,
+        )
+        assert estimate["weights_bytes"] == int(1.2 * width * 1024**3)
+        assert estimate["rejection_category"] == ""
+
+    unknown_quant = estimate_required_memory_bytes(
+        {"disk_bytes": 0, "parameter_size": "1.2B", "quantization": "mystery", "kv_geometry": geometry}, 100
+    )
+    assert unknown_quant["weights_known"] is False
+    assert unknown_quant["rejection_category"] == "unknown_weight_size"
+    partial_kv = estimate_required_memory_bytes(
+        {"disk_bytes": 1234, "kv_geometry": {"layers": 2}}, 100
+    )
+    assert partial_kv["kv_geometry_known"] is False
+    assert partial_kv["rejection_category"] == "unknown_kv_geometry"
+    malformed = estimate_required_memory_bytes(
+        {"disk_bytes": "bad", "kv_geometry": geometry}, 100
+    )
+    assert malformed["rejection_category"] == "malformed_model_metadata"
+
+
 def test_paired_endpoint_is_loopback_only() -> None:
     require_loopback_endpoint("http://127.0.0.1:11434")
     require_loopback_endpoint("http://localhost:11434")
@@ -249,14 +300,71 @@ def test_shortened_output_cannot_count_as_uplift() -> None:
     assert comparison["cold"] is None and comparison["warm"] is None
 
 
-def test_truncation_interference_and_incomplete_runs_are_invalid() -> None:
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda baseline, candidate: [artifact.update(runs=artifact["runs"][:1]) for artifact in (baseline, candidate)], "insufficient_warm_runs"),
+        (lambda baseline, candidate: candidate["runs"].append(copy.deepcopy(candidate["runs"][1]) | {"run_index": 9, "execution_order": 8}), "duplicate_run"),
+        (lambda baseline, candidate: candidate["runs"][2].update(run_index=candidate["runs"][1]["run_index"]), "duplicate_run"),
+        (lambda baseline, candidate: candidate["runs"][1].update(execution_order=baseline["runs"][1]["execution_order"]), "duplicate_execution_order"),
+        (lambda baseline, candidate: candidate["runs"].pop(2), "repetition_set_mismatch"),
+        (lambda baseline, candidate: [artifact["runs"][2].update(repetition_index=4) for artifact in (baseline, candidate)], "unbalanced_execution_order"),
+        (lambda baseline, candidate: (baseline["runs"][1].update(execution_order=3), candidate["runs"][1].update(execution_order=2)), "unbalanced_execution_order"),
+    ],
+)
+def test_hostile_paired_designs_never_enter_aggregates(mutation, reason: str) -> None:
+    baseline, candidate = _artifact("baseline"), _artifact("candidate")
+    mutation(baseline, candidate)
+    comparison = compare_artifacts([baseline, candidate])["comparisons"][0]
+    assert reason in comparison["invalid_reasons"]
+    assert comparison["cold"] is None
+    assert comparison["warm"] is None
+
+
+def test_ambient_drift_is_reported_and_only_policy_enforces_thresholds() -> None:
+    baseline, candidate = _artifact("baseline"), _artifact("candidate")
+    for run in candidate["runs"]:
+        run["pre_arm"]["interference"]["system_cpu_percent"] = 90.0
+        run["pre_arm"]["available_ram_bytes"] = 1_000
+        run["pre_arm"]["gpu_snapshot"].update(used_bytes=900, free_bytes=124)
+        run["elapsed_since_previous_arm_ms"] = 500.0
+        run["memory"]["system_cpu_mean_percent"] = 95.0
+    default = compare_artifacts([baseline, candidate])
+    comparison = default["comparisons"][0]
+    assert comparison["comparison_state"] == "valid_comparison"
+    assert default["interference_policy_applied"] is False
+    assert comparison["ambient_drift"]["pre_arm_cpu_percent"]["paired_absolute_difference"]["maximum"] == 80
+
+    policy = {
+        "schema_version": 1,
+        "max_pre_arm_cpu_percent_difference": 10.0,
+        "max_pre_arm_available_ram_difference_bytes": 100,
+        "max_pre_arm_gpu_used_difference_bytes": 100,
+        "max_elapsed_gap_ms": 100.0,
+    }
+    enforced = compare_artifacts([baseline, candidate], policy=policy)
+    assert enforced["interference_policy_applied"] is True
+    assert "system_interference" in enforced["comparisons"][0]["invalid_reasons"]
+
+
+def test_unavailable_ambient_probe_is_incomplete() -> None:
+    baseline, candidate = _artifact("baseline"), _artifact("candidate")
+    run = candidate["runs"][0]
+    run["pre_arm"]["interference"].update(state="unavailable", system_cpu_percent=None)
+    run["memory"].update(
+        cpu_sampling_state="unavailable", cpu_sampling_failure_category="cpu_probe_unavailable",
+        system_cpu_peak_percent=None, system_cpu_mean_percent=None,
+    )
+    assert "incomplete_run" in compare_artifacts([baseline, candidate])["comparisons"][0]["invalid_reasons"]
+
+
+def test_truncation_and_incomplete_runs_are_invalid() -> None:
     baseline, candidate = _artifact("baseline"), _artifact("candidate")
     candidate["runs"][0]["truncation_state"] = "truncated_prompt"
     candidate["runs"][0]["evidence_state"] = "incomplete"
-    candidate["runs"][1]["pre_arm"]["interference"]["detected"] = True
     candidate["runs"][2]["evidence_state"] = "incomplete"
     reasons = compare_artifacts([baseline, candidate])["comparisons"][0]["invalid_reasons"]
-    assert {"truncated_prompt", "system_interference", "incomplete_run"} <= set(reasons)
+    assert {"truncated_prompt", "incomplete_run"} <= set(reasons)
 
 
 def test_missing_gpu_snapshots_are_unavailable_not_zero_and_invalidate_gpu_machine() -> None:
@@ -264,7 +372,7 @@ def test_missing_gpu_snapshots_are_unavailable_not_zero_and_invalidate_gpu_machi
     candidate["runs"][0]["gpu"]["pre"] = _gpu_snapshot("unavailable")
     assert candidate["runs"][0]["gpu"]["pre"]["used_bytes"] is None
     comparison = compare_artifacts([baseline, candidate])["comparisons"][0]
-    assert "hardware_snapshot_missing" in comparison["invalid_reasons"]
+    assert "incomplete_run" in comparison["invalid_reasons"]
 
 
 def test_only_valid_pairs_enter_aggregates_and_cold_warm_stay_separate() -> None:
@@ -281,7 +389,7 @@ def test_only_valid_pairs_enter_aggregates_and_cold_warm_stay_separate() -> None
     assert valid_result["warm"]["metrics"]["time_to_first_token_ms"]["baseline"]["median"] == 5
 
 
-def test_cancellation_latency_is_recorded_separately() -> None:
+def test_cancellation_milestones_are_recorded_separately() -> None:
     baseline, candidate = _artifact("baseline"), _artifact("candidate")
     for artifact in (baseline, candidate):
         probe = copy.deepcopy(artifact["runs"][-1])
@@ -293,8 +401,8 @@ def test_cancellation_latency_is_recorded_separately() -> None:
         probe["cancellation"] = {
             "tested": True,
             "request_to_cancel_ms": 100.0,
-            "cancel_acknowledgement_ms": 110.0,
-            "cancel_latency_ms": 10.0,
+            "client_stream_closed_ms": 110.0,
+            "runtime_idle_ms": 120.0,
             "process_completion_ms": 125.0,
             "final_state": "cancelled",
             "resources_released": True,
@@ -304,7 +412,8 @@ def test_cancellation_latency_is_recorded_separately() -> None:
     report = compare_artifacts([baseline, candidate])
     cancellation = report["comparisons"][0]["cancellation"]
     assert cancellation["baseline"]["process_completion_ms"]["median"] == 125
-    assert cancellation["baseline"]["cancel_latency_ms"]["median"] == 10
+    assert cancellation["baseline"]["client_stream_closed_ms"]["median"] == 110
+    assert cancellation["baseline"]["runtime_idle_ms"]["median"] == 120
     assert cancellation["candidate"]["resources_released"] is True
 
 
@@ -331,6 +440,35 @@ def test_comparison_cli_reports_measurements_without_threshold_policy(tmp_path: 
     assert "promoted" not in output
     assert "recommended" not in output
     assert "uplift_candidate" not in output
+
+
+def test_comparison_cli_accepts_only_closed_interference_policy(tmp_path: Path, capsys) -> None:
+    baseline_path = write_artifact(_artifact("baseline"), tmp_path)
+    candidate_path = write_artifact(_artifact("candidate"), tmp_path)
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "max_pre_arm_cpu_percent_difference": None,
+            "max_pre_arm_available_ram_difference_bytes": None,
+            "max_pre_arm_gpu_used_difference_bytes": None,
+            "max_elapsed_gap_ms": None,
+        }),
+        encoding="utf-8",
+    )
+    assert main(["compare", "--policy", str(policy_path), str(baseline_path), str(candidate_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["interference_policy_applied"] is True
+    with pytest.raises(ValueError):
+        compare_artifacts([_artifact("baseline"), _artifact("candidate")], policy={"schema_version": 1})
+
+
+def test_paired_cli_does_not_allow_cold_run_suppression() -> None:
+    with pytest.raises(SystemExit):
+        main([
+            "paired", "--model", "fake", "--shape", "tiny",
+            "--experiment-id", "experiment", "--pair-id", "pair",
+            "--batch-id", "batch", "--artifact-dir", ".", "--no-cold",
+        ])
 
 
 def test_low_available_ram_aborts_before_launch(monkeypatch, tmp_path: Path) -> None:
@@ -364,6 +502,38 @@ def test_low_available_ram_aborts_before_launch(monkeypatch, tmp_path: Path) -> 
     assert result["aborted"] is True
     assert launches == []
     assert result["artifacts"][0]["runs"][0]["error_category"] == "preflight_safety_abort"
+    assert result["artifacts"][0]["runs"][0]["preflight_rejection_category"] == "insufficient_memory_budget"
+
+
+def test_unknown_estimator_state_aborts_before_execute(monkeypatch, tmp_path: Path) -> None:
+    healthy = {
+        "total_ram_bytes": 16 * 1024**3,
+        "available_ram_bytes": 12 * 1024**3,
+        "memory_load_percent": 25,
+        "pagefile_total_bytes": 32 * 1024**3,
+        "pagefile_available_bytes": 24 * 1024**3,
+    }
+    descriptor = _artifact("baseline")["model"]
+    inventory_entry = {
+        "disk_bytes": 0, "parameter_size": "1B", "quantization": "unknown",
+        "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1},
+    }
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.model_descriptor_v2", lambda *args, **kwargs: (descriptor, inventory_entry))
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.system_memory_status", lambda: healthy)
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.measure_system_cpu_percent", lambda: 10.0)
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ri._nvidia_smi_path", lambda: None)
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ri.detect_ollama_runtime", lambda: {"version": "0.32.1"})
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ri.hardware_inventory", lambda: copy.deepcopy(_artifact("baseline")["hardware"]) | {"gpus": []})
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired._resident_model", lambda *args, **kwargs: None)
+    launches = []
+    result = run_paired_ollama_batch(
+        model="installed:model", shape="tiny", experiment_id="experiment-unknown",
+        pair_id="pair-unknown", batch_id="batch-unknown", artifact_dir=str(tmp_path),
+        execute_arm=lambda **kwargs: launches.append(kwargs),
+    )
+    assert launches == []
+    run = result["artifacts"][0]["runs"][0]
+    assert run["preflight_rejection_category"] == "unknown_weight_size"
 
 
 def test_fake_paired_batch_writes_valid_balanced_artifacts(monkeypatch, tmp_path: Path) -> None:
@@ -398,8 +568,8 @@ def test_fake_paired_batch_writes_valid_balanced_artifacts(monkeypatch, tmp_path
             run["cancellation"] = {
                 "tested": True,
                 "request_to_cancel_ms": 100.0,
-                "cancel_acknowledgement_ms": 110.0,
-                "cancel_latency_ms": 10.0,
+                    "client_stream_closed_ms": 110.0,
+                    "runtime_idle_ms": 120.0,
                 "process_completion_ms": 125.0,
                 "final_state": "cancelled",
                 "resources_released": True,
@@ -432,7 +602,7 @@ def test_fake_paired_batch_writes_valid_balanced_artifacts(monkeypatch, tmp_path
         assert len([run for run in artifact["runs"] if run["cancellation"]["tested"]]) == 1
     report = compare_artifacts(result["artifacts"])
     assert report["valid_pair_count"] == 1
-    assert report["comparisons"][0]["cancellation"]["baseline"]["cancel_latency_ms"]["median"] == 10
+    assert report["comparisons"][0]["cancellation"]["baseline"]["client_stream_closed_ms"]["median"] == 110
 
 
 def test_crossing_safety_floor_requests_bounded_cancellation(monkeypatch) -> None:
@@ -452,3 +622,75 @@ def test_crossing_safety_floor_requests_bounded_cancellation(monkeypatch) -> Non
             time.sleep(0.005)
     assert cancelled == [True]
     assert sampler.safety_floor_crossed is True
+
+
+def test_hard_deadline_stops_periodically_streaming_response(monkeypatch) -> None:
+    healthy = {
+        "total_ram_bytes": 16 * 1024**3,
+        "available_ram_bytes": 12 * 1024**3,
+        "memory_load_percent": 25,
+        "pagefile_total_bytes": 32 * 1024**3,
+        "pagefile_available_bytes": 24 * 1024**3,
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args) -> None:
+            return
+
+        def do_GET(self) -> None:
+            body = b'{"models":[]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            if self.path == "/api/chat":
+                try:
+                    while True:
+                        self.wfile.write(b'{"message":{"content":"x"},"done":false}\n')
+                        self.wfile.flush()
+                        time.sleep(0.03)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+            else:
+                self.wfile.write(b'{"done":true}\n')
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        "odysseus_desktop_backend.runtime_bench.paired.system_memory_status",
+        lambda: healthy,
+    )
+    monkeypatch.setattr(
+        "odysseus_desktop_backend.runtime_bench.paired.measure_system_cpu_percent",
+        lambda: 10.0,
+    )
+    started = time.monotonic()
+    try:
+        run = execute_ollama_arm(
+            model="fake:model", shape="tiny",
+            options={"temperature": 0, "seed": 42, "top_p": 1, "top_k": 0, "num_predict": 32, "num_ctx": 4096},
+            endpoint=f"http://127.0.0.1:{server.server_port}", timeout=0.2,
+            run_index=0, repetition_index=0, execution_order=0, cold=True,
+            elapsed_since_previous_arm_ms=None, safety_floor=1, total_ram_bytes=healthy["total_ram_bytes"],
+            cancel_probe=False, cancel_after_ms=50, smi_path=None, gpu_total_bytes=None,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+    assert time.monotonic() - started < 1.5
+    assert run["error_category"] == "timeout"
+    assert run["cancellation"]["tested"] is False
+    assert not any(
+        worker.name in {"bench-sampler", "bench-deadline-watchdog", "bench-cancel-watchdog"}
+        for worker in threading.enumerate()
+    )
