@@ -36,6 +36,7 @@ from odysseus_desktop_backend.runtime_bench.paired_artifacts import (
 )
 from odysseus_desktop_backend.runtime_bench.sampler import (
     ResourceSampler,
+    measure_system_cpu_percent,
     system_memory_status,
     vram_used_bytes,
 )
@@ -51,7 +52,14 @@ RUNTIME_OVERHEAD_BYTES = 600 * 1024 * 1024
 KV_DTYPE_BYTES = 2
 UNKNOWN_KV_BYTES_PER_TOKEN = 512 * 1024
 
+_QUANT_BYTES_PER_PARAM = {
+    "q2": 0.6, "q3": 0.7, "q4": 0.85, "q5": 0.95, "q6": 1.1,
+    "q8": 1.35, "f16": 2.6, "fp16": 2.6, "bf16": 2.6,
+    "f32": 5.2, "fp32": 5.2,
+}
+
 CANCEL_TIMEOUT_SECONDS = 30.0
+DEADLINE_CLEANUP_SECONDS = 2.0
 
 
 def _now_iso() -> str:
@@ -73,19 +81,71 @@ def _parameter_count(parameter_size: str) -> int | None:
     return int(float(match.group(1)) * 1_000_000_000) if match else None
 
 
-def estimate_required_memory_bytes(model: dict[str, Any], context_limit: int) -> int:
-    """Mirror the reviewed weights + architecture KV + overhead estimate."""
-    weights = max(0, int(model.get("disk_bytes") or 0))
-    geometry = model.get("kv_geometry") or {}
-    layers = int(geometry.get("layers") or 0)
-    kv_heads = int(geometry.get("kv_heads") or 0)
-    key_length = int(geometry.get("key_length") or 0)
-    value_length = int(geometry.get("value_length") or 0)
-    if all(value > 0 for value in (layers, kv_heads, key_length, value_length)):
+def _quant_bytes_per_param(quantization: Any) -> float | None:
+    clean = str(quantization or "").strip().lower()
+    for prefix, value in _QUANT_BYTES_PER_PARAM.items():
+        if clean.startswith(prefix):
+            return value
+    return None
+
+
+def estimate_required_memory_bytes(model: dict[str, Any], context_limit: int) -> dict[str, Any]:
+    """Mirror PR #35's known/unknown estimator and expose rejection state."""
+    malformed = False
+    raw_disk = model.get("disk_bytes")
+    try:
+        weights = int(raw_disk or 0)
+    except (TypeError, ValueError):
+        weights = 0
+        malformed = raw_disk not in (None, "")
+    if weights < 0:
+        weights = 0
+        malformed = True
+    weights_known = weights > 0
+    if not weights_known and not malformed:
+        parameter_size = str(model.get("parameter_size") or "")
+        parameters = _parameter_count(parameter_size)
+        bytes_per_parameter = _quant_bytes_per_param(model.get("quantization"))
+        if parameters is not None and bytes_per_parameter is not None:
+            weights = int((parameters / 1_000_000_000) * bytes_per_parameter * 1024**3)
+            weights_known = True
+
+    geometry = model.get("kv_geometry")
+    values: list[int] = []
+    if geometry is not None and not isinstance(geometry, dict):
+        malformed = True
+        geometry = {}
+    for key in ("layers", "kv_heads", "key_length", "value_length"):
+        raw = (geometry or {}).get(key)
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            value = 0
+            malformed = True
+        if value < 0:
+            value = 0
+            malformed = True
+        values.append(value)
+    kv_geometry_known = all(value > 0 for value in values)
+    if kv_geometry_known:
+        layers, kv_heads, key_length, value_length = values
         kv = (key_length + value_length) * kv_heads * layers * KV_DTYPE_BYTES * context_limit
     else:
         kv = UNKNOWN_KV_BYTES_PER_TOKEN * context_limit
-    return weights + kv + RUNTIME_OVERHEAD_BYTES
+    category = (
+        "malformed_model_metadata" if malformed
+        else "unknown_weight_size" if not weights_known
+        else "unknown_kv_geometry" if not kv_geometry_known
+        else ""
+    )
+    return {
+        "weights_bytes": weights,
+        "kv_cache_bytes": kv,
+        "total_bytes": weights + kv + RUNTIME_OVERHEAD_BYTES,
+        "weights_known": weights_known,
+        "kv_geometry_known": kv_geometry_known,
+        "rejection_category": category,
+    }
 
 
 def arm_fits_preflight(
@@ -165,11 +225,14 @@ def model_descriptor_v2(tag: str, *, endpoint: str = OLLAMA_ENDPOINT) -> tuple[d
 
 def _gpu_snapshot(smi_path: str | None, total_bytes: int | None) -> dict[str, Any]:
     if not smi_path:
-        return {"state": "unavailable", "used_bytes": None, "total_bytes": None}
+        return {"state": "unavailable", "used_bytes": None, "free_bytes": None, "total_bytes": None}
     used = vram_used_bytes(smi_path)
-    if used is None:
-        return {"state": "unavailable", "used_bytes": None, "total_bytes": total_bytes}
-    return {"state": "available", "used_bytes": used, "total_bytes": total_bytes}
+    if used is None or total_bytes is None:
+        return {"state": "unavailable", "used_bytes": None, "free_bytes": None, "total_bytes": total_bytes}
+    return {
+        "state": "available", "used_bytes": used,
+        "free_bytes": max(0, total_bytes - used), "total_bytes": total_bytes,
+    }
 
 
 def _placement_from_residency(residency: dict[str, Any] | None) -> dict[str, str]:
@@ -193,10 +256,10 @@ def _resident_model(model: str, endpoint: str) -> dict[str, Any] | None:
     return None
 
 
-def _ollama_ps_probe(endpoint: str) -> list[dict[str, Any]] | None:
+def _ollama_ps_probe(endpoint: str, timeout: float = 5.0) -> list[dict[str, Any]] | None:
     try:
         request = urllib.request.Request(f"{endpoint}/api/ps", method="GET")
-        with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 - loopback only
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
             decoded = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError):
         return None
@@ -208,8 +271,8 @@ def _empty_cancellation() -> dict[str, Any]:
     return {
         "tested": False,
         "request_to_cancel_ms": None,
-        "cancel_acknowledgement_ms": None,
-        "cancel_latency_ms": None,
+        "client_stream_closed_ms": None,
+        "runtime_idle_ms": None,
         "process_completion_ms": None,
         "final_state": "not_tested",
         "resources_released": None,
@@ -228,8 +291,11 @@ def _preflight_abort_run(
     status: dict[str, int],
     floor: int,
     gpu_snapshot: dict[str, Any],
+    rejection_category: str,
+    pre_arm_cpu_percent: float | None,
+    memory_probe_available: bool = True,
 ) -> dict[str, Any]:
-    available = int(status["available_ram_bytes"])
+    available = int(status["available_ram_bytes"]) if memory_probe_available else 0
     result = {
         "run_index": run_index,
         "repetition_index": repetition_index,
@@ -241,10 +307,9 @@ def _preflight_abort_run(
             "available_ram_bytes": available,
             "gpu_snapshot": gpu_snapshot,
             "interference": {
-                "state": "available",
-                "system_cpu_percent": None,
-                "memory_load_percent": int(status["memory_load_percent"]),
-                "detected": False,
+                "state": "available" if memory_probe_available and pre_arm_cpu_percent is not None else "unavailable",
+                "system_cpu_percent": pre_arm_cpu_percent,
+                "memory_load_percent": int(status["memory_load_percent"]) if memory_probe_available else None,
             },
         },
         "options": dict(options),
@@ -255,21 +320,29 @@ def _preflight_abort_run(
             "available_ram_before_bytes": available,
             "min_available_ram_bytes": available,
             "process_peak_rss_bytes": 0,
-            "pagefile_used_peak_bytes": max(0, int(status["pagefile_total_bytes"]) - int(status["pagefile_available_bytes"])),
+            "pagefile_used_peak_bytes": (
+                max(0, int(status["pagefile_total_bytes"]) - int(status["pagefile_available_bytes"]))
+                if memory_probe_available else None
+            ),
             "sampler_interval_ms": 250,
             "sample_count": 0,
-            "sampling_state": "available",
-            "sampling_failure_category": "",
+            "sampling_state": "available" if memory_probe_available else "unavailable",
+            "sampling_failure_category": "" if memory_probe_available else "memory_probe_unavailable",
             "system_memory_samples": [],
             "safety_floor_bytes": floor,
             "safety_floor_crossed": False,
+            "system_cpu_peak_percent": None,
+            "system_cpu_mean_percent": None,
+            "cpu_sampling_state": "unavailable",
+            "cpu_sampling_failure_category": "cpu_probe_unavailable",
         },
         "gpu": {
             "pre": gpu_snapshot,
             "during_peak_used_bytes": None,
+            "during_min_free_bytes": None,
             "post": gpu_snapshot,
-            "sampling_state": gpu_snapshot["state"],
-            "sampling_failure_category": "" if gpu_snapshot["state"] == "available" else "gpu_probe_unavailable",
+            "sampling_state": "unavailable",
+            "sampling_failure_category": "not_sampled",
         },
         "disk": {"state": "unavailable", "read_bytes": None},
         "cache_state": "cold" if cold else "warm",
@@ -279,6 +352,7 @@ def _preflight_abort_run(
             "deterministic_answer_sha256": None, "unsupported_category": "",
         },
         "cancellation": _empty_cancellation(),
+        "preflight_rejection_category": rejection_category,
         "error_category": "preflight_safety_abort",
         "truncation_state": "incomplete_evidence",
         "evidence_state": "incomplete",
@@ -305,7 +379,7 @@ def execute_ollama_arm(
     smi_path: str | None,
     gpu_total_bytes: int | None,
 ) -> dict[str, Any]:
-    """Run one arm, closing the stream on safety breach or cancel probe."""
+    """Run one arm with a hard wall-clock deadline and bounded cleanup."""
     require_loopback_endpoint(endpoint)
     spec = BENCHMARK_SHAPES[shape]
     payload = {
@@ -317,19 +391,25 @@ def execute_ollama_arm(
     status = system_memory_status()
     if status is None:
         raise RuntimeError("system memory probe unavailable")
+    pre_arm_cpu_percent = measure_system_cpu_percent()
     pre_gpu = _gpu_snapshot(smi_path, gpu_total_bytes)
     response_holder: dict[str, Any] = {"response": None}
-    cancel_issued = threading.Event()
-    cancel_issued_ms: list[float] = []
-    safety_cancel = threading.Event()
+    close_requested = threading.Event()
+    cancel_requested = threading.Event()
+    safety_requested = threading.Event()
+    deadline_exceeded = threading.Event()
+    cancel_requested_ms: list[float] = []
     started = time.perf_counter()
 
-    def close_response(*, safety: bool = False) -> None:
-        if safety:
-            safety_cancel.set()
-        if not cancel_issued.is_set():
-            cancel_issued_ms.append((time.perf_counter() - started) * 1000)
-            cancel_issued.set()
+    def close_response(reason: str) -> None:
+        if reason == "cancel" and not cancel_requested.is_set():
+            cancel_requested_ms.append((time.perf_counter() - started) * 1000)
+            cancel_requested.set()
+        elif reason == "safety":
+            safety_requested.set()
+        elif reason == "deadline":
+            deadline_exceeded.set()
+        close_requested.set()
         response = response_holder.get("response")
         if response is not None:
             try:
@@ -337,30 +417,37 @@ def execute_ollama_arm(
             except (OSError, ValueError):
                 pass
 
-    timer: threading.Timer | None = None
+    deadline_timer = threading.Timer(timeout, close_response, args=("deadline",))
+    deadline_timer.name = "bench-deadline-watchdog"
+    deadline_timer.daemon = True
+    deadline_timer.start()
+    cancel_timer: threading.Timer | None = None
     if cancel_probe:
-        timer = threading.Timer(cancel_after_ms / 1000, close_response)
-        timer.daemon = True
-        timer.start()
+        cancel_timer = threading.Timer(cancel_after_ms / 1000, close_response, args=("cancel",))
+        cancel_timer.name = "bench-cancel-watchdog"
+        cancel_timer.daemon = True
+        cancel_timer.start()
 
     content_parts: list[str] = []
     final_stats: dict[str, Any] = {}
     first_token_ms: float | None = None
     error = ""
-    acknowledgement_ms: float | None = None
+    client_stream_closed_ms: float | None = None
     with ResourceSampler(
         exe_substring="llama",
         smi_path=smi_path,
         safety_floor_bytes=safety_floor,
-        on_safety_floor=lambda: close_response(safety=True),
+        on_safety_floor=lambda: close_response("safety"),
     ) as sampler:
         try:
             with _post_stream(f"{endpoint}/api/chat", payload, timeout) as response:
                 response_holder["response"] = response
-                if cancel_issued.is_set():
+                if close_requested.is_set():
                     response.close()
                 else:
                     for raw_line in response:
+                        if close_requested.is_set():
+                            break
                         line = raw_line.decode("utf-8", errors="replace").strip()
                         if not line:
                             continue
@@ -383,42 +470,68 @@ def execute_ollama_arm(
             error = ERROR_HTTP
         except (urllib.error.URLError, OSError, ValueError) as exc:
             reason = getattr(exc, "reason", None)
-            if not cancel_issued.is_set():
+            if not close_requested.is_set():
                 error = ERROR_TIMEOUT if isinstance(reason, TimeoutError) else ERROR_CONNECTION
         finally:
-            if cancel_issued.is_set():
-                acknowledgement_ms = (time.perf_counter() - started) * 1000
+            if cancel_requested.is_set():
+                client_stream_closed_ms = (time.perf_counter() - started) * 1000
             response_holder["response"] = None
-            if timer is not None:
-                timer.cancel()
+            deadline_timer.cancel()
+            if cancel_timer is not None:
+                cancel_timer.cancel()
+    deadline_timer.join(timeout=1)
+    if cancel_timer is not None:
+        cancel_timer.join(timeout=1)
     total_ms = (time.perf_counter() - started) * 1000
 
     cancellation = _empty_cancellation()
-    if cancel_issued.is_set():
-        before_unload = _ollama_ps_probe(endpoint)
+    if cancel_requested.is_set():
+        cleanup_budget = min(CANCEL_TIMEOUT_SECONDS, max(0.1, timeout))
+        cleanup_deadline = time.perf_counter() + cleanup_budget
+
+        def cleanup_remaining() -> float:
+            return max(0.05, cleanup_deadline - time.perf_counter())
+
+        before_unload = _ollama_ps_probe(endpoint, timeout=min(5.0, cleanup_remaining()))
         runtime_responsive = before_unload is not None
         resources_released = False
-        if cancel_probe or safety_cancel.is_set():
-            unload_ok = ollama_unload(model, endpoint=endpoint, timeout=min(CANCEL_TIMEOUT_SECONDS, timeout))
-            after_unload = _ollama_ps_probe(endpoint)
-            resources_released = bool(
-                unload_ok
-                and after_unload is not None
-                and not any(str(item.get("name") or item.get("model") or "") == model for item in after_unload)
-            )
+        runtime_idle_ms = None
+        unload_ok = ollama_unload(model, endpoint=endpoint, timeout=cleanup_remaining())
+        after_unload = (
+            _ollama_ps_probe(endpoint, timeout=min(5.0, cleanup_remaining()))
+            if time.perf_counter() < cleanup_deadline else None
+        )
+        resources_released = bool(
+            unload_ok
+            and after_unload is not None
+            and not any(str(item.get("name") or item.get("model") or "") == model for item in after_unload)
+        )
+        if resources_released:
+            runtime_idle_ms = (time.perf_counter() - started) * 1000
         process_completion_ms = (time.perf_counter() - started) * 1000
-        acknowledgement = acknowledgement_ms or process_completion_ms
         cancellation = {
             "tested": True,
-            "request_to_cancel_ms": round(cancel_issued_ms[0], 1),
-            "cancel_acknowledgement_ms": round(acknowledgement, 1),
-            "cancel_latency_ms": round(max(0, acknowledgement - cancel_issued_ms[0]), 1),
+            "request_to_cancel_ms": round(cancel_requested_ms[0], 1),
+            "client_stream_closed_ms": round(client_stream_closed_ms or total_ms, 1),
+            "runtime_idle_ms": round(runtime_idle_ms, 1) if runtime_idle_ms is not None else None,
             "process_completion_ms": round(process_completion_ms, 1),
             "final_state": "cancelled" if resources_released else "timeout",
             "resources_released": resources_released,
             "runtime_responsive": runtime_responsive,
         }
-        error = "safety_abort" if safety_cancel.is_set() else "cancelled"
+        error = "cancelled"
+    elif safety_requested.is_set():
+        ollama_unload(
+            model, endpoint=endpoint,
+            timeout=min(DEADLINE_CLEANUP_SECONDS, max(0.1, timeout)),
+        )
+        error = "safety_abort"
+    elif deadline_exceeded.is_set():
+        ollama_unload(
+            model, endpoint=endpoint,
+            timeout=min(DEADLINE_CLEANUP_SECONDS, max(0.1, timeout)),
+        )
+        error = ERROR_TIMEOUT
 
     memory_data = sampler.to_v2_dict()
     samples = memory_data["system_memory_samples"]
@@ -448,10 +561,9 @@ def execute_ollama_arm(
             "available_ram_bytes": int(status["available_ram_bytes"]),
             "gpu_snapshot": pre_gpu,
             "interference": {
-                "state": "available",
-                "system_cpu_percent": None,
+                "state": "available" if pre_arm_cpu_percent is not None else "unavailable",
+                "system_cpu_percent": pre_arm_cpu_percent,
                 "memory_load_percent": int(status["memory_load_percent"]),
-                "detected": False,
             },
         },
         "options": dict(options),
@@ -481,10 +593,19 @@ def execute_ollama_arm(
             "system_memory_samples": samples,
             "safety_floor_bytes": safety_floor,
             "safety_floor_crossed": bool(memory_data["safety_floor_crossed"]),
+            "system_cpu_peak_percent": memory_data["system_cpu_peak_percent"],
+            "system_cpu_mean_percent": memory_data["system_cpu_mean_percent"],
+            "cpu_sampling_state": memory_data["cpu_sampling_state"],
+            "cpu_sampling_failure_category": memory_data["cpu_sampling_failure_category"],
         },
         "gpu": {
             "pre": pre_gpu,
             "during_peak_used_bytes": memory_data["vram_peak_used_bytes"],
+            "during_min_free_bytes": (
+                max(0, gpu_total_bytes - int(memory_data["vram_peak_used_bytes"]))
+                if gpu_total_bytes is not None and memory_data["vram_peak_used_bytes"] is not None
+                else None
+            ),
             "post": post_gpu,
             "sampling_state": "available" if memory_data["vram_peak_used_bytes"] is not None else "unavailable",
             "sampling_failure_category": "" if memory_data["vram_peak_used_bytes"] is not None else "gpu_probe_unavailable",
@@ -500,6 +621,7 @@ def execute_ollama_arm(
             "unsupported_category": "",
         },
         "cancellation": cancellation,
+        "preflight_rejection_category": "",
         "error_category": error,
         "truncation_state": truncation,
         "evidence_state": "complete" if not error and truncation == "complete" else "incomplete",
@@ -570,7 +692,14 @@ def run_paired_ollama_batch(
     gpu_total = int((hardware.get("gpus") or [{}])[0].get("vram_total_bytes") or 0) or None
     status = system_memory_status()
     if status is None:
-        raise RuntimeError("system memory probe unavailable")
+        hardware_ram = hardware.get("ram") or {}
+        status = {
+            "total_ram_bytes": int(hardware_ram.get("total_bytes") or 0),
+            "available_ram_bytes": 0,
+            "memory_load_percent": 0,
+            "pagefile_total_bytes": 0,
+            "pagefile_available_bytes": 0,
+        }
     total_ram = int(status["total_ram_bytes"])
     floor = safety_floor_bytes(total_ram)
     estimated_required = estimate_required_memory_bytes(inventory_entry, context_limit)
@@ -592,18 +721,34 @@ def run_paired_ollama_batch(
             break
         pre = system_memory_status()
         if pre is None:
-            raise RuntimeError("system memory probe unavailable")
+            run_index = len(runs[role])
+            gpu_pre = _gpu_snapshot(smi_path, gpu_total)
+            runs[role].append(
+                _preflight_abort_run(
+                    run_index=run_index, repetition_index=repetition,
+                    execution_order=execution_order, cold=cold, elapsed_ms=None,
+                    options=arms[role], status=status, floor=floor,
+                    gpu_snapshot=gpu_pre,
+                    rejection_category="memory_probe_unavailable",
+                    pre_arm_cpu_percent=None, memory_probe_available=False,
+                )
+            )
+            aborted = True
+            break
         elapsed_ms = (time.perf_counter() - last_completed) * 1000 if last_completed is not None else None
         run_index = len(runs[role])
         gpu_pre = _gpu_snapshot(smi_path, gpu_total)
         resident = _resident_model(model, endpoint)
-        if not arm_fits_preflight(
+        rejection_category = str(estimated_required["rejection_category"])
+        if not rejection_category and not arm_fits_preflight(
             status=pre,
-            estimated_required_bytes=estimated_required,
+            estimated_required_bytes=int(estimated_required["total_bytes"]),
             resident=resident,
             pre_gpu=gpu_pre,
             options=arms[role],
         ):
+            rejection_category = "insufficient_memory_budget"
+        if rejection_category:
             runs[role].append(
                 _preflight_abort_run(
                     run_index=run_index,
@@ -615,6 +760,8 @@ def run_paired_ollama_batch(
                     status=pre,
                     floor=floor,
                     gpu_snapshot=gpu_pre,
+                    rejection_category=rejection_category,
+                    pre_arm_cpu_percent=measure_system_cpu_percent(),
                 )
             )
             aborted = True
@@ -623,15 +770,29 @@ def run_paired_ollama_batch(
             ollama_unload(model, endpoint=endpoint, timeout=min(30.0, timeout))
             pre = system_memory_status()
             if pre is None:
-                raise RuntimeError("system memory probe unavailable")
+                runs[role].append(
+                    _preflight_abort_run(
+                        run_index=run_index, repetition_index=repetition,
+                        execution_order=execution_order, cold=cold, elapsed_ms=elapsed_ms,
+                        options=arms[role], status=status, floor=floor,
+                        gpu_snapshot=_gpu_snapshot(smi_path, gpu_total),
+                        rejection_category="memory_probe_unavailable",
+                        pre_arm_cpu_percent=None, memory_probe_available=False,
+                    )
+                )
+                aborted = True
+                break
             post_unload_gpu = _gpu_snapshot(smi_path, gpu_total)
-            if not arm_fits_preflight(
+            rejection_category = str(estimated_required["rejection_category"])
+            if not rejection_category and not arm_fits_preflight(
                 status=pre,
-                estimated_required_bytes=estimated_required,
+                estimated_required_bytes=int(estimated_required["total_bytes"]),
                 resident=None,
                 pre_gpu=post_unload_gpu,
                 options=arms[role],
             ):
+                rejection_category = "insufficient_memory_budget"
+            if rejection_category:
                 runs[role].append(
                     _preflight_abort_run(
                         run_index=run_index,
@@ -643,6 +804,8 @@ def run_paired_ollama_batch(
                         status=pre,
                         floor=floor,
                         gpu_snapshot=post_unload_gpu,
+                        rejection_category=rejection_category,
+                        pre_arm_cpu_percent=measure_system_cpu_percent(),
                     )
                 )
                 aborted = True

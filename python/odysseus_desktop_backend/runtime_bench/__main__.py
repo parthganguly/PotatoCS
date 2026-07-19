@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from odysseus_desktop_backend.runtime_bench.comparison import load_and_compare
 from odysseus_desktop_backend.runtime_bench.harness import run_ollama_batch
@@ -84,10 +85,21 @@ def _legacy_main(argv: list[str]) -> int:
 def _compare_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="runtime_bench compare")
     parser.add_argument("artifacts", nargs="+", help="two or more schema-v2 arm artifacts")
+    parser.add_argument("--policy", help="optional closed schema-v1 interference policy JSON")
     args = parser.parse_args(argv)
     if len(args.artifacts) < 2:
         parser.error("compare requires at least two artifacts")
-    print(json.dumps(load_and_compare(args.artifacts), indent=1, sort_keys=True))
+    policy = None
+    if args.policy:
+        try:
+            policy = json.loads(Path(args.policy).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot load interference policy: {exc}")
+    try:
+        report = load_and_compare(args.artifacts, policy=policy)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(json.dumps(report, indent=1, sort_keys=True))
     return 0
 
 
@@ -101,8 +113,7 @@ def _paired_main(argv: list[str]) -> int:
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--context-limit", type=int, default=4096)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--no-cold", action="store_true")
-    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--timeout", type=float, default=300.0, help="hard per-arm wall-clock deadline in seconds")
     parser.add_argument("--cancel-probe", action="store_true")
     parser.add_argument("--cancel-after-ms", type=int, default=500)
     parser.add_argument("--baseline-options-json", default="{}")
@@ -123,7 +134,7 @@ def _paired_main(argv: list[str]) -> int:
         candidate_options=candidate_options,
         context_limit=args.context_limit,
         repeats=args.repeats,
-        include_cold=not args.no_cold,
+        include_cold=True,
         cancel_probe=args.cancel_probe,
         cancel_after_ms=args.cancel_after_ms,
         timeout=args.timeout,

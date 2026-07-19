@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,18 @@ INVALID_REASONS = {
     "malformed_artifact",
     "unsupported_schema",
     "engine_kind_mismatch",
+    "insufficient_cold_runs",
+    "insufficient_warm_runs",
+    "duplicate_run",
+    "duplicate_execution_order",
+    "unbalanced_execution_order",
+    "repetition_set_mismatch",
+}
+
+POLICY_KEYS = {
+    "schema_version", "max_pre_arm_cpu_percent_difference",
+    "max_pre_arm_available_ram_difference_bytes",
+    "max_pre_arm_gpu_used_difference_bytes", "max_elapsed_gap_ms",
 }
 
 
@@ -107,17 +120,121 @@ def _performance_runs(artifact: dict[str, Any]) -> list[dict[str, Any]]:
     return [run for run in artifact["runs"] if not run["cancellation"]["tested"]]
 
 
-def _matched_runs(
+def _validate_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
+    if policy is None:
+        return None
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != POLICY_KEYS
+        or isinstance(policy.get("schema_version"), bool)
+        or policy.get("schema_version") != 1
+    ):
+        raise ValueError("interference policy must be a closed schema-version-1 object")
+    for key in POLICY_KEYS - {"schema_version"}:
+        value = policy[key]
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"interference policy {key} must be null or non-negative")
+        if key.endswith("_bytes") and not isinstance(value, int):
+            raise ValueError(f"interference policy {key} must be an integer")
+    return dict(policy)
+
+
+def _paired_design(
     baseline: dict[str, Any], candidate: dict[str, Any]
 ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], set[str]]:
     reasons: set[str] = set()
-    b_runs = _performance_runs(baseline)
-    c_runs = _performance_runs(candidate)
-    bmap = {(run["cold"], run["repetition_index"]): run for run in b_runs}
-    cmap = {(run["cold"], run["repetition_index"]): run for run in c_runs}
-    if set(bmap) != set(cmap):
-        reasons.add("cold_warm_mismatch")
-    pairs = [(bmap[key], cmap[key]) for key in sorted(set(bmap) & set(cmap))]
+    by_role = {
+        "baseline": _performance_runs(baseline),
+        "candidate": _performance_runs(candidate),
+    }
+    maps: dict[str, dict[tuple[bool, int], dict[str, Any]]] = {}
+    for role, runs in by_role.items():
+        cold_count = sum(run["cold"] is True for run in runs)
+        warm_count = sum(run["cold"] is False for run in runs)
+        if cold_count != 1:
+            reasons.add("insufficient_cold_runs")
+        if warm_count < 3:
+            reasons.add("insufficient_warm_runs")
+        keys: set[tuple[bool, int]] = set()
+        run_indexes: set[int] = set()
+        role_map: dict[tuple[bool, int], dict[str, Any]] = {}
+        for run in runs:
+            key = (bool(run["cold"]), int(run["repetition_index"]))
+            if key in keys:
+                reasons.add("duplicate_run")
+            else:
+                role_map[key] = run
+            keys.add(key)
+        for run in (baseline if role == "baseline" else candidate)["runs"]:
+            if int(run["run_index"]) in run_indexes:
+                reasons.add("duplicate_run")
+            run_indexes.add(int(run["run_index"]))
+        maps[role] = role_map
+
+    if set(maps["baseline"]) != set(maps["candidate"]):
+        reasons.add("repetition_set_mismatch")
+    all_runs = [
+        (role, run)
+        for role in ("baseline", "candidate")
+        for run in by_role[role]
+    ]
+    orders = [int(run["execution_order"]) for _, run in all_runs]
+    all_orders = [
+        int(run["execution_order"])
+        for artifact in (baseline, candidate)
+        for run in artifact["runs"]
+    ]
+    if len(all_orders) != len(set(all_orders)):
+        reasons.add("duplicate_execution_order")
+    cancellation_orders = [
+        int(run["execution_order"])
+        for artifact in (baseline, candidate)
+        for run in artifact["runs"]
+        if run["cancellation"]["tested"]
+    ]
+    if cancellation_orders and orders and min(cancellation_orders) <= max(orders):
+        reasons.add("unbalanced_execution_order")
+    if not reasons & {"duplicate_run", "duplicate_execution_order", "repetition_set_mismatch"}:
+        warm_repetitions = sorted(
+            repetition for cold, repetition in maps["baseline"] if not cold
+        )
+        cold_repetitions = sorted(
+            repetition for cold, repetition in maps["baseline"] if cold
+        )
+        if cold_repetitions != [0] or warm_repetitions != list(range(len(warm_repetitions))):
+            reasons.add("unbalanced_execution_order")
+        expected: list[tuple[str, bool, int]] = []
+        if cold_repetitions:
+            expected.extend(
+                [("baseline", True, cold_repetitions[0]), ("candidate", True, cold_repetitions[0])]
+            )
+        for position, repetition in enumerate(warm_repetitions):
+            roles = ("baseline", "candidate") if position % 2 == 0 else ("candidate", "baseline")
+            expected.extend((role, False, repetition) for role in roles)
+        ordered = sorted(all_runs, key=lambda item: int(item[1]["execution_order"]))
+        actual = [(role, bool(run["cold"]), int(run["repetition_index"])) for role, run in ordered]
+        if orders and (sorted(orders) != list(range(len(orders))) or actual != expected):
+            reasons.add("unbalanced_execution_order")
+    if reasons & {
+        "duplicate_run", "duplicate_execution_order", "repetition_set_mismatch",
+        "insufficient_cold_runs", "insufficient_warm_runs", "unbalanced_execution_order",
+    }:
+        return [], reasons
+    keys = sorted(maps["baseline"])
+    return [(maps["baseline"][key], maps["candidate"][key]) for key in keys], reasons
+
+
+def _matched_runs(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], set[str]]:
+    pairs, reasons = _paired_design(baseline, candidate)
     for brun, crun in pairs:
         boptions, coptions = brun["options"], crun["options"]
         if (
@@ -158,19 +275,23 @@ def _matched_runs(
         if brun["truncation_state"] == "truncated_prompt" or crun["truncation_state"] == "truncated_prompt":
             reasons.add("truncated_prompt")
         for run in (brun, crun):
-            if run["pre_arm"]["interference"]["detected"]:
-                reasons.add("system_interference")
             gpu_expected = bool((baseline["hardware"].get("gpus") or candidate["hardware"].get("gpus")))
             if gpu_expected and (
-                run["gpu"]["pre"]["state"] != "available"
+                run["pre_arm"]["gpu_snapshot"]["state"] != "available"
+                or run["gpu"]["pre"]["state"] != "available"
                 or run["gpu"]["post"]["state"] != "available"
                 or run["gpu"]["sampling_state"] != "available"
+                or run["gpu"]["during_peak_used_bytes"] is None
+                or run["gpu"]["during_min_free_bytes"] is None
             ):
-                reasons.add("hardware_snapshot_missing")
+                reasons.add("incomplete_run")
             if (
                 run["error_category"]
                 or run["evidence_state"] != "complete"
                 or run["memory"]["sampling_state"] != "available"
+                or run["memory"]["cpu_sampling_state"] != "available"
+                or run["pre_arm"]["interference"]["state"] != "available"
+                or run["pre_arm"]["interference"]["system_cpu_percent"] is None
                 or run["placement_state"] != "recorded"
             ):
                 reasons.add("incomplete_run")
@@ -253,22 +374,89 @@ def _state_measurements(
     return {"pair_count": len(selected), "metrics": metrics}
 
 
+def _ambient_value(run: dict[str, Any], name: str) -> float | int | None:
+    if name == "pre_arm_cpu_percent":
+        return run["pre_arm"]["interference"]["system_cpu_percent"]
+    if name == "pre_arm_available_ram_bytes":
+        return run["pre_arm"]["available_ram_bytes"]
+    if name == "pre_arm_gpu_used_bytes":
+        return run["pre_arm"]["gpu_snapshot"]["used_bytes"]
+    if name == "pre_arm_gpu_free_bytes":
+        return run["pre_arm"]["gpu_snapshot"]["free_bytes"]
+    if name == "elapsed_since_previous_arm_ms":
+        return run["elapsed_since_previous_arm_ms"]
+    if name == "during_cpu_mean_percent":
+        return run["memory"]["system_cpu_mean_percent"]
+    raise KeyError(name)
+
+
+AMBIENT_METRICS = (
+    "pre_arm_cpu_percent", "pre_arm_available_ram_bytes",
+    "pre_arm_gpu_used_bytes", "pre_arm_gpu_free_bytes",
+    "elapsed_since_previous_arm_ms", "during_cpu_mean_percent",
+)
+
+
+def _ambient_drift(pairs: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name in AMBIENT_METRICS:
+        baseline_values = [_ambient_value(baseline, name) for baseline, _ in pairs]
+        candidate_values = [_ambient_value(candidate, name) for _, candidate in pairs]
+        differences = [
+            abs(float(bvalue) - float(cvalue))
+            for bvalue, cvalue in zip(baseline_values, candidate_values, strict=True)
+            if bvalue is not None and cvalue is not None
+        ]
+        result[name] = {
+            "baseline": _distribution(baseline_values),
+            "candidate": _distribution(candidate_values),
+            "paired_absolute_difference": _distribution(differences),
+        }
+    return result
+
+
+def _policy_exceeded(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]], policy: dict[str, Any] | None
+) -> bool:
+    if policy is None:
+        return False
+    mappings = {
+        "max_pre_arm_cpu_percent_difference": "pre_arm_cpu_percent",
+        "max_pre_arm_available_ram_difference_bytes": "pre_arm_available_ram_bytes",
+        "max_pre_arm_gpu_used_difference_bytes": "pre_arm_gpu_used_bytes",
+        "max_elapsed_gap_ms": "elapsed_since_previous_arm_ms",
+    }
+    for policy_key, metric_name in mappings.items():
+        threshold = policy[policy_key]
+        if threshold is None:
+            continue
+        for baseline, candidate in pairs:
+            bvalue = _ambient_value(baseline, metric_name)
+            cvalue = _ambient_value(candidate, metric_name)
+            if bvalue is not None and cvalue is not None and abs(float(bvalue) - float(cvalue)) > threshold:
+                return True
+    return False
+
+
 def _cancellation_measurements(artifact: dict[str, Any]) -> dict[str, Any] | None:
     runs = [run for run in artifact["runs"] if run["cancellation"]["tested"]]
     if not runs:
         return None
     return {
         "request_to_cancel_ms": _distribution([run["cancellation"]["request_to_cancel_ms"] for run in runs]),
-        "cancel_acknowledgement_ms": _distribution([run["cancellation"]["cancel_acknowledgement_ms"] for run in runs]),
-        "cancel_latency_ms": _distribution([run["cancellation"]["cancel_latency_ms"] for run in runs]),
+        "client_stream_closed_ms": _distribution([run["cancellation"]["client_stream_closed_ms"] for run in runs]),
+        "runtime_idle_ms": _distribution([run["cancellation"]["runtime_idle_ms"] for run in runs]),
         "process_completion_ms": _distribution([run["cancellation"]["process_completion_ms"] for run in runs]),
         "resources_released": all(run["cancellation"]["resources_released"] is True for run in runs),
         "runtime_responsive": all(run["cancellation"]["runtime_responsive"] is True for run in runs),
     }
 
 
-def compare_artifacts(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+def compare_artifacts(
+    artifacts: list[dict[str, Any]], policy: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Validate and compare all independent pairs without policy thresholds."""
+    policy = _validate_policy(policy)
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     input_errors: list[dict[str, Any]] = []
     for input_index, artifact in enumerate(artifacts):
@@ -301,6 +489,8 @@ def compare_artifacts(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
             reasons |= _protected_reasons(baseline, candidate)
             pairs, run_reasons = _matched_runs(baseline, candidate)
             reasons |= run_reasons
+            if _policy_exceeded(pairs, policy):
+                reasons.add("system_interference")
         comparison: dict[str, Any] = {
             "pair_id": pair_id,
             "experiment_id": experiment_id,
@@ -326,6 +516,7 @@ def compare_artifacts(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
             "cold": None,
             "warm": None,
             "cancellation": {"baseline": None, "candidate": None},
+            "ambient_drift": _ambient_drift(pairs) if pairs else {},
         }
         if len(baselines) == 1 and len(candidates) == 1:
             comparison["cancellation"] = {
@@ -353,10 +544,14 @@ def compare_artifacts(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
         "input_errors": input_errors,
         "comparisons": comparisons,
         "policy_thresholds_applied": False,
+        "interference_policy_applied": policy is not None,
+        "interference_policy": policy,
     }
 
 
-def load_and_compare(paths: list[str | Path]) -> dict[str, Any]:
+def load_and_compare(
+    paths: list[str | Path], policy: dict[str, Any] | None = None
+) -> dict[str, Any]:
     artifacts: list[dict[str, Any]] = []
     load_errors: list[dict[str, Any]] = []
     for input_index, path in enumerate(paths):
@@ -367,7 +562,7 @@ def load_and_compare(paths: list[str | Path]) -> dict[str, Any]:
             artifacts.append(decoded)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             load_errors.append({"input_index": input_index, "error_category": "malformed_artifact"})
-    report = compare_artifacts(artifacts)
+    report = compare_artifacts(artifacts, policy=policy)
     if load_errors:
         report["input_errors"] = load_errors + report["input_errors"]
         report["invalid_pair_count"] += len(load_errors)

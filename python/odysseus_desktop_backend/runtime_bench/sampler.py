@@ -17,6 +17,7 @@ from collections.abc import Callable
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MAX_RECORDED_SYSTEM_SAMPLES = 256
+PRE_ARM_CPU_SAMPLE_INTERVAL_MS = 100
 
 
 class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
@@ -57,6 +58,44 @@ class _IO_COUNTERS(ctypes.Structure):
         ("WriteTransferCount", ctypes.c_uint64),
         ("OtherTransferCount", ctypes.c_uint64),
     ]
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+
+def _filetime_value(value: _FILETIME) -> int:
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
+def system_cpu_times() -> tuple[int, int] | None:
+    """Return cumulative idle and total system time from one bounded probe."""
+    idle = _FILETIME()
+    kernel = _FILETIME()
+    user = _FILETIME()
+    if not ctypes.windll.kernel32.GetSystemTimes(
+        ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+    ):
+        return None
+    return _filetime_value(idle), _filetime_value(kernel) + _filetime_value(user)
+
+
+def cpu_percent_between(before: tuple[int, int], after: tuple[int, int]) -> float | None:
+    idle_delta = after[0] - before[0]
+    total_delta = after[1] - before[1]
+    if total_delta <= 0 or idle_delta < 0:
+        return None
+    return round(max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0)), 2)
+
+
+def measure_system_cpu_percent(interval_ms: int = PRE_ARM_CPU_SAMPLE_INTERVAL_MS) -> float | None:
+    """Measure system CPU utilization over one explicit, bounded interval."""
+    before = system_cpu_times()
+    if before is None:
+        return None
+    time.sleep(max(0, interval_ms) / 1000)
+    after = system_cpu_times()
+    return cpu_percent_between(before, after) if after is not None else None
 
 
 def process_tree_metrics(exe_substring: str) -> tuple[int, int | None]:
@@ -178,6 +217,9 @@ class ResourceSampler:
         self.disk_read_start_bytes: int | None = None
         self.disk_read_end_bytes: int | None = None
         self.pagefile_used_peak_bytes: int | None = None
+        self.system_cpu_samples: list[float] = []
+        self.cpu_sampling_available = True
+        self.cpu_sampling_failure_category = ""
         self.started_at = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -185,6 +227,10 @@ class ResourceSampler:
     def _loop(self) -> None:
         last_vram = 0.0
         self.started_at = time.monotonic()
+        previous_cpu = system_cpu_times()
+        if previous_cpu is None:
+            self.cpu_sampling_available = False
+            self.cpu_sampling_failure_category = "cpu_probe_unavailable"
         while not self._stop.is_set():
             rss, disk_read = process_tree_metrics(self.exe_substring)
             if rss > self.peak_rss_bytes:
@@ -194,6 +240,16 @@ class ResourceSampler:
                     self.disk_read_start_bytes = disk_read
                 self.disk_read_end_bytes = disk_read
             status = system_memory_status()
+            current_cpu = system_cpu_times()
+            cpu_percent = None
+            if previous_cpu is not None and current_cpu is not None:
+                cpu_percent = cpu_percent_between(previous_cpu, current_cpu)
+                if cpu_percent is not None:
+                    self.system_cpu_samples.append(cpu_percent)
+            elif current_cpu is None:
+                self.cpu_sampling_available = False
+                self.cpu_sampling_failure_category = "cpu_probe_unavailable"
+            previous_cpu = current_cpu
             available = int(status["available_ram_bytes"]) if status else 0
             if status is None:
                 self.sampling_available = False
@@ -214,6 +270,7 @@ class ResourceSampler:
                         "available_ram_bytes": available,
                         "memory_load_percent": int(status["memory_load_percent"]),
                         "pagefile_used_bytes": pagefile_used,
+                        "system_cpu_percent": cpu_percent,
                     }
                 )
             elif status:
@@ -283,4 +340,14 @@ class ResourceSampler:
             "disk_read_bytes": disk_read_bytes,
             "pagefile_used_peak_bytes": self.pagefile_used_peak_bytes,
             "safety_floor_crossed": self.safety_floor_crossed,
+            "system_cpu_peak_percent": max(self.system_cpu_samples, default=None),
+            "system_cpu_mean_percent": (
+                round(sum(self.system_cpu_samples) / len(self.system_cpu_samples), 2)
+                if self.system_cpu_samples else None
+            ),
+            "cpu_sampling_state": "available" if self.cpu_sampling_available and self.system_cpu_samples else "unavailable",
+            "cpu_sampling_failure_category": (
+                "" if self.cpu_sampling_available and self.system_cpu_samples
+                else self.cpu_sampling_failure_category or "cpu_probe_unavailable"
+            ),
         }

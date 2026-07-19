@@ -43,11 +43,12 @@ RUN_KEYS = {
     "run_index", "repetition_index", "execution_order", "captured_at", "cold",
     "elapsed_since_previous_arm_ms", "pre_arm", "options", "timings_ms", "tokens",
     "memory", "gpu", "disk", "cache_state", "placement_state", "quality",
-    "cancellation", "error_category", "truncation_state", "evidence_state",
+    "cancellation", "preflight_rejection_category", "error_category",
+    "truncation_state", "evidence_state",
 }
 PRE_ARM_KEYS = {"available_ram_bytes", "gpu_snapshot", "interference"}
-INTERFERENCE_KEYS = {"state", "system_cpu_percent", "memory_load_percent", "detected"}
-GPU_SNAPSHOT_KEYS = {"state", "used_bytes", "total_bytes"}
+INTERFERENCE_KEYS = {"state", "system_cpu_percent", "memory_load_percent"}
+GPU_SNAPSHOT_KEYS = {"state", "used_bytes", "free_bytes", "total_bytes"}
 OPTION_KEYS = {
     "temperature", "seed", "num_predict", "num_ctx", "num_thread", "num_gpu",
     "num_batch", "n_predict", "think", "top_p", "top_k",
@@ -59,15 +60,28 @@ MEMORY_KEYS = {
     "process_peak_rss_bytes", "pagefile_used_peak_bytes", "sampler_interval_ms",
     "sample_count", "sampling_state", "sampling_failure_category",
     "system_memory_samples", "safety_floor_bytes", "safety_floor_crossed",
+    "system_cpu_peak_percent", "system_cpu_mean_percent", "cpu_sampling_state",
+    "cpu_sampling_failure_category",
 }
-MEMORY_SAMPLE_KEYS = {"elapsed_ms", "available_ram_bytes", "memory_load_percent", "pagefile_used_bytes"}
-GPU_KEYS = {"pre", "during_peak_used_bytes", "post", "sampling_state", "sampling_failure_category"}
+MEMORY_SAMPLE_KEYS = {
+    "elapsed_ms", "available_ram_bytes", "memory_load_percent",
+    "pagefile_used_bytes", "system_cpu_percent",
+}
+GPU_KEYS = {
+    "pre", "during_peak_used_bytes", "during_min_free_bytes", "post",
+    "sampling_state", "sampling_failure_category",
+}
 DISK_KEYS = {"state", "read_bytes"}
 QUALITY_KEYS = {"state", "assertion_count", "score", "deterministic_answer_sha256", "unsupported_category"}
 CANCELLATION_KEYS = {
-    "tested", "request_to_cancel_ms", "cancel_acknowledgement_ms",
-    "cancel_latency_ms", "process_completion_ms", "final_state",
+    "tested", "request_to_cancel_ms", "client_stream_closed_ms",
+    "runtime_idle_ms", "process_completion_ms", "final_state",
     "resources_released", "runtime_responsive",
+}
+
+PREFLIGHT_REJECTION_CATEGORIES = {
+    "", "unknown_weight_size", "unknown_kv_geometry", "malformed_model_metadata",
+    "insufficient_memory_budget", "memory_probe_unavailable",
 }
 
 HARDWARE_KEYS = {"schema_version", "os", "cpu", "ram", "gpus", "npu", "storage", "errors", "captured_at_ms"}
@@ -300,6 +314,12 @@ def _validate_run(run: Any, index: int, problems: list[str]) -> None:
     _enum(run["cache_state"], {"cold", "warm", "unknown"}, f"{where}.cache_state", problems)
     _enum(run["placement_state"], {"recorded", "unavailable"}, f"{where}.placement_state", problems)
     _enum(run["error_category"], FIXED_FAILURES, f"{where}.error_category", problems)
+    _enum(
+        run["preflight_rejection_category"],
+        PREFLIGHT_REJECTION_CATEGORIES,
+        f"{where}.preflight_rejection_category",
+        problems,
+    )
     _enum(run["truncation_state"], {"complete", "truncated_prompt", "incomplete_evidence"}, f"{where}.truncation_state", problems)
     _enum(run["evidence_state"], {"complete", "incomplete", "unavailable"}, f"{where}.evidence_state", problems)
 
@@ -312,7 +332,6 @@ def _validate_run(run: Any, index: int, problems: list[str]) -> None:
             _enum(interference["state"], {"available", "unavailable"}, f"{where}.pre_arm.interference.state", problems)
             _number(interference["system_cpu_percent"], f"{where}.pre_arm.interference.system_cpu_percent", problems, nullable=True, maximum=100)
             _number(interference["memory_load_percent"], f"{where}.pre_arm.interference.memory_load_percent", problems, nullable=True, maximum=100)
-            _bool(interference["detected"], f"{where}.pre_arm.interference.detected", problems)
 
     options = run["options"]
     if not isinstance(options, dict) or set(options) - OPTION_KEYS:
@@ -337,6 +356,10 @@ def _validate_run(run: Any, index: int, problems: list[str]) -> None:
             _number(memory[key], f"{where}.memory.{key}", problems, integer=True, nullable=key == "pagefile_used_peak_bytes")
         _enum(memory["sampling_state"], {"available", "unavailable"}, f"{where}.memory.sampling_state", problems)
         _enum(memory["sampling_failure_category"], {"", "memory_probe_unavailable"}, f"{where}.memory.sampling_failure_category", problems)
+        for key in ("system_cpu_peak_percent", "system_cpu_mean_percent"):
+            _number(memory[key], f"{where}.memory.{key}", problems, nullable=True, maximum=100)
+        _enum(memory["cpu_sampling_state"], {"available", "unavailable"}, f"{where}.memory.cpu_sampling_state", problems)
+        _enum(memory["cpu_sampling_failure_category"], {"", "cpu_probe_unavailable"}, f"{where}.memory.cpu_sampling_failure_category", problems)
         _bool(memory["safety_floor_crossed"], f"{where}.memory.safety_floor_crossed", problems)
         samples = memory["system_memory_samples"]
         if not isinstance(samples, list):
@@ -347,14 +370,24 @@ def _validate_run(run: Any, index: int, problems: list[str]) -> None:
                 if _closed(sample, MEMORY_SAMPLE_KEYS, sample_where, problems):
                     for key in ("elapsed_ms", "available_ram_bytes", "memory_load_percent", "pagefile_used_bytes"):
                         _number(sample[key], f"{sample_where}.{key}", problems, integer=True, maximum=100 if key == "memory_load_percent" else None)
+                    _number(sample["system_cpu_percent"], f"{sample_where}.system_cpu_percent", problems, nullable=True, maximum=100)
 
     gpu = run["gpu"]
     if _closed(gpu, GPU_KEYS, f"{where}.gpu", problems):
         _validate_gpu_snapshot(gpu["pre"], f"{where}.gpu.pre", problems)
         _validate_gpu_snapshot(gpu["post"], f"{where}.gpu.post", problems)
         _number(gpu["during_peak_used_bytes"], f"{where}.gpu.during_peak_used_bytes", problems, integer=True, nullable=True)
+        _number(gpu["during_min_free_bytes"], f"{where}.gpu.during_min_free_bytes", problems, integer=True, nullable=True)
         _enum(gpu["sampling_state"], {"available", "unavailable"}, f"{where}.gpu.sampling_state", problems)
-        _enum(gpu["sampling_failure_category"], {"", "gpu_probe_unavailable", "gpu_probe_failed"}, f"{where}.gpu.sampling_failure_category", problems)
+        _enum(gpu["sampling_failure_category"], {"", "gpu_probe_unavailable", "gpu_probe_failed", "not_sampled"}, f"{where}.gpu.sampling_failure_category", problems)
+        if gpu["sampling_state"] == "available" and (
+            gpu["during_peak_used_bytes"] is None or gpu["during_min_free_bytes"] is None
+        ):
+            problems.append(f"{where}.gpu available sampling requires used and free bytes")
+        if gpu["sampling_state"] == "unavailable" and (
+            gpu["during_peak_used_bytes"] is not None or gpu["during_min_free_bytes"] is not None
+        ):
+            problems.append(f"{where}.gpu unavailable sampling must use null bytes")
     disk = run["disk"]
     if _closed(disk, DISK_KEYS, f"{where}.disk", problems):
         _enum(disk["state"], {"available", "unavailable"}, f"{where}.disk.state", problems)
@@ -373,14 +406,15 @@ def _validate_run(run: Any, index: int, problems: list[str]) -> None:
     cancellation = run["cancellation"]
     if _closed(cancellation, CANCELLATION_KEYS, f"{where}.cancellation", problems):
         _bool(cancellation["tested"], f"{where}.cancellation.tested", problems)
-        for key in ("request_to_cancel_ms", "cancel_acknowledgement_ms", "cancel_latency_ms", "process_completion_ms"):
+        for key in ("request_to_cancel_ms", "client_stream_closed_ms", "runtime_idle_ms", "process_completion_ms"):
             _number(cancellation[key], f"{where}.cancellation.{key}", problems, nullable=True)
         _enum(cancellation["final_state"], {"not_tested", "cancelled", "completed", "timeout", "failed"}, f"{where}.cancellation.final_state", problems)
         _bool(cancellation["resources_released"], f"{where}.cancellation.resources_released", problems, nullable=True)
         _bool(cancellation["runtime_responsive"], f"{where}.cancellation.runtime_responsive", problems, nullable=True)
-        timing_keys = ("request_to_cancel_ms", "cancel_acknowledgement_ms", "cancel_latency_ms", "process_completion_ms")
+        required_timing_keys = ("request_to_cancel_ms", "client_stream_closed_ms", "process_completion_ms")
+        timing_keys = (*required_timing_keys, "runtime_idle_ms")
         if cancellation["tested"]:
-            if cancellation["final_state"] == "not_tested" or any(cancellation[key] is None for key in timing_keys):
+            if cancellation["final_state"] == "not_tested" or any(cancellation[key] is None for key in required_timing_keys):
                 problems.append(f"{where}.cancellation tested probe is incomplete")
             if cancellation["resources_released"] is None or cancellation["runtime_responsive"] is None:
                 problems.append(f"{where}.cancellation tested probe must record resource and runtime state")
@@ -388,6 +422,10 @@ def _validate_run(run: Any, index: int, problems: list[str]) -> None:
             problems.append(f"{where}.cancellation untested probe must not carry timings or a final state")
     if run["error_category"] and isinstance(run["quality"], dict) and run["quality"].get("state") == "passed":
         problems.append(f"{where} cannot pass quality while carrying an error")
+    if run["error_category"] == "preflight_safety_abort" and not run["preflight_rejection_category"]:
+        problems.append(f"{where} preflight abort must identify its rejection category")
+    if run["error_category"] != "preflight_safety_abort" and run["preflight_rejection_category"]:
+        problems.append(f"{where} non-preflight run must not carry a preflight rejection category")
     if run["evidence_state"] == "complete" and run["truncation_state"] != "complete":
         problems.append(f"{where} complete evidence cannot be truncated")
 
@@ -396,13 +434,16 @@ def _validate_gpu_snapshot(snapshot: Any, where: str, problems: list[str]) -> No
     if _closed(snapshot, GPU_SNAPSHOT_KEYS, where, problems):
         _enum(snapshot["state"], {"available", "unavailable"}, f"{where}.state", problems)
         _number(snapshot["used_bytes"], f"{where}.used_bytes", problems, integer=True, nullable=True)
+        _number(snapshot["free_bytes"], f"{where}.free_bytes", problems, integer=True, nullable=True)
         _number(snapshot["total_bytes"], f"{where}.total_bytes", problems, integer=True, nullable=True)
-        if snapshot["state"] == "available" and (snapshot["used_bytes"] is None or snapshot["total_bytes"] is None):
+        if snapshot["state"] == "available" and any(snapshot[key] is None for key in ("used_bytes", "free_bytes", "total_bytes")):
             problems.append(f"{where} available state requires measured bytes")
-        if snapshot["state"] == "unavailable" and snapshot["used_bytes"] is not None:
+        if snapshot["state"] == "unavailable" and any(snapshot[key] is not None for key in ("used_bytes", "free_bytes")):
             problems.append(f"{where} unavailable state must not use a numeric measurement")
         if _finite(snapshot["used_bytes"]) and _finite(snapshot["total_bytes"]) and snapshot["used_bytes"] > snapshot["total_bytes"]:
             problems.append(f"{where}.used_bytes must not exceed total_bytes")
+        if _finite(snapshot["free_bytes"]) and _finite(snapshot["total_bytes"]) and snapshot["free_bytes"] > snapshot["total_bytes"]:
+            problems.append(f"{where}.free_bytes must not exceed total_bytes")
 
 
 def _validate_options(options: dict[str, Any], where: str, problems: list[str]) -> None:
