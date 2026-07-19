@@ -18,6 +18,11 @@ from pathlib import Path
 
 from odysseus_desktop_backend.runtime_bench.comparison import load_and_compare
 from odysseus_desktop_backend.runtime_bench.harness import run_ollama_batch
+from odysseus_desktop_backend.runtime_bench.isolated_server import (
+    IsolatedOllamaServer,
+    Phase1ContractError,
+    build_dry_run_plan,
+)
 from odysseus_desktop_backend.runtime_bench.paired import run_paired_ollama_batch
 
 
@@ -151,12 +156,59 @@ def _paired_main(argv: list[str]) -> int:
     return 2 if result["aborted"] else 0
 
 
+def _attest_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="runtime_bench attest")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and print the launch plan (the default and always process-free)",
+    )
+    parser.add_argument(
+        "--approved-g-iso-0",
+        action="store_true",
+        help="human approval gate for a real empty-store launch",
+    )
+    parser.add_argument("--executable", default="ollama.exe")
+    parser.add_argument("--user-overrides-json", default="{}")
+    parser.add_argument("--startup-timeout", type=float, default=30.0)
+    args = parser.parse_args(argv)
+    try:
+        overrides = json.loads(args.user_overrides_json)
+    except json.JSONDecodeError as exc:
+        parser.error(f"invalid user overrides JSON: {exc}")
+    if not isinstance(overrides, dict):
+        parser.error("user overrides must be a JSON object")
+    try:
+        # Dry-run is the default.  Merely naming the approval flag does not
+        # override an explicit --dry-run.
+        if args.dry_run or not args.approved_g_iso_0:
+            result = build_dry_run_plan(
+                user_overrides=overrides,
+                startup_timeout_seconds=args.startup_timeout,
+            )
+            print(json.dumps(result, indent=1, sort_keys=True))
+            return 0
+        if not sys.stdin.isatty():
+            parser.error("real attestation requires an interactive terminal")
+        artifact = IsolatedOllamaServer(
+            args.executable,
+            user_overrides=overrides,
+            startup_timeout_seconds=args.startup_timeout,
+        ).run()
+    except Phase1ContractError as exc:
+        parser.error(str(exc))
+    print(json.dumps(artifact, indent=1, sort_keys=True))
+    return 0 if not artifact["failures"] else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "compare":
         return _compare_main(args[1:])
     if args and args[0] == "paired":
         return _paired_main(args[1:])
+    if args and args[0] == "attest":
+        return _attest_main(args[1:])
     return _legacy_main(args)
 
 
