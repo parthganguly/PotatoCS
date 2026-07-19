@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -96,6 +96,8 @@ PHASE1_FAILURE_CATEGORIES = frozenset(
         "version_probe_output_overflow",
         "version_probe_failed",
         "version_probe_cleanup_failed",
+        "model_residency_probe_failed",
+        "unexpected_model_residency",
         "runtime_identity_mismatch",
         "attestation_missing",
         "attestation_mismatch",
@@ -114,8 +116,11 @@ MAX_LOG_BYTES = 256 * 1024
 FIRST_LOG_BYTES = 64 * 1024
 LAST_LOG_BYTES = 192 * 1024
 MAX_VERSION_OUTPUT_BYTES = 4 * 1024
+MAX_MODEL_RESIDENCY_RESPONSE_BYTES = 8 * 1024
 MAX_DIALECT_PATTERN_LENGTH = 512
 DEFAULT_SERVER_LAUNCH_ATTEMPTS = 3
+READER_JOIN_TIMEOUT_SECONDS = 1.0
+MODEL_RESIDENCY_TIMEOUT_SECONDS = 1.0
 MAX_DURATION_MS = 24 * 60 * 60 * 1000
 
 _SAFE_BASENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -590,7 +595,7 @@ class BoundedLogCapture:
                 if len(self._last) > LAST_LOG_BYTES:
                     del self._last[: len(self._last) - LAST_LOG_BYTES]
 
-    def drain(self, pipe: BinaryIO) -> None:
+    def drain(self, pipe: BinaryIO, shutdown: threading.Event | None = None) -> None:
         try:
             while True:
                 chunk = pipe.read(8192)
@@ -598,8 +603,9 @@ class BoundedLogCapture:
                     return
                 self.feed(chunk)
         except (OSError, ValueError, TypeError):
-            with self._lock:
-                self._reader_failed = True
+            if shutdown is None or not shutdown.is_set():
+                with self._lock:
+                    self._reader_failed = True
 
     @property
     def observed(self) -> int:
@@ -646,7 +652,7 @@ class BoundedVersionCapture:
             if remaining > 0:
                 self._data.extend(data[:remaining])
 
-    def drain(self, pipe: BinaryIO) -> None:
+    def drain(self, pipe: BinaryIO, shutdown: threading.Event | None = None) -> None:
         try:
             while True:
                 chunk = pipe.read(1024)
@@ -654,8 +660,9 @@ class BoundedVersionCapture:
                     return
                 self.feed(chunk)
         except (OSError, ValueError, TypeError):
-            with self._lock:
-                self._reader_failed = True
+            if shutdown is None or not shutdown.is_set():
+                with self._lock:
+                    self._reader_failed = True
 
     @property
     def observed(self) -> int:
@@ -702,6 +709,7 @@ class LifecycleApi(Protocol):
     def terminate_process(self, process: CreatedProcess) -> None: ...
     def wait_process(self, process: CreatedProcess, timeout_ms: int) -> bool: ...
     def descendant_process_ids(self, process_id: int) -> set[int]: ...
+    def cancel_reader(self, reader: threading.Thread) -> None: ...
     def close_handle(self, handle: Any) -> None: ...
 
 
@@ -806,6 +814,13 @@ class WindowsLifecycleApi:
     TCP_TABLE_OWNER_PID_LISTENER = 3
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    THREAD_TERMINATE = 0x0001
+    ERROR_NOT_FOUND = 1168
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -823,6 +838,16 @@ class WindowsLifecycleApi:
         self.kernel32.CreatePipe.restype = ctypes.c_int
         self.kernel32.SetHandleInformation.argtypes = [void_p, uint32, uint32]
         self.kernel32.SetHandleInformation.restype = ctypes.c_int
+        self.kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            uint32,
+            uint32,
+            ctypes.POINTER(_WinSecurityAttributes),
+            uint32,
+            uint32,
+            void_p,
+        ]
+        self.kernel32.CreateFileW.restype = void_p
         self.kernel32.CreateProcessW.argtypes = [
             ctypes.c_wchar_p, ctypes.c_wchar_p, void_p, void_p, ctypes.c_int,
             uint32, void_p, ctypes.c_wchar_p, void_p,
@@ -857,6 +882,10 @@ class WindowsLifecycleApi:
         self.kernel32.Process32NextW.restype = ctypes.c_int
         self.kernel32.CloseHandle.argtypes = [void_p]
         self.kernel32.CloseHandle.restype = ctypes.c_int
+        self.kernel32.OpenThread.argtypes = [uint32, ctypes.c_int, uint32]
+        self.kernel32.OpenThread.restype = void_p
+        self.kernel32.CancelSynchronousIo.argtypes = [void_p]
+        self.kernel32.CancelSynchronousIo.restype = ctypes.c_int
         self.kernel32.InitializeProcThreadAttributeList.argtypes = [
             void_p,
             uint32,
@@ -918,7 +947,24 @@ class WindowsLifecycleApi:
             self.close_handle(write_handle)
             raise IsolatedServerFailure("process_create_failed") from exc
 
-    def _create_attribute_list(self, stdout_write: Any, stderr_write: Any) -> _ProcessAttributeList:
+    def _open_null_stdin(self) -> Any:
+        attrs = _WinSecurityAttributes(ctypes.sizeof(_WinSecurityAttributes), None, 1)
+        handle = self.kernel32.CreateFileW(
+            "NUL",
+            self.GENERIC_READ,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
+            ctypes.byref(attrs),
+            self.OPEN_EXISTING,
+            self.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if not handle or handle == ctypes.c_void_p(-1).value:
+            raise IsolatedServerFailure("process_create_failed", win32_code=self._winerror())
+        return handle
+
+    def _create_attribute_list(
+        self, stdin_read: Any, stdout_write: Any, stderr_write: Any
+    ) -> _ProcessAttributeList:
         size = ctypes.c_size_t(0)
         first = self.kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
         first_error = self._winerror()
@@ -928,7 +974,7 @@ class WindowsLifecycleApi:
         pointer = ctypes.cast(buffer, ctypes.c_void_p)
         if not self.kernel32.InitializeProcThreadAttributeList(pointer, 1, 0, ctypes.byref(size)):
             raise IsolatedServerFailure("process_attribute_list_failed", win32_code=self._winerror())
-        handles = (ctypes.c_void_p * 2)(stdout_write, stderr_write)
+        handles = (ctypes.c_void_p * 3)(stdin_read, stdout_write, stderr_write)
         attributes = _ProcessAttributeList(buffer, pointer, handles)
         if not self.kernel32.UpdateProcThreadAttribute(
             pointer,
@@ -966,18 +1012,24 @@ class WindowsLifecycleApi:
 
         if any(not isinstance(argument, str) or "\x00" in argument for argument in arguments):
             raise IsolatedServerFailure("process_create_failed")
-        stdout_write, stdout_read = self._pipe()
+        stdin_read = self._open_null_stdin()
+        try:
+            stdout_write, stdout_read = self._pipe()
+        except BaseException:
+            self.close_handle(stdin_read)
+            raise
         try:
             stderr_write, stderr_read = self._pipe()
         except BaseException:
             stdout_read.close()
             self.close_handle(stdout_write)
+            self.close_handle(stdin_read)
             raise
         attributes: _ProcessAttributeList | None = None
         startup = _WinStartupInfoEx()
         startup.StartupInfo.cb = ctypes.sizeof(startup)
         startup.StartupInfo.dwFlags = self.STARTF_USESTDHANDLES
-        startup.StartupInfo.hStdInput = None
+        startup.StartupInfo.hStdInput = stdin_read
         startup.StartupInfo.hStdOutput = stdout_write
         startup.StartupInfo.hStdError = stderr_write
         proc = _WinProcessInformation()
@@ -997,7 +1049,7 @@ class WindowsLifecycleApi:
         creation_failure: IsolatedServerFailure | None = None
         cleanup_failure = False
         try:
-            attributes = self._create_attribute_list(stdout_write, stderr_write)
+            attributes = self._create_attribute_list(stdin_read, stdout_write, stderr_write)
             startup.lpAttributeList = attributes.pointer
             ok = self.kernel32.CreateProcessW(
                 str(executable),
@@ -1025,9 +1077,9 @@ class WindowsLifecycleApi:
                     self._delete_attribute_list(attributes)
                 except IsolatedServerFailure:
                     cleanup_failure = True
-            for write_handle in (stdout_write, stderr_write):
+            for child_handle in (stdin_read, stdout_write, stderr_write):
                 try:
-                    self.close_handle(write_handle)
+                    self.close_handle(child_handle)
                 except IsolatedServerFailure:
                     cleanup_failure = True
         if cleanup_failure:
@@ -1204,6 +1256,30 @@ class WindowsLifecycleApi:
                     changed = True
         return descendants
 
+    def cancel_reader(self, reader: threading.Thread) -> None:
+        native_id = reader.native_id
+        if native_id is None:
+            raise IsolatedServerFailure("teardown_incomplete")
+        handle = self.kernel32.OpenThread(self.THREAD_TERMINATE, False, native_id)
+        if not handle:
+            if not reader.is_alive():
+                return
+            raise IsolatedServerFailure("teardown_incomplete", win32_code=self._winerror())
+        failure: IsolatedServerFailure | None = None
+        try:
+            if not self.kernel32.CancelSynchronousIo(handle):
+                code = self._winerror()
+                if code != self.ERROR_NOT_FOUND and reader.is_alive():
+                    failure = IsolatedServerFailure("teardown_incomplete", win32_code=code)
+        finally:
+            try:
+                self.close_handle(handle)
+            except IsolatedServerFailure as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
     def close_handle(self, handle: Any) -> None:
         if handle and not self.kernel32.CloseHandle(handle):
             raise IsolatedServerFailure("teardown_incomplete", win32_code=self._winerror())
@@ -1225,6 +1301,46 @@ def verify_suspended_executable(
         raise IsolatedServerFailure("runtime_identity_mismatch")
 
 
+def _stop_reader_threads(
+    *,
+    api: LifecycleApi,
+    process: CreatedProcess,
+    readers: list[threading.Thread],
+    shutdown: threading.Event,
+) -> bool:
+    """Cancel exact blocked reads, close endpoints, and contain every helper."""
+
+    failed = False
+    shutdown.set()
+    for reader in readers:
+        if reader.is_alive():
+            try:
+                api.cancel_reader(reader)
+            except IsolatedServerFailure:
+                failed = True
+    for stream in (process.stdout, process.stderr):
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            failed = True
+    deadline = time.monotonic() + READER_JOIN_TIMEOUT_SECONDS
+    for reader in readers:
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+    survivors = [reader for reader in readers if reader.is_alive()]
+    if survivors:
+        failed = True
+        # A missed bounded deadline is a cleanup failure.  Never return or
+        # retry while a helper remains: cancel once more, then contain it.
+        for reader in survivors:
+            try:
+                api.cancel_reader(reader)
+            except IsolatedServerFailure:
+                pass
+        for reader in survivors:
+            reader.join()
+    return failed
+
+
 def run_owned_version_probe(
     *,
     executable: Path,
@@ -1242,6 +1358,7 @@ def run_owned_version_probe(
     job: Any = None
     job_assigned = False
     readers: list[threading.Thread] = []
+    reader_shutdown = threading.Event()
     capture = BoundedVersionCapture()
     primary_failure: IsolatedServerFailure | None = None
     cleanup_failed = False
@@ -1257,8 +1374,12 @@ def run_owned_version_probe(
         if not api.verify_job_assignment(job, process):
             raise IsolatedServerFailure("job_assignment_failed")
         readers = [
-            threading.Thread(target=capture.drain, args=(process.stdout,), daemon=True),
-            threading.Thread(target=capture.drain, args=(process.stderr,), daemon=True),
+            threading.Thread(
+                target=capture.drain, args=(process.stdout, reader_shutdown), daemon=True
+            ),
+            threading.Thread(
+                target=capture.drain, args=(process.stderr, reader_shutdown), daemon=True
+            ),
         ]
         for reader in readers:
             reader.start()
@@ -1299,20 +1420,18 @@ def run_owned_version_probe(
                     cleanup_failed = True
             except IsolatedServerFailure:
                 cleanup_failed = True
-            for reader in readers:
-                reader.join(timeout=1.0)
-            if any(reader.is_alive() for reader in readers):
+            if _stop_reader_threads(
+                api=api,
+                process=process,
+                readers=readers,
+                shutdown=reader_shutdown,
+            ):
                 cleanup_failed = True
             try:
                 if api.descendant_process_ids(process.process_id):
                     cleanup_failed = True
             except IsolatedServerFailure:
                 cleanup_failed = True
-            for stream in (process.stdout, process.stderr):
-                try:
-                    stream.close()
-                except OSError:
-                    cleanup_failed = True
             for handle in (process.thread_handle, process.process_handle, job):
                 if handle is not None:
                     try:
@@ -1343,6 +1462,43 @@ def _default_api_version(port: int, timeout: float) -> bytes:
     if not isinstance(payload, dict) or not isinstance(payload.get("version"), str):
         raise ValueError("malformed version response")
     return payload["version"].encode("utf-8")
+
+
+def _default_model_residency(port: int, timeout: float) -> bytes:
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/ps", method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - owner reverified first
+        payload = response.read(MAX_MODEL_RESIDENCY_RESPONSE_BYTES + 1)
+    return payload
+
+
+def verify_empty_model_residency(raw: str | bytes) -> None:
+    """Accept only a bounded, closed ``{"models": []}`` response."""
+
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes):
+        raise IsolatedServerFailure("model_residency_probe_failed")
+    if len(raw) > MAX_MODEL_RESIDENCY_RESPONSE_BYTES:
+        raise IsolatedServerFailure(
+            "model_residency_probe_failed",
+            bytes_observed=min(len(raw), MAX_METADATA_NUMBER),
+        )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        pairs = json.loads(text, object_pairs_hook=lambda value: value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IsolatedServerFailure("model_residency_probe_failed") from exc
+    if (
+        not isinstance(pairs, list)
+        or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs)
+        or [key for key, _ in pairs] != ["models"]
+    ):
+        raise IsolatedServerFailure("model_residency_probe_failed")
+    models = pairs[0][1]
+    if not isinstance(models, list):
+        raise IsolatedServerFailure("model_residency_probe_failed")
+    if models:
+        raise IsolatedServerFailure("unexpected_model_residency")
 
 
 def _utc_now() -> str:
@@ -1383,6 +1539,7 @@ def empty_attestation_artifact(overrides: Mapping[str, str] | None = None) -> di
         "attested_settings": {key: _unattested_setting() for key in sorted(ATTESTED_SETTING_KEYS)},
         "endpoint_owner_verified": False,
         "job_assignment_verified": False,
+        "model_residency_verified_empty": False,
         "logs": {"bytes_observed": 0, "bytes_captured": 0, "truncated": False},
         "readiness_duration_ms": None,
         "shutdown": {"method": "not_started", "duration_ms": None},
@@ -1397,6 +1554,10 @@ def empty_attestation_artifact(overrides: Mapping[str, str] | None = None) -> di
 class _CandidatePortRace(RuntimeError):
     """Internal retry signal; never persisted as an open category."""
 
+    def __init__(self, foreign_owner: int) -> None:
+        super().__init__("candidate port race")
+        self.foreign_owner = foreign_owner
+
 
 @dataclass
 class _ServerAttempt:
@@ -1407,6 +1568,7 @@ class _ServerAttempt:
     job: Any = None
     job_assigned: bool = False
     readers: list[threading.Thread] | None = None
+    reader_shutdown: threading.Event = dataclass_field(default_factory=threading.Event)
 
 
 @dataclass
@@ -1443,6 +1605,7 @@ class IsolatedOllamaServer:
         launch_attempts: int = DEFAULT_SERVER_LAUNCH_ATTEMPTS,
         api: LifecycleApi | None = None,
         api_version_probe: Callable[[int, float], str | bytes] = _default_api_version,
+        model_residency_probe: Callable[[int, float], str | bytes] = _default_model_residency,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         temp_parent: Path | None = None,
@@ -1471,6 +1634,7 @@ class IsolatedOllamaServer:
         self.launch_attempts = launch_attempts
         self.api = api
         self.api_version_probe = api_version_probe
+        self.model_residency_probe = model_residency_probe
         self.clock = clock
         self.sleeper = sleeper
         self.temp_parent = temp_parent
@@ -1521,14 +1685,9 @@ class IsolatedOllamaServer:
             for attempt_index in range(1, self.launch_attempts + 1):
                 attempt = self._new_attempt(executable, exclusions)
                 last_capture = attempt.capture
-                bind_race = False
+                race_owner: int | None = None
                 primary_failure: IsolatedServerFailure | None = None
                 ready_result: tuple[str | bytes, int] | None = None
-                attestation_result: tuple[
-                    dict[str, Any],
-                    dict[str, dict[str, Any]],
-                    IsolatedServerFailure | None,
-                ] | None = None
                 try:
                     self._create_owned_server(
                         attempt, lifecycle_api, executable, basename, digest
@@ -1539,15 +1698,26 @@ class IsolatedOllamaServer:
                     artifact["endpoint_owner_verified"] = True
                     api_raw, readiness_ms = ready_result
                     artifact["readiness_duration_ms"] = readiness_ms
-                    attestation_result = self._wait_for_attestation(
+                    identity, attested, attestation_failure = self._wait_for_attestation(
                         attempt, lifecycle_api, binary, api_raw, dialect, required_keys
                     )
-                except _CandidatePortRace:
-                    bind_race = True
+                    artifact["runtime_identity"] = identity
+                    artifact["attested_settings"] = attested
+                    if attestation_failure is not None:
+                        raise attestation_failure
+                    mismatches = compare_requested_attestation(self.user_overrides, attested)
+                    if mismatches:
+                        raise mismatches[0]
+                    self._verify_empty_model_residency(attempt, lifecycle_api)
+                    artifact["model_residency_verified_empty"] = True
+                except _CandidatePortRace as exc:
+                    race_owner = exc.foreign_owner
                 except IsolatedServerFailure as exc:
                     primary_failure = exc
 
-                cleanup = self._cleanup_attempt(attempt, lifecycle_api)
+                cleanup = self._cleanup_attempt(
+                    attempt, lifecycle_api, expected_foreign_owner=race_owner
+                )
                 all_temp_torn_down = (
                     all_temp_torn_down and cleanup.temporary_space_torn_down
                 )
@@ -1555,7 +1725,7 @@ class IsolatedOllamaServer:
                     artifact["failures"].extend(cleanup.failures)
                     self._apply_cleanup(artifact, cleanup)
                     break
-                if bind_race:
+                if race_owner is not None:
                     exclusions.add(attempt.port)
                     if attempt_index == self.launch_attempts:
                         artifact["failures"].append(
@@ -1571,22 +1741,6 @@ class IsolatedOllamaServer:
                 if primary_failure is not None:
                     artifact["failures"].append(primary_failure.as_record())
                     break
-                if attestation_result is None:
-                    artifact["failures"].append(
-                        IsolatedServerFailure("attestation_missing").as_record()
-                    )
-                    break
-                identity, attested, attestation_failure = attestation_result
-                artifact["runtime_identity"] = identity
-                artifact["attested_settings"] = attested
-                if attestation_failure is not None:
-                    artifact["failures"].append(attestation_failure.as_record())
-                artifact["failures"].extend(
-                    failure.as_record()
-                    for failure in compare_requested_attestation(
-                        self.user_overrides, attested
-                    )
-                )
                 break
         except IsolatedServerFailure as exc:
             artifact["failures"].append(exc.as_record())
@@ -1600,6 +1754,7 @@ class IsolatedOllamaServer:
             not artifact["failures"]
             and artifact["endpoint_owner_verified"]
             and artifact["job_assignment_verified"]
+            and artifact["model_residency_verified_empty"]
             and artifact["port_closed"]
             and artifact["temporary_space_torn_down"]
             and artifact["orphan_verification"] == "clean"
@@ -1686,10 +1841,14 @@ class IsolatedOllamaServer:
             raise IsolatedServerFailure("job_assignment_failed")
         attempt.readers = [
             threading.Thread(
-                target=attempt.capture.drain, args=(attempt.process.stdout,), daemon=True
+                target=attempt.capture.drain,
+                args=(attempt.process.stdout, attempt.reader_shutdown),
+                daemon=True,
             ),
             threading.Thread(
-                target=attempt.capture.drain, args=(attempt.process.stderr,), daemon=True
+                target=attempt.capture.drain,
+                args=(attempt.process.stderr, attempt.reader_shutdown),
+                daemon=True,
             ),
         ]
         for reader in attempt.readers:
@@ -1723,7 +1882,7 @@ class IsolatedOllamaServer:
                     if exit_code is not None or self._foreign_owner_won_race(
                         attempt, api
                     ):
-                        raise _CandidatePortRace()
+                        raise _CandidatePortRace(owner)
                     raise IsolatedServerFailure("port_hijacked")
                 try:
                     api_raw = self.api_version_probe(
@@ -1803,8 +1962,44 @@ class IsolatedOllamaServer:
                 )
             self.sleeper(0.05)
 
-    def _cleanup_attempt(
+    def _verify_empty_model_residency(
         self, attempt: _ServerAttempt, api: LifecycleApi
+    ) -> None:
+        assert attempt.process is not None and attempt.job is not None
+        self._capture_health(attempt)
+        exit_code = api.process_exit_code(attempt.process)
+        if exit_code is not None:
+            raise IsolatedServerFailure(
+                "startup_process_exit",
+                exit_code=max(0, min(exit_code, MAX_METADATA_NUMBER)),
+            )
+        owner = api.listener_owner(attempt.port)
+        if owner is None:
+            raise IsolatedServerFailure("ownership_probe_unavailable")
+        if owner != attempt.process.process_id and not api.process_id_in_job(
+            attempt.job, owner
+        ):
+            raise IsolatedServerFailure("port_hijacked")
+        try:
+            raw = self.model_residency_probe(
+                attempt.port, MODEL_RESIDENCY_TIMEOUT_SECONDS
+            )
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise IsolatedServerFailure("model_residency_probe_failed") from exc
+        verify_empty_model_residency(raw)
+
+    def _cleanup_attempt(
+        self,
+        attempt: _ServerAttempt,
+        api: LifecycleApi,
+        *,
+        expected_foreign_owner: int | None = None,
     ) -> _CleanupEvidence:
         failures: list[dict[str, Any]] = []
         shutdown = {"method": "not_started", "duration_ms": None}
@@ -1826,12 +2021,12 @@ class IsolatedOllamaServer:
                     )
             except IsolatedServerFailure as exc:
                 failures.append(exc.as_record())
-            for reader in attempt.readers or []:
-                reader.join(timeout=1.0)
-            if (
-                any(reader.is_alive() for reader in attempt.readers or [])
-                or attempt.capture.reader_failed
-            ):
+            if _stop_reader_threads(
+                api=api,
+                process=attempt.process,
+                readers=attempt.readers or [],
+                shutdown=attempt.reader_shutdown,
+            ) or attempt.capture.reader_failed:
                 failures.append(IsolatedServerFailure("log_reader_failed").as_record())
             shutdown = {
                 "method": method,
@@ -1847,11 +2042,28 @@ class IsolatedOllamaServer:
             except IsolatedServerFailure as exc:
                 orphan = "unavailable"
                 failures.append(exc.as_record())
-            for stream in (attempt.process.stdout, attempt.process.stderr):
-                try:
-                    stream.close()
-                except OSError:
-                    failures.append(IsolatedServerFailure("teardown_incomplete").as_record())
+            try:
+                owner = api.listener_owner(attempt.port)
+                if expected_foreign_owner is None:
+                    if owner is None:
+                        port_closed = True
+                    else:
+                        failures.append(IsolatedServerFailure("port_not_closed").as_record())
+                elif owner is None:
+                    port_closed = True
+                elif owner != expected_foreign_owner:
+                    failures.append(IsolatedServerFailure("port_hijacked").as_record())
+                elif owner == attempt.process.process_id or attempt.job is None:
+                    failures.append(IsolatedServerFailure("port_not_closed").as_record())
+                elif api.process_id_in_job(attempt.job, owner):
+                    failures.append(IsolatedServerFailure("port_not_closed").as_record())
+                else:
+                    # The same foreign owner observed at race detection may
+                    # remain.  It is memory-only evidence that our endpoint is
+                    # clear, not a durable identity.
+                    port_closed = True
+            except IsolatedServerFailure as exc:
+                failures.append(exc.as_record())
             for handle in (
                 attempt.process.thread_handle,
                 attempt.process.process_handle,
@@ -1862,13 +2074,14 @@ class IsolatedOllamaServer:
                         api.close_handle(handle)
                     except IsolatedServerFailure as exc:
                         failures.append(exc.as_record())
-        try:
-            if api.listener_owner(attempt.port) is None:
-                port_closed = True
-            else:
-                failures.append(IsolatedServerFailure("port_not_closed").as_record())
-        except IsolatedServerFailure as exc:
-            failures.append(exc.as_record())
+        else:
+            try:
+                if api.listener_owner(attempt.port) is None:
+                    port_closed = True
+                else:
+                    failures.append(IsolatedServerFailure("port_not_closed").as_record())
+            except IsolatedServerFailure as exc:
+                failures.append(exc.as_record())
         try:
             teardown_session_space(attempt.space)
             temp_clean = True
@@ -1915,7 +2128,8 @@ _TOP_KEYS = frozenset(
     {
         "schema_version", "artifact_kind", "captured_at", "runtime_identity",
         "requested_settings", "attested_settings", "endpoint_owner_verified",
-        "job_assignment_verified", "logs", "readiness_duration_ms", "shutdown",
+        "job_assignment_verified", "model_residency_verified_empty", "logs",
+        "readiness_duration_ms", "shutdown",
         "orphan_verification", "port_closed", "temporary_space_torn_down",
         "failures", "overall_diagnostic_evidence_state",
     }
@@ -2053,7 +2267,13 @@ def validate_attestation_artifact(artifact: Any) -> list[str]:
                     problems.append(f"attested_settings.{key} attested value is invalid")
             else:
                 problems.append(f"attested_settings.{key} state is invalid")
-    for key in ("endpoint_owner_verified", "job_assignment_verified", "port_closed", "temporary_space_torn_down"):
+    for key in (
+        "endpoint_owner_verified",
+        "job_assignment_verified",
+        "model_residency_verified_empty",
+        "port_closed",
+        "temporary_space_torn_down",
+    ):
         if not isinstance(artifact[key], bool):
             problems.append(f"{key} must be boolean")
     logs = artifact["logs"]
@@ -2104,6 +2324,7 @@ def validate_attestation_artifact(artifact: Any) -> list[str]:
             artifact[key]
             for key in (
                 "endpoint_owner_verified", "job_assignment_verified",
+                "model_residency_verified_empty",
                 "port_closed", "temporary_space_torn_down",
             )
         ):
@@ -2210,5 +2431,6 @@ def build_dry_run_plan(
         "reviewed_dialect_required": True,
         "reviewed_dialect_registry_entries": len(REVIEWED_DIALECT_REGISTRY),
         "model_access": "none_empty_temp_store",
+        "model_residency_proof": "bounded_owned_get_api_ps_requires_empty",
         "network_scope": "loopback_only",
     }

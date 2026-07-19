@@ -43,7 +43,12 @@ from odysseus_desktop_backend.runtime_bench.isolated_server import (
     teardown_session_space,
     validate_attestation_artifact,
     validate_user_overrides,
+    verify_empty_model_residency,
 )
+
+
+def _empty_model_residency(port: int, timeout: float) -> bytes:
+    return b'{"models":[]}'
 
 
 def test_environment_key_sets_are_separate_and_closed() -> None:
@@ -346,6 +351,20 @@ class FakeAttributeKernel:
         self.initialize_calls = 0
         self.updated_handles: tuple[int, ...] = ()
         self.deleted = 0
+        self.null_opened = False
+
+    def CreateFileW(self, name, access, share, attrs, disposition, flags, template) -> int:
+        self.null_opened = True
+        if self.fail_stage == "null_open":
+            isolated_server.ctypes.set_last_error(5)
+            return isolated_server.ctypes.c_void_p(-1).value
+        security = isolated_server.ctypes.cast(
+            attrs, isolated_server.ctypes.POINTER(isolated_server._WinSecurityAttributes)
+        ).contents
+        assert name == "NUL"
+        assert access == WindowsLifecycleApi.GENERIC_READ
+        assert security.bInheritHandle == 1
+        return 10
 
     def InitializeProcThreadAttributeList(self, target, count, flags, size_pointer) -> int:
         self.initialize_calls += 1
@@ -363,7 +382,7 @@ class FakeAttributeKernel:
     ) -> int:
         handle_array = isolated_server.ctypes.cast(
             value,
-            isolated_server.ctypes.POINTER(isolated_server.ctypes.c_void_p * 2),
+            isolated_server.ctypes.POINTER(isolated_server.ctypes.c_void_p * 3),
         ).contents
         self.updated_handles = tuple(int(handle or 0) for handle in handle_array)
         return 0 if self.fail_stage == "update" else 1
@@ -380,13 +399,16 @@ def _attribute_api(kernel: FakeAttributeKernel) -> WindowsLifecycleApi:
     return api
 
 
-def test_startupinfoex_inherits_only_stdout_and_stderr_handles() -> None:
+def test_startupinfoex_inherits_only_null_stdin_stdout_and_stderr_handles() -> None:
     kernel = FakeAttributeKernel()
     api = _attribute_api(kernel)
-    attributes = api._create_attribute_list(11, 12)
+    stdin_read = api._open_null_stdin()
+    attributes = api._create_attribute_list(stdin_read, 11, 12)
     api._delete_attribute_list(attributes)
-    assert kernel.updated_handles == (11, 12)
+    assert kernel.updated_handles == (10, 11, 12)
+    assert 0 not in kernel.updated_handles  # parent/terminal stdin
     assert 999 not in kernel.updated_handles  # unrelated inheritable parent handle
+    assert kernel.null_opened is True
     assert kernel.deleted == 1
 
 
@@ -394,12 +416,167 @@ def test_startupinfoex_inherits_only_stdout_and_stderr_handles() -> None:
 def test_attribute_list_api_failures_are_closed(stage: str) -> None:
     api = _attribute_api(FakeAttributeKernel(fail_stage=stage))
     with pytest.raises(IsolatedServerFailure, match="process_attribute_list_failed"):
-        api._create_attribute_list(11, 12)
+        api._create_attribute_list(10, 11, 12)
+
+
+def test_null_stdin_open_failure_is_closed() -> None:
+    api = _attribute_api(FakeAttributeKernel(fail_stage="null_open"))
+    with pytest.raises(IsolatedServerFailure, match="process_create_failed"):
+        api._open_null_stdin()
+
+
+def test_pipe_write_is_inheritable_and_parent_read_endpoint_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PipeKernel:
+        def __init__(self) -> None:
+            self.security_inherit = None
+            self.handle_update = None
+
+        def CreatePipe(self, read_pointer, write_pointer, attrs, size) -> int:
+            security = isolated_server.ctypes.cast(
+                attrs,
+                isolated_server.ctypes.POINTER(isolated_server._WinSecurityAttributes),
+            ).contents
+            self.security_inherit = security.bInheritHandle
+            isolated_server.ctypes.cast(
+                read_pointer, isolated_server.ctypes.POINTER(isolated_server.ctypes.c_void_p)
+            )[0] = 20
+            isolated_server.ctypes.cast(
+                write_pointer, isolated_server.ctypes.POINTER(isolated_server.ctypes.c_void_p)
+            )[0] = 21
+            return 1
+
+        def SetHandleInformation(self, handle, mask, flags) -> int:
+            self.handle_update = (int(handle.value), mask, flags)
+            return 1
+
+    kernel = PipeKernel()
+    api = object.__new__(WindowsLifecycleApi)
+    api.kernel32 = kernel
+    monkeypatch.setattr("msvcrt.open_osfhandle", lambda handle, flags: 123)
+    parent_read = io.BytesIO()
+    monkeypatch.setattr(isolated_server.os, "fdopen", lambda fd, mode, buffering: parent_read)
+    write_handle, returned_read = api._pipe()
+    assert write_handle.value == 21
+    assert returned_read is parent_read
+    assert kernel.security_inherit == 1
+    assert kernel.handle_update == (20, WindowsLifecycleApi.HANDLE_FLAG_INHERIT, 0)
+
+
+class FakeCreateProcessKernel:
+    def __init__(self) -> None:
+        self.startup_handles: tuple[int, int, int] | None = None
+
+    def CreateProcessW(
+        self, executable, command, process_attrs, thread_attrs, inherit, flags,
+        environment, cwd, startup_pointer, process_pointer
+    ) -> int:
+        startup = isolated_server.ctypes.cast(
+            startup_pointer, isolated_server.ctypes.POINTER(isolated_server._WinStartupInfoEx)
+        ).contents.StartupInfo
+        self.startup_handles = (
+            int(startup.hStdInput or 0),
+            int(startup.hStdOutput or 0),
+            int(startup.hStdError or 0),
+        )
+        process = isolated_server.ctypes.cast(
+            process_pointer,
+            isolated_server.ctypes.POINTER(isolated_server._WinProcessInformation),
+        ).contents
+        process.hProcess = 30
+        process.hThread = 31
+        process.dwProcessId = 32
+        return 1
+
+
+def _create_process_api(*, fail_null_close: bool = False):
+    api = object.__new__(WindowsLifecycleApi)
+    api.kernel32 = FakeCreateProcessKernel()
+    reads = iter((io.BytesIO(), io.BytesIO()))
+    writes = iter((11, 12))
+    closed: list[int] = []
+    aborted: list[bool] = []
+    api._open_null_stdin = lambda: 10
+    api._pipe = lambda: (next(writes), next(reads))
+    api._create_attribute_list = lambda stdin, stdout, stderr: (
+        isolated_server._ProcessAttributeList(
+            None,
+            isolated_server.ctypes.c_void_p(99),
+            (stdin, stdout, stderr),
+        )
+    )
+    api._delete_attribute_list = lambda attributes: None
+
+    def close_handle(handle) -> None:
+        value = int(handle.value) if hasattr(handle, "value") else int(handle)
+        closed.append(value)
+        if fail_null_close and value == 10:
+            raise IsolatedServerFailure("teardown_incomplete")
+
+    api.close_handle = close_handle
+    api._abort_created_suspended = lambda process: aborted.append(True)
+    return api, closed, aborted
+
+
+def test_create_process_uses_matching_three_handle_stdio_and_closes_child_ends() -> None:
+    api, closed, aborted = _create_process_api()
+    process = api.create_suspended(Path("C:/fixture/ollama.exe"), ("--version",), {})
+    assert api.kernel32.startup_handles == (10, 11, 12)
+    assert closed == [10, 11, 12]
+    assert aborted == []
+    assert process.process_id == 32
+
+
+def test_null_parent_handle_close_failure_aborts_suspended_child_and_is_closed() -> None:
+    api, closed, aborted = _create_process_api(fail_null_close=True)
+    with pytest.raises(IsolatedServerFailure, match="process_attribute_list_cleanup_failed"):
+        api.create_suspended(Path("C:/fixture/ollama.exe"), ("serve",), {})
+    assert closed == [10, 11, 12]
+    assert aborted == [True]
+
+
+def test_windows_reader_cancellation_targets_exact_reader_thread() -> None:
+    class CancelKernel:
+        def __init__(self) -> None:
+            self.opened_thread_id = None
+            self.cancelled_handle = None
+            self.closed_handle = None
+
+        def OpenThread(self, access, inherit, thread_id) -> int:
+            assert access == WindowsLifecycleApi.THREAD_TERMINATE
+            assert inherit is False
+            self.opened_thread_id = thread_id
+            return 40
+
+        def CancelSynchronousIo(self, handle) -> int:
+            self.cancelled_handle = handle
+            return 1
+
+        def CloseHandle(self, handle) -> int:
+            self.closed_handle = handle
+            return 1
+
+    release = threading.Event()
+    reader = threading.Thread(target=release.wait, daemon=True)
+    reader.start()
+    try:
+        kernel = CancelKernel()
+        api = object.__new__(WindowsLifecycleApi)
+        api.kernel32 = kernel
+        api.cancel_reader(reader)
+        assert kernel.opened_thread_id == reader.native_id
+        assert kernel.cancelled_handle == 40
+        assert kernel.closed_handle == 40
+    finally:
+        release.set()
+        reader.join(timeout=1.0)
+    assert not reader.is_alive()
 
 
 def test_attribute_list_cleanup_failure_is_closed() -> None:
     api = _attribute_api(FakeAttributeKernel(fail_stage="delete"))
-    attributes = api._create_attribute_list(11, 12)
+    attributes = api._create_attribute_list(10, 11, 12)
     with pytest.raises(IsolatedServerFailure, match="process_attribute_list_cleanup_failed"):
         api._delete_attribute_list(attributes)
 
@@ -536,6 +713,9 @@ class FakeLifecycleApi:
 
     def close_handle(self, handle: str) -> None:
         self.calls.append(f"close_{handle}")
+
+    def cancel_reader(self, reader: threading.Thread) -> None:
+        self.calls.append("cancel_reader")
 
 
 def _owned_version_fixture(
@@ -732,6 +912,7 @@ def test_job_member_listener_is_owned_but_foreign_listener_is_never_contacted(
         executable,
         api=owned,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         temp_parent=tmp_path,
     ).run()
     assert artifact["endpoint_owner_verified"] is True
@@ -749,6 +930,7 @@ def test_job_member_listener_is_owned_but_foreign_listener_is_never_contacted(
         executable,
         api=foreign,
         api_version_probe=forbidden_probe,
+        model_residency_probe=_empty_model_residency,
         temp_parent=tmp_path,
     ).run()
     assert "port_hijacked" in {failure["category"] for failure in artifact["failures"]}
@@ -766,6 +948,7 @@ def test_pre_assignment_failure_directly_terminates_suspended_process(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         temp_parent=tmp_path,
     ).run()
     assert [failure["category"] for failure in artifact["failures"]] == [
@@ -785,6 +968,7 @@ def test_synthetic_end_to_end_lifecycle_produces_private_closed_artifact(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         temp_parent=tmp_path,
     ).run()
     assert validate_attestation_artifact(artifact) == []
@@ -812,6 +996,7 @@ def test_synthetic_orphan_is_reported_without_persisting_process_identity(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         temp_parent=tmp_path,
     ).run()
     assert artifact["orphan_verification"] == "survivor_detected"
@@ -897,6 +1082,7 @@ def test_attestation_waits_for_configuration_logs_after_api_readiness(
         executable,
         api=api,
         api_version_probe=version_api,
+        model_residency_probe=_empty_model_residency,
         sleeper=release_after_readiness,
         temp_parent=tmp_path,
     ).run()
@@ -917,6 +1103,7 @@ def test_attestation_deadline_is_separate_and_bounded(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         attestation_timeout_seconds=0.2,
         clock=clock,
         sleeper=clock.sleep,
@@ -964,6 +1151,7 @@ def test_readiness_duration_excludes_all_prelaunch_work(
         executable,
         api=api,
         api_version_probe=api_probe,
+        model_residency_probe=_empty_model_residency,
         clock=clock,
         sleeper=clock.sleep,
         temp_parent=tmp_path,
@@ -997,6 +1185,7 @@ def test_executable_replacement_is_detected_before_server_resume(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         temp_parent=tmp_path,
     ).run()
     assert [failure["category"] for failure in artifact["failures"]] == [
@@ -1013,6 +1202,7 @@ class BindRaceApi(FakeLifecycleApi):
         super().__init__()
         self.races_remaining = races
         self.racing_processes: set[int] = set()
+        self.racing_ports: dict[int, int] = {}
 
     def create_suspended(
         self, executable: Path, arguments: tuple[str, ...], environment: dict[str, str]
@@ -1021,11 +1211,13 @@ class BindRaceApi(FakeLifecycleApi):
         if arguments == ("serve",) and self.races_remaining > 0:
             self.races_remaining -= 1
             self.racing_processes.add(process.process_id)
+            self.racing_ports[
+                int(environment["OLLAMA_HOST"].rsplit(":", 1)[1])
+            ] = process.process_id
         return process
 
     def listener_owner(self, port: int) -> int | None:
-        active = self.active_server_id
-        if active in self.racing_processes and active not in self.terminated:
+        if port in self.racing_ports:
             self.calls.append("listener_owner_race")
             return 7777
         return super().listener_owner(port)
@@ -1050,6 +1242,7 @@ def test_genuine_bind_race_retries_full_clean_attempt(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         launch_attempts=3,
         temp_parent=tmp_path,
     ).run()
@@ -1060,9 +1253,9 @@ def test_genuine_bind_race_retries_full_clean_attempt(
         if args == ("serve",)
     ]
     assert len(set(server_ports)) == 2
-    first_post = api.calls.index("listener_owner_post")
+    first_cleanup = api.calls.index("process_id_in_job")
     second_create = api.calls.index("create_suspended_server", api.calls.index("create_suspended_server") + 1)
-    assert first_post < second_create
+    assert first_cleanup < second_create
     assert all(process.stdout.closed and process.stderr.closed for process in api.processes.values())
     assert list(tmp_path.glob("odysseus-ollama-attest-*")) == []
 
@@ -1080,6 +1273,7 @@ def test_exhausted_bind_races_report_bounded_attempt_count(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         launch_attempts=3,
         temp_parent=tmp_path,
     ).run()
@@ -1088,6 +1282,56 @@ def test_exhausted_bind_races_report_bounded_attempt_count(
     )
     assert failure["numeric_metadata"] == {"attempts": 3}
     assert api.arguments.count(("serve",)) == 3
+
+
+class MutatingRaceOwnerApi(BindRaceApi):
+    def __init__(self, cleanup_state: str) -> None:
+        super().__init__(races=1)
+        self.cleanup_state = cleanup_state
+
+    def listener_owner(self, port: int) -> int | None:
+        process_id = self.racing_ports.get(port)
+        if process_id is not None and process_id in self.terminated:
+            if self.cleanup_state == "changed":
+                return 8888
+            if self.cleanup_state == "owned":
+                return process_id
+            if self.cleanup_state == "uncertain":
+                raise IsolatedServerFailure("ownership_probe_unavailable", win32_code=5)
+        return super().listener_owner(port)
+
+
+@pytest.mark.parametrize(
+    ("cleanup_state", "expected_category"),
+    [
+        ("changed", "port_hijacked"),
+        ("owned", "port_hijacked"),
+        ("uncertain", "ownership_probe_unavailable"),
+    ],
+)
+def test_bind_race_cleanup_ambiguity_never_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_state: str,
+    expected_category: str,
+) -> None:
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"bind cleanup uncertainty fixture")
+    _register_test_dialect(monkeypatch, executable)
+    monkeypatch.setattr(isolated_server, "choose_loopback_port", lambda exclusions: 50201)
+    api = MutatingRaceOwnerApi(cleanup_state)
+    artifact = IsolatedOllamaServer(
+        executable,
+        api=api,
+        api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
+        launch_attempts=3,
+        temp_parent=tmp_path,
+    ).run()
+    assert expected_category in {
+        failure["category"] for failure in artifact["failures"]
+    }
+    assert api.arguments.count(("serve",)) == 1
 
 
 class ArbitraryCrashApi(FakeLifecycleApi):
@@ -1112,6 +1356,7 @@ def test_non_bind_process_failure_is_never_retried(
         executable,
         api=api,
         api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
         launch_attempts=3,
         temp_parent=tmp_path,
     ).run()
@@ -1119,6 +1364,299 @@ def test_non_bind_process_failure_is_never_retried(
         failure["category"] for failure in artifact["failures"]
     }
     assert api.arguments.count(("serve",)) == 1
+
+
+def test_empty_model_residency_response_is_closed_and_valid() -> None:
+    verify_empty_model_residency(b'{"models":[]}')
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"not-json",
+        b"[]",
+        b'{}',
+        b'{"models":null}',
+        b'{"models":[],"extra":true}',
+        b'{"models":[],"models":[]}',
+    ],
+)
+def test_malformed_model_residency_response_fails_closed(payload: bytes) -> None:
+    with pytest.raises(IsolatedServerFailure, match="model_residency_probe_failed"):
+        verify_empty_model_residency(payload)
+
+
+def test_nonempty_model_residency_response_is_typed_without_leaking_model() -> None:
+    with pytest.raises(IsolatedServerFailure, match="unexpected_model_residency") as exc:
+        verify_empty_model_residency(b'{"models":[{"name":"private-model"}]}')
+    assert "private-model" not in str(exc.value)
+
+
+def test_oversized_model_residency_response_is_bounded() -> None:
+    payload = b"x" * (isolated_server.MAX_MODEL_RESIDENCY_RESPONSE_BYTES + 1)
+    with pytest.raises(IsolatedServerFailure, match="model_residency_probe_failed") as exc:
+        verify_empty_model_residency(payload)
+    assert exc.value.numeric_metadata == {"bytes_observed": len(payload)}
+
+
+def test_default_model_residency_probe_makes_only_bounded_get_api_ps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, str, int]] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def read(self, size: int) -> bytes:
+            observed.append((request.get_method(), request.full_url, size))
+            return b'{"models":[]}'
+
+    def fake_urlopen(probe_request, timeout: float):
+        nonlocal request
+        request = probe_request
+        assert timeout == isolated_server.MODEL_RESIDENCY_TIMEOUT_SECONDS
+        return Response()
+
+    request = None
+    monkeypatch.setattr(isolated_server.urllib.request, "urlopen", fake_urlopen)
+    raw = isolated_server._default_model_residency(
+        54321, isolated_server.MODEL_RESIDENCY_TIMEOUT_SECONDS
+    )
+    verify_empty_model_residency(raw)
+    assert observed == [
+        (
+            "GET",
+            "http://127.0.0.1:54321/api/ps",
+            isolated_server.MAX_MODEL_RESIDENCY_RESPONSE_BYTES + 1,
+        )
+    ]
+    assert not any(token in observed[0][1] for token in ("generate", "load", "unload"))
+
+
+class ResidencyOwnerChangeApi(FakeLifecycleApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_owner_probes = 0
+
+    def listener_owner(self, port: int) -> int | None:
+        active = self.active_server_id
+        if active is not None and active not in self.terminated:
+            self.active_owner_probes += 1
+            if self.active_owner_probes >= 2:
+                return 7777
+        return super().listener_owner(port)
+
+
+def test_ownership_change_before_api_ps_prevents_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"residency ownership fixture")
+    _register_test_dialect(monkeypatch, executable)
+    contacted = False
+
+    def forbidden_residency(port: int, timeout: float) -> bytes:
+        nonlocal contacted
+        contacted = True
+        return b'{"models":[]}'
+
+    api = ResidencyOwnerChangeApi()
+    artifact = IsolatedOllamaServer(
+        executable,
+        api=api,
+        api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=forbidden_residency,
+        temp_parent=tmp_path,
+    ).run()
+    assert "port_hijacked" in {
+        failure["category"] for failure in artifact["failures"]
+    }
+    assert artifact["model_residency_verified_empty"] is False
+    assert contacted is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "category"),
+    [
+        (b"malformed", "model_residency_probe_failed"),
+        (b'{"models":[{"name":"private-model"}]}', "unexpected_model_residency"),
+        (
+            b"x" * (isolated_server.MAX_MODEL_RESIDENCY_RESPONSE_BYTES + 1),
+            "model_residency_probe_failed",
+        ),
+    ],
+)
+def test_model_residency_failures_are_privacy_safe_artifact_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    category: str,
+) -> None:
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"residency failure fixture")
+    _register_test_dialect(monkeypatch, executable)
+    artifact = IsolatedOllamaServer(
+        executable,
+        api=FakeLifecycleApi(),
+        api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=lambda port, timeout: payload,
+        temp_parent=tmp_path,
+    ).run()
+    assert category in {failure["category"] for failure in artifact["failures"]}
+    assert artifact["model_residency_verified_empty"] is False
+    assert "private-model" not in json.dumps(artifact)
+
+
+class BlockingReadPipe:
+    def __init__(self, *, close_raises: bool = False, close_releases: bool = True) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.close_raises = close_raises
+        self.close_releases = close_releases
+
+    def read(self, size: int) -> bytes:
+        self.entered.set()
+        self.release.wait()
+        self.finished.set()
+        return b""
+
+    def close(self) -> None:
+        if self.close_releases:
+            self.release.set()
+        if self.close_raises:
+            raise OSError("synthetic close failure")
+
+
+class PayloadThenBlockingPipe(BlockingReadPipe):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(close_releases=False)
+        self.payload = payload
+        self.payload_sent = False
+
+    def read(self, size: int) -> bytes:
+        if not self.payload_sent:
+            self.payload_sent = True
+            return self.payload
+        return super().read(size)
+
+
+class ReaderCancellationApi:
+    def __init__(self, pipes: list[BlockingReadPipe], *, release_on_cancel: int | None = None) -> None:
+        self.pipes = pipes
+        self.release_on_cancel = release_on_cancel
+        self.cancel_calls = 0
+
+    def cancel_reader(self, reader: threading.Thread) -> None:
+        self.cancel_calls += 1
+        if self.release_on_cancel is not None and self.cancel_calls >= self.release_on_cancel:
+            for pipe in self.pipes:
+                pipe.release.set()
+
+
+def _reader_cleanup_fixture(
+    stdout,
+    stderr,
+    api: ReaderCancellationApi,
+) -> tuple[bool, list[threading.Thread]]:
+    capture = isolated_server.BoundedVersionCapture()
+    shutdown = threading.Event()
+    process = CreatedProcess(1, "process", "thread", stdout, stderr)
+    readers = [
+        threading.Thread(target=capture.drain, args=(stdout, shutdown), daemon=True),
+        threading.Thread(target=capture.drain, args=(stderr, shutdown), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    for pipe in (stdout, stderr):
+        if isinstance(pipe, BlockingReadPipe):
+            assert pipe.entered.wait(timeout=1.0)
+    failed = isolated_server._stop_reader_threads(
+        api=api, process=process, readers=readers, shutdown=shutdown
+    )
+    return failed, readers
+
+
+def test_reader_blocked_until_close_is_stopped_before_cleanup_returns() -> None:
+    blocked = BlockingReadPipe()
+    api = ReaderCancellationApi([blocked])
+    failed, readers = _reader_cleanup_fixture(blocked, io.BytesIO(), api)
+    assert failed is False
+    assert blocked.finished.is_set()
+    assert all(not reader.is_alive() for reader in readers)
+
+
+def test_one_finished_reader_and_one_process_termination_ignoring_reader_are_contained() -> None:
+    blocked = BlockingReadPipe(close_releases=False)
+    api = ReaderCancellationApi([blocked], release_on_cancel=1)
+    failed, readers = _reader_cleanup_fixture(io.BytesIO(), blocked, api)
+    assert failed is False
+    assert api.cancel_calls >= 1
+    assert all(not reader.is_alive() for reader in readers)
+
+
+def test_reader_stream_close_failure_is_cleanup_failure_without_survivor() -> None:
+    blocked = BlockingReadPipe(close_raises=True)
+    api = ReaderCancellationApi([blocked])
+    failed, readers = _reader_cleanup_fixture(blocked, io.BytesIO(), api)
+    assert failed is True
+    assert all(not reader.is_alive() for reader in readers)
+
+
+def test_reader_final_join_deadline_failure_is_contained_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = BlockingReadPipe(close_releases=False)
+    api = ReaderCancellationApi([blocked], release_on_cancel=2)
+    monkeypatch.setattr(isolated_server, "READER_JOIN_TIMEOUT_SECONDS", 0.01)
+    failed, readers = _reader_cleanup_fixture(blocked, io.BytesIO(), api)
+    assert failed is True
+    assert api.cancel_calls >= 2
+    assert all(not reader.is_alive() for reader in readers)
+
+
+class BlockingServerReaderApi(FakeLifecycleApi):
+    def __init__(self) -> None:
+        super().__init__(logs=b"")
+        self.blocked = PayloadThenBlockingPipe(
+            b"server_version=0.32.1 noprune=true no_cloud=true"
+        )
+
+    def create_suspended(
+        self, executable: Path, arguments: tuple[str, ...], environment: dict[str, str]
+    ) -> CreatedProcess:
+        process = super().create_suspended(executable, arguments, environment)
+        if arguments == ("serve",):
+            process.stdout = self.blocked
+        return process
+
+    def cancel_reader(self, reader: threading.Thread) -> None:
+        super().cancel_reader(reader)
+        self.blocked.release.set()
+
+
+def test_blocked_server_log_reader_is_cancelled_and_joined_before_complete_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"blocked server reader fixture")
+    _register_test_dialect(monkeypatch, executable)
+    api = BlockingServerReaderApi()
+    artifact = IsolatedOllamaServer(
+        executable,
+        api=api,
+        api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_model_residency,
+        temp_parent=tmp_path,
+    ).run()
+    assert artifact["overall_diagnostic_evidence_state"] == "complete"
+    assert artifact["failures"] == []
+    assert api.blocked.finished.is_set()
+    assert "cancel_reader" in api.calls
 
 
 def test_attestation_artifact_schema_rejects_unknown_and_private_fields(tmp_path: Path) -> None:

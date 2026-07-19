@@ -1,6 +1,6 @@
 # Isolated Ollama Benchmark Server Strategy
 
-Status: PROPOSED, revision 4 — dev-only measurement-infrastructure
+Status: PROPOSED, revision 5 — dev-only measurement-infrastructure
 design (Fable, 2026-07-19; revised same day after maintainer review and
 Phase 1 contract correction). No real servers or models were run and
 nothing was downloaded or installed. PRs #33 / #35 / #36 / #37 are
@@ -44,6 +44,16 @@ and the suspended process image plus executable hash are revalidated before
 assignment/resume. The registry intentionally contains no entry for the
 installed binary in this correction cycle. Registering that binary's
 reviewed dialect is a separate prerequisite before human G-ISO-0 execution.
+
+Revision 5 final Phase 1 review corrections: every child receives valid
+stdio through an exact three-handle allowlist containing a launcher-owned
+read-only Windows NUL handle plus the stdout/stderr pipe writers; race cleanup
+may tolerate only the same observed foreign listener after proving every
+benchmark-owned resource is gone; G-ISO-0 now requires a bounded owned
+`GET /api/ps` proof of zero resident models; and exact-thread Windows I/O
+cancellation, closed parent read endpoints, and a final bounded join prevent
+reader helpers from surviving cleanup. The dialect registry remains empty and
+no real runtime, service, or model store was touched.
 
 Authority notes:
 
@@ -308,8 +318,11 @@ overrides.
   that port. A retry requires proof of a genuine race: a foreign listener
   owns the previously free candidate and our child exits before contact.
   The whole failed attempt is terminated and must prove no descendants,
-  stopped readers, closed handles, released port, and removed temporary
-  space before a fresh candidate is tried. Job, identity, log, attestation,
+  stopped readers, closed handles, no benchmark-owned listener, and removed
+  temporary space before a fresh candidate is tried. The exact foreign owner
+  observed during race detection may remain ephemerally; it is never persisted.
+  A missing, changed, ambiguous, or benchmark/job-owned cleanup result fails
+  closed rather than retrying. Job, identity, log, attestation,
   and arbitrary process failures are never retried. Exhaustion reports
   `port_bind_failed` with the bounded outer attempt count.
 - **Ownership is verified before the first HTTP request**: once the
@@ -320,8 +333,9 @@ overrides.
   `port_hijacked` and invalidates the session — no request is ever
   sent to a socket the harness has not proven it owns.
 - After teardown, the harness re-reads the TCP table and confirms the
-  benchmark port has **no listener**; a survivor is
-  `port_not_closed` (§4).
+  benchmark port has **no listener**; a survivor is `port_not_closed` (§4).
+  This strict final rule is distinct from an intermediate proved bind-race
+  cleanup, which may tolerate only the unchanged foreign owner described above.
 - The ordinary service's endpoint — whatever it is (§3.5) — is
   excluded from candidate selection. No fixed port number, including
   11434, is assumed or hardcoded as *the* ordinary port; discovery
@@ -414,9 +428,12 @@ The child is a tree (`ollama serve` → runner subprocess, §2.2). Rules:
    Process creation uses `STARTUPINFOEX`,
    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and
    `EXTENDED_STARTUPINFO_PRESENT`; the explicit inheritance list contains
-   exactly the stdout and stderr pipe write handles. No stdin or unrelated
-   inheritable parent handle reaches either child. Every attribute-list API
-   result is checked and the list is deleted during creation cleanup.
+   exactly a benchmark-opened read-only Windows NUL stdin handle and the stdout
+   and stderr pipe write handles. All three are explicitly inheritable; parent
+   pipe readers are explicitly non-inheritable. The parent terminal stdin and
+   every unrelated handle are absent. All three `STARTF_USESTDHANDLES` fields
+   match these valid handles, and the parent NUL/writer handles plus attribute
+   list are closed with checked results immediately after process creation.
 2. **Graceful-first shutdown.** End of session: unload via
    `keep_alive: 0`, poll `/api/ps` until empty (bounded, reusing the
    existing 30 s cancel-poll discipline), then terminate the job.
@@ -461,6 +478,13 @@ dialect is observed. Process exit, overflow, and reader failure remain
 fatal during this interval. Deadline expiry yields `attestation_missing`
 with bounded timeout metadata; there is no scheduling-only `sleep(0)` path.
 
+Cleanup first terminates and waits for the owned process tree, then cancels any
+remaining synchronous pipe read through `CancelSynchronousIo` on the exact
+reader thread, closes both parent read endpoints, and performs a final bounded
+join. A missed deadline or close/cancellation failure is typed cleanup failure;
+no retry or complete artifact is possible. A containment join prevents return
+while any helper thread is still alive.
+
 **Raw logs are never persisted.** They are parsed in memory into typed
 attestation records (§6) and then discarded. Durable artifacts contain
 **no** PID, no port number, no executable path, no model-store or
@@ -479,7 +503,7 @@ reuse performance schema v3:
 - requested typed settings, using only `loopback: true` and
   `store_kind: empty_temp` markers for the generated endpoint/store;
 - attested typed settings and their closed sources;
-- endpoint-owner and job-assignment booleans;
+- endpoint-owner, job-assignment, and `model_residency_verified_empty` booleans;
 - bounded log counts and truncation state;
 - readiness duration;
 - shutdown method and duration;
@@ -513,7 +537,7 @@ length, contain exactly one capture group, use only allowlisted setting
 names and sources, and include mandatory Phase 1 `noprune` and `no_cloud`
 markers. Caller-supplied regexes or fixture paths are forbidden. An unknown
 hash is rejected before either `--version` or `serve` starts as
-`attestation_dialect_unavailable`. The empty registry in revision 4 is
+`attestation_dialect_unavailable`. The empty registry in revision 5 is
 intentional: it prevents the CLI from implying that G-ISO-0 can complete
 before the installed binary's dialect has been independently reviewed and
 committed.
@@ -522,6 +546,7 @@ committed.
 | --- | --- | --- |
 | `runtime_identity` (§2.6 normalized bind) | file hash, `--version`, `/api/version`, optional startup log | one specific binary served this session |
 | `endpoint_owner_verified` | TCP table, pre-first-request (§3.3) | it is *our* server |
+| `model_residency_verified_empty` | bounded owned `GET /api/ps` after config attestation | the isolated empty-store server has zero resident models |
 | `effective_env_report` (typed subset) | startup config report (envconfig `Values()`) | env the server parsed — incl. noprune and no-cloud |
 | `flash_attention_applied` (`on`/`off`/`auto`/`unattested`) | runner launch line | flag handed to the runner |
 | `kv_cache_type_applied` (type or `unattested`) | runner launch line | flag handed to the runner |
@@ -562,7 +587,7 @@ G-ISO-0, §11), and deliberately inert:
 **Separate prerequisite before approval/execution:** resolve and hash the
 installed binary without launching it, independently review synthetic/raw
 log samples outside this implementation run, and commit a validated dialect
-entry for that exact SHA-256. Revision 4 deliberately does not invent or
+entry for that exact SHA-256. Revision 5 deliberately does not invent or
 register the installed binary's dialect. Until that prerequisite lands,
 the real CLI fails `attestation_dialect_unavailable` before process creation;
 the approval flag alone is insufficient.
@@ -573,6 +598,15 @@ the approval flag alone is insufficient.
 - **temporary home/profile** (§3.2);
 - **no model load, no inference** — the only requests are
   `/api/version` and `/api/ps` (expected empty).
+
+Immediately before `GET /api/ps`, TCP ownership is reverified against the
+child/Job Object. The response read is capped at 8 KiB and must have the exact
+closed shape `{"models": []}`. Only the boolean
+`model_residency_verified_empty` persists; model names, digests, sizes, raw
+JSON, endpoint, port, and owner identity remain memory-only. Malformed or
+oversized evidence is `model_residency_probe_failed`; any entry in `models` is
+`unexpected_model_residency`. A complete G-ISO-0 artifact requires the boolean
+to be true.
 
 Its sole purpose is to prove the mechanism itself, on the installed
 binary, before any model is ever involved:
@@ -587,7 +621,8 @@ binary, before any model is ever involved:
    §3.4);
 5. log capture stays within bounds and parses into typed records;
 6. Job Object teardown leaves zero survivors (orphan scan clean);
-7. the benchmark port has no listener after teardown.
+7. the bounded owned `/api/ps` proof reports zero resident models;
+8. the benchmark port has no listener after teardown.
 
 Every proof lands in a typed attestation artifact (§5 rules apply —
 no paths, no PIDs, no ports, no raw logs). Only after this artifact
@@ -726,6 +761,8 @@ string.
 | `version_probe_output_overflow` | combined version output exceeds 4 KiB | launch |
 | `version_probe_failed` | owned version probe exits nonzero, emits no usable output, or its reader fails | launch |
 | `version_probe_cleanup_failed` | probe tree/reader/handle/temporary cleanup cannot be proven | launch |
+| `model_residency_probe_failed` | bounded owned `/api/ps` response is unavailable, malformed, or oversized | session |
+| `unexpected_model_residency` | owned isolated `/api/ps` reports one or more resident models | launch attestation |
 | `runtime_identity_mismatch` | required normalized versions disagree, or a parseable startup version disagrees (§2.6) | session; batch if the binary changed mid-batch |
 | `attestation_missing` | arm-defining field `unattested` (§6.2) | session for verdicts |
 | `attestation_mismatch` | requested ≠ attested on arm-defining field (§6.3) | session as intended arm |
@@ -905,9 +942,11 @@ loopback-only:
       HTTP request; port_hijacked on mismatch. Post-teardown
       port-closure check; port_not_closed on survivor. Retry only a
       proven foreign-owner + child-exit bind race, and only after full
-      tree/reader/handle/port/temp cleanup.
+      tree/reader/handle/temp cleanup plus proof that any persistent listener
+      is the unchanged observed foreign owner and not in the benchmark job.
    e) Windows Job Object ownership per section 4: CREATE_SUSPENDED ->
-      STARTUPINFOEX with an exact stdout/stderr HANDLE_LIST ->
+      STARTUPINFOEX with an exact read-only NUL stdin + stdout/stderr writers
+      HANDLE_LIST (never parent stdin) ->
       CreateJobObjectW -> SetInformationJobObject with
       JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE -> AssignProcessToJobObject
       -> verify (job_assignment_verified) -> ResumeThread. Bounded
@@ -921,7 +960,10 @@ loopback-only:
       (default 30 s), then a separate bounded mandatory-marker
       attestation deadline (default 10 s) -> startup_timeout /
       startup_log_overflow. Raw capture is never written to disk and
-      is discarded after parsing.
+      is discarded after parsing. After tree termination/wait, cancel exact
+      blocked reader threads with checked CancelSynchronousIo, close parent
+      read endpoints, perform a final bounded join, and never return/retry
+      while a helper survives.
    g) Typed startup attestation per section 6: parse (fixture-driven
       through a closed committed SHA-256 registry, never caller regex) the
       startup config report and, when present, the runner launch
@@ -932,6 +974,10 @@ loopback-only:
       artifact_kind isolated_ollama_server_attestation contract in
       section 5. It contains no pid, port, path, raw excerpt, command
       line, prompt, generated output, or schema-v3 performance field.
+      After configuration attestation, reverify endpoint ownership and perform
+      one bounded read-only GET /api/ps. Require the exact empty models shape
+      and persist only model_residency_verified_empty=true; a complete artifact
+      requires it.
 
 2. Failure categories: implement exactly the section 9 categories
    reachable in Phase 1, including platform/executable/temp failures,
