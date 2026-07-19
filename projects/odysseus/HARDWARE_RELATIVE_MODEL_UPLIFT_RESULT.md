@@ -93,6 +93,10 @@ equal. Fixed invalid reasons are:
 - `duplicate_execution_order`
 - `unbalanced_execution_order`
 - `repetition_set_mismatch`
+- `file_identity_missing`
+- `tokenizer_identity_missing`
+- `template_identity_missing`
+- `runtime_identity_missing`
 
 GPU unavailability is represented as an explicit fixed state with null byte
 measurements. It is never silently converted to zero. A malformed input is
@@ -104,15 +108,30 @@ The harness reuses the reviewed PR #35 RAM policy by exact value:
 
 `safety floor = max(1.5 GiB, 12% of total physical RAM)`
 
-The pre-arm estimator mirrors PR #35 known/unknown semantics. A positive disk
-size is known; otherwise a valid parameter count uses the reviewed Q2, Q3, Q4,
-Q5, Q6, Q8, F16/FP16/BF16, or F32/FP32 multiplier. Complete positive KV
-geometry uses the architecture formula; partial geometry uses the conservative
-512 KiB/token value but remains unknown. It records `weights_bytes`,
+The pre-arm estimator mirrors PR #35 known/unknown semantics. A positive
+integral disk size is known; otherwise a supported, strictly positive parameter
+count uses the reviewed Q2, Q3, Q4, Q5, Q6, Q8, F16/FP16/BF16, or F32/FP32
+multiplier. Boolean, zero, negative, non-integral, or malformed disk/parameter
+metadata is malformed rather than coerced. Complete positive integral KV
+geometry uses the architecture formula; boolean, zero, negative, or fractional
+geometry is malformed. Missing/partial geometry uses the conservative 512
+KiB/token value but remains unknown. It records `weights_bytes`,
 `kv_cache_bytes`, `total_bytes`, `weights_known`, `kv_geometry_known`, and a
 fixed rejection category: empty, `unknown_weight_size`, `unknown_kv_geometry`,
 or `malformed_model_metadata`. Budget and probe rejection use
 `insufficient_memory_budget` and `memory_probe_unavailable`.
+
+Execution controls are validated before model inventory, `/api/show`, hardware
+inventory, runtime detection, unload, or arm execution. `context_limit` must be
+an integer at least 1, `repeats` an integer at least 3, `timeout` finite and
+positive, and `cancel_after_ms` a non-negative integer. Booleans are rejected
+as numbers. With cancellation enabled, its delay must be strictly less than
+the arm timeout. The endpoint must remain loopback HTTP.
+
+Protected identities cannot compare merely because both arms say
+`unavailable`. Missing digest reuses `model_digest_mismatch`; file, tokenizer,
+template, and runtime identity use their narrow fixed reasons above. Empty
+identity text remains a closed-schema `malformed_artifact`.
 
 If available memory, including safely
 reclaimable residency for the target model, cannot satisfy the estimate plus
@@ -152,6 +171,9 @@ Deterministic local tests cover:
 - generated-token shortening and prompt truncation;
 - explicit unavailable GPU evidence;
 - estimator known/unknown cases and pre-launch low-RAM/unknown-state aborts;
+- hostile zero/boolean/fractional/negative metadata rejection before execution;
+- execution-control rejection before inventory, probes, unload, or execution;
+- unavailable and empty protected-identity rejection;
 - bounded cancellation on a sampled floor crossing;
 - honest cancellation milestone reporting;
 - hard deadline against an endlessly chunking loopback response;
@@ -162,13 +184,13 @@ Deterministic local tests cover:
 - separate cold and warm results; and
 - absence of hardcoded comparison thresholds.
 
-Focused result: **101 passed** across the legacy and paired benchmark test
-modules, including **37 paired-test cases**.
+Focused result: **146 passed** across the legacy and paired benchmark test
+modules, including **82 paired-test cases**.
 
 ## Validation matrix
 
-- `python -m pytest python\tests`: **732 passed, 8 skipped**, 1 existing
-  Pillow decompression-size warning; 740 collected.
+- `python -m pytest python\tests`: **777 passed, 8 skipped**, 1 existing
+  Pillow decompression-size warning; 785 collected.
 - `npm run test:backend-status`: `backend-status-tests-ok`.
 - `npm run test:progress`: `chat-progress-tests-ok`.
 - `npm run test:readiness`: readiness row mapping tests passed.
