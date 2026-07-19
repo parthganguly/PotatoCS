@@ -240,7 +240,7 @@ def test_preflight_estimator_mirrors_known_unknown_semantics() -> None:
     for quantization, width in (("Q4_K_M", 0.85), ("Q8_0", 1.35), ("FP16", 2.6), ("FP32", 5.2)):
         estimate = estimate_required_memory_bytes(
             {
-                "disk_bytes": 0, "parameter_size": "1.2B",
+                "parameter_size": "1.2B",
                 "quantization": quantization, "kv_geometry": geometry,
             },
             100,
@@ -249,10 +249,16 @@ def test_preflight_estimator_mirrors_known_unknown_semantics() -> None:
         assert estimate["rejection_category"] == ""
 
     unknown_quant = estimate_required_memory_bytes(
-        {"disk_bytes": 0, "parameter_size": "1.2B", "quantization": "mystery", "kv_geometry": geometry}, 100
+        {"parameter_size": "1.2B", "quantization": "mystery", "kv_geometry": geometry}, 100
     )
     assert unknown_quant["weights_known"] is False
     assert unknown_quant["rejection_category"] == "unknown_weight_size"
+    missing_weights = estimate_required_memory_bytes(
+        {"kv_geometry": geometry}, 100
+    )
+    assert missing_weights["rejection_category"] == "unknown_weight_size"
+    missing_kv = estimate_required_memory_bytes({"disk_bytes": 1234}, 100)
+    assert missing_kv["rejection_category"] == "unknown_kv_geometry"
     partial_kv = estimate_required_memory_bytes(
         {"disk_bytes": 1234, "kv_geometry": {"layers": 2}}, 100
     )
@@ -269,6 +275,57 @@ def test_paired_endpoint_is_loopback_only() -> None:
     require_loopback_endpoint("http://localhost:11434")
     with pytest.raises(ValueError):
         require_loopback_endpoint("https://example.com")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"context_limit": 0}, {"context_limit": -1}, {"context_limit": True},
+        {"context_limit": 1.0},
+        {"repeats": 2}, {"repeats": True}, {"repeats": 3.0},
+        {"timeout": 0}, {"timeout": -1}, {"timeout": float("nan")},
+        {"timeout": float("inf")}, {"timeout": True},
+        {"cancel_after_ms": -1}, {"cancel_after_ms": True}, {"cancel_after_ms": 0.0},
+        {"cancel_probe": 1},
+        {"cancel_probe": True, "timeout": 1, "cancel_after_ms": 1000},
+        {"cancel_probe": True, "timeout": 1, "cancel_after_ms": 1001},
+        {"endpoint": "https://example.com"}, {"endpoint": True},
+    ],
+)
+def test_invalid_execution_controls_fail_before_inventory_or_runtime(
+    monkeypatch, tmp_path: Path, overrides: dict
+) -> None:
+    calls: list[str] = []
+
+    def forbidden(name: str):
+        def record(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} must not be called")
+
+        return record
+
+    monkeypatch.setattr(
+        "odysseus_desktop_backend.runtime_bench.paired.ri.model_inventory",
+        forbidden("model_inventory"),
+    )
+    monkeypatch.setattr(
+        "odysseus_desktop_backend.runtime_bench.paired._ollama_show_identity",
+        forbidden("model_metadata_probe"),
+    )
+    monkeypatch.setattr(
+        "odysseus_desktop_backend.runtime_bench.paired.ollama_unload",
+        forbidden("unload"),
+    )
+    arguments = {
+        "model": "installed:model", "shape": "tiny",
+        "experiment_id": "experiment-controls", "pair_id": "pair-controls",
+        "batch_id": "batch-controls", "artifact_dir": str(tmp_path),
+        "execute_arm": forbidden("execute_arm"),
+    }
+    arguments.update(overrides)
+    with pytest.raises(ValueError):
+        run_paired_ollama_batch(**arguments)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -290,6 +347,45 @@ def test_material_mismatches_are_invalid(mutation, reason: str) -> None:
     comparison = compare_artifacts([baseline, candidate])["comparisons"][0]
     assert comparison["comparison_state"] == "invalid_comparison"
     assert reason in comparison["invalid_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "reason"),
+    [
+        ("model", "digest", "model_digest_mismatch"),
+        ("model", "file_identity", "file_identity_missing"),
+        ("model", "tokenizer_identity", "tokenizer_identity_missing"),
+        ("model", "chat_template_identity", "template_identity_missing"),
+        ("runtime", "name", "runtime_identity_missing"),
+        ("runtime", "version", "runtime_identity_missing"),
+    ],
+)
+def test_unavailable_protected_identities_are_invalid(
+    section: str, field: str, reason: str
+) -> None:
+    baseline, candidate = _artifact("baseline"), _artifact("candidate")
+    baseline[section][field] = "unavailable"
+    candidate[section][field] = "unavailable"
+    comparison = compare_artifacts([baseline, candidate])["comparisons"][0]
+    assert comparison["comparison_state"] == "invalid_comparison"
+    assert reason in comparison["invalid_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("model", "digest"), ("model", "file_identity"),
+        ("model", "tokenizer_identity"), ("model", "chat_template_identity"),
+        ("runtime", "name"), ("runtime", "version"),
+    ],
+)
+def test_empty_protected_identities_are_malformed(section: str, field: str) -> None:
+    baseline, candidate = _artifact("baseline"), _artifact("candidate")
+    baseline[section][field] = ""
+    candidate[section][field] = ""
+    report = compare_artifacts([baseline, candidate])
+    assert report["valid_pair_count"] == 0
+    assert report["invalid_reason_counts"]["malformed_artifact"] == 2
 
 
 def test_shortened_output_cannot_count_as_uplift() -> None:
@@ -515,7 +611,7 @@ def test_unknown_estimator_state_aborts_before_execute(monkeypatch, tmp_path: Pa
     }
     descriptor = _artifact("baseline")["model"]
     inventory_entry = {
-        "disk_bytes": 0, "parameter_size": "1B", "quantization": "unknown",
+        "parameter_size": "1B", "quantization": "unknown",
         "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1},
     }
     monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.model_descriptor_v2", lambda *args, **kwargs: (descriptor, inventory_entry))
@@ -534,6 +630,58 @@ def test_unknown_estimator_state_aborts_before_execute(monkeypatch, tmp_path: Pa
     assert launches == []
     run = result["artifacts"][0]["runs"][0]
     assert run["preflight_rejection_category"] == "unknown_weight_size"
+
+
+@pytest.mark.parametrize(
+    "inventory_entry",
+    [
+        {"disk_bytes": 0, "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": True, "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": 1.5, "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": -1, "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"parameter_size": "0B", "quantization": "Q4", "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"parameter_size": "0.0B", "quantization": "Q4", "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"parameter_size": "-1B", "quantization": "Q4", "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"parameter_size": "malformed", "quantization": "Q4", "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"parameter_size": True, "quantization": "Q4", "kv_geometry": {"layers": 1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": 1_000, "kv_geometry": {"layers": True, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": 1_000, "kv_geometry": {"layers": 1.5, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": 1_000, "kv_geometry": {"layers": -1, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+        {"disk_bytes": 1_000, "kv_geometry": {"layers": 0, "kv_heads": 1, "key_length": 1, "value_length": 1}},
+    ],
+)
+def test_malformed_numeric_metadata_never_calls_execute_arm(
+    monkeypatch, tmp_path: Path, inventory_entry: dict
+) -> None:
+    healthy = {
+        "total_ram_bytes": 16 * 1024**3,
+        "available_ram_bytes": 12 * 1024**3,
+        "memory_load_percent": 25,
+        "pagefile_total_bytes": 32 * 1024**3,
+        "pagefile_available_bytes": 24 * 1024**3,
+    }
+    descriptor = _artifact("baseline")["model"]
+    monkeypatch.setattr(
+        "odysseus_desktop_backend.runtime_bench.paired.model_descriptor_v2",
+        lambda *args, **kwargs: (descriptor, inventory_entry),
+    )
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.system_memory_status", lambda: healthy)
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.measure_system_cpu_percent", lambda: 10.0)
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ri._nvidia_smi_path", lambda: None)
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ri.detect_ollama_runtime", lambda: {"version": "0.32.1"})
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ri.hardware_inventory", lambda: copy.deepcopy(_artifact("baseline")["hardware"]) | {"gpus": []})
+    unloads: list[bool] = []
+    launches: list[dict] = []
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired.ollama_unload", lambda *args, **kwargs: unloads.append(True))
+    monkeypatch.setattr("odysseus_desktop_backend.runtime_bench.paired._resident_model", lambda *args, **kwargs: None)
+    result = run_paired_ollama_batch(
+        model="installed:model", shape="tiny", experiment_id="experiment-malformed",
+        pair_id="pair-malformed", batch_id="batch-malformed", artifact_dir=str(tmp_path),
+        execute_arm=lambda **kwargs: launches.append(kwargs),
+    )
+    assert unloads == []
+    assert launches == []
+    assert result["artifacts"][0]["runs"][0]["preflight_rejection_category"] == "malformed_model_metadata"
 
 
 def test_fake_paired_batch_writes_valid_balanced_artifacts(monkeypatch, tmp_path: Path) -> None:
