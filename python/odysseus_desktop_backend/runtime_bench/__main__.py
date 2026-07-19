@@ -1,4 +1,4 @@
-"""Dev CLI for the benchmark harness.
+"""Dev CLI for single-arm, paired-arm and comparison benchmarks.
 
 Example (from the `python/` directory):
 
@@ -15,10 +15,12 @@ import argparse
 import json
 import sys
 
+from odysseus_desktop_backend.runtime_bench.comparison import load_and_compare
 from odysseus_desktop_backend.runtime_bench.harness import run_ollama_batch
+from odysseus_desktop_backend.runtime_bench.paired import run_paired_ollama_batch
 
 
-def main(argv: list[str] | None = None) -> int:
+def _legacy_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="runtime_bench")
     parser.add_argument("--model", required=True)
     parser.add_argument("--shape", required=True)
@@ -77,6 +79,74 @@ def main(argv: list[str] | None = None) -> int:
     }
     print(json.dumps(summary, indent=1))
     return 0
+
+
+def _compare_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="runtime_bench compare")
+    parser.add_argument("artifacts", nargs="+", help="two or more schema-v2 arm artifacts")
+    args = parser.parse_args(argv)
+    if len(args.artifacts) < 2:
+        parser.error("compare requires at least two artifacts")
+    print(json.dumps(load_and_compare(args.artifacts), indent=1, sort_keys=True))
+    return 0
+
+
+def _paired_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="runtime_bench paired")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--shape", required=True)
+    parser.add_argument("--experiment-id", required=True)
+    parser.add_argument("--pair-id", required=True)
+    parser.add_argument("--batch-id", required=True)
+    parser.add_argument("--artifact-dir", required=True)
+    parser.add_argument("--context-limit", type=int, default=4096)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--no-cold", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--cancel-probe", action="store_true")
+    parser.add_argument("--cancel-after-ms", type=int, default=500)
+    parser.add_argument("--baseline-options-json", default="{}")
+    parser.add_argument("--candidate-options-json", default="{}")
+    args = parser.parse_args(argv)
+    baseline_options = json.loads(args.baseline_options_json)
+    candidate_options = json.loads(args.candidate_options_json)
+    if not isinstance(baseline_options, dict) or not isinstance(candidate_options, dict):
+        parser.error("arm options must be JSON objects")
+    result = run_paired_ollama_batch(
+        model=args.model,
+        shape=args.shape,
+        experiment_id=args.experiment_id,
+        pair_id=args.pair_id,
+        batch_id=args.batch_id,
+        artifact_dir=args.artifact_dir,
+        baseline_options=baseline_options,
+        candidate_options=candidate_options,
+        context_limit=args.context_limit,
+        repeats=args.repeats,
+        include_cold=not args.no_cold,
+        cancel_probe=args.cancel_probe,
+        cancel_after_ms=args.cancel_after_ms,
+        timeout=args.timeout,
+    )
+    print(
+        json.dumps(
+            {
+                "aborted": result["aborted"],
+                "artifacts": [artifact["batch_id"] for artifact in result["artifacts"]],
+            },
+            indent=1,
+        )
+    )
+    return 2 if result["aborted"] else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "compare":
+        return _compare_main(args[1:])
+    if args and args[0] == "paired":
+        return _paired_main(args[1:])
+    return _legacy_main(args)
 
 
 if __name__ == "__main__":

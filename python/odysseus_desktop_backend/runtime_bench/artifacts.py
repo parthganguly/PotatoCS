@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 ARTIFACT_SCHEMA_VERSION = 1
+PAIRED_ARTIFACT_SCHEMA_VERSION = 2
 
 VALID_SHAPES = {"tiny", "medium", "long_context", "repeat", "grounded", "overcommit"}
 VALID_MODES = {"interactive", "persisted_job_sim"}
@@ -213,6 +214,14 @@ def validate_artifact(artifact: dict[str, Any]) -> list[str]:
     problems: list[str] = []
     if not isinstance(artifact, dict):
         return ["artifact must be an object"]
+    if artifact.get("schema_version") == PAIRED_ARTIFACT_SCHEMA_VERSION:
+        from odysseus_desktop_backend.runtime_bench.paired_artifacts import (
+            validate_paired_artifact,
+        )
+
+        problems = validate_paired_artifact(artifact)
+        _string_violations(artifact, "artifact", problems)
+        return problems
     missing = _REQUIRED_TOP_LEVEL - set(artifact)
     if missing:
         problems.append(f"missing top-level keys: {sorted(missing)}")
