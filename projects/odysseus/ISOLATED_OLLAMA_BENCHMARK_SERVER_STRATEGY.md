@@ -1,10 +1,10 @@
 # Isolated Ollama Benchmark Server Strategy
 
-Status: PROPOSED, revision 5 — dev-only measurement-infrastructure
-design (Fable, 2026-07-19; revised same day after maintainer review and
-Phase 1 contract correction). No real servers or models were run and
-nothing was downloaded or installed. PRs #33 / #35 / #36 / #37 are
-inputs and are not modified by this document.
+Status: PROPOSED, revision 6 — dev-only measurement-infrastructure
+design (Fable, 2026-07-19; revised same day after independent
+architecture review 4731154883 on draft PR #38). No real servers or
+models were run and nothing was downloaded or installed. PRs #33 /
+#35 / #36 / #37 are inputs and are not modified by this document.
 
 Parent strategy: `HARDWARE_RELATIVE_MODEL_UPLIFT_STRATEGY.md` (the
 PR #37 stack). This document designs the one mechanism that strategy
@@ -33,11 +33,9 @@ the dry-run CLI and synthetic fixture lifecycle may execute. The real-
 launch approval flag, installed Ollama binary, ordinary Ollama service,
 and real model store remain untouched.
 
-Revision 4 Phase 1 review corrections: the command-version probe is a
-separate suspended, minimal-environment, kill-on-close-job-owned process
-with a 4 KiB combined-output cap and a true deadline; every child uses
-`STARTUPINFOEX` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` so only stdout
-and stderr pipe writers are inherited; startup dialects live in a closed
+Revision 4 Phase 1 review corrections: every child uses
+`STARTUPINFOEX` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` so only the
+declared stdio handles are inherited; startup dialects live in a closed
 committed SHA-256 registry; readiness and attestation use separate clocks;
 the real candidate-port race retries only after complete verified cleanup;
 and the suspended process image plus executable hash are revalidated before
@@ -45,15 +43,45 @@ assignment/resume. The registry intentionally contains no entry for the
 installed binary in this correction cycle. Registering that binary's
 reviewed dialect is a separate prerequisite before human G-ISO-0 execution.
 
-Revision 5 final Phase 1 review corrections: every child receives valid
-stdio through an exact three-handle allowlist containing a launcher-owned
-read-only Windows NUL handle plus the stdout/stderr pipe writers; race cleanup
-may tolerate only the same observed foreign listener after proving every
-benchmark-owned resource is gone; G-ISO-0 now requires a bounded owned
-`GET /api/ps` proof of zero resident models; and exact-thread Windows I/O
-cancellation, closed parent read endpoints, and a final bounded join prevent
-reader helpers from surviving cleanup. The dialect registry remains empty and
-no real runtime, service, or model store was touched.
+Revision 5 Phase 1 review corrections that remain in force: every child
+receives valid stdio through an exact three-handle allowlist containing a
+launcher-owned read-only Windows NUL handle plus the stdout/stderr pipe
+writers; race cleanup may tolerate only the same observed foreign listener
+after proving every benchmark-owned resource is gone; and G-ISO-0 requires
+a bounded owned `GET /api/ps` proof of zero resident models. Revision 5's
+pre-server command-version probe, its port-only first-PID listener lookup,
+and its reader-thread cancellation/containment-join design were
+architectural mistakes and are superseded below.
+
+Revision 6 architecture corrections (independent review 4731154883 on
+draft PR #38; all incorporated below):
+
+1. **Command-version binding is post-readiness.** `ollama --version` is
+   a client-server probe that contacts `OLLAMA_HOST` and reports both
+   client and server versions (§2.7, verified-upstream). The version
+   child now runs only after the isolated server's endpoint is ready
+   and TCP-owned, pointed at that owned endpoint, and its output is
+   parsed only through the closed SHA-256 version-output dialect
+   (§2.6). No harness process may ever target port 1, a guessed port,
+   or an unproven endpoint.
+2. **Address-aware TCP ownership.** Listener ownership is decided from
+   all relevant rows (exact loopback and wildcard on the requested
+   port), with a closed owned / not-present / foreign / ambiguous /
+   uncertain result model, and bind-race evidence uses a stable
+   non-reusable foreign-owner identity — a held checked process handle
+   plus creation time — never PID equality alone (§3.3).
+3. **Genuinely bounded log I/O.** Blocking reader threads and the
+   unbounded containment join are replaced by benchmark-owned
+   overlapped named-pipe reads with event waits under absolute
+   deadlines, checked `CancelIoEx` against the exact pending
+   operation, and a fixed no-retry cleanup failure after cleanup-
+   deadline exhaustion. No Python helper thread exists in the I/O
+   path and no unbounded wait or join exists anywhere in the
+   lifecycle (§5).
+
+The Phase 1 lifecycle is now specified as an explicit ordered state
+machine (§12). The dialect registry remains empty and no real runtime,
+service, or model store was touched in this revision.
 
 Authority notes:
 
@@ -121,7 +149,8 @@ store — with the ordinary service left untouched.
 All items in this section are verified-upstream on 2026-07-19 from
 docs.ollama.com (FAQ, API reference, troubleshooting) and the
 `ollama/ollama` source (`envconfig/config.go`, `llm/server.go`,
-`llm/llama_server.go`, repo file listing).
+`llm/llama_server.go`, `cmd/cmd.go`, `server/routes.go`, repo file
+listing).
 
 ### 2.1 Server environment variables (envconfig/config.go)
 
@@ -210,36 +239,119 @@ Instead, **every session binds one normalized runtime identity**:
 1. resolved executable **basename** (e.g. `ollama.exe` — the basename
    only; the path is used transiently and never persisted, §5);
 2. executable **SHA-256** (hashed from the resolved file before
-   launch);
-3. the strictly normalized version parsed from `ollama --version` for
-   that same executable;
-4. the same normalized representation parsed from `/api/version` for
-   the owned child endpoint.
+   launch and re-hashed at suspended-image verification);
+3. the strictly normalized **client executable version**, parsed from
+   the owned post-readiness `ollama --version` child through the
+   reviewed version-output dialect (§2.7);
+4. the strictly normalized **command-reported server version**, parsed
+   from that same output through the same dialect;
+5. the strictly normalized `/api/version` value obtained from the
+   owned child endpoint.
 
-The command and API versions are required and must match. The child's
-startup-log version is optional because log shape is not a stable API.
-If the fixture-reviewed dialect for the attested executable hash yields a
-parseable startup version, it is normalized and must match. If it does
-not, the artifact records the typed state `unattested`; absence alone
-does not fail an otherwise valid identity bind. Raw command output and
-raw startup logs remain memory-only. A required disagreement, a parseable
+Values 3–5 are all required and must be equal after normalization.
+
+**Command-version identity sequence (ordered, post-readiness).**
+`ollama --version` is a client-server probe, not executable metadata
+(§2.7): it contacts `OLLAMA_HOST` and reports both client and server
+versions. It therefore runs only against an endpoint this harness has
+already proved it owns, in this exact order:
+
+1. resolve the executable; compute its basename and SHA-256;
+2. select the reviewed **startup dialect and version-output dialect**
+   for that hash from the closed committed registry (§6) — an unknown
+   hash fails `attestation_dialect_unavailable` before any child
+   process exists;
+3. create the isolated **server** child suspended;
+4. verify the suspended process image and re-hash the executable;
+5. assign the kill-on-close Job Object and verify the assignment;
+6. resume the server;
+7. verify the owned loopback TCP endpoint under the address-aware
+   ownership model (§3.3);
+8. obtain a bounded `/api/version` response from the owned endpoint;
+9. verify endpoint ownership again;
+10. only then launch a **separately Job-owned** `ollama --version`
+    child, built with the same minimal deny-by-default environment
+    construction and with `OLLAMA_HOST` set to the already-owned
+    server endpoint;
+11. capture at most 4 KiB of combined stdout/stderr under an absolute
+    deadline;
+12. parse the capture through the reviewed installed-binary
+    version-output dialect into the **client executable version** and
+    the **command-reported server version**;
+13. require both to equal the normalized `/api/version` value.
+
+The version child retains every isolation property of the server
+child: its own temporary home; its own temporary **empty** model
+store; the exact NUL/stdout/stderr three-handle inherited-handle list
+(§4.1); a hard absolute wall-clock deadline; suspended-image
+verification and executable re-hash before resume; complete verified
+Job/tree/handle/temporary-space cleanup; and no raw output
+persistence. Plain `subprocess.run` remains forbidden.
+
+**No harness-created process may ever be pointed at port 1, a guessed
+port, or any endpoint whose ownership has not been proved under §3.3.**
+Revision 5's pre-server version probe against an arbitrary unused
+endpoint is withdrawn: §2.7 shows such a run yields no server version,
+emits warning lines a strict parser must not see, and — if anything
+listens on the arbitrary endpoint — contacts a socket the harness
+never proved it owns.
+
+**Fail-closed handling (closed categories, §9):**
+
+| Condition | Category |
+| --- | --- |
+| missing client version — the reviewed dialect can neither find an explicit client-version line nor derive the client version by its reviewed rule | `version_output_malformed` |
+| missing command-reported server version | `version_output_malformed` |
+| the dialect's connection-warning marker is present (the child could not reach the owned endpoint) | `version_endpoint_ownership_failed` |
+| output unparseable under the reviewed dialect (unexpected lines, invalid encoding, over-cap length) | `version_output_malformed` |
+| client / command-server / API disagreement after normalization | `runtime_identity_mismatch` |
+| endpoint ownership changed, ambiguous, or uncertain at the recheck immediately before the version child starts | `version_endpoint_ownership_failed` |
+
+No universal version-output format is assumed. Which lines exist, how
+the client and server versions are derived (including a dialect rule
+such as "a lone server line with no client warning attests client =
+server"), and the exact connection-warning marker are properties of
+the installed binary, bound through the closed SHA-256 dialect
+registry — which remains empty until installed-binary evidence is
+independently reviewed (§6, §7).
+
+The child server's startup-log version remains optional because log
+shape is not a stable API. If the fixture-reviewed startup dialect for
+the attested executable hash yields a parseable startup version, it is
+normalized and must match; if it does not, the artifact records the
+typed state `unattested`, and absence alone does not fail an otherwise
+valid identity bind. A required disagreement, a parseable
 startup-version disagreement, or a hash/basename change is
-**`runtime_identity_mismatch`** and invalidates the session, fail closed.
-Log-shape and flag-spelling expectations are fixture-driven per attested
-identity, never assumed from upstream `main` (consistent with this
-branch's fail-closed metadata rules, commits `0ccad259`…`b5308a4a`).
+**`runtime_identity_mismatch`** and invalidates the session, fail
+closed. Log-shape and flag-spelling expectations are fixture-driven per
+attested identity, never assumed from upstream `main` (consistent with
+this branch's fail-closed metadata rules, commits
+`0ccad259`…`b5308a4a`).
 
-The command-version evidence is itself isolated: `--version` is created
-suspended with the same deny-by-default environment, temporary profile,
-and empty model store as the server; assigned to its own verified
-kill-on-close Job Object; then resumed under a true wall-clock deadline.
-Combined stdout/stderr retention is capped at 4 KiB, overflow or timeout
-kills the whole probe job, and descendant/handle/temp cleanup is verified.
-Plain `subprocess.run` is forbidden. After each suspended process creation
-(probe and server), the checked process image is compared to the resolved
-executable and that file is re-hashed before assignment/resume; disagreement
-is `runtime_identity_mismatch`. Image paths and raw probe output remain
-memory-only.
+### 2.7 Version-command semantics (verified-upstream)
+
+Current upstream `cmd/cmd.go` `versionHandler`:
+
+- builds its client via `api.ClientFromEnvironment()` — i.e.
+  **`ollama --version` reads `OLLAMA_HOST`** and calls that server's
+  `/api/version`;
+- server reachable: prints `ollama version is <serverVersion>`, and
+  adds `Warning: client version is <clientVersion>` only when the two
+  differ;
+- server unreachable: prints
+  `Warning: could not connect to a running Ollama instance` plus
+  `Warning: client version is <clientVersion>`, and still exits 0 —
+  connection failure is not reflected in the exit code.
+
+`/api/version` itself is registered for GET and HEAD and returns
+`{"version": <serverVersion>}` (`server/routes.go`).
+
+Consequences bound into this design: the version command is a
+client-server identity probe, never local executable metadata; it must
+not run before the isolated server is ready and owned; its exit code
+proves nothing about connectivity; and its output dialect is a
+property of the installed binary, bound through the SHA-256 registry
+(§2.6), never assumed universal.
 
 ---
 
@@ -298,6 +410,10 @@ guarantee; the named removals above document intent, not mechanism.
   `OLLAMA_KEEP_ALIVE` (and, if an experiment declares it,
   `OLLAMA_CONTEXT_LENGTH`).
 
+For the version child (§2.6), `OLLAMA_HOST` is set to the already-owned
+server endpoint; every other rule above applies unchanged, with the
+child's own temporary profile and empty store.
+
 The launcher defines `FIXED_INTERNAL_ENV_KEYS` as the closed set of every
 minimum Windows variable and explicit fixed setting listed above. These
 keys are generated exclusively by the launcher and cannot be provided or
@@ -311,35 +427,105 @@ The temporary profile and temp directories are deleted at teardown; their
 paths are never persisted (§5). Phase 1 normally supplies no user
 overrides.
 
-### 3.3 Port ownership — verified before first contact
+### 3.3 Port ownership — address-aware, verified before first contact
 
-- Candidate port chosen by probe-binding a fresh randomized dynamic-range
-  loopback port, then closing the probe socket; the child is launched with
-  that port. A retry requires proof of a genuine race: a foreign listener
-  owns the previously free candidate and our child exits before contact.
-  The whole failed attempt is terminated and must prove no descendants,
-  stopped readers, closed handles, no benchmark-owned listener, and removed
-  temporary space before a fresh candidate is tried. The exact foreign owner
-  observed during race detection may remain ephemerally; it is never persisted.
-  A missing, changed, ambiguous, or benchmark/job-owned cleanup result fails
-  closed rather than retrying. Job, identity, log, attestation,
-  and arbitrary process failures are never retried. Exhaustion reports
-  `port_bind_failed` with the bounded outer attempt count.
-- **Ownership is verified before the first HTTP request**: once the
-  child is running, the harness reads the Windows TCP table
-  (`GetExtendedTcpTable`, ctypes, read-only) and confirms the PID
-  listening on the benchmark port is the child (or a member of its
-  job object). Only then is `/api/version` called. A mismatch is
-  `port_hijacked` and invalidates the session — no request is ever
-  sent to a socket the harness has not proven it owns.
-- After teardown, the harness re-reads the TCP table and confirms the
-  benchmark port has **no listener**; a survivor is `port_not_closed` (§4).
-  This strict final rule is distinct from an intermediate proved bind-race
-  cleanup, which may tolerate only the unchanged foreign owner described above.
-- The ordinary service's endpoint — whatever it is (§3.5) — is
-  excluded from candidate selection. No fixed port number, including
-  11434, is assumed or hardcoded as *the* ordinary port; discovery
-  decides.
+- **Candidate selection.** A candidate port is chosen by probe-binding
+  a fresh randomized dynamic-range loopback port, then closing the
+  probe socket; the child is launched with that port. The ordinary
+  service's endpoints — whatever they are (§3.5) — are excluded from
+  candidate selection. No fixed port number, including 11434, is
+  assumed or hardcoded as *the* ordinary port; discovery decides.
+- **Address-aware listener classification.** Every ownership question
+  is answered from the Windows IPv4 listener table
+  (`GetExtendedTcpTable` with `TCP_TABLE_OWNER_PID_LISTENER`,
+  read-only; each `MIB_TCPROW_OWNER_PID` row carries state, local
+  address, local port, remote address, remote port, and owning PID,
+  with the local address and port in network byte order). For the
+  requested endpoint `127.0.0.1:<port>`, every row is classified as
+  exactly one of:
+  - **exact loopback listener** — local address `127.0.0.1`, local
+    port `<port>`; relevant;
+  - **wildcard listener** — local address `0.0.0.0`, local port
+    `<port>`; relevant, because a wildcard bind also covers loopback;
+  - **unrelated concrete-interface listener** — same port on another
+    concrete local address; never relevant, and never mistaken for the
+    benchmark endpoint;
+  - **irrelevant row** — any other port.
+  The ownership query returns **all** relevant rows with their owner
+  identities — never an arbitrary first PID, and wildcard and loopback
+  rows are never silently collapsed into one another.
+- **Closed ownership result model.** Every ownership probe resolves to
+  exactly one of:
+  - **OWNED** — exactly one relevant row, and its owner is the child
+    process or a member of the benchmark Job Object;
+  - **NOT_PRESENT** — zero relevant rows; interpreted by lifecycle
+    stage (not yet ready during readiness; closed during the closure
+    check);
+  - **FOREIGN** — exactly one relevant row, not benchmark-owned; its
+    stable identity is captured (below);
+  - **AMBIGUOUS** — more than one relevant row (including wildcard
+    plus loopback coexisting, whoever owns them) →
+    `port_ownership_ambiguous`, fail closed;
+  - **UNCERTAIN** — the table cannot be read or an owner cannot be
+    resolved with checked read-only APIs →
+    `ownership_probe_unavailable`, fail closed.
+  An HTTP request is sent only from the OWNED state; ownership is
+  verified before the first request, re-verified before the version
+  child starts (§2.6), and re-verified again before `/api/ps` (§7).
+- **Stable foreign-owner identity.** Bind-race evidence never relies
+  on PID equality alone — PIDs are reusable. When a FOREIGN result is
+  captured during readiness:
+  - *capture*: open the owner with a checked
+    `PROCESS_QUERY_LIMITED_INFORMATION` handle and read its creation
+    time (`GetProcessTimes`). The identity is the (PID, creation time)
+    pair pinned by the **held-open handle**: while the handle is open
+    the kernel process object persists and Windows cannot recycle the
+    PID. If the handle or creation time cannot be obtained →
+    `owner_identity_unavailable`, fail closed.
+  - *comparison during race cleanup*: re-run the classification; the
+    result must be exactly one relevant foreign row whose PID matches,
+    whose freshly re-queried creation time is identical, and whose
+    held handle is still unsignaled (a signaled handle means the
+    original owner exited).
+  - *PID-reuse detection*: a same-PID row with a different creation
+    time, or a signaled held handle while a same-PID row exists, is a
+    reused PID → `owner_identity_changed`.
+  - *handle lifetime*: the identity handle is closed with a checked
+    result at the end of the attempt's endpoint-closure state
+    (§12 S19), whether the attempt retries or fails.
+  - *privacy*: PID, address, port, handle value, and creation time are
+    memory-only and never persisted.
+- **Closed race/closure outcomes:**
+  - **unchanged foreign identity**, plus proof that every
+    benchmark-owned resource is gone (terminated tree, no descendants,
+    no pending I/O, closed handles, no benchmark-owned relevant row,
+    removed temporary space) → the *only* condition permitting a
+    retry: one transition back to candidate endpoint selection with
+    the raced port excluded, under the bounded outer attempt count;
+  - **changed foreign identity** → `owner_identity_changed`, fail
+    closed, no retry;
+  - **PID reused by a new process** → `owner_identity_changed`, fail
+    closed, no retry;
+  - **owner vanished** (zero relevant rows where the captured foreign
+    owner was expected) → `owner_identity_changed`: the identity can
+    no longer be proven unchanged, so the attempt fails closed rather
+    than retrying;
+  - **multiple relevant owners** → `port_ownership_ambiguous`, fail
+    closed;
+  - **benchmark/job-owned listener** remaining at closure →
+    `port_not_closed`;
+  - **ownership probe uncertainty** → `ownership_probe_unavailable`
+    (or `owner_identity_unavailable` for the identity step), fail
+    closed.
+- **Post-teardown closure.** After teardown the classification must
+  return NOT_PRESENT for the benchmark endpoint; a benchmark-owned
+  survivor is `port_not_closed` (§4). The only tolerated non-empty
+  result is the unchanged proven foreign owner of the race-cleanup
+  path above.
+- A retry is only ever the proved bind race defined above. Job,
+  identity, log, attestation, and arbitrary process failures are never
+  retried. Exhaustion reports `port_bind_failed` with the bounded
+  outer attempt count.
 
 ### 3.4 Model store design — disposable shadow store (preferred)
 
@@ -416,8 +602,8 @@ listening:
 
 The child is a tree (`ollama serve` → runner subprocess, §2.2). Rules:
 
-1. **Job object ownership.** Both the version probe and server child are
-   created suspended, assigned
+1. **Job object ownership.** Both the version child and server child
+   are created suspended, assigned
    to a dedicated Windows Job Object with
    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resumed (all via ctypes;
    stdlib-only). Every process the server spawns lands in the job. The
@@ -428,12 +614,15 @@ The child is a tree (`ollama serve` → runner subprocess, §2.2). Rules:
    Process creation uses `STARTUPINFOEX`,
    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and
    `EXTENDED_STARTUPINFO_PRESENT`; the explicit inheritance list contains
-   exactly a benchmark-opened read-only Windows NUL stdin handle and the stdout
-   and stderr pipe write handles. All three are explicitly inheritable; parent
-   pipe readers are explicitly non-inheritable. The parent terminal stdin and
-   every unrelated handle are absent. All three `STARTF_USESTDHANDLES` fields
-   match these valid handles, and the parent NUL/writer handles plus attribute
-   list are closed with checked results immediately after process creation.
+   exactly a benchmark-opened read-only Windows NUL stdin handle and the
+   stdout and stderr write ends of the two benchmark-created overlapped
+   pipes (§5). All three are explicitly inheritable; the parent-side
+   overlapped read handles are never inheritable. The parent terminal
+   stdin and every unrelated handle are absent. All three
+   `STARTF_USESTDHANDLES` fields match these valid handles, and the
+   parent-held child-side NUL/writer handles plus attribute
+   list are closed with checked results immediately after process
+   creation, so pipe EOF is observable.
 2. **Graceful-first shutdown.** End of session: unload via
    `keep_alive: 0`, poll `/api/ps` until empty (bounded, reusing the
    existing 30 s cancel-poll discipline), then terminate the job.
@@ -446,9 +635,9 @@ The child is a tree (`ollama serve` → runner subprocess, §2.2). Rules:
    by parentage and job membership, never by image name alone —
    name-based cleanup could hit the user's ordinary service and is
    forbidden.
-4. **Port closure.** The TCP table is re-checked (§3.3); a listener
-   remaining on the benchmark port is `port_not_closed` and aborts the
-   batch.
+4. **Port closure.** The address-aware classification is re-run
+   (§3.3); a benchmark-owned listener remaining on the benchmark
+   endpoint is `port_not_closed` and aborts the batch.
 5. **Temporary-space teardown.** The session's temporary profile,
    temp dirs, and shadow store are removed; failure to remove is
    recorded (`teardown_incomplete`) but does not retroactively
@@ -457,39 +646,91 @@ The child is a tree (`ollama serve` → runner subprocess, §2.2). Rules:
 
 ---
 
-## 5. Bounded in-memory logs and privacy-safe artifacts
+## 5. Bounded overlapped log I/O and privacy-safe artifacts
 
-The child's stdout/stderr are drained continuously by reader threads
-(an undrained pipe on Windows blocks the writer — a stalled server
-that "never becomes ready" would otherwise be self-inflicted) into a
-**memory-only** bounded capture: first 64 KiB + last 192 KiB, 256 KiB
-cap, truncation flag. INFO level only (`OLLAMA_DEBUG=0`,
-`OLLAMA_DEBUG_LOG_REQUESTS=0`). The readiness clock starts immediately
-before `ResumeThread`, excluding hashing, the owned version probe,
-temporary-space creation, and suspended process/job setup. If the owned
-endpoint does not answer within the readiness deadline (default 30 s), the
-tree is killed and the session is `startup_timeout`; capture overflow is
-`startup_log_overflow`.
+**Selected design: benchmark-owned overlapped pipe reads under
+absolute deadlines; no helper threads, no helper processes.** An
+undrained pipe on Windows blocks the writer, so stdout and stderr must
+be drained continuously — but revision 5's blocking reader threads
+ended in an unbounded containment join, which contradicted the
+hard-deadline contract. Revision 6 removes the threads entirely:
+
+- **Pipe construction.** Each of stdout and stderr is a
+  benchmark-created single-instance named pipe with a unique random
+  name (`PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED |
+  FILE_FLAG_FIRST_PIPE_INSTANCE`, byte mode,
+  `PIPE_REJECT_REMOTE_CLIENTS`, one instance) — the standard Windows
+  technique for cancellable anonymous-style pipes. The child's write
+  end is opened inheritable via `CreateFileW` and is exactly the
+  writer entry in the three-handle inheritance list (§4.1); the
+  parent's overlapped read handle is never inheritable. The pipe name
+  contains a random component, is memory-only, and is never persisted.
+  Creation or connection failure is `log_io_setup_failed`.
+- **Continuous draining.** One overlapped `ReadFile` is kept pending
+  per stream, each with its own manual-reset event. The single
+  lifecycle thread waits with `WaitForMultipleObjects` on
+  {stdout event, stderr event, process handle}, with the timeout
+  computed from the governing absolute deadline. A completion is
+  confirmed with checked `GetOverlappedResult`, its bytes are fed to
+  the bounded capture, and the next read is posted;
+  `ERROR_BROKEN_PIPE` marks that stream EOF. A read completing with
+  any other unrecoverable error is `log_read_failed`. No Python helper
+  thread exists anywhere in the I/O path; the version child uses the
+  same mechanism.
+- **Caps.** Server logs: first 64 KiB + last 192 KiB retained,
+  256 KiB total diagnostic cap, truncation flag; bytes beyond the cap
+  are counted and discarded. Overflow before readiness is
+  `startup_log_overflow`. Version child: 4 KiB combined cap; overflow
+  is `version_probe_output_overflow`.
+- **Absolute deadlines.** Readiness (default 30 s, measured from
+  immediately before `ResumeThread` — excluding hashing,
+  temporary-space creation, and suspended process/job setup), startup
+  attestation (separate clock, default 10 s), version binding
+  (default 10 s), and cleanup each have an absolute wall-clock
+  deadline computed once; every wait in the lifecycle uses
+  max(0, deadline − now). **No unbounded wait or join exists anywhere,
+  including cleanup.**
+- **Cancellation sequence (cleanup, in order).**
+  1. terminate the Job Object and wait, bounded, on the process
+     handle;
+  2. drain any already-completed reads (checked
+     `GetOverlappedResult`);
+  3. for each still-pending read: checked `CancelIoEx(handle,
+     &overlapped)` against exactly that pipe handle and operation
+     (`ERROR_NOT_FOUND` — already complete — is acceptable);
+  4. wait, bounded by the absolute cleanup deadline, on that
+     operation's event, and confirm via `GetOverlappedResult` that the
+     operation finished or aborted (`ERROR_OPERATION_ABORTED`);
+  5. close pipe and event handles with checked results;
+  6. close thread, process, and job handles with checked results.
+- **Proof that nothing remains.** The design owns zero helper threads
+  and zero helper processes, and step 4 confirms every pending
+  operation individually — after it, no pending I/O references any
+  buffer, and there is no reader to contain.
+- **When cancellation itself fails.** A failed `CancelIoEx` is
+  `io_cancellation_failed`; an operation not confirmed complete by the
+  absolute cleanup deadline is `pending_io_cleanup_timeout`. Both are
+  fixed cleanup failures: the attempt is **never retried**, evidence
+  is **never declared complete**, the affected buffers and OVERLAPPED
+  blocks stay referenced for the remaining process lifetime (never
+  freed or reused, so a late completion cannot corrupt memory), and
+  the CLI exits nonzero. The kill-on-close Job Object has already
+  destroyed the child tree, and the design owns no helper — so no
+  uncontrolled benchmark-owned helper can be left behind. There is no
+  "containment" operation hiding an infinite wait.
 
 API readiness is not attestation readiness. After ownership and
-`/api/version` succeed, a separate bounded attestation clock (default 10 s)
-continues draining logs until every mandatory pattern in the reviewed
-dialect is observed. Process exit, overflow, and reader failure remain
-fatal during this interval. Deadline expiry yields `attestation_missing`
-with bounded timeout metadata; there is no scheduling-only `sleep(0)` path.
-
-Cleanup first terminates and waits for the owned process tree, then cancels any
-remaining synchronous pipe read through `CancelSynchronousIo` on the exact
-reader thread, closes both parent read endpoints, and performs a final bounded
-join. A missed deadline or close/cancellation failure is typed cleanup failure;
-no retry or complete artifact is possible. A containment join prevents return
-while any helper thread is still alive.
+`/api/version` succeed, the separate bounded attestation clock
+(default 10 s) continues draining logs until every mandatory pattern in
+the reviewed dialect is observed. Process exit, overflow, and read
+failure remain fatal during this interval. Deadline expiry yields
+`attestation_missing` with bounded timeout metadata.
 
 **Raw logs are never persisted.** They are parsed in memory into typed
 attestation records (§6) and then discarded. Durable artifacts contain
 **no** PID, no port number, no executable path, no model-store or
-shadow-store or temporary-profile path, no raw log excerpts, and no
-command lines.
+shadow-store or temporary-profile path, no pipe name, no raw log
+excerpts, and no command lines.
 
 Phase 1 has its own standalone closed artifact; it does not implement or
 reuse performance schema v3:
@@ -498,7 +739,8 @@ reuse performance schema v3:
 - `artifact_kind: isolated_ollama_server_attestation`;
 - captured UTC timestamp;
 - runtime identity: executable basename, executable SHA-256, normalized
-  binary-command version, normalized API version, and the optional typed
+  client executable version, normalized command-reported server
+  version, normalized API version, and the optional typed
   startup-version state/value/source;
 - requested typed settings, using only `loopback: true` and
   `store_kind: empty_temp` markers for the generated endpoint/store;
@@ -530,22 +772,26 @@ differently across versions.
 **Attested** = what the running server demonstrably did, parsed in
 memory from the capture and the API, persisted only in typed form:
 
-Startup parsing is selected only through a closed, committed registry
-keyed by executable SHA-256. Registry construction validates that every
-entry's key and dialect identity match; patterns are compiled, bounded in
-length, contain exactly one capture group, use only allowlisted setting
-names and sources, and include mandatory Phase 1 `noprune` and `no_cloud`
-markers. Caller-supplied regexes or fixture paths are forbidden. An unknown
-hash is rejected before either `--version` or `serve` starts as
-`attestation_dialect_unavailable`. The empty registry in revision 5 is
-intentional: it prevents the CLI from implying that G-ISO-0 can complete
-before the installed binary's dialect has been independently reviewed and
-committed.
+Startup and version-output parsing is selected only through a closed,
+committed registry keyed by executable SHA-256. Each entry carries
+**both** the startup dialect (config-report and runner-line patterns)
+and the **version-output dialect** (which lines exist, how the client
+and command-reported server versions are derived, and the
+connection-warning marker — §2.6/§2.7). Registry construction validates
+that every entry's key and dialect identity match; patterns are
+compiled, bounded in length, contain exactly one capture group, use
+only allowlisted setting names and sources, and include mandatory
+Phase 1 `noprune` and `no_cloud` markers. Caller-supplied regexes or
+fixture paths are forbidden. An unknown hash is rejected before any
+child process is created as `attestation_dialect_unavailable`. The
+empty registry in revision 6 is intentional: it prevents the CLI from
+implying that G-ISO-0 can complete before the installed binary's
+dialects have been independently reviewed and committed.
 
 | Typed field | Source | Attests |
 | --- | --- | --- |
-| `runtime_identity` (§2.6 normalized bind) | file hash, `--version`, `/api/version`, optional startup log | one specific binary served this session |
-| `endpoint_owner_verified` | TCP table, pre-first-request (§3.3) | it is *our* server |
+| `runtime_identity` (§2.6 normalized bind) | file hash, version command (client and command-reported server), `/api/version`, optional startup log | one specific binary served this session |
+| `endpoint_owner_verified` | address-aware TCP classification, pre-first-request (§3.3) | it is *our* server |
 | `model_residency_verified_empty` | bounded owned `GET /api/ps` after config attestation | the isolated empty-store server has zero resident models |
 | `effective_env_report` (typed subset) | startup config report (envconfig `Values()`) | env the server parsed — incl. noprune and no-cloud |
 | `flash_attention_applied` (`on`/`off`/`auto`/`unattested`) | runner launch line | flag handed to the runner |
@@ -557,7 +803,7 @@ metadata rules):
 
 1. Every artifact records requested and attested side by side; each
    attested field carries `source` ∈ {`startup_log`, `runner_log`,
-   `api_ps`, `api_version`, `binary_version`, `file_hash`,
+   `api_ps`, `api_version`, `version_command`, `file_hash`,
    `tcp_table`} or the value `unattested`.
 2. `unattested` on an arm-defining field (flash attention or KV type
    for a Stage-B arm) → `attestation_missing`: the session may
@@ -571,10 +817,12 @@ metadata rules):
 4. `flash_attn=auto` observed on a baseline arm is recorded as `auto`,
    never coerced: the comparison layer must see what was actually
    applied.
-5. Any required normalized command/API disagreement, or a disagreement
-   with a parseable startup-log version, → `runtime_identity_mismatch`
-   (§2.6), session invalid. An unparseable or absent startup-log version
-   remains typed `unattested` and does not by itself invalidate identity.
+5. Any required normalized version disagreement (client,
+   command-reported server, or API — §2.6), or a disagreement with a
+   parseable startup-log version, → `runtime_identity_mismatch`,
+   session invalid. An unparseable or absent startup-log version
+   remains typed `unattested` and does not by itself invalidate
+   identity.
 
 ---
 
@@ -586,11 +834,12 @@ G-ISO-0, §11), and deliberately inert:
 
 **Separate prerequisite before approval/execution:** resolve and hash the
 installed binary without launching it, independently review synthetic/raw
-log samples outside this implementation run, and commit a validated dialect
-entry for that exact SHA-256. Revision 5 deliberately does not invent or
-register the installed binary's dialect. Until that prerequisite lands,
-the real CLI fails `attestation_dialect_unavailable` before process creation;
-the approval flag alone is insufficient.
+log and version-output samples outside this implementation run, and
+commit a validated dialect entry (startup **and** version-output
+dialects) for that exact SHA-256. Revision 6 deliberately does not
+invent or register the installed binary's dialects. Until that
+prerequisite lands, the real CLI fails `attestation_dialect_unavailable`
+before process creation; the approval flag alone is insufficient.
 
 - **temporary empty model store** (a fresh empty directory as
   `OLLAMA_MODELS`) — the user's model files are not exposed in any
@@ -599,9 +848,10 @@ the approval flag alone is insufficient.
 - **no model load, no inference** — the only requests are
   `/api/version` and `/api/ps` (expected empty).
 
-Immediately before `GET /api/ps`, TCP ownership is reverified against the
-child/Job Object. The response read is capped at 8 KiB and must have the exact
-closed shape `{"models": []}`. Only the boolean
+Immediately before `GET /api/ps`, endpoint ownership is reverified with
+the address-aware classification (§3.3) against the child/Job Object.
+The response read is capped at 8 KiB and must have the exact closed
+shape `{"models": []}`. Only the boolean
 `model_residency_verified_empty` persists; model names, digests, sizes, raw
 JSON, endpoint, port, and owner identity remain memory-only. Malformed or
 oversized evidence is `model_residency_probe_failed`; any entry in `models` is
@@ -611,10 +861,12 @@ to be true.
 Its sole purpose is to prove the mechanism itself, on the installed
 binary, before any model is ever involved:
 
-1. required normalized runtime identity binds with no mismatch (§2.6),
-   with startup-log version either matching or typed `unattested`;
+1. the required normalized runtime identity binds with no mismatch
+   (§2.6): client version, command-reported server version, and
+   `/api/version` agree, with the startup-log version either matching
+   or typed `unattested`;
 2. the server binds loopback-only on the assigned port;
-3. TCP-table ownership verification works pre-first-request;
+3. address-aware ownership verification works pre-first-request;
 4. the startup config report shows `OLLAMA_NOPRUNE=1` and
    `OLLAMA_NO_CLOUD=1` parsed as requested (this attestation is the
    precondition for ever considering the shared-store fallback,
@@ -622,7 +874,7 @@ binary, before any model is ever involved:
 5. log capture stays within bounds and parses into typed records;
 6. Job Object teardown leaves zero survivors (orphan scan clean);
 7. the bounded owned `/api/ps` proof reports zero resident models;
-8. the benchmark port has no listener after teardown.
+8. the benchmark endpoint has no listener after teardown.
 
 Every proof lands in a typed attestation artifact (§5 rules apply —
 no paths, no PIDs, no ports, no raw logs). Only after this artifact
@@ -733,16 +985,18 @@ cache*; true first-boot cold start stays explicitly unmeasured.
 Additive to the existing per-run `error_category` values (which remain
 for in-run errors: timeouts, HTTP errors, safety floor). Closed set —
 an unrecognized condition is a validation failure, not a new ad-hoc
-string.
+string. Revision 6 renames `log_reader_failed` to `log_read_failed`
+(there are no reader threads) and adds the version-endpoint,
+address-aware-ownership, owner-identity, and overlapped-I/O categories.
 
 | Category | Raised when | Invalidates |
 | --- | --- | --- |
 | `platform_unsupported` | required Windows lifecycle APIs are unavailable | launch |
 | `executable_not_found` | configured executable cannot be resolved | launch |
-| `executable_identity_unavailable` | executable hash or normalized command version cannot be established | launch |
-| `attestation_dialect_unavailable` | executable hash has no closed committed reviewed dialect | launch before process creation |
+| `executable_identity_unavailable` | executable hash or image identity cannot be established | launch |
+| `attestation_dialect_unavailable` | executable hash has no closed committed reviewed dialect entry (startup + version-output) | launch before process creation |
 | `temp_space_failed` | isolated profile, scratch, or empty store cannot be created | launch |
-| `port_bind_failed` | no candidate port bound after retries | session |
+| `port_bind_failed` | no candidate port bound after the bounded proved-race retries | session |
 | `process_create_failed` | checked suspended process creation fails | session |
 | `process_attribute_list_failed` | STARTUPINFOEX handle-list sizing/initialization/update fails | launch |
 | `process_attribute_list_cleanup_failed` | attribute-list or post-create handle cleanup cannot be completed | launch |
@@ -750,20 +1004,28 @@ string.
 | `job_limit_configuration_failed` | kill-on-close limit configuration fails | session |
 | `job_assignment_failed` | assignment or assignment verification fails | session |
 | `process_resume_failed` | checked primary-thread resume fails | session |
-| `ownership_probe_unavailable` | TCP/process ownership cannot be established using checked read-only APIs | session |
-| `port_hijacked` | TCP-table owner of benchmark port ∉ job, pre-request (§3.3) | session |
-| `port_not_closed` | listener remains on benchmark port after teardown (§4.4) | batch (aborts) |
-| `startup_timeout` | endpoint not answering by deadline | session |
+| `log_io_setup_failed` | overlapped pipe/event creation, child-end open, or initial overlapped read post fails | launch |
+| `ownership_probe_unavailable` | the TCP table or an owner cannot be read with checked read-only APIs | session |
+| `port_ownership_ambiguous` | more than one relevant listener row (exact loopback and/or wildcard) for the benchmark endpoint (§3.3) | session |
+| `owner_identity_unavailable` | a stable foreign-owner identity (checked handle + creation time) cannot be captured | session |
+| `owner_identity_changed` | the foreign owner's identity changed, its PID was reused, or the owner vanished before race cleanup proved it unchanged | session |
+| `port_hijacked` | the single relevant listener is foreign pre-request without a proved bind race (§3.3) | session |
+| `port_not_closed` | a benchmark-owned listener remains on the benchmark endpoint after teardown (§4.4) | batch (aborts) |
+| `startup_timeout` | endpoint not answering by the readiness deadline | session |
 | `startup_process_exit` | child exits before readiness | session |
 | `startup_log_overflow` | capture cap hit before readiness | session |
-| `log_reader_failed` | a stdout/stderr drain fails | session |
-| `version_probe_timeout` | owned command-version probe exceeds its wall deadline | launch |
-| `version_probe_output_overflow` | combined version output exceeds 4 KiB | launch |
-| `version_probe_failed` | owned version probe exits nonzero, emits no usable output, or its reader fails | launch |
-| `version_probe_cleanup_failed` | probe tree/reader/handle/temporary cleanup cannot be proven | launch |
+| `log_read_failed` | an overlapped stdout/stderr read completes with an unrecoverable error | session |
+| `version_probe_timeout` | the owned version child exceeds its absolute deadline | session |
+| `version_probe_output_overflow` | combined version output exceeds 4 KiB | session |
+| `version_probe_failed` | the owned version child exits nonzero or emits no output | session |
+| `version_output_malformed` | version output lacks a dialect-required client or server version or is unparseable under the reviewed dialect (§2.6) | session |
+| `version_endpoint_ownership_failed` | endpoint ownership is lost, ambiguous, or uncertain at the pre-version-child recheck, or the dialect's connection-warning marker appears | session |
+| `version_probe_cleanup_failed` | version-child tree/handle/pending-I/O/temporary cleanup cannot be proven | session |
+| `io_cancellation_failed` | checked `CancelIoEx` against an exact pending pipe operation fails (§5) | session (cleanup failure; no retry) |
+| `pending_io_cleanup_timeout` | a pending operation is not confirmed complete by the absolute cleanup deadline (§5) | session (cleanup failure; no retry) |
 | `model_residency_probe_failed` | bounded owned `/api/ps` response is unavailable, malformed, or oversized | session |
 | `unexpected_model_residency` | owned isolated `/api/ps` reports one or more resident models | launch attestation |
-| `runtime_identity_mismatch` | required normalized versions disagree, or a parseable startup version disagrees (§2.6) | session; batch if the binary changed mid-batch |
+| `runtime_identity_mismatch` | required normalized versions disagree (client / command-server / API), or a parseable startup version disagrees (§2.6) | session; batch if the binary changed mid-batch |
 | `attestation_missing` | arm-defining field `unattested` (§6.2) | session for verdicts |
 | `attestation_mismatch` | requested ≠ attested on arm-defining field (§6.3) | session as intended arm |
 | `ordinary_service_busy` | preflight: model loaded on an identified ordinary endpoint | batch never starts |
@@ -776,15 +1038,15 @@ string.
 | `unload_failed` | `/api/ps` non-empty after bounded unload poll | session (→ terminate path) |
 | `orphaned_runner` | post-shutdown scan finds survivor (§4.3) | batch (aborts) |
 | `unclean_shutdown` | graceful path failed, job kill needed | recorded; session valid only if all runs completed first |
-| `teardown_incomplete` | temp profile/shadow store not fully removed (§4.5) | blocks next session |
+| `teardown_incomplete` | temp profile/shadow store not fully removed, or a handle close fails (§4.5) | blocks next session |
 | `session_incomplete` | fewer than the declared runs completed | session |
 | `block_incomplete` | any of a block's four sessions invalid | the block |
 | `inconsistent_across_blocks` | block difference reports disagree in direction (§8) | pooled verdict (reported, not averaged) |
 
 Every Windows API return value is checked. Durable diagnostics expose
 only this fixed vocabulary and closed bounded numeric metadata; raw Win32
-messages, paths, handles, process identifiers, and port numbers are never
-persisted.
+messages, paths, handles, process identifiers, creation times, addresses,
+and port numbers are never persisted.
 
 Aggregation rule, unchanged in spirit from schema v2: invalid units
 are excluded *and named* in the batch manifest's validity ledger; a
@@ -822,9 +1084,10 @@ strategy §13; none delegable to implementation agents:
    isolated server ever runs on the dev machine: the maintainer
    approves the empty-store, no-inference attestation launch (§7).
    Phase 1 code existing does not imply permission to run it. A closed,
-   reviewed dialect entry committed for the resolved executable SHA-256 is
-   a prerequisite to seeking or exercising this approval; unknown hashes
-   fail before process creation.
+   reviewed dialect entry (startup + version-output) committed for the
+   resolved executable SHA-256 is a prerequisite to seeking or
+   exercising this approval; unknown hashes fail before process
+   creation.
 2. **G-ISO-1 — session-plan + policy approval.** Before any
    inference-phase batch: the experiment definition (model, arms,
    blocks, shapes, wall-clock budget, priming plan) **and the
@@ -851,17 +1114,78 @@ defense-in-depth), no new dependencies (ctypes is stdlib).
 
 ---
 
-## 12. Implementation ladder
+## 12. Phase 1 lifecycle state machine
+
+The Phase 1 attestation lifecycle is this explicit ordered state
+machine. States execute in order; the **only** backward edge in the
+entire machine is S10 → S4 on a proved candidate-port race (§3.3),
+under the bounded outer attempt count. Every other failure is fatal
+for the attempt and follows the cleanup rule below. "Owned resources"
+lists what the launcher holds once the state completes.
+
+| # | State | Success → | Fatal failure categories (fail closed) | Retry | Owned resources after state |
+| --- | --- | --- | --- | --- | --- |
+| S0 | contract validation (overrides, timeouts, attempts, exclusions) | S1 | contract error (pre-lifecycle, typed `Phase1ContractError`; no artifact category) | no | none |
+| S1 | executable resolution + basename + SHA-256 | S2 | `executable_not_found`, `executable_identity_unavailable` | no | none (path/hash memory-only) |
+| S2 | dialect lookup (closed SHA-256 registry: startup + version-output dialects) | S3 | `attestation_dialect_unavailable` | no | none |
+| S3 | temporary-space creation (profile, LOCALAPPDATA, scratch, empty store) | S4 | `temp_space_failed` | no | session space |
+| S4 | candidate endpoint selection (probe-bind fresh loopback port, close probe socket) | S5 | `port_bind_failed` on exhaustion | re-entered only via the S10 race edge | session space |
+| S5 | suspended server creation (overlapped pipes + events, NUL stdin, attribute list, `CreateProcessW` suspended; child-side handles closed checked) | S6 | `process_create_failed`, `process_attribute_list_failed`, `process_attribute_list_cleanup_failed`, `log_io_setup_failed` | no | + suspended process, pipe/event handles |
+| S6 | executable revalidation (image query + file re-hash) | S7 | `runtime_identity_mismatch`, `executable_identity_unavailable` | no | unchanged |
+| S7 | Job Object assignment (create, kill-on-close, assign, verify) | S8 | `job_create_failed`, `job_limit_configuration_failed`, `job_assignment_failed` | no | + job |
+| S8 | log-I/O setup (post initial overlapped reads on both pipes) | S9 | `log_io_setup_failed` | no | + pending overlapped reads |
+| S9 | resume (`ResumeThread`, checked; readiness clock starts immediately before) | S10 | `process_resume_failed` | no | running child tree |
+| S10 | endpoint ownership readiness (address-aware classification loop, log draining, absolute readiness deadline) | S11 | `startup_timeout`, `startup_process_exit`, `startup_log_overflow`, `log_read_failed`, `port_hijacked`, `port_ownership_ambiguous`, `ownership_probe_unavailable`, `owner_identity_unavailable` | **only** proved race → S4 (after full attempt cleanup S16–S20 with no failures; raced port excluded) | running child tree |
+| S11 | bounded `/api/version` against the OWNED endpoint (within the readiness deadline) | S12 | same categories as S10; malformed response → `runtime_identity_mismatch` | no | running child tree |
+| S12 | command-version binding (§2.6: ownership recheck → own temp space → version child suspended → image verify/re-hash → own job → resume → ≤ 4 KiB capture under absolute deadline → dialect parse → client/command-server/API equality → verified probe cleanup incl. its temp space) | S13 | `version_endpoint_ownership_failed`, `version_probe_timeout`, `version_probe_output_overflow`, `version_probe_failed`, `version_output_malformed`, `runtime_identity_mismatch`, `version_probe_cleanup_failed` | no | running child tree (version-child resources are transient inside this state and fully cleaned before exit) |
+| S13 | mandatory startup attestation (reviewed dialect markers incl. `noprune`/`no_cloud`; separate absolute attestation deadline) | S14 | `attestation_missing`, `attestation_mismatch`, `startup_process_exit`, `startup_log_overflow`, `log_read_failed` | no | running child tree |
+| S14 | ownership revalidation (address-aware, must be OWNED) | S15 | `port_hijacked`, `port_ownership_ambiguous`, `ownership_probe_unavailable` | no | running child tree |
+| S15 | bounded `/api/ps` (8 KiB cap; exact `{"models": []}`) | S16 | `model_residency_probe_failed`, `unexpected_model_residency` | no | running child tree |
+| S16 | shutdown (terminate job; bounded wait on process handle) | S17 | `unclean_shutdown` (recorded) | no | dead tree; handles; pending I/O |
+| S17 | pending-I/O cancellation (§5 sequence: drain, `CancelIoEx`, bounded confirmation, close pipe/event handles) | S18 | `io_cancellation_failed`, `pending_io_cleanup_timeout` | no | process/thread/job handles |
+| S18 | orphan verification (parentage/job membership, read-only snapshot) | S19 | `orphaned_runner`, `ownership_probe_unavailable` | no | process/thread/job handles |
+| S19 | address-aware endpoint closure (NOT_PRESENT required; race-identity comparison when applicable; close process/thread/job and any identity handles, checked) | S20 | `port_not_closed`, `port_ownership_ambiguous`, `owner_identity_changed`, `owner_identity_unavailable`, `ownership_probe_unavailable`, `teardown_incomplete` (handle close) | no | session space only |
+| S20 | temporary-space teardown | S21 | `teardown_incomplete` | no | none |
+| S21 | artifact validation (closed schema; `complete` only with zero failures and every proof true) | done | internal validation error (never a weakened artifact) | no | none |
+
+**Cleanup rule (mandatory before exit).** A fatal failure in S5–S15
+does not end the attempt: the lifecycle always proceeds through
+S16 → S17 → S18 → S19 → S20 → S21, recording both the primary failure
+and any cleanup failures, before the launcher returns. A failure in
+S0–S4 runs only the cleanup states matching resources actually
+acquired (S20 → S21 once the session space exists; S21 alone before
+that). Cleanup states never loop back and are themselves bounded by
+the absolute cleanup deadline (§5); exhausting it yields the fixed
+cleanup failure, never a retry, and never `complete` evidence.
+
+**Race edge, restated.** S10 → S4 fires only when §3.3's proved-race
+conditions hold: the candidate was free at probe time, exactly one
+relevant foreign listener with a captured stable identity now owns it,
+the benchmark child exited promptly, the abandoned attempt's full
+cleanup chain (S16–S20) completed with **no** failures, and the
+closure check found the identical unchanged foreign identity. Anything
+less fails closed with the matching category. Version-child failures
+(S12), job failures, identity failures, log failures, and attestation
+failures never re-enter S4.
+
+---
+
+## 13. Implementation ladder
 
 The work is deliberately split so that no single agent task ever holds
 both "can launch servers" and "touches model files":
 
-- **Phase 1 (the only task prompted below)** — isolated child-server
-  *lifecycle and attestation* against synthetic fixtures: temp
-  home/store construction, minimal env, job objects, bounded
-  in-memory logs, typed attestation, identity binding, TCP ownership,
-  readiness, shutdown, orphan and port-closure verification. No model
-  is ever loaded; no real server is launched by code or tests.
+- **Phase 1** — isolated child-server *lifecycle and attestation*
+  against synthetic fixtures: temp home/store construction, minimal
+  env, job objects, bounded overlapped log I/O, typed attestation,
+  post-readiness identity binding, address-aware TCP ownership,
+  readiness, shutdown, orphan and endpoint-closure verification. No
+  model is ever loaded; no real server is launched by code or tests.
+  Phase 1 exists as draft PR #38 (branch
+  `codex/isolated-ollama-attestation-phase-1`, based on
+  `research/hardware-relative-uplift-benchmark`); the revisions 3–5
+  build prompts are superseded, and the single active implementation
+  prompt is the revision-6 correction prompt in §15.
 - **Gate G-ISO-0**, then the human-executed empty-store attestation
   launch (§7) using Phase 1's CLI.
 - **Phase 2** — shadow-store construction (§3.4) + the
@@ -872,162 +1196,7 @@ both "can launch servers" and "touches model files":
   reporting, feeding the existing compare pipeline.
 
 Each later phase gets its own narrow prompt only after the previous
-phase's review. Phase 1 is based on
-`research/hardware-relative-uplift-benchmark` at `b5308a4a` and is
-published from a separate implementation branch.
-
-### Phase 1 implementation prompt for GPT-5.6 Sol/Codex
-
-```
-TASK: Phase 1 only — isolated Ollama child-server lifecycle and typed
-attestation for the runtime_bench harness. Lifecycle and attestation
-infrastructure with synthetic tests; no model work of any kind.
-
-Base: research/hardware-relative-uplift-benchmark (b5308a4a). Do not
-modify main, feat/deep-local-fable, or any planner/RPC/UI/provider code.
-
-CONTEXT (read first):
-- projects/odysseus/ISOLATED_OLLAMA_BENCHMARK_SERVER_STRATEGY.md —
-  the contract. Phase 1 implements sections 2.6, 3.1-3.3, 4, 5, 6
-  (identity + startup attestation only), and 7's mechanics. Follow
-  every fail-closed rule exactly.
-- python/odysseus_desktop_backend/runtime_bench/paired.py and
-  paired_artifacts.py — reuse the loopback guard, redaction
-  discipline, and closed-schema style. Its schema-v2 SERVER_ENV_KEYS
-  is not the child-process allowlist.
-- python/odysseus_desktop_backend/runtime_bench/__main__.py — CLI
-  conventions (subcommand style, JSON summaries, nonzero on failure).
-
-BUILD exactly this, dev-only, stdlib-only, Windows-first,
-loopback-only:
-
-1. isolated_server.py — an IsolatedOllamaServer lifecycle owner:
-   a) Temporary session space: create per-session temp USERPROFILE
-      (with LOCALAPPDATA subdir), TEMP/TMP dirs, and an EMPTY model
-      store dir; delete all of them at teardown; report
-      teardown_incomplete on failure. Never resolve, read, or link
-      the user's real model store in Phase 1 — there is no code path
-      to it.
-   b) Minimal explicit child environment per strategy section 3.2:
-      constructed from empty; only SystemRoot, SystemDrive, minimal
-      explicit PATH (install dir + lib subdir + System32), temp
-      USERPROFILE/HOMEDRIVE/HOMEPATH/TEMP/TMP/LOCALAPPDATA, plus
-      NO_PROXY=127.0.0.1,localhost, OLLAMA_DEBUG_LOG_REQUESTS=0,
-      OLLAMA_NO_CLOUD=1, OLLAMA_NOPRUNE=1, OLLAMA_HOST, OLLAMA_MODELS
-      (the empty temp store), OLLAMA_NUM_PARALLEL=1,
-      OLLAMA_MAX_LOADED_MODELS=1, OLLAMA_MAX_QUEUE=1, OLLAMA_DEBUG=0,
-      These form the closed FIXED_INTERNAL_ENV_KEYS and cannot be
-      supplied or overridden by callers. Define the separate closed
-      USER_OVERRIDE_ENV_KEYS containing only OLLAMA_FLASH_ATTENTION,
-      OLLAMA_KV_CACHE_TYPE, OLLAMA_KEEP_ALIVE and
-      OLLAMA_CONTEXT_LENGTH. Reject fixed-key attempts and all other
-      keys before any allocation or probe. Unit-test that
-      inherited OLLAMA_*/proxy/secret variables can never appear.
-   c) Runtime identity binding per section 2.6: resolve the
-      executable, record basename, compute SHA-256, capture
-      `ollama --version` output through its own suspended,
-      minimal-environment, job-owned, 4-KiB-capped, true-deadline
-      lifecycle (never subprocess.run); strictly normalize it and the
-      /api/version response into one representation and require them
-      to match. A parseable startup-log version must normalize to the
-      same value; an absent or unparseable startup-log version is the
-      typed state unattested and does not fail identity. Raw version
-      output and the resolved path are memory-only. Query the suspended
-      process image and re-hash before job assignment/resume.
-   d) Port policy per section 3.3: probe-bind a fresh dynamic candidate,
-      bounded whole-launch retries, exclusion list for endpoints identified as
-      non-owned (Phase 1 takes an explicit exclusion list argument;
-      discovery itself is Phase 2). TCP-table ownership check
-      (GetExtendedTcpTable via ctypes, read-only) BEFORE the first
-      HTTP request; port_hijacked on mismatch. Post-teardown
-      port-closure check; port_not_closed on survivor. Retry only a
-      proven foreign-owner + child-exit bind race, and only after full
-      tree/reader/handle/temp cleanup plus proof that any persistent listener
-      is the unchanged observed foreign owner and not in the benchmark job.
-   e) Windows Job Object ownership per section 4: CREATE_SUSPENDED ->
-      STARTUPINFOEX with an exact read-only NUL stdin + stdout/stderr writers
-      HANDLE_LIST (never parent stdin) ->
-      CreateJobObjectW -> SetInformationJobObject with
-      JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE -> AssignProcessToJobObject
-      -> verify (job_assignment_verified) -> ResumeThread. Bounded
-      graceful-first shutdown (Phase 1 has no model to unload: ready
-      -> terminate job), orphan verification by parentage/job
-      membership only (never image name), via read-only
-      CreateToolhelp32Snapshot.
-   f) Bounded in-memory log capture per section 5: reader threads,
-      first 64 KiB + last 192 KiB, 256 KiB cap, truncation flag,
-      readiness deadline starting immediately before ResumeThread
-      (default 30 s), then a separate bounded mandatory-marker
-      attestation deadline (default 10 s) -> startup_timeout /
-      startup_log_overflow. Raw capture is never written to disk and
-      is discarded after parsing. After tree termination/wait, cancel exact
-      blocked reader threads with checked CancelSynchronousIo, close parent
-      read endpoints, perform a final bounded join, and never return/retry
-      while a helper survives.
-   g) Typed startup attestation per section 6: parse (fixture-driven
-      through a closed committed SHA-256 registry, never caller regex) the
-      startup config report and, when present, the runner launch
-      line, into typed fields each carrying a source or "unattested".
-      Unknown hashes fail attestation_dialect_unavailable before launch;
-      do not invent an installed-binary dialect in Phase 1 corrections.
-      Persistable output uses the standalone schema_version 1 /
-      artifact_kind isolated_ollama_server_attestation contract in
-      section 5. It contains no pid, port, path, raw excerpt, command
-      line, prompt, generated output, or schema-v3 performance field.
-      After configuration attestation, reverify endpoint ownership and perform
-      one bounded read-only GET /api/ps. Require the exact empty models shape
-      and persist only model_residency_verified_empty=true; a complete artifact
-      requires it.
-
-2. Failure categories: implement exactly the section 9 categories
-   reachable in Phase 1, including platform/executable/temp failures,
-   each process/job stage, ownership probe availability, early process
-   exit, and log-reader failure. Check every Windows API result. Expose
-   only the fixed category and closed bounded numeric metadata; never
-   raw Win32 messages or identity-bearing values. Unknown categories
-   are validation errors.
-
-3. CLI: python -m odysseus_desktop_backend.runtime_bench attest
-   --dry-run (default): validate configuration, print the typed
-   launch plan as JSON, spawn nothing. Real execution requires an
-   explicit --approved-g-iso-0 flag AND is refused when stdin is not
-   a terminal; the default invocation can never launch a process.
-   JSON summary out; nonzero exit on any failure category.
-
-4. Tests, same discipline as the existing harness/paired tests, all
-   against synthetic fixtures (fake process objects, fake pipes with
-   scripted log bytes, fake TCP tables, fake clock; loopback socket
-   fixtures only for the port-probe logic): env construction
-   (deny-by-default, secret/proxy exclusion, allowlist rejection),
-   temp-space lifecycle incl. teardown_incomplete, identity binding
-   agree/disagree paths, port policy incl. exclusion list and
-   pre-request ownership and post-teardown closure, job-object call
-   sequence and orphan verdicts (fake API layer), log bounds and
-   truncation, attestation parsing for at least two fixture log
-   dialects plus an unparseable dialect yielding "unattested",
-   privacy of persisted output (property test: no pid/port/path
-   strings in any persisted structure), every Phase 1 category
-   reachable. Tests never spawn a real ollama, never touch the real
-   model store, never open non-loopback sockets.
-
-DO NOT: implement model loading, inference, shadow-store
-construction, ordinary-service discovery, schema-v3 performance
-artifacts, sessions/blocks/priming, comparison logic, or any
-auto-launch of a real server; do not modify paired.py public
-behavior, shapes, prompts, planner, services/, providers, UI, or
-settings; do not add dependencies; do not download anything; do not
-signal any process the harness did not create; do not write raw logs
-to disk. During implementation, do not invoke the real-launch approval
-flag, launch the installed Ollama binary, probe the ordinary Ollama
-service, or read the real model store. Execute only the dry-run CLI and
-synthetic fixture lifecycle.
-
-DONE WHEN: full existing test suite green plus the new tests; a
-synthetic end-to-end lifecycle (fake process fixture) produces a
-typed standalone attestation dict that validates and contains no
-forbidden fields; the dry-run CLI emits the plan without spawning;
-result summary explicitly lists any deviation from this contract.
-```
+phase's review.
 
 The real empty-store attestation launch (§7) is **not** part of
 Phase 1: it happens only after Phase 1 review and an explicit G-ISO-0
@@ -1035,7 +1204,7 @@ approval, executed by a human using the reviewed CLI.
 
 ---
 
-## 13. Non-goals
+## 14. Non-goals
 
 - No llama.cpp server sessions (the mechanism generalizes — llama.cpp
   flags are per-server too — but that is a later extension).
@@ -1062,11 +1231,128 @@ drift for per-request options; this mechanism extends the same
 fail-closed discipline one level up — to the server process itself —
 by making each server configuration a short-lived, loopback-only,
 job-owned child with a disposable home and a disposable shadow of the
-model store, which binds the identity of the binary it ran, attests
-what that binary actually applied, persists only typed privacy-safe
-evidence, and dies provably clean. The ladder to get there starts
-deliberately small: Phase 1 builds and tests the lifecycle against
-fixtures alone, a human then launches one empty, model-less server to
-prove the mechanism on the real binary, and only after that does any
-model file — via shadow links, never the original store — enter the
-picture.
+model store, which binds the identity of the binary it ran against its
+own proven endpoint, attests what that binary actually applied,
+persists only typed privacy-safe evidence, and dies provably clean
+under absolute deadlines. The ladder to get there starts deliberately
+small: Phase 1 builds and tests the lifecycle against fixtures alone,
+a human then launches one empty, model-less server to prove the
+mechanism on the real binary, and only after that does any model
+file — via shadow links, never the original store — enter the picture.
+
+---
+
+## 15. Revision 6 correction prompt for GPT-5.6 Sol/Codex
+
+```
+TASK: Revision-6 architecture corrections only, continuing on the
+existing draft PR #38 branch codex/isolated-ollama-attestation-phase-1.
+Do not create a new branch.
+
+CONTEXT (read first):
+- projects/odysseus/ISOLATED_OLLAMA_BENCHMARK_SERVER_STRATEGY.md
+  revision 6 — the contract. Especially §2.6/§2.7 (post-readiness
+  command-version binding), §3.3 (address-aware ownership + stable
+  owner identity), §5 (overlapped bounded I/O), §9 (updated failure
+  vocabulary), §12 (state machine).
+- python/odysseus_desktop_backend/runtime_bench/isolated_server.py and
+  python/tests/test_isolated_ollama_server.py — the code under
+  correction.
+
+Scope is exactly the three architectural corrections and their tests:
+
+1. COMMAND-VERSION BINDING (§2.6, §2.7, state S12). Delete the
+   pre-server port-1 version probe entirely. Run the version child
+   only after endpoint ownership readiness and /api/version, with an
+   ownership recheck immediately before it and OLLAMA_HOST set to the
+   proven owned endpoint. The version child keeps: its own temporary
+   home and empty model store, the same minimal from-empty
+   environment, the exact NUL/stdout/stderr inherited-handle list, its
+   own verified kill-on-close job, suspended-image verification and
+   re-hash before resume, the 4 KiB combined cap, an absolute
+   deadline, complete verified cleanup, and no raw output persistence.
+   Parse client and command-reported server versions only through the
+   closed SHA-256 version-output dialect; require both to equal the
+   normalized /api/version value. Implement the §2.6 fail-closed
+   table: version_output_malformed, version_endpoint_ownership_failed,
+   runtime_identity_mismatch. No harness process may target port 1, a
+   guessed port, or any unproven endpoint.
+
+2. ADDRESS-AWARE TCP OWNERSHIP (§3.3). Replace the port-only
+   first-PID lookup: classify every listener row by local address and
+   port (exact loopback 127.0.0.1:<port>, wildcard 0.0.0.0:<port>,
+   unrelated concrete-interface, irrelevant), return all relevant rows,
+   and implement the closed OWNED / NOT_PRESENT / FOREIGN / AMBIGUOUS /
+   UNCERTAIN result model. Multiple relevant rows fail closed as
+   port_ownership_ambiguous; wildcard and loopback rows are never
+   collapsed; unrelated-interface rows are never matched. Implement
+   the stable foreign-owner identity: held checked
+   PROCESS_QUERY_LIMITED_INFORMATION handle plus GetProcessTimes
+   creation time, compared during race cleanup with PID-reuse
+   detection (same PID + different creation time, or signaled held
+   handle), owner_identity_unavailable / owner_identity_changed, a
+   checked handle close at endpoint closure, and no persistence of
+   PID, address, port, handle, or creation time. Only an unchanged
+   proven foreign identity with every benchmark resource gone may
+   permit the single S10 → S4 retry.
+
+3. GENUINELY BOUNDED LOG I/O (§5, states S5/S8/S17). Replace the
+   reader threads and every unbounded join with benchmark-owned
+   overlapped pipe reads: single-instance uniquely named pipes
+   (PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED |
+   FILE_FLAG_FIRST_PIPE_INSTANCE, byte mode,
+   PIPE_REJECT_REMOTE_CLIENTS), inheritable child write ends only, one
+   pending overlapped ReadFile per stream with a manual-reset event,
+   WaitForMultipleObjects under the absolute
+   readiness/attestation/version/cleanup deadlines, checked
+   GetOverlappedResult, first-64-KiB + last-192-KiB / 256 KiB / 4 KiB
+   caps, and the §5 cancellation sequence with checked CancelIoEx
+   against the exact pending operation. Implement log_io_setup_failed,
+   log_read_failed (renamed from log_reader_failed),
+   io_cancellation_failed, and pending_io_cleanup_timeout. After
+   cleanup-deadline exhaustion: fixed cleanup failure, no retry, never
+   complete evidence, buffers stay referenced. No Python helper thread
+   may remain in the I/O path and no Thread.join may remain in the
+   lifecycle.
+
+Align the lifecycle ordering and artifact validation with the §12
+state machine and §9 vocabulary (runtime identity now records client,
+command-reported server, and API versions). Preserve every revision-5
+decision listed in the strategy: exact three-handle inheritance,
+from-empty environment, temporary profile and empty store, the closed
+SHA-256 dialect registry kept EMPTY, requested-versus-attested typing,
+separate readiness/attestation deadlines, suspended-image
+verification, bounded /api/ps requiring exactly {"models": []},
+privacy-safe closed artifact, process-free dry-run default, and
+synthetic-only validation.
+
+TESTS: synthetic fixtures only (fake lifecycle API, fake TCP rows with
+addresses, scripted pipe/event fixtures, fake clock). Add or update
+hostile tests for at least: version output containing the
+connection-warning marker; missing client version; missing server
+version; client/server/API disagreement; ownership change immediately
+before the version child; same-port listeners on different local
+addresses; wildcard plus loopback rows for one port; multiple relevant
+owners; PID reuse (same PID, different creation time); vanished
+foreign owner; a pending read that never completes and ignores the
+first cancellation; CancelIoEx failure; and cleanup-deadline
+exhaustion returning the fixed cleanup failure without retry. Property
+test: no persisted structure contains a PID, port, address, path,
+handle, creation time, pipe name, or raw output.
+
+PROHIBITED: launching the installed Ollama binary or any real server;
+contacting the ordinary Ollama service; reading any real model store;
+registering any dialect entry (the registry stays empty); invoking or
+weakening the G-ISO-0 approval flag; downloads or new dependencies;
+redesigning Phase 2, shadow stores, inference, schema v3, ABBA/BAAB
+execution, planner promotion, or UI; merging, rebasing, retargeting,
+or force-pushing; taking PR #38 out of draft or changing its base from
+research/hardware-relative-uplift-benchmark.
+
+DONE WHEN: the three corrections match revision 6 exactly; the
+complete validation matrix passes — full Python test suite, JavaScript
+suite, frontend checks, Cargo checks/tests, and `git diff --check` —
+the branch is updated with ordinary pushes only, PR #38 remains a
+draft targeting research/hardware-relative-uplift-benchmark, and the
+result summary explicitly lists any deviation from this contract.
+```

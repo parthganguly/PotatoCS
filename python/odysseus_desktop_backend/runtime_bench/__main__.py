@@ -176,6 +176,7 @@ def _attest_main(argv: list[str]) -> int:
     parser.add_argument("--startup-timeout", type=float, default=30.0)
     parser.add_argument("--attestation-timeout", type=float, default=10.0)
     parser.add_argument("--version-timeout", type=float, default=10.0)
+    parser.add_argument("--cleanup-timeout", type=float, default=10.0)
     parser.add_argument("--launch-attempts", type=int, default=3)
     args = parser.parse_args(argv)
     try:
@@ -193,6 +194,7 @@ def _attest_main(argv: list[str]) -> int:
                 startup_timeout_seconds=args.startup_timeout,
                 attestation_timeout_seconds=args.attestation_timeout,
                 version_timeout_seconds=args.version_timeout,
+                cleanup_timeout_seconds=args.cleanup_timeout,
                 launch_attempts=args.launch_attempts,
             )
             print(json.dumps(result, indent=1, sort_keys=True))
@@ -205,6 +207,7 @@ def _attest_main(argv: list[str]) -> int:
             startup_timeout_seconds=args.startup_timeout,
             attestation_timeout_seconds=args.attestation_timeout,
             version_timeout_seconds=args.version_timeout,
+            cleanup_timeout_seconds=args.cleanup_timeout,
             launch_attempts=args.launch_attempts,
         ).run()
     except Phase1ContractError as exc:
