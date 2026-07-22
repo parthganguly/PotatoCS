@@ -841,3 +841,332 @@ def test_validator_rejects_multibyte_lines_over_byte_cap_under_char_cap(
     assert sum(len(entry.encode("utf-8")) for entry in lines) > MAX_VERSION_OUTPUT_BYTES
     result["observations"]["version_command_lines"] = lines
     assert validate_capture_result(result) != []
+
+
+# ---------------------------------------------------------------------------
+# Round 2: independent privacy validation (Blocker 1), explicit proxy/user/
+# host contexts (Blockers 2-4), secret-keyword overmatching (Blocker 5),
+# post-redaction version cap (Blocker 6), and the startup-drain deadline
+# (Blocker 7).
+# ---------------------------------------------------------------------------
+
+
+def test_validator_privacy_check_never_calls_the_redactor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 1: validate_capture_result's privacy scan must be genuinely
+    independent of redact_evidence_line. Breaking the redactor must not
+    break the validator's ability to detect (or accept) raw content."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+
+    monkeypatch.setattr(
+        dialect_capture,
+        "redact_evidence_line",
+        lambda line: (_ for _ in ()).throw(AssertionError("redactor must not be called")),
+    )
+
+    # A clean, already-redacted capture result still validates even
+    # though the redactor is now broken.
+    assert validate_capture_result(result) == []
+
+    # A result with raw, never-redacted sensitive content is still
+    # independently rejected -- the validator does not need to call the
+    # (broken) redactor to notice this.
+    dirty = dict(result)
+    dirty["observations"] = dict(result["observations"])
+    dirty["observations"]["version_command_lines"] = ["host=corp-server-01"]
+    assert validate_capture_result(dirty) != []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("proxy: abc123", "proxy: <SECRET>"),
+        ("proxy abc123", "proxy <SECRET>"),
+        ("proxy=abc123", "proxy=<SECRET>"),
+        ("proxy_url: http://user:pass@example.com:8080", "proxy_url: <URL>"),
+        ("HTTP_PROXY: http://user:pass@example.com:8080", "HTTP_PROXY: <URL>"),
+        ("HTTPS_PROXY=http://user:pass@example.com:8080", "HTTPS_PROXY=<URL>"),
+    ],
+)
+def test_proxy_contexts_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 2: every required proxy input form redacts to exactly the
+    specified output, preserving assignment punctuation and spacing."""
+
+    assert redact_evidence_line(raw) == expected
+    # Idempotent: redacting the already-redacted output is a no-op.
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "proxy: abc123",
+        "proxy abc123",
+        "proxy=abc123",
+        "proxy_url: http://user:pass@example.com:8080",
+        "HTTP_PROXY: http://user:pass@example.com:8080",
+        "HTTPS_PROXY=http://user:pass@example.com:8080",
+    ],
+)
+@pytest.mark.parametrize("field", ["api_version", "version_command_lines", "startup_evidence_lines"])
+def test_proxy_inputs_independently_rejected_in_every_evidence_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 2: every proxy form, injected raw into any evidence field,
+    is independently rejected."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    if field == "api_version":
+        result["observations"]["api_version"] = raw
+    else:
+        result["observations"][field] = [raw]
+    assert validate_capture_result(result) != []
+
+
+def test_proxy_secret_prefix_does_not_leak_into_assignment() -> None:
+    """Blocker 5's headline example: the optional separator must not let
+    the proxy keyword swallow only part of a hyphenated value."""
+
+    redacted = redact_evidence_line("proxy: secret-value")
+    assert redacted == "proxy: <SECRET>"
+    assert redacted != "proxy: secret<SECRET>"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("username=alice", "username=<USER>"),
+        ("username: alice", "username: <USER>"),
+        ("username alice", "username <USER>"),
+        ("user=alice", "user=<USER>"),
+        ("user: alice", "user: <USER>"),
+        ("user alice", "user <USER>"),
+    ],
+)
+def test_user_contexts_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 3: every required user/username input form redacts to
+    exactly the specified output."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "username=alice",
+        "username: alice",
+        "username alice",
+        "user=alice",
+        "user: alice",
+        "user alice",
+    ],
+)
+def test_user_inputs_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Blocker 3: every required user/username input form, injected raw,
+    is independently rejected by the validator."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "userspace processes running",
+        "username_hash computed",
+    ],
+)
+def test_user_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 3: ordinary words merely beginning with user/username
+    (glued into a larger identifier, no word boundary) are untouched."""
+
+    assert redact_evidence_line(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("host=workstation", "host=<HOST>"),
+        ("host: workstation", "host: <HOST>"),
+        ("host workstation", "host <HOST>"),
+        ("hostname=corp-server-01", "hostname=<HOST>"),
+        ("hostname: corp-server-01", "hostname: <HOST>"),
+        ("hostname corp-server-01", "hostname <HOST>"),
+        ("listening on workstation", "listening on <HOST>"),
+        ("server=corp-server-01", "server=<HOST>"),
+        ("server: corp-server-01", "server: <HOST>"),
+    ],
+)
+def test_host_contexts_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 4: every required host/hostname/server/on context input
+    form redacts to exactly the specified output."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "host=workstation",
+        "host: workstation",
+        "host workstation",
+        "hostname=corp-server-01",
+        "hostname: corp-server-01",
+        "hostname corp-server-01",
+        "listening on workstation",
+        "server=corp-server-01",
+        "server: corp-server-01",
+    ],
+)
+def test_host_inputs_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Blocker 4: every required host context input form, injected raw,
+    is independently rejected by the validator."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "server started",
+        "server ready",
+        "hostile process",
+        "hostname validation complete",
+    ],
+)
+def test_host_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 4: these must never be mistaken for a host assignment --
+    "server" has no bare-whitespace form, "hostile" fails the keyword
+    boundary, and a bare "hostname"/"host" value must run to the end of
+    the line (or a comma/semicolon) to count as an assignment."""
+
+    assert redact_evidence_line(raw) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "tokenizer ready",
+        "tokenization complete",
+        "secretary started",
+        "passwordless mode",
+        "password policy loaded",
+        "access_tokenizer initialized",
+    ],
+)
+def test_secret_keyword_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 5: none of these ordinary phrases may be mistaken for a
+    secret assignment. api_key/access_token/secret/password/passwd only
+    ever match with an explicit ":"/"=" separator (never bare
+    whitespace), so a standalone keyword followed by an ordinary word
+    ("password policy loaded") is never swallowed."""
+
+    assert redact_evidence_line(raw) == raw
+
+
+def test_designated_tokens_validate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 2: designated replacement tokens (including <USER>) validate
+    cleanly under the independent privacy scan."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [
+        "path=<PATH> host=<HOST> port=<PORT> secret=<SECRET> user=<USER> "
+        "pid=<PID> pipe=<PIPE> handle=<HANDLE> url=<URL>"
+    ]
+    assert validate_capture_result(result) == []
+
+
+@pytest.mark.parametrize("version", ["0.5.7", "v0.5.7", "0.5.7-rc1"])
+def test_valid_version_strings_validate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """Round 2: legitimate normalized version strings must never be
+    rejected by the independent privacy scan."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api_version_probe=lambda port, timeout: version)
+    assert result["failures"] == []
+    assert validate_capture_result(result) == []
+
+
+def test_post_redaction_version_cap_bounds_expanded_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 6: redaction can expand raw evidence (many short paths each
+    becoming their own <PATH> token). The post-redaction aggregate must
+    still respect MAX_VERSION_OUTPUT_BYTES, every included line must be
+    complete, and the result must be marked truncated."""
+
+    raw = b"C:\\a\n" * 819  # 4095 raw bytes: at most the existing raw capture limit
+    lines, truncated = select_version_command_lines(raw)
+    aggregate = sum(len(line.encode("utf-8")) for line in lines)
+    assert aggregate <= MAX_VERSION_OUTPUT_BYTES
+    assert all(line == "<PATH>" for line in lines)
+    assert truncated is True
+
+    # An internally generated bounded result (from a real successful
+    # capture, with this evidence substituted in) must still validate.
+    fabricated, _, _ = _capture(tmp_path, monkeypatch)
+    fabricated["observations"]["version_command_lines"] = lines
+    fabricated["truncation"]["version_command_truncated"] = True
+    assert validate_capture_result(fabricated) == []
+
+
+def test_post_redaction_version_cap_bounds_multibyte_evidence() -> None:
+    """Blocker 6, multibyte case: near the byte boundary, the aggregate
+    cap must still be enforced in encoded bytes, not characters."""
+
+    line = "café " * 100  # multibyte-heavy raw content
+    raw = (line + "\n") .encode("utf-8") * 40
+    lines, truncated = select_version_command_lines(raw)
+    aggregate = sum(len(entry.encode("utf-8")) for entry in lines)
+    assert aggregate <= MAX_VERSION_OUTPUT_BYTES
+    assert truncated is True
+
+
+def test_capture_does_not_raise_when_redaction_expands_version_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 6: DialectCaptureSession.run must not raise AssertionError
+    solely because redaction expanded the version-command evidence."""
+
+    api = FakeLifecycleApi(version_output=(b"C:\\a\n" * 819))
+    result, _, _ = _capture(tmp_path, monkeypatch, api=api)
+    assert result["failures"] == []
+    aggregate = sum(
+        len(line.encode("utf-8")) for line in result["observations"]["version_command_lines"]
+    )
+    assert aggregate <= MAX_VERSION_OUTPUT_BYTES
+    assert result["truncation"]["version_command_truncated"] is True
+    assert validate_capture_result(result) == []
+
+
+def test_drain_performs_no_wait_once_startup_deadline_is_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 7: once the fake clock reaches the startup deadline right
+    after the API probe succeeds, _drain_startup_evidence must not issue
+    any wait -- it must simply stop, never extending the deadline."""
+
+    values = iter([0.0, 4.9, 10.0])
+
+    def clock() -> float:
+        return next(values, 10.0)
+
+    api = HangingStdoutApi()
+    result, api, _ = _capture(
+        tmp_path, monkeypatch, api=api, clock=clock, startup_timeout_seconds=5.0
+    )
+    assert "wait_for_completion" not in api.calls
+    assert result["failures"] == []

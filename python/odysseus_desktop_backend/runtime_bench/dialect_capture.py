@@ -112,7 +112,13 @@ _TRUNCATION_KEYS = frozenset(
 )
 
 _REPLACEMENT_TOKENS = r"<(?:PATH|USER|HOST|PORT|URL|SECRET|PID|PIPE|HANDLE)>"
-_REPLACEMENT_TOKEN_FULLMATCH = re.compile(rf"^{_REPLACEMENT_TOKENS}$")
+# A "value" counts as already fully redacted if it is one designated
+# token, or a short run of them joined by ":" (e.g. the "<HOST>:<PORT>"
+# pair a prior host/IP pass may have produced). Either shape must be a
+# stable fixed point of every later assignment-style substitution.
+_REPLACEMENT_TOKEN_FULLMATCH = re.compile(
+    rf"^{_REPLACEMENT_TOKENS}(?::{_REPLACEMENT_TOKENS})*$"
+)
 
 _QUOTED_PATH = re.compile(
     r'"[^"\r\n]*[\\/][^"\r\n]*"' r"|'[^'\r\n]*[\\/][^'\r\n]*'"
@@ -123,11 +129,29 @@ _AUTHORIZATION = re.compile(
     r"(?i)(\bauthorization\s*:\s*)(?:bearer\s+)?[^\s,;]+"
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd)\s*(?:=|:)?\s*)([^\s,;]+)"
+
+# Secret/credential keywords that only ever take an *explicit* separator
+# (":" or "="). Bare whitespace is deliberately unsupported here: an
+# optional/absent separator is exactly what let a keyword like
+# "password" swallow the next ordinary word ("password policy loaded")
+# and let "secret" swallow a hyphen-glued suffix ("secret-value") in the
+# previous design.
+_SECRET_ASSIGNMENT_EXPLICIT = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|secret|password|passwd)\b\s*[:=]\s*)([^\s,;]+)"
+)
+# "token" alone additionally supports bare whitespace, since that form is
+# explicitly required ("token abc"). The bare branch only fires when the
+# captured value runs to the end of the line (or a comma/semicolon), so
+# an ordinary sentence like "tokenizer ready" mid-line is never mistaken
+# for an assignment -- "tokenizer" is already excluded by \b, but a
+# genuine standalone "token" followed by more prose is additionally
+# guarded by this anchor.
+_TOKEN_ASSIGNMENT = re.compile(
+    r"(?i)(\btoken\b)(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+)(?=[,;]|$))"
 )
 _PROXY_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:https?|all|wss)_proxy\s*(?:=|:)?\s*)([^\s,;]+)"
+    r"(?i)(\b(?:(?:https?|all|wss)_proxy|proxy_url|proxy)\b)"
+    r"(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+)(?=[,;]|$))"
 )
 _PID = re.compile(
     r"(?i)(\(\s*pid\s+|\bprocess[_ ]id\s*(?:=|:)?\s*|\bpid\s*(?:=|:)?\s*)(\d+)(\)?)"
@@ -135,7 +159,9 @@ _PID = re.compile(
 _HANDLE = re.compile(
     r"(?i)(\bprocess[_ ]handle\s*(?:=|:)?\s*|\bhandle\s*(?:=|:)?\s*)(?:0x[0-9a-f]+|\d+)"
 )
-_USER = re.compile(r"(?i)(\b(?:username|user)\s*=\s*)[^\s,;]+")
+_USER_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:username|user)\b)(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+)(?=[,;]|$))"
+)
 _WINDOWS_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\[^\s,;]+")
 _UNC_PATH = re.compile(r"\\\\[^\\\s]+\\[^\s,;]+")
 _UNIX_PATH = re.compile(r"(?<![A-Za-z0-9_:])/(?:[^\s/,;]+/)*[^\s,;]*")
@@ -158,9 +184,14 @@ _DOTTED_HOST = re.compile(
     r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]*[a-z0-9])?\b"
 )
-_HOST_ASSIGNMENT = re.compile(r"(?i)(\bhost(?:name)?\s*=\s*)(?:localhost|[a-z0-9][a-z0-9.-]*)")
+# host/hostname support both explicit and bare-whitespace forms; server
+# only takes an explicit separator, so "server started"/"server ready"
+# are never mistaken for "server=<value>".
+_HOST_ASSIGNMENT_EXPLICIT = re.compile(
+    r"(?i)(\b(?:host(?:name)?|server)\b\s*[:=]\s*)([^\s,;]+)"
+)
 _HOST_CONTEXT = re.compile(
-    r"(?i)(\b(?:on|host|hostname)\s+)(?:localhost|[a-z0-9][a-z0-9.-]*)"
+    r"(?i)(\b(?:on|host(?:name)?)\b\s+)([^\s,;]+)(?=[,;]|$)"
 )
 _LOCALHOST = re.compile(r"(?i)\blocalhost\b")
 _PORT = re.compile(r":\d{1,5}\b")
@@ -191,11 +222,46 @@ def _replace_port_context(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}<PORT>"
 
 
-def _replace_assignment_secret(match: re.Match[str]) -> str:
-    prefix, value = match.group(1), match.group(2)
-    if _REPLACEMENT_TOKEN_FULLMATCH.match(value):
-        return match.group(0)
-    return prefix + "<SECRET>"
+def _replace_assignment(token: str) -> Callable[[re.Match[str]], str]:
+    """Build a (prefix, value) substitution callback for the given token.
+
+    A value that is already a designated token (or run of them) is left
+    untouched, so a later pass can never re-tag an earlier one.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix, value = match.group(1), match.group(2)
+        if _REPLACEMENT_TOKEN_FULLMATCH.match(value):
+            return match.group(0)
+        return prefix + token
+
+    return _replace
+
+
+def _replace_explicit_or_bare_assignment(token: str) -> Callable[[re.Match[str]], str]:
+    """Callback for the (keyword)(explicit-sep, value | bare-sep, value)
+    four-slot pattern shared by the token/proxy/user assignments."""
+
+    def _replace(match: re.Match[str]) -> str:
+        keyword = match.group(1)
+        explicit_sep, explicit_value = match.group(2), match.group(3)
+        bare_sep, bare_value = match.group(4), match.group(5)
+        if explicit_sep is not None:
+            sep, value = explicit_sep, explicit_value
+        else:
+            sep, value = bare_sep, bare_value
+        if _REPLACEMENT_TOKEN_FULLMATCH.match(value):
+            return match.group(0)
+        return f"{keyword}{sep}{token}"
+
+    return _replace
+
+
+_replace_secret_explicit = _replace_assignment("<SECRET>")
+_replace_token_assignment = _replace_explicit_or_bare_assignment("<SECRET>")
+_replace_proxy_assignment = _replace_explicit_or_bare_assignment("<SECRET>")
+_replace_user_assignment = _replace_explicit_or_bare_assignment("<USER>")
+_replace_host = _replace_assignment("<HOST>")
 
 
 def redact_evidence_line(line: str) -> str:
@@ -205,7 +271,13 @@ def redact_evidence_line(line: str) -> str:
     first so a prior substitution (e.g. collapsing a whole URL to
     ``<URL>``) cannot expose fragments to the later, more generic
     hostname/path passes. Replacement tokens are never themselves matched
-    by a later pass.
+    by a later pass. Keywords that only support an explicit ":"/"="
+    separator (secret/password/passwd/api_key/access_token, and server)
+    never consume an unrelated following word; keywords that also
+    support a bare-whitespace form (token, the proxy family,
+    user/username, host/hostname, "on") only do so when the captured
+    value runs to the end of the line or a comma/semicolon, so ordinary
+    prose is left alone.
     """
 
     if not isinstance(line, str):
@@ -215,11 +287,12 @@ def redact_evidence_line(line: str) -> str:
     value = _PIPE.sub("<PIPE>", value)
     value = _AUTHORIZATION.sub(lambda match: match.group(1) + "<SECRET>", value)
     value = _BEARER.sub("<SECRET>", value)
-    value = _SECRET_ASSIGNMENT.sub(_replace_assignment_secret, value)
-    value = _PROXY_ASSIGNMENT.sub(_replace_assignment_secret, value)
+    value = _SECRET_ASSIGNMENT_EXPLICIT.sub(_replace_secret_explicit, value)
+    value = _TOKEN_ASSIGNMENT.sub(_replace_token_assignment, value)
+    value = _PROXY_ASSIGNMENT.sub(_replace_proxy_assignment, value)
     value = _PID.sub(_replace_pid, value)
     value = _HANDLE.sub(lambda match: match.group(1) + "<HANDLE>", value)
-    value = _USER.sub(lambda match: match.group(1) + "<USER>", value)
+    value = _USER_ASSIGNMENT.sub(_replace_user_assignment, value)
     value = _WINDOWS_PATH.sub("<PATH>", value)
     value = _UNC_PATH.sub("<PATH>", value)
     value = _UNIX_PATH.sub("<PATH>", value)
@@ -229,29 +302,113 @@ def redact_evidence_line(line: str) -> str:
     value = _PORT_CONTEXT.sub(_replace_port_context, value)
     value = _HOST_WITH_PORT.sub("<HOST>:<PORT>", value)
     value = _DOTTED_HOST.sub("<HOST>", value)
-    value = _HOST_ASSIGNMENT.sub(lambda match: match.group(1) + "<HOST>", value)
-    value = _HOST_CONTEXT.sub(lambda match: match.group(1) + "<HOST>", value)
+    value = _HOST_ASSIGNMENT_EXPLICIT.sub(_replace_host, value)
+    value = _HOST_CONTEXT.sub(_replace_host, value)
     value = _LOCALHOST.sub("<HOST>", value)
     value = _PORT.sub(":<PORT>", value)
     return value
 
 
-def _contains_unredacted_sensitive_data(value: str) -> bool:
-    """Fail closed on a recognizable raw sensitive form.
+_TOKEN_MASK = re.compile(_REPLACEMENT_TOKENS)
 
-    Independently re-derives the answer from the same redaction rules
-    instead of trusting that ``redact_evidence_line`` was ever called on
-    this value: a string is clean exactly when redacting it is a no-op.
-    Designated tokens are already stable fixed points of every pattern
-    (see ``test_replacement_tokens_survive_the_full_pipeline_unmodified``),
-    and none of the patterns match plain version strings or ordinary
-    punctuation without an explicit sensitive marker (a scheme, an IP
-    shape, or a host/port/pid/handle keyword), so neither is flagged.
+
+def _mask_replacement_tokens(value: str) -> str:
+    """Blank designated tokens to a single space before independent
+    detection, so a masked-out token can never let two unrelated fields
+    on either side of it read as one concatenated value."""
+
+    return _TOKEN_MASK.sub(" ", value)
+
+
+# Separately authored raw-content detectors used only by the validator.
+# These deliberately do not call redact_evidence_line and do not reuse
+# its substitution callbacks: a validator that can only recognize what
+# the redactor already recognizes gives no independent verification, so
+# every pattern below is its own, independently written regex. Keyword
+# detectors use a bounded "\s?" around the separator (never an unbounded
+# "\s*") specifically because a masked-out token can leave a short run
+# of whitespace behind; an unbounded quantifier would bridge across that
+# gap and misread the *next* field's keyword as this field's value.
+_RAW_WINDOWS_PATH = re.compile(r"(?i)[A-Z]:\\[^\s,;]+")
+_RAW_UNC_PATH = re.compile(r"\\\\[^\\\s]+\\[^\s,;]+")
+_RAW_UNIX_PATH = re.compile(r"(?<![A-Za-z0-9_:])/[^\s,;]+")
+_RAW_PIPE = re.compile(r"(?i)\\\\\.\\pipe\\[^\s,;]+")
+_RAW_URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://\S+")
+_RAW_URL_CREDENTIALS = re.compile(r"(?i)://[^\s/@]+:[^\s/@]+@")
+_RAW_QUERY_STRING = re.compile(r"\?[A-Za-z0-9_.-]+=")
+_RAW_IPV4 = re.compile(
+    r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
+)
+_RAW_IPV6 = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}"
+    r"(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])"
+)
+_RAW_HOST_CONTEXT = re.compile(
+    r"(?i)\bhost(?:name)?\b(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+    r"|\bon\b\s+[^\s,;]+(?=[,;]|$)"
+    r"|\bserver\b\s?[:=]\s?[^\s,;]+"
+)
+_RAW_PORT_CONTEXT = re.compile(r"(?i)\b(?:port|listen(?:ing)?)\b\s?[:=]?\s?\d")
+_RAW_USER_CONTEXT = re.compile(
+    r"(?i)\b(?:username|user)\b(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+)
+_RAW_PID_CONTEXT = re.compile(
+    r"(?i)\b(?:process[_ ]id|pid)\b\s?[:=]?\s?\d|\(\s*pid\s+\d"
+)
+_RAW_HANDLE_CONTEXT = re.compile(
+    r"(?i)\b(?:process[_ ]handle|handle)\b\s?[:=]?\s?(?:0x[0-9a-f]|\d)"
+)
+_RAW_AUTH = re.compile(r"(?i)\bauthorization\b\s?:\s?\S|\bbearer\b\s+\S")
+_RAW_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\btoken\b(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+    r"|\b(?:api[_-]?key|access[_-]?token|secret|password|passwd)\b\s?[:=]\s?[^\s,;]+"
+)
+_RAW_PROXY_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:(?:https?|all|wss)_proxy|proxy_url|proxy)\b"
+    r"(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+)
+
+_RAW_DETECTORS: tuple[re.Pattern[str], ...] = (
+    _RAW_WINDOWS_PATH,
+    _RAW_UNC_PATH,
+    _RAW_UNIX_PATH,
+    _RAW_PIPE,
+    _RAW_URL,
+    _RAW_URL_CREDENTIALS,
+    _RAW_QUERY_STRING,
+    _RAW_IPV4,
+    _RAW_IPV6,
+    _RAW_HOST_CONTEXT,
+    _RAW_PORT_CONTEXT,
+    _RAW_USER_CONTEXT,
+    _RAW_PID_CONTEXT,
+    _RAW_HANDLE_CONTEXT,
+    _RAW_AUTH,
+    _RAW_SECRET_ASSIGNMENT,
+    _RAW_PROXY_ASSIGNMENT,
+)
+
+
+def _contains_unredacted_sensitive_data(value: str) -> bool:
+    """Independently detect a recognizable raw sensitive form.
+
+    This never calls ``redact_evidence_line`` and never reuses its
+    substitution callbacks -- it is a separately authored set of
+    detection patterns, so a blind spot in the redactor is not
+    automatically a blind spot here too. Designated tokens are masked to
+    a single space first (not deleted), so a masked-out token can never
+    let unrelated adjacent evidence be misread as its value. None of the
+    detectors match a plain version string (``0.5.7``, ``v0.5.7``,
+    ``0.5.7-rc1``) or ordinary punctuation, since every one of them
+    requires an explicit sensitive marker: a URI scheme, an IP-address
+    shape, or a host/port/user/pid/handle/secret/proxy keyword.
     """
 
     if "\x00" in value:
         return True
-    return redact_evidence_line(value) != value
+    masked = _mask_replacement_tokens(value)
+    return any(pattern.search(masked) for pattern in _RAW_DETECTORS)
 
 
 def _decode_lines(raw: bytes) -> list[str]:
@@ -279,17 +436,40 @@ def select_startup_evidence_lines(raw: bytes) -> tuple[list[str], bool]:
 
 
 def select_version_command_lines(raw: bytes) -> tuple[list[str], bool]:
-    """Bound, redact, and retain every version-command output line."""
+    """Bound, redact, and retain version-command output.
+
+    Redaction can expand a line (e.g. a long path collapsing to
+    ``<PATH>`` is usually shorter, but several short raw fragments each
+    becoming their own token can be longer). The aggregate cap is
+    therefore enforced *after* redaction, in deterministic source order:
+    once appending the next complete, per-line-bounded line would push
+    the running UTF-8 byte total over ``MAX_VERSION_OUTPUT_BYTES``, that
+    line and every line after it are omitted, and the result is marked
+    truncated. A line is never partially included, so no replacement
+    token or multi-byte sequence is ever split.
+    """
 
     bounded = BoundedVersionCapture()
     bounded.feed(raw)
     truncated = bounded.overflowed
     selected: list[str] = []
+    aggregate_bytes = 0
+    omit_rest = False
     for line in _decode_lines(bounded.bytes()):
         redacted = redact_evidence_line(line)
         if len(line) > MAX_EVIDENCE_LINE_CHARS or len(redacted) > MAX_EVIDENCE_LINE_CHARS:
             truncated = True
-        selected.append(redacted[:MAX_EVIDENCE_LINE_CHARS])
+        bounded_line = redacted[:MAX_EVIDENCE_LINE_CHARS]
+        if omit_rest:
+            truncated = True
+            continue
+        line_bytes = len(bounded_line.encode("utf-8"))
+        if aggregate_bytes + line_bytes > MAX_VERSION_OUTPUT_BYTES:
+            omit_rest = True
+            truncated = True
+            continue
+        aggregate_bytes += line_bytes
+        selected.append(bounded_line)
     return selected, truncated
 
 
@@ -397,14 +577,19 @@ class DialectCaptureSession:
         pump: OverlappedLogPump,
         capture: BoundedLogCapture,
         api: LifecycleApi,
+        deadline: float,
     ) -> None:
         """Bounded, best-effort drain of already-available output.
 
         A healthy server's pipes may never reach EOF, so this never waits
         for ``pump.all_finished``: it consumes whatever is already
-        complete and performs only a small fixed number of short waits.
-        The pump itself is left running so later lifecycle steps and
-        final cleanup keep draining safely.
+        complete and performs only a small fixed number of short waits,
+        each bounded by both the fixed slice and whatever startup
+        deadline actually remains. Once the deadline has passed, no
+        further wait is issued -- the loop simply stops so the governing
+        startup deadline is never extended. The pump itself is left
+        running so later lifecycle steps and final cleanup keep draining
+        safely.
         """
 
         pump.service()
@@ -417,7 +602,13 @@ class DialectCaptureSession:
                     "startup_process_exit",
                     exit_code=max(0, min(exit_code, MAX_METADATA_NUMBER)),
                 )
-            pump.wait(_STARTUP_DRAIN_WAIT_MS)
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                break
+            wait_ms = min(_STARTUP_DRAIN_WAIT_MS, int(remaining * 1000))
+            if wait_ms <= 0:
+                break
+            pump.wait(wait_ms)
             pump.service()
 
     def _run_version_command(
@@ -645,6 +836,7 @@ class DialectCaptureSession:
                 pump=pump,
                 capture=capture,
                 api=lifecycle_api,
+                deadline=deadline,
             )
 
             ownership = resolve_endpoint_ownership(
@@ -898,30 +1090,23 @@ def validate_capture_result(result: Any) -> list[str]:
 
     inspect(result, "result")
 
-    # Independently re-derive privacy safety for every evidence-bearing
-    # string (never trusting that redact_evidence_line was previously
-    # called). Scoped to the fields that actually carry captured
-    # evidence -- executable.basename/sha256 and the fixed category
-    # enum are validated by their own dedicated checks above and are not
-    # redaction targets.
+    # Independently enforce privacy safety for every evidence-bearing
+    # string, never trusting that redact_evidence_line was previously
+    # called on it. Scoped to the fields that actually carry captured
+    # evidence: executable.basename/sha256 have their own dedicated
+    # validators above (and are not redaction targets -- a basename like
+    # "ollama.exe" is not sensitive), and failure categories are a closed
+    # enum that needs no heuristic scan.
     if isinstance(observations, dict):
         api_version = observations.get("api_version")
         if isinstance(api_version, str) and _contains_unredacted_sensitive_data(api_version):
-            problems.append("observations.api_version contains unredacted sensitive data")
+            problems.append("observations.api_version contains raw sensitive data")
         for key in ("version_command_lines", "startup_evidence_lines"):
             lines = observations.get(key)
             if isinstance(lines, list):
                 for index, entry in enumerate(lines):
                     if isinstance(entry, str) and _contains_unredacted_sensitive_data(entry):
                         problems.append(
-                            f"observations.{key}[{index}] contains unredacted sensitive data"
+                            f"observations.{key}[{index}] contains raw sensitive data"
                         )
-    if isinstance(failures, list):
-        for index, failure in enumerate(failures):
-            if isinstance(failure, dict):
-                category = failure.get("category")
-                if isinstance(category, str) and _contains_unredacted_sensitive_data(category):
-                    problems.append(
-                        f"failures[{index}].category contains unredacted sensitive data"
-                    )
     return problems
