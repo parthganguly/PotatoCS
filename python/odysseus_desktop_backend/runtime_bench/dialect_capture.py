@@ -140,18 +140,19 @@ _SECRET_ASSIGNMENT_EXPLICIT = re.compile(
     r"(?i)(\b(?:api[_-]?key|access[_-]?token|secret|password|passwd)\b\s*[:=]\s*)([^\s,;]+)"
 )
 # "token" alone additionally supports bare whitespace, since that form is
-# explicitly required ("token abc"). The bare branch only fires when the
-# captured value runs to the end of the line (or a comma/semicolon), so
-# an ordinary sentence like "tokenizer ready" mid-line is never mistaken
-# for an assignment -- "tokenizer" is already excluded by \b, but a
-# genuine standalone "token" followed by more prose is additionally
-# guarded by this anchor.
+# explicitly required ("token abc"). The bare branch consumes exactly
+# one whitespace-delimited value token (the value group already stops at
+# the next space/comma/semicolon) and leaves everything after it
+# untouched, so "token abc ready" redacts only "abc" -- an ordinary
+# sentence like "tokenizer ready" is still never mistaken for an
+# assignment, since "tokenizer" is excluded by \b before the bare branch
+# is even considered.
 _TOKEN_ASSIGNMENT = re.compile(
-    r"(?i)(\btoken\b)(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+)(?=[,;]|$))"
+    r"(?i)(\btoken\b)(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+))"
 )
 _PROXY_ASSIGNMENT = re.compile(
     r"(?i)(\b(?:(?:https?|all|wss)_proxy|proxy_url|proxy)\b)"
-    r"(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+)(?=[,;]|$))"
+    r"(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+))"
 )
 _PID = re.compile(
     r"(?i)(\(\s*pid\s+|\bprocess[_ ]id\s*(?:=|:)?\s*|\bpid\s*(?:=|:)?\s*)(\d+)(\)?)"
@@ -160,7 +161,7 @@ _HANDLE = re.compile(
     r"(?i)(\bprocess[_ ]handle\s*(?:=|:)?\s*|\bhandle\s*(?:=|:)?\s*)(?:0x[0-9a-f]+|\d+)"
 )
 _USER_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:username|user)\b)(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+)(?=[,;]|$))"
+    r"(?i)(\b(?:username|user)\b)(?:(\s*[:=]\s*)([^\s,;]+)|(\s+)([^\s,;]+))"
 )
 _WINDOWS_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\[^\s,;]+")
 _UNC_PATH = re.compile(r"\\\\[^\\\s]+\\[^\s,;]+")
@@ -176,7 +177,13 @@ _IPV6 = re.compile(
     r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}"
     r"(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])"
 )
-_HOST_WITH_PORT = re.compile(r"(?i)\b(?:localhost|[a-z0-9][a-z0-9.-]*):\d{1,5}\b")
+# Only "localhost" is treated as a bare, unqualified hostname worth
+# pairing with a following ":port" -- a plain alphanumeric token (e.g.
+# the leading "12" of a bare "12:34:56" timestamp) is not structurally a
+# validated hostname, so it must not be accepted here. Real bare
+# hostnames (e.g. "workstation") are only ever redacted through an
+# explicit host/hostname/server/listening keyword context below.
+_HOST_WITH_PORT = re.compile(r"(?i)\blocalhost:\d{1,5}\b")
 _PORT_CONTEXT = re.compile(
     r"(?i)\b(port|listen(?:ing)?)\b((?:\s+on)?[\s:=]*)(\d{1,5})\b"
 )
@@ -190,11 +197,15 @@ _DOTTED_HOST = re.compile(
 _HOST_ASSIGNMENT_EXPLICIT = re.compile(
     r"(?i)(\b(?:host(?:name)?|server)\b\s*[:=]\s*)([^\s,;]+)"
 )
+# Bare "host"/"hostname" take exactly one following value token. A bare
+# "on" is deliberately NOT a generic hostname context (treating any
+# "on <word>" as a host swallowed ordinary phrases like "version on
+# startup"); only the structurally meaningful "listen(ing) on <value>"
+# form is recognized.
 _HOST_CONTEXT = re.compile(
-    r"(?i)(\b(?:on|host(?:name)?)\b\s+)([^\s,;]+)(?=[,;]|$)"
+    r"(?i)(\blisten(?:ing)?\s+on\s+|\bhost(?:name)?\s+)([^\s,;]+)"
 )
 _LOCALHOST = re.compile(r"(?i)\blocalhost\b")
-_PORT = re.compile(r":\d{1,5}\b")
 
 
 def _replace_url(match: re.Match[str]) -> str:
@@ -220,6 +231,21 @@ def _replace_host_with_optional_port(match: re.Match[str]) -> str:
 
 def _replace_port_context(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}<PORT>"
+
+
+_IPV6_MARKER = re.compile(r"(?i)[a-f]|::")
+
+
+def _replace_bare_ipv6(match: re.Match[str]) -> str:
+    """A bare (unbracketed) hex-colon run is only genuinely IPv6 shaped
+    if it has a hex letter or a "::" compression -- digits 0-9 are also
+    valid hex, so without this guard a plain decimal timestamp like
+    "12:34:56" or "00:01:30" would be misread as an address."""
+
+    value = match.group(0)
+    if not _IPV6_MARKER.search(value):
+        return value
+    return "<HOST>"
 
 
 def _replace_assignment(token: str) -> Callable[[re.Match[str]], str]:
@@ -275,9 +301,14 @@ def redact_evidence_line(line: str) -> str:
     separator (secret/password/passwd/api_key/access_token, and server)
     never consume an unrelated following word; keywords that also
     support a bare-whitespace form (token, the proxy family,
-    user/username, host/hostname, "on") only do so when the captured
-    value runs to the end of the line or a comma/semicolon, so ordinary
-    prose is left alone.
+    user/username, host/hostname, "listen(ing) on") consume exactly one
+    whitespace-delimited value token and leave everything after it
+    untouched, so multi-field or prose-like log lines are not fully
+    swallowed. There is no generic "colon followed by digits" port rule:
+    a port is only redacted when structurally established by a
+    validated IPv4/bracketed-IPv6 address, the literal word
+    "localhost", or an explicit port/listen(ing) keyword context --
+    timestamps and durations like "12:34:56" are left alone.
     """
 
     if not isinstance(line, str):
@@ -298,24 +329,31 @@ def redact_evidence_line(line: str) -> str:
     value = _UNIX_PATH.sub("<PATH>", value)
     value = _BRACKETED_IPV6.sub(_replace_host_with_optional_port, value)
     value = _IPV4.sub(_replace_host_with_optional_port, value)
-    value = _IPV6.sub("<HOST>", value)
+    value = _IPV6.sub(_replace_bare_ipv6, value)
     value = _PORT_CONTEXT.sub(_replace_port_context, value)
     value = _HOST_WITH_PORT.sub("<HOST>:<PORT>", value)
     value = _DOTTED_HOST.sub("<HOST>", value)
     value = _HOST_ASSIGNMENT_EXPLICIT.sub(_replace_host, value)
     value = _HOST_CONTEXT.sub(_replace_host, value)
     value = _LOCALHOST.sub("<HOST>", value)
-    value = _PORT.sub(":<PORT>", value)
     return value
 
 
-_TOKEN_MASK = re.compile(_REPLACEMENT_TOKENS)
+_TOKEN_MASK = re.compile(rf"{_REPLACEMENT_TOKENS}(?::{_REPLACEMENT_TOKENS})*")
 
 
 def _mask_replacement_tokens(value: str) -> str:
     """Blank designated tokens to a single space before independent
     detection, so a masked-out token can never let two unrelated fields
-    on either side of it read as one concatenated value."""
+    on either side of it read as one concatenated value.
+
+    A run of tokens joined by ":" (e.g. an already-redacted
+    "<HOST>:<PORT>" pair) is masked as a single unit, not one space per
+    token -- otherwise the connecting ":" would survive masking and a
+    bare-whitespace detector could bridge across it (e.g. reading
+    "listening on <HOST>:<PORT>" as "listening on" followed by a stray
+    ":" value once both tokens are blanked independently).
+    """
 
     return _TOKEN_MASK.sub(" ", value)
 
@@ -340,18 +378,47 @@ _RAW_IPV4 = re.compile(
     r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
     r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
 )
-_RAW_IPV6 = re.compile(
+_RAW_IPV6_SHAPE = re.compile(
     r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}"
     r"(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])"
 )
+
+
+def _detect_bare_ipv6(masked: str) -> bool:
+    """Same hex-letter-or-"::" guard as the redactor's bare-IPv6 pass: a
+    plain decimal run of digits and colons (a timestamp like "12:34:56")
+    is not IPv6 shaped just because 0-9 happen to also be valid hex."""
+
+    match = _RAW_IPV6_SHAPE.search(masked)
+    return match is not None and _IPV6_MARKER.search(match.group(0)) is not None
+# Bare "on" is deliberately not a generic hostname marker here either --
+# only "listen(ing) on <value>" is structurally meaningful. A bare
+# "localhost:port" is also independently flagged, mirroring the
+# redactor's restriction of unqualified hostname:port pairs to the
+# literal word "localhost" (a plain alphanumeric prefix like the "12" of
+# "12:34:56" is not a validated hostname).
+#
+# Bare-whitespace branches use a single literal " " (never "\s+"), for
+# the same reason the separator uses a bounded "\s?": masking a token
+# leaves the *original* spaces on both sides of it intact, so a field
+# like "on <HOST>:<PORT> path=" can mask down to "on   path=" (three
+# spaces). An unbounded "\s+" would bridge straight through and misread
+# the next field's keyword as this field's value; requiring exactly one
+# space means the match simply fails once more than one space remains.
 _RAW_HOST_CONTEXT = re.compile(
-    r"(?i)\bhost(?:name)?\b(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
-    r"|\bon\b\s+[^\s,;]+(?=[,;]|$)"
+    r"(?i)\bhost(?:name)?\b(?:\s?[:=]\s?[^\s,;]+| [^\s,;]+)"
+    r"|\blisten(?:ing)? on [^\s,;]+"
     r"|\bserver\b\s?[:=]\s?[^\s,;]+"
+    r"|\blocalhost:\d{1,5}\b"
 )
-_RAW_PORT_CONTEXT = re.compile(r"(?i)\b(?:port|listen(?:ing)?)\b\s?[:=]?\s?\d")
+# The optional " on" mirrors the redactor's handling of "listening on
+# <port>", where an actual word separates the keyword from the digits
+# (not just whitespace).
+_RAW_PORT_CONTEXT = re.compile(
+    r"(?i)\b(?:port|listen(?:ing)?)\b(?: on)?\s?[:=]?\s?\d"
+)
 _RAW_USER_CONTEXT = re.compile(
-    r"(?i)\b(?:username|user)\b(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+    r"(?i)\b(?:username|user)\b(?:\s?[:=]\s?[^\s,;]+| [^\s,;]+)"
 )
 _RAW_PID_CONTEXT = re.compile(
     r"(?i)\b(?:process[_ ]id|pid)\b\s?[:=]?\s?\d|\(\s*pid\s+\d"
@@ -361,32 +428,32 @@ _RAW_HANDLE_CONTEXT = re.compile(
 )
 _RAW_AUTH = re.compile(r"(?i)\bauthorization\b\s?:\s?\S|\bbearer\b\s+\S")
 _RAW_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\btoken\b(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+    r"(?i)\btoken\b(?:\s?[:=]\s?[^\s,;]+| [^\s,;]+)"
     r"|\b(?:api[_-]?key|access[_-]?token|secret|password|passwd)\b\s?[:=]\s?[^\s,;]+"
 )
 _RAW_PROXY_ASSIGNMENT = re.compile(
     r"(?i)\b(?:(?:https?|all|wss)_proxy|proxy_url|proxy)\b"
-    r"(?:\s?[:=]\s?[^\s,;]+|\s+[^\s,;]+(?=[,;]|$))"
+    r"(?:\s?[:=]\s?[^\s,;]+| [^\s,;]+)"
 )
 
-_RAW_DETECTORS: tuple[re.Pattern[str], ...] = (
-    _RAW_WINDOWS_PATH,
-    _RAW_UNC_PATH,
-    _RAW_UNIX_PATH,
-    _RAW_PIPE,
-    _RAW_URL,
-    _RAW_URL_CREDENTIALS,
-    _RAW_QUERY_STRING,
-    _RAW_IPV4,
-    _RAW_IPV6,
-    _RAW_HOST_CONTEXT,
-    _RAW_PORT_CONTEXT,
-    _RAW_USER_CONTEXT,
-    _RAW_PID_CONTEXT,
-    _RAW_HANDLE_CONTEXT,
-    _RAW_AUTH,
-    _RAW_SECRET_ASSIGNMENT,
-    _RAW_PROXY_ASSIGNMENT,
+_RAW_DETECTORS: tuple[Callable[[str], bool], ...] = (
+    lambda masked: _RAW_WINDOWS_PATH.search(masked) is not None,
+    lambda masked: _RAW_UNC_PATH.search(masked) is not None,
+    lambda masked: _RAW_UNIX_PATH.search(masked) is not None,
+    lambda masked: _RAW_PIPE.search(masked) is not None,
+    lambda masked: _RAW_URL.search(masked) is not None,
+    lambda masked: _RAW_URL_CREDENTIALS.search(masked) is not None,
+    lambda masked: _RAW_QUERY_STRING.search(masked) is not None,
+    lambda masked: _RAW_IPV4.search(masked) is not None,
+    _detect_bare_ipv6,
+    lambda masked: _RAW_HOST_CONTEXT.search(masked) is not None,
+    lambda masked: _RAW_PORT_CONTEXT.search(masked) is not None,
+    lambda masked: _RAW_USER_CONTEXT.search(masked) is not None,
+    lambda masked: _RAW_PID_CONTEXT.search(masked) is not None,
+    lambda masked: _RAW_HANDLE_CONTEXT.search(masked) is not None,
+    lambda masked: _RAW_AUTH.search(masked) is not None,
+    lambda masked: _RAW_SECRET_ASSIGNMENT.search(masked) is not None,
+    lambda masked: _RAW_PROXY_ASSIGNMENT.search(masked) is not None,
 )
 
 
@@ -408,7 +475,7 @@ def _contains_unredacted_sensitive_data(value: str) -> bool:
     if "\x00" in value:
         return True
     masked = _mask_replacement_tokens(value)
-    return any(pattern.search(masked) for pattern in _RAW_DETECTORS)
+    return any(detect(masked) for detect in _RAW_DETECTORS)
 
 
 def _decode_lines(raw: bytes) -> list[str]:

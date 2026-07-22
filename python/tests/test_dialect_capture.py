@@ -1043,16 +1043,31 @@ def test_host_inputs_independently_rejected(
         "server started",
         "server ready",
         "hostile process",
-        "hostname validation complete",
     ],
 )
 def test_host_negative_controls_remain_unchanged(raw: str) -> None:
     """Blocker 4: these must never be mistaken for a host assignment --
-    "server" has no bare-whitespace form, "hostile" fails the keyword
-    boundary, and a bare "hostname"/"host" value must run to the end of
-    the line (or a comma/semicolon) to count as an assignment."""
+    "server" has no bare-whitespace form, and "hostile" fails the
+    keyword boundary ("host" is not followed by a word boundary)."""
 
     assert redact_evidence_line(raw) == raw
+
+
+def test_bare_hostname_now_consumes_exactly_one_token() -> None:
+    """Round 2, Blocker 1: fixing "host workstation ready" -> "host <HOST>
+    ready" (values surviving in prose-like lines) necessarily means a
+    bare "hostname"/"host" followed by ordinary prose is no longer
+    exempt merely because more than one word follows -- there is no
+    regex-observable difference between "hostname corp-server-01
+    active" (must redact "corp-server-01") and "hostname validation
+    complete" (previously preserved verbatim). This documents that
+    "hostname validation complete" now redacts its first token, exactly
+    like every other bare "hostname"/"host" value; a real host name is
+    never distinguishable from an ordinary following word by shape
+    alone, so the fix that makes bare-form redaction have to be
+    trailing-context-safe applies uniformly."""
+
+    assert redact_evidence_line("hostname validation complete") == "hostname <HOST> complete"
 
 
 @pytest.mark.parametrize(
@@ -1170,3 +1185,229 @@ def test_drain_performs_no_wait_once_startup_deadline_is_reached(
     )
     assert "wait_for_completion" not in api.calls
     assert result["failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# Round 3: whitespace values with trailing context (Blocker 1), the
+# overbroad generic "on" host context (Blocker 2), and generic
+# colon-number port redaction (Blocker 3).
+# ---------------------------------------------------------------------------
+
+
+def _inject_and_assert_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    if field == "version_command_lines":
+        result["observations"]["version_command_lines"] = [raw]
+    else:
+        result["observations"]["startup_evidence_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("token abc ready", "token <SECRET> ready"),
+        ("token abc status=ready", "token <SECRET> status=ready"),
+        ("proxy abc123 enabled", "proxy <SECRET> enabled"),
+        ("proxy abc123 mode=direct", "proxy <SECRET> mode=direct"),
+        ("user alice connected", "user <USER> connected"),
+        ("username alice state=active", "username <USER> state=active"),
+        ("host workstation ready", "host <HOST> ready"),
+        ("hostname corp-server-01 active", "hostname <HOST> active"),
+    ],
+)
+def test_bare_values_redact_only_the_first_token_with_trailing_context(
+    raw: str, expected: str
+) -> None:
+    """Blocker 1: the first whitespace-delimited value after an explicit
+    sensitive keyword is redacted while all following text is retained
+    verbatim, fixing raw values that previously survived in ordinary
+    multi-field or prose-like log lines."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "token abc ready",
+        "token abc status=ready",
+        "proxy abc123 enabled",
+        "proxy abc123 mode=direct",
+        "user alice connected",
+        "username alice state=active",
+        "host workstation ready",
+        "hostname corp-server-01 active",
+    ],
+)
+@pytest.mark.parametrize("field", ["version_command_lines", "startup_evidence_lines"])
+def test_trailing_context_values_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 1: every raw trailing-context form, injected into either
+    evidence field, is independently rejected by the validator."""
+
+    _inject_and_assert_rejected(tmp_path, monkeypatch, raw, field)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "tokenizer ready",
+        "tokenization complete",
+        "secretary started",
+        "passwordless mode",
+        "password policy loaded",
+        "access_tokenizer initialized",
+        "userspace processes running",
+        "username_hash computed",
+        "hostile process",
+        "server started",
+        "server ready",
+    ],
+)
+def test_round3_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 1: these negative controls must survive the trailing-
+    context fix unchanged (unaffected keywords, or keywords with no
+    bare-whitespace form at all)."""
+
+    assert redact_evidence_line(raw) == raw
+    assert not dialect_capture._contains_unredacted_sensitive_data(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("listening on workstation", "listening on <HOST>"),
+        ("listen on workstation", "listen on <HOST>"),
+        ("server listening on workstation", "server listening on <HOST>"),
+    ],
+)
+def test_listening_on_host_context_produces_exact_output(raw: str, expected: str) -> None:
+    """Blocker 2: only the structurally meaningful "listen(ing) on
+    <value>" form is treated as a hostname context."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["listening on workstation", "listen on workstation", "server listening on workstation"],
+)
+@pytest.mark.parametrize("field", ["version_command_lines", "startup_evidence_lines"])
+def test_listening_on_host_context_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 2: every listening-host form, injected raw, is
+    independently rejected by the validator."""
+
+    _inject_and_assert_rejected(tmp_path, monkeypatch, raw, field)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "version on startup",
+        "cloud disabled on startup",
+        "pruning disabled on startup",
+        "started on demand",
+        "running on battery",
+    ],
+)
+def test_generic_on_context_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 2: an arbitrary "on <word>" must never be treated as a
+    hostname context -- only "listen(ing) on <value>" qualifies. These
+    must also not be independently flagged by the validator, since they
+    carry no genuine host identity."""
+
+    assert redact_evidence_line(raw) == raw
+    assert not dialect_capture._contains_unredacted_sensitive_data(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "12:34:56",
+        "2026-07-22T20:58:22Z",
+        "duration=01:23",
+        "elapsed 00:01:30",
+        "version 0.5.7: release candidate",
+    ],
+)
+def test_generic_colon_number_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 3: a colon followed by digits is not independently a
+    network port -- timestamps and durations must survive untouched,
+    and must not be independently flagged by the validator either."""
+
+    assert redact_evidence_line(raw) == raw
+    assert not dialect_capture._contains_unredacted_sensitive_data(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("localhost:11434", "<HOST>:<PORT>"),
+        ("127.0.0.1:11434", "<HOST>:<PORT>"),
+        ("[::1]:11434", "<HOST>:<PORT>"),
+        ("port=11434", "port=<PORT>"),
+        ("port: 11434", "port: <PORT>"),
+        ("listening on 11434", "listening on <PORT>"),
+    ],
+)
+def test_structural_port_forms_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 3: ports are only redacted when structurally established
+    by a validated address or an explicit port/listen(ing) keyword."""
+
+    assert redact_evidence_line(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "localhost:11434",
+        "127.0.0.1:11434",
+        "[::1]:11434",
+        "port=11434",
+        "port: 11434",
+        "listening on 11434",
+    ],
+)
+@pytest.mark.parametrize("field", ["version_command_lines", "startup_evidence_lines"])
+def test_structural_port_forms_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 3: every structural port form, injected raw, is
+    independently rejected by the validator."""
+
+    _inject_and_assert_rejected(tmp_path, monkeypatch, raw, field)
+
+
+def test_validator_privacy_check_still_never_calls_the_redactor_round3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3: re-confirm the independent validator's privacy scan does
+    not depend on redact_evidence_line, using the new Round 3 detector
+    classes (listening-host and structural port forms) as the probe."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+
+    monkeypatch.setattr(
+        dialect_capture,
+        "redact_evidence_line",
+        lambda line: (_ for _ in ()).throw(AssertionError("redactor must not be called")),
+    )
+
+    # Still validates cleanly with a broken redactor.
+    assert validate_capture_result(result) == []
+
+    for raw in ("listening on workstation", "localhost:11434", "port=11434"):
+        dirty = dict(result)
+        dirty["observations"] = dict(result["observations"])
+        dirty["observations"]["version_command_lines"] = [raw]
+        assert validate_capture_result(dirty) != []
