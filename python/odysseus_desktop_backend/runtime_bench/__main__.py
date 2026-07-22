@@ -17,6 +17,10 @@ import sys
 from pathlib import Path
 
 from odysseus_desktop_backend.runtime_bench.comparison import load_and_compare
+from odysseus_desktop_backend.runtime_bench.dialect_capture import (
+    DialectCaptureSession,
+    build_capture_dry_run_plan,
+)
 from odysseus_desktop_backend.runtime_bench.harness import run_ollama_batch
 from odysseus_desktop_backend.runtime_bench.isolated_server import (
     IsolatedOllamaServer,
@@ -216,6 +220,41 @@ def _attest_main(argv: list[str]) -> int:
     return 0 if not artifact["failures"] else 2
 
 
+def _capture_dialect_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="runtime_bench capture-dialect")
+    parser.add_argument(
+        "--approved-g-iso-d0",
+        action="store_true",
+        help="human approval gate for one unreviewed empty-store evidence capture",
+    )
+    parser.add_argument("--executable", default="ollama.exe")
+    parser.add_argument("--startup-timeout", type=float, default=30.0)
+    parser.add_argument("--version-timeout", type=float, default=10.0)
+    parser.add_argument("--cleanup-timeout", type=float, default=10.0)
+    args = parser.parse_args(argv)
+    try:
+        if not args.approved_g_iso_d0:
+            result = build_capture_dry_run_plan(
+                startup_timeout_seconds=args.startup_timeout,
+                version_timeout_seconds=args.version_timeout,
+                cleanup_timeout_seconds=args.cleanup_timeout,
+            )
+            print(json.dumps(result, indent=1, sort_keys=True))
+            return 0
+        if not sys.stdin.isatty():
+            parser.error("real dialect capture requires an interactive terminal")
+        result = DialectCaptureSession(
+            args.executable,
+            startup_timeout_seconds=args.startup_timeout,
+            version_timeout_seconds=args.version_timeout,
+            cleanup_timeout_seconds=args.cleanup_timeout,
+        ).run()
+    except Phase1ContractError as exc:
+        parser.error(str(exc))
+    print(json.dumps(result, indent=1, sort_keys=True))
+    return 0 if not result["failures"] else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "compare":
@@ -224,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         return _paired_main(args[1:])
     if args and args[0] == "attest":
         return _attest_main(args[1:])
+    if args and args[0] == "capture-dialect":
+        return _capture_dialect_main(args[1:])
     return _legacy_main(args)
 
 

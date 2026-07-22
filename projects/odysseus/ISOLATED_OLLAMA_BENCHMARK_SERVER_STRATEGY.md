@@ -1356,3 +1356,37 @@ the branch is updated with ordinary pushes only, PR #38 remains a
 draft targeting research/hardware-relative-uplift-benchmark, and the
 result summary explicitly lists any deviation from this contract.
 ```
+
+## 16. G-ISO-D0: unreviewed dialect-evidence capture
+
+`capture-dialect` is a separate, evidence-only prerequisite workflow for an
+installed executable SHA-256 that has no reviewed dialect entry. Its dry-run
+is process-free by default. One real capture requires the explicit
+`--approved-g-iso-d0` flag and an interactive terminal; that approval is not
+G-ISO-0 and produces no attestation.
+
+The capture uses one temporary empty model store and profile, a single
+loopback server attempt, suspended-image verification, a verified
+kill-on-close Job Object, address-aware endpoint ownership before
+`/api/version`, again before the owned `--version` child, and again before the
+exact-empty `GET /api/ps` proof. The version child retains its separate
+temporary home/store, bounded overlapped I/O, job ownership, and complete
+cleanup. No model is loaded, no inference occurs, no caller environment
+override is accepted, and the ordinary service and real model store remain
+untouched.
+
+Only bounded, in-memory observations may enter the schema-v1 capture result:
+up to 32 allow-listed startup lines, 512 characters per evidence line, and
+4 KiB combined version-command output. Every retained line is redacted before
+it enters the result. Raw logs, raw command output, paths, users, hosts, ports,
+URLs, secrets, PIDs, pipe names, and handles are never persisted. Cleanup
+proofs cover shutdown, orphan absence, endpoint closure, and temporary-space
+removal; any failure keeps the result non-successful.
+
+The literal evidence state is always `unreviewed_capture`. Its closed schema is
+structurally incompatible with the Phase-1 attestation schema, cannot satisfy
+`validate_attestation_artifact`, does not call `reviewed_dialect_for_hash`, and
+does not add or generate any `REVIEWED_DIALECT_REGISTRY` entry. A human may use
+the bounded redacted observations to design and separately review a future
+committed dialect entry; only that later reviewed entry can unblock the normal
+G-ISO-0 attestation gate.
