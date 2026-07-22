@@ -241,7 +241,7 @@ def _capture_dialect_main(argv: list[str]) -> int:
             )
             print(json.dumps(result, indent=1, sort_keys=True))
             return 0
-        if not sys.stdin.isatty():
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
             parser.error("real dialect capture requires an interactive terminal")
         result = DialectCaptureSession(
             args.executable,

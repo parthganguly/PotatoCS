@@ -83,6 +83,8 @@ STARTUP_EVIDENCE_KEYWORDS = frozenset(
 )
 
 _WAIT_SLICE_MS = 50
+_STARTUP_DRAIN_MAX_ATTEMPTS = 3
+_STARTUP_DRAIN_WAIT_MS = 10
 _SAFE_BASENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TOP_KEYS = frozenset(
@@ -109,6 +111,12 @@ _TRUNCATION_KEYS = frozenset(
     {"startup_evidence_truncated", "version_command_truncated"}
 )
 
+_REPLACEMENT_TOKENS = r"<(?:PATH|USER|HOST|PORT|URL|SECRET|PID|PIPE|HANDLE)>"
+_REPLACEMENT_TOKEN_FULLMATCH = re.compile(rf"^{_REPLACEMENT_TOKENS}$")
+
+_QUOTED_PATH = re.compile(
+    r'"[^"\r\n]*[\\/][^"\r\n]*"' r"|'[^'\r\n]*[\\/][^'\r\n]*'"
+)
 _URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+")
 _PIPE = re.compile(r"(?i)\\\\\.\\pipe\\[^\s,;]+")
 _AUTHORIZATION = re.compile(
@@ -116,24 +124,36 @@ _AUTHORIZATION = re.compile(
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd)\s*=\s*)[^\s,;]+"
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd)\s*(?:=|:)?\s*)([^\s,;]+)"
 )
 _PROXY_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:https?|all|wss)_proxy\s*=\s*)[^\s,;]+"
+    r"(?i)(\b(?:https?|all|wss)_proxy\s*(?:=|:)?\s*)([^\s,;]+)"
 )
-_PID = re.compile(r"(?i)(\bpid\s*=\s*|\(pid\s+)\d+(\)?)")
-_HANDLE = re.compile(r"(?i)(\bhandle\s*=\s*)(?:0x[0-9a-f]+|\d+)")
+_PID = re.compile(
+    r"(?i)(\(\s*pid\s+|\bprocess[_ ]id\s*(?:=|:)?\s*|\bpid\s*(?:=|:)?\s*)(\d+)(\)?)"
+)
+_HANDLE = re.compile(
+    r"(?i)(\bprocess[_ ]handle\s*(?:=|:)?\s*|\bhandle\s*(?:=|:)?\s*)(?:0x[0-9a-f]+|\d+)"
+)
 _USER = re.compile(r"(?i)(\b(?:username|user)\s*=\s*)[^\s,;]+")
 _WINDOWS_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\[^\s,;]+")
 _UNC_PATH = re.compile(r"\\\\[^\\\s]+\\[^\s,;]+")
 _UNIX_PATH = re.compile(r"(?<![A-Za-z0-9_:])/(?:[^\s/,;]+/)*[^\s,;]*")
-_BRACKETED_IPV6 = re.compile(r"\[[0-9A-Fa-f:.]+\](?::\d{1,5})?")
+_BRACKETED_IPV6 = re.compile(
+    r"\[[0-9A-Fa-f:.]+(?:%[0-9A-Za-z]+)?\](?::\d{1,5})?"
+)
 _IPV4 = re.compile(
     r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
     r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?::\d{1,5})?(?![\d.])"
 )
-_IPV6 = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])")
+_IPV6 = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}"
+    r"(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])"
+)
 _HOST_WITH_PORT = re.compile(r"(?i)\b(?:localhost|[a-z0-9][a-z0-9.-]*):\d{1,5}\b")
+_PORT_CONTEXT = re.compile(
+    r"(?i)\b(port|listen(?:ing)?)\b((?:\s+on)?[\s:=]*)(\d{1,5})\b"
+)
 _DOTTED_HOST = re.compile(
     r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]*[a-z0-9])?\b"
@@ -157,7 +177,7 @@ def _replace_url(match: re.Match[str]) -> str:
 
 def _replace_pid(match: re.Match[str]) -> str:
     prefix = match.group(1)
-    suffix = match.group(2) or ""
+    suffix = match.group(3) or ""
     return f"{prefix}<PID>{suffix}"
 
 
@@ -167,17 +187,36 @@ def _replace_host_with_optional_port(match: re.Match[str]) -> str:
     return "<HOST>:<PORT>" if has_port else "<HOST>"
 
 
+def _replace_port_context(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{match.group(2)}<PORT>"
+
+
+def _replace_assignment_secret(match: re.Match[str]) -> str:
+    prefix, value = match.group(1), match.group(2)
+    if _REPLACEMENT_TOKEN_FULLMATCH.match(value):
+        return match.group(0)
+    return prefix + "<SECRET>"
+
+
 def redact_evidence_line(line: str) -> str:
-    """Redact identity- and secret-bearing values while preserving grammar."""
+    """Redact identity- and secret-bearing values while preserving grammar.
+
+    Quoted values and explicit secret/credential assignments are redacted
+    first so a prior substitution (e.g. collapsing a whole URL to
+    ``<URL>``) cannot expose fragments to the later, more generic
+    hostname/path passes. Replacement tokens are never themselves matched
+    by a later pass.
+    """
 
     if not isinstance(line, str):
         raise TypeError("evidence lines must be strings")
-    value = _URL.sub(_replace_url, line)
+    value = _QUOTED_PATH.sub("<PATH>", line)
+    value = _URL.sub(_replace_url, value)
     value = _PIPE.sub("<PIPE>", value)
     value = _AUTHORIZATION.sub(lambda match: match.group(1) + "<SECRET>", value)
     value = _BEARER.sub("<SECRET>", value)
-    value = _SECRET_ASSIGNMENT.sub(lambda match: match.group(1) + "<SECRET>", value)
-    value = _PROXY_ASSIGNMENT.sub(lambda match: match.group(1) + "<SECRET>", value)
+    value = _SECRET_ASSIGNMENT.sub(_replace_assignment_secret, value)
+    value = _PROXY_ASSIGNMENT.sub(_replace_assignment_secret, value)
     value = _PID.sub(_replace_pid, value)
     value = _HANDLE.sub(lambda match: match.group(1) + "<HANDLE>", value)
     value = _USER.sub(lambda match: match.group(1) + "<USER>", value)
@@ -187,6 +226,7 @@ def redact_evidence_line(line: str) -> str:
     value = _BRACKETED_IPV6.sub(_replace_host_with_optional_port, value)
     value = _IPV4.sub(_replace_host_with_optional_port, value)
     value = _IPV6.sub("<HOST>", value)
+    value = _PORT_CONTEXT.sub(_replace_port_context, value)
     value = _HOST_WITH_PORT.sub("<HOST>:<PORT>", value)
     value = _DOTTED_HOST.sub("<HOST>", value)
     value = _HOST_ASSIGNMENT.sub(lambda match: match.group(1) + "<HOST>", value)
@@ -194,6 +234,24 @@ def redact_evidence_line(line: str) -> str:
     value = _LOCALHOST.sub("<HOST>", value)
     value = _PORT.sub(":<PORT>", value)
     return value
+
+
+def _contains_unredacted_sensitive_data(value: str) -> bool:
+    """Fail closed on a recognizable raw sensitive form.
+
+    Independently re-derives the answer from the same redaction rules
+    instead of trusting that ``redact_evidence_line`` was ever called on
+    this value: a string is clean exactly when redacting it is a no-op.
+    Designated tokens are already stable fixed points of every pattern
+    (see ``test_replacement_tokens_survive_the_full_pipeline_unmodified``),
+    and none of the patterns match plain version strings or ordinary
+    punctuation without an explicit sensitive marker (a scheme, an IP
+    shape, or a host/port/pid/handle keyword), so neither is flagged.
+    """
+
+    if "\x00" in value:
+        return True
+    return redact_evidence_line(value) != value
 
 
 def _decode_lines(raw: bytes) -> list[str]:
@@ -339,10 +397,18 @@ class DialectCaptureSession:
         pump: OverlappedLogPump,
         capture: BoundedLogCapture,
         api: LifecycleApi,
-        deadline: float,
     ) -> None:
-        while not pump.all_finished:
-            pump.service()
+        """Bounded, best-effort drain of already-available output.
+
+        A healthy server's pipes may never reach EOF, so this never waits
+        for ``pump.all_finished``: it consumes whatever is already
+        complete and performs only a small fixed number of short waits.
+        The pump itself is left running so later lifecycle steps and
+        final cleanup keep draining safely.
+        """
+
+        pump.service()
+        for _ in range(_STARTUP_DRAIN_MAX_ATTEMPTS):
             if pump.all_finished:
                 break
             exit_code = api.process_exit_code(process)
@@ -351,10 +417,8 @@ class DialectCaptureSession:
                     "startup_process_exit",
                     exit_code=max(0, min(exit_code, MAX_METADATA_NUMBER)),
                 )
-            remaining = deadline - self.clock()
-            if remaining <= 0:
-                break
-            pump.wait(int(min(_WAIT_SLICE_MS, remaining * 1000)))
+            pump.wait(_STARTUP_DRAIN_WAIT_MS)
+            pump.service()
 
     def _run_version_command(
         self,
@@ -506,7 +570,6 @@ class DialectCaptureSession:
             result["executable"] = {"basename": basename, "sha256": digest}
 
             space = create_session_space(self.temp_parent)
-            result["proofs"]["empty_model_store_used"] = True
             port = choose_loopback_port(frozenset())
             environment = build_child_environment(
                 executable=executable,
@@ -515,6 +578,7 @@ class DialectCaptureSession:
                 user_overrides=None,
             )
             process = lifecycle_api.create_suspended(executable, ("serve",), environment)
+            result["proofs"]["empty_model_store_used"] = True
             verify_suspended_executable(lifecycle_api, process, executable, basename, digest)
             result["proofs"]["executable_image_verified"] = True
             job = lifecycle_api.create_job()
@@ -554,10 +618,13 @@ class DialectCaptureSession:
                     )
                 pump.wait(int(min(_WAIT_SLICE_MS, remaining * 1000)))
 
-            try:
-                raw_api_version = self.api_version_probe(
-                    port, min(1.0, max(0.1, deadline - self.clock()))
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise IsolatedServerFailure(
+                    "startup_timeout", timeout_ms=int(self.startup_timeout_seconds * 1000)
                 )
+            try:
+                raw_api_version = self.api_version_probe(port, min(1.0, remaining))
                 result["observations"]["api_version"] = normalize_ollama_version(
                     raw_api_version
                 )
@@ -578,7 +645,6 @@ class DialectCaptureSession:
                 pump=pump,
                 capture=capture,
                 api=lifecycle_api,
-                deadline=deadline,
             )
 
             ownership = resolve_endpoint_ownership(
@@ -758,6 +824,12 @@ def validate_capture_result(result: Any) -> list[str]:
                 or any(not isinstance(line, str) or len(line) > MAX_EVIDENCE_LINE_CHARS for line in lines)
             ):
                 problems.append(f"observations.{key} is invalid")
+            elif key == "version_command_lines":
+                aggregate_bytes = sum(len(line.encode("utf-8")) for line in lines)
+                if aggregate_bytes > MAX_VERSION_OUTPUT_BYTES:
+                    problems.append(
+                        "observations.version_command_lines exceeds the aggregate byte cap"
+                    )
         if not isinstance(observations["api_ps_empty"], bool):
             problems.append("observations.api_ps_empty must be boolean")
 
@@ -825,4 +897,31 @@ def validate_capture_result(result: Any) -> list[str]:
                 problems.append(f"{where} contains unredacted path-like data")
 
     inspect(result, "result")
+
+    # Independently re-derive privacy safety for every evidence-bearing
+    # string (never trusting that redact_evidence_line was previously
+    # called). Scoped to the fields that actually carry captured
+    # evidence -- executable.basename/sha256 and the fixed category
+    # enum are validated by their own dedicated checks above and are not
+    # redaction targets.
+    if isinstance(observations, dict):
+        api_version = observations.get("api_version")
+        if isinstance(api_version, str) and _contains_unredacted_sensitive_data(api_version):
+            problems.append("observations.api_version contains unredacted sensitive data")
+        for key in ("version_command_lines", "startup_evidence_lines"):
+            lines = observations.get(key)
+            if isinstance(lines, list):
+                for index, entry in enumerate(lines):
+                    if isinstance(entry, str) and _contains_unredacted_sensitive_data(entry):
+                        problems.append(
+                            f"observations.{key}[{index}] contains unredacted sensitive data"
+                        )
+    if isinstance(failures, list):
+        for index, failure in enumerate(failures):
+            if isinstance(failure, dict):
+                category = failure.get("category")
+                if isinstance(category, str) and _contains_unredacted_sensitive_data(category):
+                    problems.append(
+                        f"failures[{index}].category contains unredacted sensitive data"
+                    )
     return problems
