@@ -1785,3 +1785,113 @@ def test_successful_capture_still_performs_only_one_api_attempt(
     result, _, _ = _capture(tmp_path, monkeypatch, api_version_probe=probe)
     assert result["failures"] == []
     assert attempts["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Round 5: removal of the obsolete generic recursive slash/backslash
+# validator. The second approved G-ISO-D0 run raised a false positive --
+# "startup_evidence_lines[3..10] contains unredacted path-like data" -- from
+# a blanket rule that rejected any string still containing "\" or "/" after
+# stripping literal "<PATH>" tokens, even benign escaped log grammar with no
+# real path in it. That rule is removed; the separately authored
+# _contains_unredacted_sensitive_data detectors (already applied to
+# api_version, version_command_lines, and startup_evidence_lines) remain the
+# sole, more precise enforcement, including NUL rejection.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        r'startup message: \"ready\" noprune enabled',
+        r'{\"status\": \"ready\", \"pruning\": \"disabled\"}',
+        r'config path: \"<PATH>\" loaded',
+        r'raw noprune\, cloud_disabled\; ready',
+    ],
+)
+def test_benign_escaped_log_grammar_validates_after_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    """Round 5: escaped quotation marks, JSON-like escaped punctuation, an
+    already-redacted <PATH> token surrounded by escaped quotes, and
+    ordinary backslash escaping that is not a filesystem path must all
+    validate cleanly. The removed generic slash/backslash rule previously
+    rejected every one of these as "unredacted path-like data" even though
+    none of them names a real path."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = [line]
+    assert validate_capture_result(result) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        r"C:\Users\alice\ollama.exe",
+        r"\\server\share\models\file.bin",
+        "/home/alice/.ollama/models",
+    ],
+)
+def test_raw_filesystem_paths_are_still_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Round 5: removing the overbroad generic slash/backslash rule must
+    not weaken the separately authored raw-path detectors -- a genuine
+    Windows path, UNC path, or Unix path injected into startup evidence is
+    still independently rejected."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+def test_nul_byte_still_rejected_without_the_generic_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: NUL rejection survives the removal of the generic rule
+    because _contains_unredacted_sensitive_data independently checks for
+    "\\x00", never relying on the removed slash/backslash sweep."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = ["value\x00withnul"]
+    assert validate_capture_result(result) != []
+
+
+def test_eight_benign_escaped_startup_evidence_lines_validate_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: reproduces the real G-ISO-D0 failure shape, where multiple
+    (indices 3..10) otherwise-safe startup evidence lines containing
+    benign escaped syntax were all rejected together by the generic rule.
+    At least eight such lines must now validate successfully as a group."""
+
+    lines = [
+        r'starting server version 0.32.1 \"ready\"',
+        r'{\"status\": \"starting\"}',
+        r'noprune\, cloud_disabled\;',
+        r'config path: \"<PATH>\" loaded',
+        r'listening \"ready\" noprune',
+        r'{\"pruning\": \"disabled\", \"cloud\": \"disabled\"}',
+        r'readiness check: \"ok\"',
+        r'startup complete\; noprune enabled\; cloud disabled',
+    ]
+    assert len(lines) >= 8
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = lines
+    assert validate_capture_result(result) == []
+
+
+def test_generic_recursive_path_rule_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: the validator's internal implementation no longer defines
+    the removed generic recursive scan, guarding against reintroduction."""
+
+    import inspect as inspect_module
+
+    source = inspect_module.getsource(validate_capture_result)
+    assert "contains unredacted path-like data" not in source

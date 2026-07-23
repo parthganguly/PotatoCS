@@ -1218,20 +1218,6 @@ def validate_capture_result(result: Any) -> list[str]:
         if failures and all(proofs.get(key) is True for key in _PROOF_KEYS):
             problems.append("capture with failures cannot have every proof")
 
-    def inspect(value: Any, where: str) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                inspect(child, f"{where}.{key}")
-        elif isinstance(value, list):
-            for index, child in enumerate(value):
-                inspect(child, f"{where}[{index}]")
-        elif isinstance(value, str):
-            remainder = value.replace("<PATH>", "")
-            if "\\" in remainder or "/" in remainder or "\x00" in remainder:
-                problems.append(f"{where} contains unredacted path-like data")
-
-    inspect(result, "result")
-
     # Independently enforce privacy safety for every evidence-bearing
     # string, never trusting that redact_evidence_line was previously
     # called on it. Scoped to the fields that actually carry captured
