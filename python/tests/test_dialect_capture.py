@@ -1411,3 +1411,377 @@ def test_validator_privacy_check_still_never_calls_the_redactor_round3(
         dirty["observations"] = dict(result["observations"])
         dirty["observations"]["version_command_lines"] = [raw]
         assert validate_capture_result(dirty) != []
+
+
+# ---------------------------------------------------------------------------
+# Round 4: the real G-ISO-D0 API-readiness race. Endpoint ownership becoming
+# OWNED proves TCP-level ownership, not that Ollama's HTTP server is ready to
+# answer GET /api/version. These regressions prove bounded, ownership-
+# reproved retries of transient transport/readiness failures inside the
+# existing absolute startup deadline, while semantic (non-transport)
+# failures still fail closed immediately without retry.
+# ---------------------------------------------------------------------------
+
+
+def test_api_version_retries_after_first_transient_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionRefusedError("refused")
+        return "0.32.1"
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert result["failures"] == []
+    assert attempts["count"] == 2
+    assert result["observations"]["api_version"] == "0.32.1"
+    assert result["proofs"]["endpoint_owned_before_api_version"] is True
+
+
+def test_api_version_retries_multiple_transient_failures_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    errors = iter(
+        [
+            ConnectionRefusedError("refused"),
+            socket.timeout("timed out"),
+            ConnectionResetError("reset"),
+        ]
+    )
+
+    def probe(port: int, timeout: float) -> str:
+        error = next(errors, None)
+        if error is not None:
+            raise error
+        return "0.32.1"
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert result["failures"] == []
+    assert result["observations"]["api_version"] == "0.32.1"
+
+
+def test_ownership_rechecked_before_every_api_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    attempt_markers: list[int] = []
+
+    def probe(port: int, timeout: float) -> str:
+        attempt_number = len(attempt_markers) + 1
+        attempt_markers.append(len(api.calls))
+        api.calls.append(f"api_version_probe_{attempt_number}")
+        if attempt_number == 1:
+            raise ConnectionRefusedError("refused")
+        return "0.32.1"
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert result["failures"] == []
+    assert len(attempt_markers) == 2
+    first_index = api.calls.index("api_version_probe_1")
+    second_index = api.calls.index("api_version_probe_2")
+    tcp_indices = [i for i, call in enumerate(api.calls) if call == "tcp_listener_rows"]
+    assert any(i < first_index for i in tcp_indices)
+    assert any(first_index < i < second_index for i in tcp_indices)
+
+
+class FlipToForeignApi(FakeLifecycleApi):
+    """Reports genuine ownership for ``flip_after`` calls, then a foreign
+    owner on every subsequent tcp_listener_rows call."""
+
+    def __init__(self, *, flip_after: int) -> None:
+        super().__init__()
+        self.flip_after = flip_after
+        self.tcp_call_count = 0
+
+    def tcp_listener_rows(self) -> tuple[TcpListenerRow, ...]:
+        self.tcp_call_count += 1
+        self.calls.append("tcp_listener_rows")
+        if self.active_server_id is None:
+            return ()
+        if self.tcp_call_count > self.flip_after:
+            return (TcpListenerRow("127.0.0.1", self.active_server_port, 999999),)
+        return (TcpListenerRow("127.0.0.1", self.active_server_port, self.active_server_id),)
+
+
+def test_ownership_foreign_between_attempts_fails_closed_without_further_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FlipToForeignApi(flip_after=2)
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] > 1:
+            raise AssertionError("must not attempt HTTP after ownership turns foreign")
+        raise ConnectionRefusedError("refused")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "port_hijacked" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+class FlipToAmbiguousApi(FakeLifecycleApi):
+    """Reports genuine ownership for ``flip_after`` calls, then an extra
+    relevant listener row (ambiguous) on every subsequent call."""
+
+    def __init__(self, *, flip_after: int) -> None:
+        super().__init__()
+        self.flip_after = flip_after
+        self.tcp_call_count = 0
+
+    def tcp_listener_rows(self) -> tuple[TcpListenerRow, ...]:
+        self.tcp_call_count += 1
+        self.calls.append("tcp_listener_rows")
+        if self.active_server_id is None:
+            return ()
+        real = TcpListenerRow("127.0.0.1", self.active_server_port, self.active_server_id)
+        if self.tcp_call_count > self.flip_after:
+            return (real, TcpListenerRow("127.0.0.1", self.active_server_port, 999999))
+        return (real,)
+
+
+def test_ownership_ambiguous_between_attempts_fails_closed_without_further_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FlipToAmbiguousApi(flip_after=2)
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] > 1:
+            raise AssertionError("must not attempt HTTP after ownership turns ambiguous")
+        raise ConnectionRefusedError("refused")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "port_ownership_ambiguous" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+class ExitBetweenAttemptsApi(FakeLifecycleApi):
+    """The server process reports a live exit code starting on the
+    ``exit_on_call``-th ``process_exit_code`` check for the server
+    process."""
+
+    def __init__(self, *, exit_on_call: int) -> None:
+        super().__init__()
+        self.exit_on_call = exit_on_call
+        self._server_exit_calls = 0
+
+    def process_exit_code(self, process) -> int | None:
+        self.calls.append(f"process_exit_{self._kind(process)}")
+        if self._kind(process) == "server":
+            self._server_exit_calls += 1
+            if self._server_exit_calls >= self.exit_on_call:
+                return 1
+        return None
+
+
+def test_process_exit_between_attempts_fails_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = ExitBetweenAttemptsApi(exit_on_call=3)
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] > 1:
+            raise AssertionError("must not attempt HTTP after the child process exited")
+        raise ConnectionRefusedError("refused")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "startup_process_exit" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_transient_failures_until_deadline_produce_startup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(port: int, timeout: float) -> str:
+        raise ConnectionResetError("reset")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.2,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_no_wait_or_retry_exceeds_the_absolute_startup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(port: int, timeout: float) -> str:
+        raise ConnectionRefusedError("refused")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.2,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+    assert clock.now <= 0.2 + 1e-9
+
+
+def test_malformed_successful_payload_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        raise ValueError("malformed version response")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "version_probe_failed" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_missing_or_invalid_version_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        return "not-a-version"
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "version_probe_failed" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_cleanup_proofs_remain_correct_after_exhausted_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(port: int, timeout: float) -> str:
+        raise ConnectionResetError("reset")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.2,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+    assert result["proofs"]["endpoint_owned_before_api_version"] is True
+    assert result["proofs"]["shutdown_confirmed"] is True
+    assert result["proofs"]["orphan_check_clean"] is True
+    assert result["proofs"]["endpoint_closed"] is True
+    assert result["proofs"]["temporary_space_removed"] is True
+    assert validate_capture_result(result) == []
+
+
+def test_successful_capture_still_performs_only_one_api_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        return "0.32.1"
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api_version_probe=probe)
+    assert result["failures"] == []
+    assert attempts["count"] == 1

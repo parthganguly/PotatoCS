@@ -637,6 +637,94 @@ class DialectCaptureSession:
     def _record_failure(result: dict[str, Any], failure: IsolatedServerFailure) -> None:
         result["failures"].append(failure.as_record())
 
+    def _await_api_version(
+        self,
+        *,
+        process: Any,
+        pump: OverlappedLogPump,
+        api: LifecycleApi,
+        port: int,
+        job: Any,
+        deadline: float,
+        result: dict[str, Any],
+    ) -> None:
+        """Bounded, ownership-reproved retry of GET /api/version.
+
+        Endpoint ownership becoming OWNED proves the child process holds
+        the TCP listener -- it does not prove Ollama's HTTP server is yet
+        ready to answer requests. Before every attempt this reproves
+        ownership (failing closed immediately on FOREIGN/AMBIGUOUS) and
+        rechecks process liveness; only a transient transport/readiness
+        failure (connection refused/reset, socket timeout, premature
+        close, or another OSError-shaped transport failure -- never an
+        HTTP error response) is retried, and never beyond the absolute
+        startup deadline. A malformed or semantically invalid response
+        fails closed immediately without retry.
+        """
+
+        while True:
+            pump.service()
+            ownership = resolve_endpoint_ownership(api, port, process=process, job=job)
+            if ownership.state == OWNERSHIP_FOREIGN:
+                raise IsolatedServerFailure("port_hijacked")
+            if ownership.state == OWNERSHIP_AMBIGUOUS:
+                raise IsolatedServerFailure("port_ownership_ambiguous")
+            exit_code = api.process_exit_code(process)
+            if exit_code is not None:
+                raise IsolatedServerFailure(
+                    "startup_process_exit",
+                    exit_code=max(0, min(exit_code, MAX_METADATA_NUMBER)),
+                )
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise IsolatedServerFailure(
+                    "startup_timeout", timeout_ms=int(self.startup_timeout_seconds * 1000)
+                )
+            if ownership.state != OWNERSHIP_OWNED:
+                wait_ms = int(min(_WAIT_SLICE_MS, remaining * 1000))
+                if wait_ms <= 0:
+                    raise IsolatedServerFailure(
+                        "startup_timeout", timeout_ms=int(self.startup_timeout_seconds * 1000)
+                    )
+                pump.wait(wait_ms)
+                continue
+
+            result["proofs"]["endpoint_owned_before_api_version"] = True
+            try:
+                raw_api_version = self.api_version_probe(port, min(1.0, remaining))
+            except IsolatedServerFailure as exc:
+                if exc.category == "version_probe_failed":
+                    raise
+                raise IsolatedServerFailure("version_probe_failed") from exc
+            except urllib.error.HTTPError as exc:
+                # A real HTTP response with an error status is a semantic
+                # protocol failure, not a transport failure -- it is
+                # never retried even though HTTPError subclasses OSError.
+                raise IsolatedServerFailure("version_probe_failed") from exc
+            except OSError as exc:
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    raise IsolatedServerFailure(
+                        "startup_timeout",
+                        timeout_ms=int(self.startup_timeout_seconds * 1000),
+                    ) from exc
+                wait_ms = int(min(_WAIT_SLICE_MS, remaining * 1000))
+                if wait_ms <= 0:
+                    raise IsolatedServerFailure(
+                        "startup_timeout",
+                        timeout_ms=int(self.startup_timeout_seconds * 1000),
+                    ) from exc
+                pump.wait(wait_ms)
+                continue
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise IsolatedServerFailure("version_probe_failed") from exc
+
+            try:
+                result["observations"]["api_version"] = normalize_ollama_version(raw_api_version)
+            except ValueError as exc:
+                raise IsolatedServerFailure("version_probe_failed") from exc
+            return
+
     def _drain_startup_evidence(
         self,
         *,
@@ -858,7 +946,6 @@ class DialectCaptureSession:
                 )
                 exit_code = lifecycle_api.process_exit_code(process)
                 if ownership.state == OWNERSHIP_OWNED:
-                    result["proofs"]["endpoint_owned_before_api_version"] = True
                     break
                 if ownership.state == OWNERSHIP_FOREIGN:
                     raise IsolatedServerFailure("port_hijacked")
@@ -876,27 +963,15 @@ class DialectCaptureSession:
                     )
                 pump.wait(int(min(_WAIT_SLICE_MS, remaining * 1000)))
 
-            remaining = deadline - self.clock()
-            if remaining <= 0:
-                raise IsolatedServerFailure(
-                    "startup_timeout", timeout_ms=int(self.startup_timeout_seconds * 1000)
-                )
-            try:
-                raw_api_version = self.api_version_probe(port, min(1.0, remaining))
-                result["observations"]["api_version"] = normalize_ollama_version(
-                    raw_api_version
-                )
-            except (
-                IsolatedServerFailure,
-                OSError,
-                TypeError,
-                ValueError,
-                urllib.error.URLError,
-                json.JSONDecodeError,
-            ) as exc:
-                if isinstance(exc, IsolatedServerFailure) and exc.category == "version_probe_failed":
-                    raise
-                raise IsolatedServerFailure("version_probe_failed") from exc
+            self._await_api_version(
+                process=process,
+                pump=pump,
+                api=lifecycle_api,
+                port=port,
+                job=job,
+                deadline=deadline,
+                result=result,
+            )
 
             self._drain_startup_evidence(
                 process=process,
