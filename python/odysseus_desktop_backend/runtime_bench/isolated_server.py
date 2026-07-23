@@ -380,11 +380,53 @@ def _validate_dialect_pattern(pattern: Any, where: str) -> None:
         raise ValueError(f"dialect {where} pattern must contain exactly one capture group")
 
 
-# Intentionally empty in this correction cycle.  Registering an installed
-# binary requires a separately reviewed committed entry carrying both the
-# startup and version-output dialects; the CLI accepts no caller-supplied
-# regex or fixture path.
-REVIEWED_DIALECT_REGISTRY: Mapping[str, ReviewedDialectEntry] = MappingProxyType({})
+# A SemVer token with every internal alternative/group made non-capturing,
+# so wrapping it in one outer ``(...)`` gives each dialect pattern that
+# embeds it exactly one capture group, as required by
+# ``_validate_dialect_pattern``.
+_REVIEWED_SEMVER_TOKEN = (
+    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+)
+
+# One reviewed, SHA-256-bound entry captured from a real Ollama 0.32.1
+# install (G-ISO-D0 evidence, PR #39): executable basename ``ollama.exe``,
+# owned version-command output ``ollama version is 0.32.1``, and startup
+# evidence including ``msg="Ollama cloud disabled: true"`` and
+# ``msg="Listening on <host>:<port> (version 0.32.1)"``.  Registering any
+# other binary requires its own separately reviewed committed entry; the
+# CLI accepts no caller-supplied regex or fixture path.
+_OLLAMA_0321_SHA256 = "7a777be95617a38798a9942a7fce7ec65f972ccc10ec061007b5a4dd5329741b"
+
+_OLLAMA_0321_STARTUP_DIALECT = StartupDialect(
+    _OLLAMA_0321_SHA256,
+    re.compile(
+        r'msg="Listening on 127\.0\.0\.1:\d{1,5} \(version (' + _REVIEWED_SEMVER_TOKEN + r')\)"'
+    ),
+    {
+        "noprune": (re.compile(r"OLLAMA_NOPRUNE:(true|false)"), "startup_log"),
+        "no_cloud": (re.compile(r'msg="Ollama cloud disabled: (true|false)"'), "startup_log"),
+    },
+)
+
+_OLLAMA_0321_VERSION_OUTPUT_DIALECT = VersionOutputDialect(
+    _OLLAMA_0321_SHA256,
+    re.compile(r"ollama version is (" + _REVIEWED_SEMVER_TOKEN + r")"),
+    re.compile(r"Warning: client version is (" + _REVIEWED_SEMVER_TOKEN + r")"),
+    "Warning: could not connect to a running Ollama instance",
+    True,
+)
+
+REVIEWED_DIALECT_REGISTRY: Mapping[str, ReviewedDialectEntry] = MappingProxyType(
+    {
+        _OLLAMA_0321_SHA256: ReviewedDialectEntry(
+            _OLLAMA_0321_SHA256,
+            _OLLAMA_0321_STARTUP_DIALECT,
+            _OLLAMA_0321_VERSION_OUTPUT_DIALECT,
+        ),
+    }
+)
 
 
 def validate_dialect_registry(registry: Mapping[str, ReviewedDialectEntry]) -> None:

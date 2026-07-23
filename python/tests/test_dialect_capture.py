@@ -179,15 +179,18 @@ def test_capture_succeeds_for_hash_absent_from_registry(
     assert api.arguments == [("serve",), ("--version",)]
 
 
-def test_capture_import_and_use_leave_registry_mapping_proxy_empty(
+def test_capture_import_and_use_leave_registry_mapping_proxy_unmodified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The registry is no longer empty (a reviewed SHA-256-bound entry is
+    # now committed), but capture-dialect must still never read, rebind,
+    # or mutate it -- it bypasses the reviewed-dialect gate entirely.
     registry = isolated_server.REVIEWED_DIALECT_REGISTRY
     assert isinstance(registry, MappingProxyType)
-    assert dict(registry) == {}
+    before = dict(registry)
     _capture(tmp_path, monkeypatch)
     assert isolated_server.REVIEWED_DIALECT_REGISTRY is registry
-    assert dict(registry) == {}
+    assert dict(registry) == before
 
 
 def test_ownership_is_proved_before_api_version(
@@ -735,10 +738,11 @@ def test_capture_generates_no_dialect_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = isolated_server.REVIEWED_DIALECT_REGISTRY
+    before = dict(registry)
     result, _, _ = _capture(tmp_path, monkeypatch)
     assert result["failures"] == []
     assert isolated_server.REVIEWED_DIALECT_REGISTRY is registry
-    assert dict(registry) == {}
+    assert dict(registry) == before
 
 
 def test_capture_validator_rejects_unknown_keys_and_non_lowercase_hash(

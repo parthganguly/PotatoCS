@@ -49,9 +49,11 @@ from odysseus_desktop_backend.runtime_bench.isolated_server import (
     parse_version_output,
     hash_executable,
     resolve_endpoint_ownership,
+    reviewed_dialect_for_hash,
     run_owned_version_probe,
     teardown_session_space,
     validate_attestation_artifact,
+    validate_dialect_registry,
     validate_user_overrides,
     verify_empty_model_residency,
 )
@@ -2052,3 +2054,157 @@ def test_complete_artifact_contains_no_pid_port_address_or_pipe_name(
     assert "0.0.0.0" not in serialized
     assert "\\\\.\\pipe\\" not in serialized
     assert str(tmp_path) not in serialized
+
+
+# ---------------------------------------------------------------------------
+# Reviewed Ollama 0.32.1 dialect (SHA-256-bound, G-ISO-D0 real evidence)
+# ---------------------------------------------------------------------------
+
+_REVIEWED_OLLAMA_0321_SHA256 = "7a777be95617a38798a9942a7fce7ec65f972ccc10ec061007b5a4dd5329741b"
+
+_REVIEWED_STARTUP_FIXTURE = (
+    'time=2026-07-20T09:14:02.001-07:00 level=INFO source=routes.go:1234 msg="server config" '
+    'env="map[OLLAMA_DEBUG:false OLLAMA_HOST:127.0.0.1:54321 OLLAMA_NOPRUNE:true OLLAMA_NUM_PARALLEL:0]"\n'
+    'time=2026-07-20T09:14:02.050-07:00 level=INFO source=routes.go:1240 msg="Ollama cloud disabled: true"\n'
+    'time=2026-07-20T09:14:02.301-07:00 level=INFO source=routes.go:1300 '
+    'msg="Listening on 127.0.0.1:54321 (version 0.32.1)"\n'
+).encode("utf-8")
+
+
+def _reviewed_identity() -> RuntimeIdentity:
+    return RuntimeIdentity("ollama.exe", _REVIEWED_OLLAMA_0321_SHA256, "0.32.1", "0.32.1", "0.32.1")
+
+
+def _reviewed_entry() -> ReviewedDialectEntry:
+    return isolated_server.REVIEWED_DIALECT_REGISTRY[_REVIEWED_OLLAMA_0321_SHA256]
+
+
+def test_reviewed_registry_contains_exactly_the_one_reviewed_sha() -> None:
+    assert set(isolated_server.REVIEWED_DIALECT_REGISTRY) == {_REVIEWED_OLLAMA_0321_SHA256}
+
+
+def test_reviewed_dialect_for_hash_returns_the_exact_entry() -> None:
+    entry = reviewed_dialect_for_hash(_REVIEWED_OLLAMA_0321_SHA256)
+    assert entry.identity_sha256 == _REVIEWED_OLLAMA_0321_SHA256
+    assert entry is _reviewed_entry()
+
+
+def test_reviewed_registry_validates_cleanly() -> None:
+    validate_dialect_registry(isolated_server.REVIEWED_DIALECT_REGISTRY)
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "0" * 64,
+        "b" * 64,
+        _REVIEWED_OLLAMA_0321_SHA256[:-1] + ("0" if _REVIEWED_OLLAMA_0321_SHA256[-1] != "0" else "1"),
+    ],
+)
+def test_unknown_or_unrelated_hash_fails_closed(digest: str) -> None:
+    with pytest.raises(IsolatedServerFailure, match="attestation_dialect_unavailable"):
+        reviewed_dialect_for_hash(digest)
+
+
+def test_reviewed_dialect_does_not_admit_unrelated_hash() -> None:
+    unrelated = "f" * 64
+    assert unrelated not in isolated_server.REVIEWED_DIALECT_REGISTRY
+    with pytest.raises(IsolatedServerFailure, match="attestation_dialect_unavailable"):
+        reviewed_dialect_for_hash(unrelated)
+
+
+def test_every_reviewed_dialect_pattern_has_exactly_one_capture_group() -> None:
+    entry = _reviewed_entry()
+    assert entry.startup.startup_version.groups == 1
+    for pattern, _source in entry.startup.setting_patterns.values():
+        assert pattern.groups == 1
+    assert entry.version_output.server_version_pattern.groups == 1
+    assert entry.version_output.client_version_pattern.groups == 1
+
+
+def test_reviewed_version_output_parses_the_owned_command_line() -> None:
+    client, server = parse_version_output(b"ollama version is 0.32.1\n", _reviewed_entry().version_output)
+    assert client == "0.32.1"
+    assert server == "0.32.1"
+
+
+def test_reviewed_version_grammar_accepts_another_valid_semver_directly() -> None:
+    # Same grammar, invoked directly against the reviewed dialect's own
+    # parser -- not registered under a different SHA-256.
+    client, server = parse_version_output(
+        b"ollama version is 1.2.3-rc.1+build.9\n", _reviewed_entry().version_output
+    )
+    assert client == "1.2.3-rc.1+build.9"
+    assert server == "1.2.3-rc.1+build.9"
+
+
+def test_reviewed_client_warning_line_is_recognized_and_captured() -> None:
+    raw = b"Warning: client version is 0.32.0\nollama version is 0.32.1\n"
+    client, server = parse_version_output(raw, _reviewed_entry().version_output)
+    assert client == "0.32.0"
+    assert server == "0.32.1"
+
+
+def test_reviewed_connection_warning_fails_endpoint_ownership() -> None:
+    raw = b"Warning: could not connect to a running Ollama instance\n"
+    with pytest.raises(IsolatedServerFailure, match="version_endpoint_ownership_failed"):
+        parse_version_output(raw, _reviewed_entry().version_output)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"unexpected line that matches nothing\n",
+        b"ollama version is 0.32.1\nollama version is 0.32.1\n",
+        b"ollama version is 0.32.1\nollama version is 0.32.2\n",
+    ],
+)
+def test_reviewed_unexpected_or_duplicate_version_lines_fail_malformed(raw: bytes) -> None:
+    with pytest.raises(IsolatedServerFailure, match="version_output_malformed"):
+        parse_version_output(raw, _reviewed_entry().version_output)
+
+
+def test_reviewed_startup_fixture_attests_version_noprune_and_no_cloud() -> None:
+    startup_record, settings = parse_startup_attestation(
+        _REVIEWED_STARTUP_FIXTURE, identity=_reviewed_identity(), dialect=_reviewed_entry().startup
+    )
+    assert startup_record == {"state": "attested", "value": "0.32.1", "source": "startup_log"}
+    assert settings["noprune"] == {"state": "attested", "value": "true", "source": "startup_log"}
+    assert settings["no_cloud"] == {"state": "attested", "value": "true", "source": "startup_log"}
+
+
+def test_reviewed_startup_version_mismatch_fails_identity() -> None:
+    mismatched_identity = RuntimeIdentity(
+        "ollama.exe", _REVIEWED_OLLAMA_0321_SHA256, "0.32.9", "0.32.9", "0.32.9"
+    )
+    with pytest.raises(IsolatedServerFailure, match="runtime_identity_mismatch"):
+        parse_startup_attestation(
+            _REVIEWED_STARTUP_FIXTURE, identity=mismatched_identity, dialect=_reviewed_entry().startup
+        )
+
+
+def test_reviewed_absent_mandatory_settings_stay_unattested_and_report_missing() -> None:
+    raw = (
+        'time=2026-07-20T09:14:02.301-07:00 level=INFO msg="Listening on 127.0.0.1:54321 (version 0.32.1)"\n'
+    ).encode("utf-8")
+    startup_record, settings = parse_startup_attestation(
+        raw, identity=_reviewed_identity(), dialect=_reviewed_entry().startup
+    )
+    assert startup_record["state"] == "attested"
+    assert settings["noprune"] == {"state": "unattested", "value": None, "source": "unattested"}
+    assert settings["no_cloud"] == {"state": "unattested", "value": None, "source": "unattested"}
+    failures = compare_requested_attestation({}, settings)
+    assert [failure.category for failure in failures] == ["attestation_missing"]
+
+
+def test_reviewed_dialect_synthetic_tests_never_launch_real_ollama(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_create_suspended(self, executable_arg, arguments, environment):
+        raise AssertionError("real process creation must not happen in synthetic dialect tests")
+
+    monkeypatch.setattr(WindowsLifecycleApi, "create_suspended", forbidden_create_suspended)
+    entry = reviewed_dialect_for_hash(_REVIEWED_OLLAMA_0321_SHA256)
+    parse_startup_attestation(_REVIEWED_STARTUP_FIXTURE, identity=_reviewed_identity(), dialect=entry.startup)
+    parse_version_output(b"ollama version is 0.32.1\n", entry.version_output)
+    validate_dialect_registry(isolated_server.REVIEWED_DIALECT_REGISTRY)
