@@ -1,0 +1,1897 @@
+from __future__ import annotations
+
+import json
+import shutil
+import socket
+import sys
+from pathlib import Path
+from types import MappingProxyType
+
+import pytest
+
+from odysseus_desktop_backend.runtime_bench import __main__ as runtime_main
+from odysseus_desktop_backend.runtime_bench import dialect_capture, isolated_server
+from odysseus_desktop_backend.runtime_bench.dialect_capture import (
+    EVIDENCE_STATE,
+    MAX_EVIDENCE_LINE_CHARS,
+    MAX_STARTUP_EVIDENCE_LINES,
+    DialectCaptureSession,
+    build_capture_dry_run_plan,
+    redact_evidence_line,
+    select_startup_evidence_lines,
+    select_version_command_lines,
+    validate_capture_result,
+)
+from odysseus_desktop_backend.runtime_bench.isolated_server import (
+    MAX_VERSION_OUTPUT_BYTES,
+    REVIEWED_DIALECT_REGISTRY,
+    BoundedVersionCapture,
+    IsolatedOllamaServer,
+    IsolatedServerFailure,
+    TcpListenerRow,
+    validate_attestation_artifact,
+    verify_empty_model_residency,
+)
+from test_isolated_ollama_server import FakeClock, FakeLifecycleApi, FakePipe
+
+
+def _empty_ps(port: int, timeout: float) -> bytes:
+    return b'{"models": []}'
+
+
+def _capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api: FakeLifecycleApi | None = None,
+    api_version_probe=None,
+    model_residency_probe=None,
+    clock=None,
+    startup_timeout_seconds: float = 0.2,
+) -> tuple[dict, FakeLifecycleApi, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"synthetic unreviewed executable")
+    monkeypatch.setattr(dialect_capture, "choose_loopback_port", lambda exclusions: 54321)
+    selected_api = FakeLifecycleApi() if api is None else api
+    session = DialectCaptureSession(
+        executable,
+        startup_timeout_seconds=startup_timeout_seconds,
+        version_timeout_seconds=0.2,
+        cleanup_timeout_seconds=0.2,
+        api=selected_api,
+        api_version_probe=(lambda port, timeout: "0.32.1")
+        if api_version_probe is None
+        else api_version_probe,
+        model_residency_probe=_empty_ps
+        if model_residency_probe is None
+        else model_residency_probe,
+        clock=selected_api.clock if clock is None and selected_api.clock is not None else (
+            clock if clock is not None else dialect_capture.time.monotonic
+        ),
+        temp_parent=tmp_path,
+    )
+    return session.run(), selected_api, executable
+
+
+def test_capture_dialect_no_approval_is_process_free(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        dialect_capture.tempfile if hasattr(dialect_capture, "tempfile") else isolated_server.tempfile,
+        "mkdtemp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not allocate")),
+    )
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not open socket")),
+    )
+    assert runtime_main.main(["capture-dialect"]) == 0
+    assert json.loads(capsys.readouterr().out) == build_capture_dry_run_plan()
+
+
+def test_capture_dialect_approval_requires_tty_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(
+        runtime_main,
+        "DialectCaptureSession",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not resolve")),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        runtime_main.main(["capture-dialect", "--approved-g-iso-d0"])
+    assert exc_info.value.code == 2
+
+
+def test_capture_dialect_approval_requires_tty_stdout_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stdin alone being interactive must not be sufficient (Blocker 1)."""
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    monkeypatch.setattr(
+        runtime_main,
+        "DialectCaptureSession",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not construct a session")),
+    )
+    monkeypatch.setattr(
+        dialect_capture.shutil,
+        "which",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not resolve executable")),
+    )
+    monkeypatch.setattr(
+        dialect_capture,
+        "create_session_space",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not allocate temp space")),
+    )
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not open socket")),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        runtime_main.main(["capture-dialect", "--approved-g-iso-d0"])
+    assert exc_info.value.code == 2
+
+
+def test_capture_dialect_dry_run_permits_redirected_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The dry-run path stays usable and process-free with redirected stdio."""
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not open socket")),
+    )
+    assert runtime_main.main(["capture-dialect"]) == 0
+    assert json.loads(capsys.readouterr().out) == build_capture_dry_run_plan()
+
+
+def test_normal_attest_unknown_hash_gate_remains_empty_and_prelaunch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"fresh unknown attestation executable")
+    monkeypatch.setattr(isolated_server, "REVIEWED_DIALECT_REGISTRY", MappingProxyType({}))
+    api = FakeLifecycleApi()
+    artifact = IsolatedOllamaServer(executable, api=api, temp_parent=tmp_path).run()
+    assert dict(isolated_server.REVIEWED_DIALECT_REGISTRY) == {}
+    assert [failure["category"] for failure in artifact["failures"]] == [
+        "attestation_dialect_unavailable"
+    ]
+    assert api.arguments == []
+
+
+def test_capture_succeeds_for_hash_absent_from_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, api, _ = _capture(tmp_path, monkeypatch)
+    assert result["failures"] == []
+    assert result["evidence_state"] == EVIDENCE_STATE
+    assert result["executable"]["sha256"] not in REVIEWED_DIALECT_REGISTRY
+    assert all(result["proofs"].values())
+    assert api.arguments == [("serve",), ("--version",)]
+
+
+def test_capture_import_and_use_leave_registry_mapping_proxy_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = isolated_server.REVIEWED_DIALECT_REGISTRY
+    assert isinstance(registry, MappingProxyType)
+    assert dict(registry) == {}
+    _capture(tmp_path, monkeypatch)
+    assert isolated_server.REVIEWED_DIALECT_REGISTRY is registry
+    assert dict(registry) == {}
+
+
+def test_ownership_is_proved_before_api_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeLifecycleApi()
+
+    def probe(port: int, timeout: float) -> str:
+        api.calls.append("api_version_probe")
+        assert "tcp_listener_rows" in api.calls[:-1]
+        return "0.32.1"
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api=api, api_version_probe=probe)
+    assert result["failures"] == []
+    assert api.calls.index("tcp_listener_rows") < api.calls.index("api_version_probe")
+
+
+def test_ownership_is_reproved_before_version_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeLifecycleApi()
+
+    def probe(port: int, timeout: float) -> str:
+        api.calls.append("api_version_probe")
+        return "0.32.1"
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api=api, api_version_probe=probe)
+    assert result["failures"] == []
+    api_index = api.calls.index("api_version_probe")
+    version_index = api.calls.index("create_suspended_version")
+    assert "tcp_listener_rows" in api.calls[api_index + 1 : version_index]
+
+
+def test_capture_result_never_validates_as_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    assert validate_attestation_artifact(result)
+
+
+def test_absolute_startup_deadline_enforced_before_api_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 2: the api_version_probe must never run once the startup
+    deadline has already expired, and it must not receive a manufactured
+    minimum allowance."""
+
+    values = iter([0.0, 100.0])
+
+    def clock() -> float:
+        return next(values, 100.0)
+
+    def probe(port: int, timeout: float) -> str:
+        raise AssertionError("api_version_probe must not be invoked past the deadline")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.1,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+
+
+class HangingStdoutApi(FakeLifecycleApi):
+    """A healthy server whose stdout pipe never reaches EOF or aborts on
+    its own -- only an explicit cancellation (during cleanup) resolves
+    the outstanding read."""
+
+    def create_suspended(self, executable, arguments, environment):
+        process = super().create_suspended(executable, arguments, environment)
+        if arguments == ("serve",):
+            process.stdout = FakePipe(events=[("data", b"listening ready")])
+        return process
+
+
+def test_drain_bounded_when_server_pipes_never_reach_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 2: the post-readiness drain must not wait for a healthy,
+    long-running server's pipes to reach EOF, and evidence already
+    available at readiness must be retained. Cleanup still safely
+    cancels the outstanding read."""
+
+    clock = FakeClock()
+    api = HangingStdoutApi()
+    api.clock = clock
+    result, api, _ = _capture(
+        tmp_path, monkeypatch, api=api, clock=clock, startup_timeout_seconds=5.0
+    )
+    assert result["failures"] == []
+    assert all(result["proofs"].values())
+    assert clock.now < 1.0
+    assert any(
+        "listening" in line for line in result["observations"]["startup_evidence_lines"]
+    )
+    assert "cancel_overlapped_read" in api.calls
+    assert "close_pipe" in api.calls
+
+
+class ServeCreateFailsApi(FakeLifecycleApi):
+    def create_suspended(self, executable, arguments, environment):
+        if arguments == ("serve",):
+            raise IsolatedServerFailure("process_create_failed")
+        return super().create_suspended(executable, arguments, environment)
+
+
+def test_empty_model_store_proof_false_when_create_suspended_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 3: empty_model_store_used must only become true once the
+    server child was actually created with the isolated-store
+    environment -- not merely because the session space was built."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api=ServeCreateFailsApi())
+    assert result["proofs"]["empty_model_store_used"] is False
+    assert "process_create_failed" in {
+        failure["category"] for failure in result["failures"]
+    }
+
+
+def test_empty_model_store_proof_true_after_successful_suspended_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 3, positive case: the proof becomes true once the child is
+    actually created using the empty-store environment."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert result["failures"] == []
+    assert result["proofs"]["empty_model_store_used"] is True
+
+
+class NeverReadyApi(FakeLifecycleApi):
+    def tcp_listener_rows(self) -> tuple[TcpListenerRow, ...]:
+        self.calls.append("tcp_listener_rows")
+        return ()
+
+
+def test_evidence_state_is_constant_on_startup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = NeverReadyApi(server_log=b"")
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path, monkeypatch, api=api, clock=clock, startup_timeout_seconds=0.1
+    )
+    assert result["evidence_state"] == EVIDENCE_STATE
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+
+
+def test_startup_evidence_keeps_only_allowlisted_lines() -> None:
+    raw = (
+        b"diagnostic noise\n"
+        b"starting server version 0.32.1\n"
+        b"unrelated allocation detail\n"
+        b"listening on 127.0.0.1:54321\n"
+    )
+    lines, truncated = select_startup_evidence_lines(raw)
+    assert lines == [
+        "starting server version 0.32.1",
+        "listening on <HOST>:<PORT>",
+    ]
+    assert truncated is False
+
+
+def test_startup_evidence_caps_line_count_and_length() -> None:
+    raw = b"\n".join(
+        [b"ready " + b"x" * 600] + [f"ready line {index}".encode() for index in range(39)]
+    )
+    lines, truncated = select_startup_evidence_lines(raw)
+    assert len(lines) == MAX_STARTUP_EVIDENCE_LINES
+    assert all(len(line) <= MAX_EVIDENCE_LINE_CHARS for line in lines)
+    assert len(lines[0]) == MAX_EVIDENCE_LINE_CHARS
+    assert truncated is True
+
+
+def test_version_evidence_uses_combined_four_kib_cap() -> None:
+    raw = b"version evidence\n" * 1000
+    bounded = BoundedVersionCapture()
+    bounded.feed(raw)
+    lines, truncated = select_version_command_lines(raw)
+    assert len(bounded.bytes()) == MAX_VERSION_OUTPUT_BYTES
+    assert sum(len(line.encode()) for line in lines) <= MAX_VERSION_OUTPUT_BYTES
+    assert bounded.overflowed is True
+    assert truncated is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "token"),
+    [
+        (r"binary=C:\Users\foo\bar\ollama.exe", "<PATH>"),
+        (r"share=\\server\share\path", "<PATH>"),
+        ("store=/home/foo/.ollama/models", "<PATH>"),
+    ],
+)
+def test_paths_are_redacted(raw: str, token: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert token in redacted
+    assert "foo" not in redacted
+
+
+def test_usernames_are_redacted_bare_and_inside_paths() -> None:
+    bare = redact_evidence_line("USERNAME=foo user=bar")
+    path = redact_evidence_line(r"C:\Users\alice\ollama.exe")
+    assert bare == "USERNAME=<USER> user=<USER>"
+    assert path == "<PATH>"
+    assert not {"foo", "bar", "alice"} & {bare, path}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "127.0.0.1",
+        "::1",
+        "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+        "node.example.local",
+        "workstation",
+    ],
+)
+def test_ip_literals_and_bare_hostnames_are_redacted(raw: str) -> None:
+    assert redact_evidence_line(f"listening on {raw}") == "listening on <HOST>"
+
+
+def test_host_and_port_are_redacted_separately() -> None:
+    redacted = redact_evidence_line("listening on 127.0.0.1:54321")
+    assert redacted == "listening on <HOST>:<PORT>"
+    assert "54321" not in redacted
+
+
+def test_url_credentials_and_query_are_one_token() -> None:
+    redacted = redact_evidence_line(
+        "proxy http://user:pass@host:1234/path?token=abc, ready"
+    )
+    assert redacted == "proxy <URL>, ready"
+    assert not any(secret in redacted for secret in ("user", "pass", "1234", "abc"))
+
+
+def test_proxy_authorization_bearer_and_token_values_are_redacted() -> None:
+    redacted = redact_evidence_line(
+        "Authorization: Bearer sk-abcdef123456 HTTP_PROXY=http://proxy token=secret-value"
+    )
+    assert "<SECRET>" in redacted
+    assert "<URL>" in redacted or "HTTP_PROXY=<SECRET>" in redacted
+    assert not any(secret in redacted for secret in ("sk-abcdef123456", "http://proxy", "secret-value"))
+
+
+def test_pid_pipe_and_handle_are_redacted() -> None:
+    redacted = redact_evidence_line(
+        r"pid=4821 (pid 4822) pipe=\\.\pipe\ollama-abc123 handle=0x1F4"
+    )
+    assert "<PID>" in redacted
+    assert "<PIPE>" in redacted
+    assert "<HANDLE>" in redacted
+    assert not any(raw in redacted for raw in ("4821", "4822", "ollama-abc123", "0x1F4"))
+
+
+def test_redaction_preserves_surrounding_grammar() -> None:
+    redacted = redact_evidence_line("server listening on localhost:54321, ready")
+    assert redacted == "server listening on <HOST>:<PORT>, ready"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("port=11434", "port=<PORT>"),
+        ("port:11434", "port:<PORT>"),
+        ("port: 11434", "port: <PORT>"),
+        ("port 11434", "port <PORT>"),
+        ("listening on 11434", "listening on <PORT>"),
+        ("listen=11434", "listen=<PORT>"),
+    ],
+)
+def test_bare_ports_are_redacted_in_every_keyword_form(raw: str, expected: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert redacted == expected
+    assert "11434" not in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "localhost:11434",
+        "127.0.0.1:11434",
+        "[::1]:11434",
+    ],
+)
+def test_host_and_port_combinations_are_redacted(raw: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert "<HOST>:<PORT>" in redacted
+    assert "11434" not in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "pid=1234",
+        "pid:1234",
+        "pid: 1234",
+        "PID 1234",
+        "process id 1234",
+        "process_id=1234",
+        "(pid 1234)",
+    ],
+)
+def test_pids_are_redacted_in_every_keyword_form(raw: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert "<PID>" in redacted
+    assert "1234" not in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "handle=0x1F4",
+        "handle: 0x1F4",
+        "HANDLE 500",
+        "process_handle=500",
+    ],
+)
+def test_handles_are_redacted_in_every_keyword_form(raw: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert "<HANDLE>" in redacted
+    assert "0x1F4" not in redacted
+    assert "500" not in redacted.replace("<HANDLE>", "")
+
+
+@pytest.mark.parametrize(
+    ("raw", "forbidden"),
+    [
+        ("token=abc", "abc"),
+        ("token: abc", "abc"),
+        ("token abc", "abc"),
+        ("Authorization: Bearer abc", "abc"),
+        ("Bearer abc", "abc"),
+        ("HTTPS_PROXY=http://user:pass@host:8080", "pass"),
+        ("proxy: secret-value", "secret-value"),
+    ],
+)
+def test_secrets_and_credentials_are_redacted_in_every_form(raw: str, forbidden: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert forbidden not in redacted
+    assert "<SECRET>" in redacted or "<URL>" in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        r'"C:\Users\Alice Smith\secret.txt"',
+        r"'C:\Program Files\Ollama\ollama.exe'",
+        r"C:\Users\Alice\file.txt",
+        r"\\server\share\Alice\file.txt",
+        "/home/alice/.ollama/models",
+        r'"C:\\Users\\Alice Smith\\file.txt"',
+    ],
+)
+def test_paths_are_redacted_without_trailing_fragments(raw: str) -> None:
+    redacted = redact_evidence_line(raw)
+    assert "<PATH>" in redacted
+    assert "Alice" not in redacted
+    assert "\\" not in redacted.replace("<PATH>", "")
+    assert "/" not in redacted.replace("<PATH>", "")
+
+
+@pytest.mark.parametrize(
+    ("raw", "port"),
+    [
+        ("127.0.0.1", None),
+        ("127.0.0.1:11434", "11434"),
+        ("2001:0db8:85a3:0000:0000:8a2e:0370:7334", None),
+        ("[::1]", None),
+        ("[::1]:11434", "11434"),
+        ("fe80::1%12", None),
+        ("[fe80::1%12]:9000", "9000"),
+        ("localhost", None),
+        ("node.example.local", None),
+        ("workstation", None),
+        ("corp-server-01", None),
+    ],
+)
+def test_hosts_and_addresses_are_redacted(raw: str, port: str | None) -> None:
+    redacted = redact_evidence_line(f"listening on {raw}")
+    assert "<HOST>" in redacted
+    assert raw not in redacted
+    if port is not None:
+        assert "<PORT>" in redacted
+        assert port not in redacted
+
+
+def test_replacement_tokens_survive_the_full_pipeline_unmodified() -> None:
+    line = (
+        "path=<PATH> host=<HOST> port=<PORT> secret=<SECRET> pid=<PID> "
+        "pipe=<PIPE> handle=<HANDLE> url=<URL>"
+    )
+    assert redact_evidence_line(line) == line
+
+
+@pytest.mark.parametrize(
+    ("payload", "category"),
+    [
+        (b'{"models": []}', None),
+        (b'{"models": [{"name": "x"}]}', "unexpected_model_residency"),
+        (b'{"models": [], "extra": 1}', "model_residency_probe_failed"),
+        (b'{"models": [', "model_residency_probe_failed"),
+    ],
+)
+def test_api_ps_accepts_only_exact_empty_shape(payload: bytes, category: str | None) -> None:
+    if category is None:
+        verify_empty_model_residency(payload)
+    else:
+        with pytest.raises(IsolatedServerFailure) as exc_info:
+            verify_empty_model_residency(payload)
+        assert exc_info.value.category == category
+
+
+@pytest.mark.parametrize(
+    ("payload", "category"),
+    [
+        (b'{"models": [{"name": "x"}]}', "unexpected_model_residency"),
+        (b'{"models": [], "extra": 1}', "model_residency_probe_failed"),
+        (b"not json", "model_residency_probe_failed"),
+    ],
+)
+def test_capture_api_ps_failures_keep_empty_proof_false(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    category: str,
+) -> None:
+    result, _, _ = _capture(
+        tmp_path, monkeypatch, model_residency_probe=lambda port, timeout: payload
+    )
+    assert result["observations"]["api_ps_empty"] is False
+    assert result["proofs"]["api_ps_exactly_empty"] is False
+    assert category in {failure["category"] for failure in result["failures"]}
+
+
+class CancelFailureApi(FakeLifecycleApi):
+    def create_suspended(self, executable, arguments, environment):
+        process = super().create_suspended(executable, arguments, environment)
+        if arguments == ("serve",):
+            process.stdout = FakePipe(events=[("data", b"listening ready")], hang=True)
+            self.cancel_failures.add(process.stdout)
+        return process
+
+
+def test_cleanup_failure_prevents_all_true_proofs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = CancelFailureApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path, monkeypatch, api=api, clock=clock, startup_timeout_seconds=0.1
+    )
+    assert "io_cancellation_failed" in {
+        failure["category"] for failure in result["failures"]
+    }
+    assert not all(result["proofs"].values())
+    assert result["proofs"]["shutdown_confirmed"] is False
+
+
+class EndpointSurvivorApi(FakeLifecycleApi):
+    def tcp_listener_rows(self) -> tuple[TcpListenerRow, ...]:
+        self.calls.append("tcp_listener_rows")
+        if self.active_server_id is None:
+            return ()
+        return (TcpListenerRow("127.0.0.1", self.active_server_port, self.active_server_id),)
+
+
+def test_endpoint_closure_failure_prevents_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = _capture(tmp_path, monkeypatch, api=EndpointSurvivorApi())
+    assert "port_not_closed" in {failure["category"] for failure in result["failures"]}
+    assert result["proofs"]["endpoint_closed"] is False
+    assert not all(result["proofs"].values())
+
+
+def test_capture_writes_no_raw_evidence_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"synthetic unreviewed executable")
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    monkeypatch.setattr(Path, "write_text", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no text writes")))
+    monkeypatch.setattr(Path, "write_bytes", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no byte writes")))
+    monkeypatch.setattr(dialect_capture, "choose_loopback_port", lambda exclusions: 54321)
+    result = DialectCaptureSession(
+        executable,
+        startup_timeout_seconds=0.2,
+        version_timeout_seconds=0.2,
+        cleanup_timeout_seconds=0.2,
+        api=FakeLifecycleApi(),
+        api_version_probe=lambda port, timeout: "0.32.1",
+        model_residency_probe=_empty_ps,
+        temp_parent=tmp_path,
+    ).run()
+    assert result["failures"] == []
+    after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    assert after == before
+
+
+def _assert_no_raw_identity(value, *, raw_pids: set[int]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            assert "pid" not in str(key).casefold()
+            _assert_no_raw_identity(child, raw_pids=raw_pids)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_no_raw_identity(child, raw_pids=raw_pids)
+    elif isinstance(value, str):
+        remainder = value.replace("<PATH>", "")
+        assert "\\" not in remainder and "/" not in remainder
+        assert all(str(pid) not in value for pid in raw_pids)
+
+
+def test_success_and_failure_results_contain_no_raw_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeLifecycleApi(
+        server_log=(
+            rb"starting server version 0.32.1 listening on 127.0.0.1:54321 "
+            rb"path=C:\Users\alice\ollama.exe pid=4201"
+        )
+    )
+    success, _, _ = _capture(tmp_path / "success", monkeypatch, api=api)
+    clock = FakeClock()
+    failed_api = NeverReadyApi(server_log=b"listening on 127.0.0.1:54321")
+    failed_api.clock = clock
+    failure, _, _ = _capture(
+        tmp_path / "failure",
+        monkeypatch,
+        api=failed_api,
+        clock=clock,
+        startup_timeout_seconds=0.1,
+    )
+    _assert_no_raw_identity(success, raw_pids=set(api.processes))
+    _assert_no_raw_identity(failure, raw_pids=set(failed_api.processes))
+
+
+def test_capture_generates_no_dialect_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = isolated_server.REVIEWED_DIALECT_REGISTRY
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert result["failures"] == []
+    assert isolated_server.REVIEWED_DIALECT_REGISTRY is registry
+    assert dict(registry) == {}
+
+
+def test_capture_validator_rejects_unknown_keys_and_non_lowercase_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["unknown"] = True
+    assert validate_capture_result(result)
+    del result["unknown"]
+    result["executable"]["sha256"] = result["executable"]["sha256"].upper()
+    assert validate_capture_result(result)
+
+
+def test_validator_accepts_a_valid_normal_capture_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 5, baseline: an ordinary successful capture still validates."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert result["failures"] == []
+    assert validate_capture_result(result) == []
+
+
+def test_validator_accepts_designated_replacement_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 5: designated redaction tokens must validate cleanly."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [
+        "path=<PATH> host=<HOST> port=<PORT> secret=<SECRET> "
+        "pid=<PID> pipe=<PIPE> handle=<HANDLE> url=<URL>"
+    ]
+    assert validate_capture_result(result) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"C:\Users\alice\ollama.exe",
+        r"\\server\share\path",
+        "/home/alice/.ollama/models",
+        "127.0.0.1",
+        "listening on 127.0.0.1:54321",
+        "host=corp-server-01",
+        "port=11434",
+        "http://example.com/path",
+        "http://user:pass@host:1234/path?token=abc",
+        "Authorization: Bearer sk-abcdef123456",
+        "Bearer sk-abcdef123456",
+        "api_key=sk-live-abc123",
+        "password=hunter2",
+        "HTTPS_PROXY=http://proxy.internal:8080",
+        "pid=4821",
+        r"\\.\pipe\ollama-abc123",
+        "handle=0x1F4",
+        "value\x00withnul",
+    ],
+)
+def test_validator_rejects_every_injected_forbidden_form(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Blocker 5: validate_capture_result must independently reject raw
+    sensitive forms injected directly, without ever calling the
+    redactor."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["version_command_lines"] = [value]
+    assert validate_capture_result(result) != []
+
+
+def test_validator_rejects_aggregate_version_lines_over_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 5: many individually valid small lines whose combined
+    UTF-8 size exceeds MAX_VERSION_OUTPUT_BYTES must be rejected, even
+    though no single line trips the per-line character cap."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    line = "v0.1.0"
+    assert len(line) <= MAX_EVIDENCE_LINE_CHARS
+    count = MAX_VERSION_OUTPUT_BYTES // len(line.encode("utf-8")) + 1
+    result["observations"]["version_command_lines"] = [line] * count
+    assert validate_capture_result(result) != []
+
+
+def test_validator_rejects_multibyte_lines_over_byte_cap_under_char_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 5: a multibyte Unicode collection that stays under the
+    per-line character cap can still exceed the aggregate byte cap, and
+    must be rejected on encoded bytes, not Python character count."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    line = "é" * 300  # 300 chars (< 512 char cap), 600 UTF-8 bytes
+    assert len(line) < MAX_EVIDENCE_LINE_CHARS
+    lines = [line] * 8  # 8 * 600 = 4800 bytes > MAX_VERSION_OUTPUT_BYTES
+    assert sum(len(entry) for entry in lines) < MAX_VERSION_OUTPUT_BYTES
+    assert sum(len(entry.encode("utf-8")) for entry in lines) > MAX_VERSION_OUTPUT_BYTES
+    result["observations"]["version_command_lines"] = lines
+    assert validate_capture_result(result) != []
+
+
+# ---------------------------------------------------------------------------
+# Round 2: independent privacy validation (Blocker 1), explicit proxy/user/
+# host contexts (Blockers 2-4), secret-keyword overmatching (Blocker 5),
+# post-redaction version cap (Blocker 6), and the startup-drain deadline
+# (Blocker 7).
+# ---------------------------------------------------------------------------
+
+
+def test_validator_privacy_check_never_calls_the_redactor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 1: validate_capture_result's privacy scan must be genuinely
+    independent of redact_evidence_line. Breaking the redactor must not
+    break the validator's ability to detect (or accept) raw content."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+
+    monkeypatch.setattr(
+        dialect_capture,
+        "redact_evidence_line",
+        lambda line: (_ for _ in ()).throw(AssertionError("redactor must not be called")),
+    )
+
+    # A clean, already-redacted capture result still validates even
+    # though the redactor is now broken.
+    assert validate_capture_result(result) == []
+
+    # A result with raw, never-redacted sensitive content is still
+    # independently rejected -- the validator does not need to call the
+    # (broken) redactor to notice this.
+    dirty = dict(result)
+    dirty["observations"] = dict(result["observations"])
+    dirty["observations"]["version_command_lines"] = ["host=corp-server-01"]
+    assert validate_capture_result(dirty) != []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("proxy: abc123", "proxy: <SECRET>"),
+        ("proxy abc123", "proxy <SECRET>"),
+        ("proxy=abc123", "proxy=<SECRET>"),
+        ("proxy_url: http://user:pass@example.com:8080", "proxy_url: <URL>"),
+        ("HTTP_PROXY: http://user:pass@example.com:8080", "HTTP_PROXY: <URL>"),
+        ("HTTPS_PROXY=http://user:pass@example.com:8080", "HTTPS_PROXY=<URL>"),
+    ],
+)
+def test_proxy_contexts_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 2: every required proxy input form redacts to exactly the
+    specified output, preserving assignment punctuation and spacing."""
+
+    assert redact_evidence_line(raw) == expected
+    # Idempotent: redacting the already-redacted output is a no-op.
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "proxy: abc123",
+        "proxy abc123",
+        "proxy=abc123",
+        "proxy_url: http://user:pass@example.com:8080",
+        "HTTP_PROXY: http://user:pass@example.com:8080",
+        "HTTPS_PROXY=http://user:pass@example.com:8080",
+    ],
+)
+@pytest.mark.parametrize("field", ["api_version", "version_command_lines", "startup_evidence_lines"])
+def test_proxy_inputs_independently_rejected_in_every_evidence_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 2: every proxy form, injected raw into any evidence field,
+    is independently rejected."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    if field == "api_version":
+        result["observations"]["api_version"] = raw
+    else:
+        result["observations"][field] = [raw]
+    assert validate_capture_result(result) != []
+
+
+def test_proxy_secret_prefix_does_not_leak_into_assignment() -> None:
+    """Blocker 5's headline example: the optional separator must not let
+    the proxy keyword swallow only part of a hyphenated value."""
+
+    redacted = redact_evidence_line("proxy: secret-value")
+    assert redacted == "proxy: <SECRET>"
+    assert redacted != "proxy: secret<SECRET>"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("username=alice", "username=<USER>"),
+        ("username: alice", "username: <USER>"),
+        ("username alice", "username <USER>"),
+        ("user=alice", "user=<USER>"),
+        ("user: alice", "user: <USER>"),
+        ("user alice", "user <USER>"),
+    ],
+)
+def test_user_contexts_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 3: every required user/username input form redacts to
+    exactly the specified output."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "username=alice",
+        "username: alice",
+        "username alice",
+        "user=alice",
+        "user: alice",
+        "user alice",
+    ],
+)
+def test_user_inputs_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Blocker 3: every required user/username input form, injected raw,
+    is independently rejected by the validator."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "userspace processes running",
+        "username_hash computed",
+    ],
+)
+def test_user_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 3: ordinary words merely beginning with user/username
+    (glued into a larger identifier, no word boundary) are untouched."""
+
+    assert redact_evidence_line(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("host=workstation", "host=<HOST>"),
+        ("host: workstation", "host: <HOST>"),
+        ("host workstation", "host <HOST>"),
+        ("hostname=corp-server-01", "hostname=<HOST>"),
+        ("hostname: corp-server-01", "hostname: <HOST>"),
+        ("hostname corp-server-01", "hostname <HOST>"),
+        ("listening on workstation", "listening on <HOST>"),
+        ("server=corp-server-01", "server=<HOST>"),
+        ("server: corp-server-01", "server: <HOST>"),
+    ],
+)
+def test_host_contexts_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 4: every required host/hostname/server/on context input
+    form redacts to exactly the specified output."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "host=workstation",
+        "host: workstation",
+        "host workstation",
+        "hostname=corp-server-01",
+        "hostname: corp-server-01",
+        "hostname corp-server-01",
+        "listening on workstation",
+        "server=corp-server-01",
+        "server: corp-server-01",
+    ],
+)
+def test_host_inputs_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Blocker 4: every required host context input form, injected raw,
+    is independently rejected by the validator."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "server started",
+        "server ready",
+        "hostile process",
+    ],
+)
+def test_host_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 4: these must never be mistaken for a host assignment --
+    "server" has no bare-whitespace form, and "hostile" fails the
+    keyword boundary ("host" is not followed by a word boundary)."""
+
+    assert redact_evidence_line(raw) == raw
+
+
+def test_bare_hostname_now_consumes_exactly_one_token() -> None:
+    """Round 2, Blocker 1: fixing "host workstation ready" -> "host <HOST>
+    ready" (values surviving in prose-like lines) necessarily means a
+    bare "hostname"/"host" followed by ordinary prose is no longer
+    exempt merely because more than one word follows -- there is no
+    regex-observable difference between "hostname corp-server-01
+    active" (must redact "corp-server-01") and "hostname validation
+    complete" (previously preserved verbatim). This documents that
+    "hostname validation complete" now redacts its first token, exactly
+    like every other bare "hostname"/"host" value; a real host name is
+    never distinguishable from an ordinary following word by shape
+    alone, so the fix that makes bare-form redaction have to be
+    trailing-context-safe applies uniformly."""
+
+    assert redact_evidence_line("hostname validation complete") == "hostname <HOST> complete"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "tokenizer ready",
+        "tokenization complete",
+        "secretary started",
+        "passwordless mode",
+        "password policy loaded",
+        "access_tokenizer initialized",
+    ],
+)
+def test_secret_keyword_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 5: none of these ordinary phrases may be mistaken for a
+    secret assignment. api_key/access_token/secret/password/passwd only
+    ever match with an explicit ":"/"=" separator (never bare
+    whitespace), so a standalone keyword followed by an ordinary word
+    ("password policy loaded") is never swallowed."""
+
+    assert redact_evidence_line(raw) == raw
+
+
+def test_designated_tokens_validate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 2: designated replacement tokens (including <USER>) validate
+    cleanly under the independent privacy scan."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    result["observations"]["version_command_lines"] = [
+        "path=<PATH> host=<HOST> port=<PORT> secret=<SECRET> user=<USER> "
+        "pid=<PID> pipe=<PIPE> handle=<HANDLE> url=<URL>"
+    ]
+    assert validate_capture_result(result) == []
+
+
+@pytest.mark.parametrize("version", ["0.5.7", "v0.5.7", "0.5.7-rc1"])
+def test_valid_version_strings_validate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """Round 2: legitimate normalized version strings must never be
+    rejected by the independent privacy scan."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api_version_probe=lambda port, timeout: version)
+    assert result["failures"] == []
+    assert validate_capture_result(result) == []
+
+
+def test_post_redaction_version_cap_bounds_expanded_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 6: redaction can expand raw evidence (many short paths each
+    becoming their own <PATH> token). The post-redaction aggregate must
+    still respect MAX_VERSION_OUTPUT_BYTES, every included line must be
+    complete, and the result must be marked truncated."""
+
+    raw = b"C:\\a\n" * 819  # 4095 raw bytes: at most the existing raw capture limit
+    lines, truncated = select_version_command_lines(raw)
+    aggregate = sum(len(line.encode("utf-8")) for line in lines)
+    assert aggregate <= MAX_VERSION_OUTPUT_BYTES
+    assert all(line == "<PATH>" for line in lines)
+    assert truncated is True
+
+    # An internally generated bounded result (from a real successful
+    # capture, with this evidence substituted in) must still validate.
+    fabricated, _, _ = _capture(tmp_path, monkeypatch)
+    fabricated["observations"]["version_command_lines"] = lines
+    fabricated["truncation"]["version_command_truncated"] = True
+    assert validate_capture_result(fabricated) == []
+
+
+def test_post_redaction_version_cap_bounds_multibyte_evidence() -> None:
+    """Blocker 6, multibyte case: near the byte boundary, the aggregate
+    cap must still be enforced in encoded bytes, not characters."""
+
+    line = "café " * 100  # multibyte-heavy raw content
+    raw = (line + "\n") .encode("utf-8") * 40
+    lines, truncated = select_version_command_lines(raw)
+    aggregate = sum(len(entry.encode("utf-8")) for entry in lines)
+    assert aggregate <= MAX_VERSION_OUTPUT_BYTES
+    assert truncated is True
+
+
+def test_capture_does_not_raise_when_redaction_expands_version_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 6: DialectCaptureSession.run must not raise AssertionError
+    solely because redaction expanded the version-command evidence."""
+
+    api = FakeLifecycleApi(version_output=(b"C:\\a\n" * 819))
+    result, _, _ = _capture(tmp_path, monkeypatch, api=api)
+    assert result["failures"] == []
+    aggregate = sum(
+        len(line.encode("utf-8")) for line in result["observations"]["version_command_lines"]
+    )
+    assert aggregate <= MAX_VERSION_OUTPUT_BYTES
+    assert result["truncation"]["version_command_truncated"] is True
+    assert validate_capture_result(result) == []
+
+
+def test_drain_performs_no_wait_once_startup_deadline_is_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 7: once the fake clock reaches the startup deadline right
+    after the API probe succeeds, _drain_startup_evidence must not issue
+    any wait -- it must simply stop, never extending the deadline."""
+
+    values = iter([0.0, 4.9, 10.0])
+
+    def clock() -> float:
+        return next(values, 10.0)
+
+    api = HangingStdoutApi()
+    result, api, _ = _capture(
+        tmp_path, monkeypatch, api=api, clock=clock, startup_timeout_seconds=5.0
+    )
+    assert "wait_for_completion" not in api.calls
+    assert result["failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# Round 3: whitespace values with trailing context (Blocker 1), the
+# overbroad generic "on" host context (Blocker 2), and generic
+# colon-number port redaction (Blocker 3).
+# ---------------------------------------------------------------------------
+
+
+def _inject_and_assert_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    if field == "version_command_lines":
+        result["observations"]["version_command_lines"] = [raw]
+    else:
+        result["observations"]["startup_evidence_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("token abc ready", "token <SECRET> ready"),
+        ("token abc status=ready", "token <SECRET> status=ready"),
+        ("proxy abc123 enabled", "proxy <SECRET> enabled"),
+        ("proxy abc123 mode=direct", "proxy <SECRET> mode=direct"),
+        ("user alice connected", "user <USER> connected"),
+        ("username alice state=active", "username <USER> state=active"),
+        ("host workstation ready", "host <HOST> ready"),
+        ("hostname corp-server-01 active", "hostname <HOST> active"),
+    ],
+)
+def test_bare_values_redact_only_the_first_token_with_trailing_context(
+    raw: str, expected: str
+) -> None:
+    """Blocker 1: the first whitespace-delimited value after an explicit
+    sensitive keyword is redacted while all following text is retained
+    verbatim, fixing raw values that previously survived in ordinary
+    multi-field or prose-like log lines."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "token abc ready",
+        "token abc status=ready",
+        "proxy abc123 enabled",
+        "proxy abc123 mode=direct",
+        "user alice connected",
+        "username alice state=active",
+        "host workstation ready",
+        "hostname corp-server-01 active",
+    ],
+)
+@pytest.mark.parametrize("field", ["version_command_lines", "startup_evidence_lines"])
+def test_trailing_context_values_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 1: every raw trailing-context form, injected into either
+    evidence field, is independently rejected by the validator."""
+
+    _inject_and_assert_rejected(tmp_path, monkeypatch, raw, field)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "tokenizer ready",
+        "tokenization complete",
+        "secretary started",
+        "passwordless mode",
+        "password policy loaded",
+        "access_tokenizer initialized",
+        "userspace processes running",
+        "username_hash computed",
+        "hostile process",
+        "server started",
+        "server ready",
+    ],
+)
+def test_round3_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 1: these negative controls must survive the trailing-
+    context fix unchanged (unaffected keywords, or keywords with no
+    bare-whitespace form at all)."""
+
+    assert redact_evidence_line(raw) == raw
+    assert not dialect_capture._contains_unredacted_sensitive_data(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("listening on workstation", "listening on <HOST>"),
+        ("listen on workstation", "listen on <HOST>"),
+        ("server listening on workstation", "server listening on <HOST>"),
+    ],
+)
+def test_listening_on_host_context_produces_exact_output(raw: str, expected: str) -> None:
+    """Blocker 2: only the structurally meaningful "listen(ing) on
+    <value>" form is treated as a hostname context."""
+
+    assert redact_evidence_line(raw) == expected
+    assert redact_evidence_line(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["listening on workstation", "listen on workstation", "server listening on workstation"],
+)
+@pytest.mark.parametrize("field", ["version_command_lines", "startup_evidence_lines"])
+def test_listening_on_host_context_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 2: every listening-host form, injected raw, is
+    independently rejected by the validator."""
+
+    _inject_and_assert_rejected(tmp_path, monkeypatch, raw, field)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "version on startup",
+        "cloud disabled on startup",
+        "pruning disabled on startup",
+        "started on demand",
+        "running on battery",
+    ],
+)
+def test_generic_on_context_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 2: an arbitrary "on <word>" must never be treated as a
+    hostname context -- only "listen(ing) on <value>" qualifies. These
+    must also not be independently flagged by the validator, since they
+    carry no genuine host identity."""
+
+    assert redact_evidence_line(raw) == raw
+    assert not dialect_capture._contains_unredacted_sensitive_data(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "12:34:56",
+        "2026-07-22T20:58:22Z",
+        "duration=01:23",
+        "elapsed 00:01:30",
+        "version 0.5.7: release candidate",
+    ],
+)
+def test_generic_colon_number_negative_controls_remain_unchanged(raw: str) -> None:
+    """Blocker 3: a colon followed by digits is not independently a
+    network port -- timestamps and durations must survive untouched,
+    and must not be independently flagged by the validator either."""
+
+    assert redact_evidence_line(raw) == raw
+    assert not dialect_capture._contains_unredacted_sensitive_data(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("localhost:11434", "<HOST>:<PORT>"),
+        ("127.0.0.1:11434", "<HOST>:<PORT>"),
+        ("[::1]:11434", "<HOST>:<PORT>"),
+        ("port=11434", "port=<PORT>"),
+        ("port: 11434", "port: <PORT>"),
+        ("listening on 11434", "listening on <PORT>"),
+    ],
+)
+def test_structural_port_forms_produce_exact_output(raw: str, expected: str) -> None:
+    """Blocker 3: ports are only redacted when structurally established
+    by a validated address or an explicit port/listen(ing) keyword."""
+
+    assert redact_evidence_line(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "localhost:11434",
+        "127.0.0.1:11434",
+        "[::1]:11434",
+        "port=11434",
+        "port: 11434",
+        "listening on 11434",
+    ],
+)
+@pytest.mark.parametrize("field", ["version_command_lines", "startup_evidence_lines"])
+def test_structural_port_forms_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, field: str
+) -> None:
+    """Blocker 3: every structural port form, injected raw, is
+    independently rejected by the validator."""
+
+    _inject_and_assert_rejected(tmp_path, monkeypatch, raw, field)
+
+
+def test_validator_privacy_check_still_never_calls_the_redactor_round3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3: re-confirm the independent validator's privacy scan does
+    not depend on redact_evidence_line, using the new Round 3 detector
+    classes (listening-host and structural port forms) as the probe."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+
+    monkeypatch.setattr(
+        dialect_capture,
+        "redact_evidence_line",
+        lambda line: (_ for _ in ()).throw(AssertionError("redactor must not be called")),
+    )
+
+    # Still validates cleanly with a broken redactor.
+    assert validate_capture_result(result) == []
+
+    for raw in ("listening on workstation", "localhost:11434", "port=11434"):
+        dirty = dict(result)
+        dirty["observations"] = dict(result["observations"])
+        dirty["observations"]["version_command_lines"] = [raw]
+        assert validate_capture_result(dirty) != []
+
+
+# ---------------------------------------------------------------------------
+# Round 4: the real G-ISO-D0 API-readiness race. Endpoint ownership becoming
+# OWNED proves TCP-level ownership, not that Ollama's HTTP server is ready to
+# answer GET /api/version. These regressions prove bounded, ownership-
+# reproved retries of transient transport/readiness failures inside the
+# existing absolute startup deadline, while semantic (non-transport)
+# failures still fail closed immediately without retry.
+# ---------------------------------------------------------------------------
+
+
+def test_api_version_retries_after_first_transient_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionRefusedError("refused")
+        return "0.32.1"
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert result["failures"] == []
+    assert attempts["count"] == 2
+    assert result["observations"]["api_version"] == "0.32.1"
+    assert result["proofs"]["endpoint_owned_before_api_version"] is True
+
+
+def test_api_version_retries_multiple_transient_failures_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    errors = iter(
+        [
+            ConnectionRefusedError("refused"),
+            socket.timeout("timed out"),
+            ConnectionResetError("reset"),
+        ]
+    )
+
+    def probe(port: int, timeout: float) -> str:
+        error = next(errors, None)
+        if error is not None:
+            raise error
+        return "0.32.1"
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert result["failures"] == []
+    assert result["observations"]["api_version"] == "0.32.1"
+
+
+def test_ownership_rechecked_before_every_api_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    attempt_markers: list[int] = []
+
+    def probe(port: int, timeout: float) -> str:
+        attempt_number = len(attempt_markers) + 1
+        attempt_markers.append(len(api.calls))
+        api.calls.append(f"api_version_probe_{attempt_number}")
+        if attempt_number == 1:
+            raise ConnectionRefusedError("refused")
+        return "0.32.1"
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert result["failures"] == []
+    assert len(attempt_markers) == 2
+    first_index = api.calls.index("api_version_probe_1")
+    second_index = api.calls.index("api_version_probe_2")
+    tcp_indices = [i for i, call in enumerate(api.calls) if call == "tcp_listener_rows"]
+    assert any(i < first_index for i in tcp_indices)
+    assert any(first_index < i < second_index for i in tcp_indices)
+
+
+class FlipToForeignApi(FakeLifecycleApi):
+    """Reports genuine ownership for ``flip_after`` calls, then a foreign
+    owner on every subsequent tcp_listener_rows call."""
+
+    def __init__(self, *, flip_after: int) -> None:
+        super().__init__()
+        self.flip_after = flip_after
+        self.tcp_call_count = 0
+
+    def tcp_listener_rows(self) -> tuple[TcpListenerRow, ...]:
+        self.tcp_call_count += 1
+        self.calls.append("tcp_listener_rows")
+        if self.active_server_id is None:
+            return ()
+        if self.tcp_call_count > self.flip_after:
+            return (TcpListenerRow("127.0.0.1", self.active_server_port, 999999),)
+        return (TcpListenerRow("127.0.0.1", self.active_server_port, self.active_server_id),)
+
+
+def test_ownership_foreign_between_attempts_fails_closed_without_further_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FlipToForeignApi(flip_after=2)
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] > 1:
+            raise AssertionError("must not attempt HTTP after ownership turns foreign")
+        raise ConnectionRefusedError("refused")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "port_hijacked" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+class FlipToAmbiguousApi(FakeLifecycleApi):
+    """Reports genuine ownership for ``flip_after`` calls, then an extra
+    relevant listener row (ambiguous) on every subsequent call."""
+
+    def __init__(self, *, flip_after: int) -> None:
+        super().__init__()
+        self.flip_after = flip_after
+        self.tcp_call_count = 0
+
+    def tcp_listener_rows(self) -> tuple[TcpListenerRow, ...]:
+        self.tcp_call_count += 1
+        self.calls.append("tcp_listener_rows")
+        if self.active_server_id is None:
+            return ()
+        real = TcpListenerRow("127.0.0.1", self.active_server_port, self.active_server_id)
+        if self.tcp_call_count > self.flip_after:
+            return (real, TcpListenerRow("127.0.0.1", self.active_server_port, 999999))
+        return (real,)
+
+
+def test_ownership_ambiguous_between_attempts_fails_closed_without_further_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = FlipToAmbiguousApi(flip_after=2)
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] > 1:
+            raise AssertionError("must not attempt HTTP after ownership turns ambiguous")
+        raise ConnectionRefusedError("refused")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "port_ownership_ambiguous" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+class ExitBetweenAttemptsApi(FakeLifecycleApi):
+    """The server process reports a live exit code starting on the
+    ``exit_on_call``-th ``process_exit_code`` check for the server
+    process."""
+
+    def __init__(self, *, exit_on_call: int) -> None:
+        super().__init__()
+        self.exit_on_call = exit_on_call
+        self._server_exit_calls = 0
+
+    def process_exit_code(self, process) -> int | None:
+        self.calls.append(f"process_exit_{self._kind(process)}")
+        if self._kind(process) == "server":
+            self._server_exit_calls += 1
+            if self._server_exit_calls >= self.exit_on_call:
+                return 1
+        return None
+
+
+def test_process_exit_between_attempts_fails_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    api = ExitBetweenAttemptsApi(exit_on_call=3)
+    api.clock = clock
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        if attempts["count"] > 1:
+            raise AssertionError("must not attempt HTTP after the child process exited")
+        raise ConnectionRefusedError("refused")
+
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "startup_process_exit" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_transient_failures_until_deadline_produce_startup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(port: int, timeout: float) -> str:
+        raise ConnectionResetError("reset")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.2,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_no_wait_or_retry_exceeds_the_absolute_startup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(port: int, timeout: float) -> str:
+        raise ConnectionRefusedError("refused")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.2,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+    assert clock.now <= 0.2 + 1e-9
+
+
+def test_malformed_successful_payload_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        raise ValueError("malformed version response")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "version_probe_failed" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_missing_or_invalid_version_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        return "not-a-version"
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=5.0,
+    )
+    assert attempts["count"] == 1
+    assert "version_probe_failed" in {failure["category"] for failure in result["failures"]}
+    assert result["observations"]["api_version"] is None
+
+
+def test_cleanup_proofs_remain_correct_after_exhausted_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(port: int, timeout: float) -> str:
+        raise ConnectionResetError("reset")
+
+    clock = FakeClock()
+    api = FakeLifecycleApi()
+    api.clock = clock
+    result, _, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        api=api,
+        api_version_probe=probe,
+        clock=clock,
+        startup_timeout_seconds=0.2,
+    )
+    assert "startup_timeout" in {failure["category"] for failure in result["failures"]}
+    assert result["proofs"]["endpoint_owned_before_api_version"] is True
+    assert result["proofs"]["shutdown_confirmed"] is True
+    assert result["proofs"]["orphan_check_clean"] is True
+    assert result["proofs"]["endpoint_closed"] is True
+    assert result["proofs"]["temporary_space_removed"] is True
+    assert validate_capture_result(result) == []
+
+
+def test_successful_capture_still_performs_only_one_api_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = {"count": 0}
+
+    def probe(port: int, timeout: float) -> str:
+        attempts["count"] += 1
+        return "0.32.1"
+
+    result, _, _ = _capture(tmp_path, monkeypatch, api_version_probe=probe)
+    assert result["failures"] == []
+    assert attempts["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Round 5: removal of the obsolete generic recursive slash/backslash
+# validator. The second approved G-ISO-D0 run raised a false positive --
+# "startup_evidence_lines[3..10] contains unredacted path-like data" -- from
+# a blanket rule that rejected any string still containing "\" or "/" after
+# stripping literal "<PATH>" tokens, even benign escaped log grammar with no
+# real path in it. That rule is removed; the separately authored
+# _contains_unredacted_sensitive_data detectors (already applied to
+# api_version, version_command_lines, and startup_evidence_lines) remain the
+# sole, more precise enforcement, including NUL rejection.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        r'startup message: \"ready\" noprune enabled',
+        r'{\"status\": \"ready\", \"pruning\": \"disabled\"}',
+        r'config path: \"<PATH>\" loaded',
+        r'raw noprune\, cloud_disabled\; ready',
+    ],
+)
+def test_benign_escaped_log_grammar_validates_after_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    """Round 5: escaped quotation marks, JSON-like escaped punctuation, an
+    already-redacted <PATH> token surrounded by escaped quotes, and
+    ordinary backslash escaping that is not a filesystem path must all
+    validate cleanly. The removed generic slash/backslash rule previously
+    rejected every one of these as "unredacted path-like data" even though
+    none of them names a real path."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = [line]
+    assert validate_capture_result(result) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        r"C:\Users\alice\ollama.exe",
+        r"\\server\share\models\file.bin",
+        "/home/alice/.ollama/models",
+    ],
+)
+def test_raw_filesystem_paths_are_still_independently_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Round 5: removing the overbroad generic slash/backslash rule must
+    not weaken the separately authored raw-path detectors -- a genuine
+    Windows path, UNC path, or Unix path injected into startup evidence is
+    still independently rejected."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = [raw]
+    assert validate_capture_result(result) != []
+
+
+def test_nul_byte_still_rejected_without_the_generic_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: NUL rejection survives the removal of the generic rule
+    because _contains_unredacted_sensitive_data independently checks for
+    "\\x00", never relying on the removed slash/backslash sweep."""
+
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = ["value\x00withnul"]
+    assert validate_capture_result(result) != []
+
+
+def test_eight_benign_escaped_startup_evidence_lines_validate_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: reproduces the real G-ISO-D0 failure shape, where multiple
+    (indices 3..10) otherwise-safe startup evidence lines containing
+    benign escaped syntax were all rejected together by the generic rule.
+    At least eight such lines must now validate successfully as a group."""
+
+    lines = [
+        r'starting server version 0.32.1 \"ready\"',
+        r'{\"status\": \"starting\"}',
+        r'noprune\, cloud_disabled\;',
+        r'config path: \"<PATH>\" loaded',
+        r'listening \"ready\" noprune',
+        r'{\"pruning\": \"disabled\", \"cloud\": \"disabled\"}',
+        r'readiness check: \"ok\"',
+        r'startup complete\; noprune enabled\; cloud disabled',
+    ]
+    assert len(lines) >= 8
+    result, _, _ = _capture(tmp_path, monkeypatch)
+    assert validate_capture_result(result) == []
+    result["observations"]["startup_evidence_lines"] = lines
+    assert validate_capture_result(result) == []
+
+
+def test_generic_recursive_path_rule_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: the validator's internal implementation no longer defines
+    the removed generic recursive scan, guarding against reintroduction."""
+
+    import inspect as inspect_module
+
+    source = inspect_module.getsource(validate_capture_result)
+    assert "contains unredacted path-like data" not in source
