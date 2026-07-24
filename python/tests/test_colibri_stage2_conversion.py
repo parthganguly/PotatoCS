@@ -119,10 +119,55 @@ def test_source_shard_entry_rejects_malformed_sha256() -> None:
         conv.SourceShardEntry(basename=CONFIG_BASENAME, size_bytes=10, sha256="Z" * 64)
 
 
-def test_source_manifest_unreviewed_in_this_commit() -> None:
-    assert dict(conv.REVIEWED_SOURCE_SHARD_MANIFEST) == {}
+def test_source_manifest_unreviewed_when_registry_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(conv, "REVIEWED_SOURCE_SHARD_MANIFEST", MappingProxyType({}))
     with pytest.raises(conv.ColibriStage2Failure, match="source_model_manifest_unreviewed"):
         conv.require_reviewed_source_manifest()
+
+
+def test_default_source_manifest_has_exactly_four_reviewed_entries() -> None:
+    assert set(conv.REVIEWED_SOURCE_SHARD_MANIFEST) == set(conv.REQUIRED_SOURCE_FILES)
+    assert len(conv.REVIEWED_SOURCE_SHARD_MANIFEST) == 4
+    assert tuple(conv.REVIEWED_SOURCE_SHARD_MANIFEST) == conv.REQUIRED_SOURCE_FILES
+
+
+def test_default_source_manifest_matches_reviewed_capture() -> None:
+    expected = {
+        "config.json": (828, "272998dd7ba4846dcc682f0b5a46144f4bcd9dde8e94d2f17bd8e5cf2f23d6ce"),
+        "model-00001-of-00003.safetensors": (
+            4997744872,
+            "61874210ca7c360f43f8c622cecc12441083d40190eae3b56bc9d6e1c0a30c1e",
+        ),
+        "model-00002-of-00003.safetensors": (
+            4997235176,
+            "c523a43b8a17269d5fab33395048a83633f4d1d89c1958570cea738e2bbe80c9",
+        ),
+        "model-00003-of-00003.safetensors": (
+            3843741912,
+            "97ae01e3519c52e63a018bca96ab17a89c4cd5cab1c6d742efed0fa5c0e2bb17",
+        ),
+    }
+    for basename, (size_bytes, sha256) in expected.items():
+        entry = conv.REVIEWED_SOURCE_SHARD_MANIFEST[basename]
+        assert entry.basename == basename
+        assert entry.size_bytes == size_bytes
+        assert entry.sha256 == sha256
+
+
+def test_default_source_manifest_exact_total_bytes() -> None:
+    total = sum(entry.size_bytes for entry in conv.REVIEWED_SOURCE_SHARD_MANIFEST.values())
+    assert total == 13_838_722_788
+
+
+def test_default_source_manifest_is_immutable() -> None:
+    assert isinstance(conv.REVIEWED_SOURCE_SHARD_MANIFEST, MappingProxyType)
+    with pytest.raises(TypeError):
+        conv.REVIEWED_SOURCE_SHARD_MANIFEST["config.json"] = None  # type: ignore[index]
+
+
+def test_default_source_manifest_satisfies_require_reviewed_source_manifest() -> None:
+    reviewed = conv.require_reviewed_source_manifest()
+    assert dict(reviewed) == dict(conv.REVIEWED_SOURCE_SHARD_MANIFEST)
 
 
 def test_source_manifest_partial_coverage_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,8 +223,10 @@ def test_reviewed_manifest_succeeds_when_all_four_entries_are_valid(monkeypatch:
 
 
 def test_approved_preconditions_check_source_manifest_before_anything_else(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(conv, "REVIEWED_SOURCE_SHARD_MANIFEST", MappingProxyType({}))
+
     def _boom_probe(path: Path) -> int:
         raise AssertionError("disk probe must not run before the manifest gate")
 
@@ -336,8 +383,9 @@ def test_approved_preconditions_pass_when_everything_is_satisfied(
 
 
 def test_cli_approve_never_touches_network_and_fails_closed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.setattr(conv, "REVIEWED_SOURCE_SHARD_MANIFEST", MappingProxyType({}))
     destination = tmp_path / "dest"
     converted = tmp_path / "converted"
     exit_code = conv.main(
@@ -363,6 +411,7 @@ def test_cli_approve_blocks_before_every_side_effect_while_manifest_is_empty(
     def _boom(*args: object, **kwargs: object) -> None:
         raise AssertionError("must not run before the source manifest gate")
 
+    monkeypatch.setattr(conv, "REVIEWED_SOURCE_SHARD_MANIFEST", MappingProxyType({}))
     monkeypatch.setattr(conv, "_default_dependency_versions", _boom)
     monkeypatch.setattr(conv, "_default_isolated_python_env_ready", _boom)
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
@@ -784,7 +833,10 @@ class _FullRunConverter:
         (output_dir / shard_names[0]).write_bytes(self.converted_payloads[shard_names[0]])
 
 
-def test_run_approved_conversion_is_unreachable_while_manifest_is_empty(tmp_path: Path) -> None:
+def test_run_approved_conversion_is_unreachable_while_manifest_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conv, "REVIEWED_SOURCE_SHARD_MANIFEST", MappingProxyType({}))
     with pytest.raises(conv.ColibriStage2Failure, match="source_model_manifest_unreviewed"):
         conv.run_approved_conversion(
             interactive_check=lambda: True,
