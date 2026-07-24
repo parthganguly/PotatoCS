@@ -256,7 +256,17 @@ class PinnedRevisionFileDownloader:
 
         if not is_safe_basename(basename):
             raise ColibriStage2Failure("unsafe_basename_rejected")
-        partial_path = destination.parent / f"{basename}.partial"
+
+        partial_basename = f"{basename}.partial"
+        if not is_safe_basename(partial_basename):
+            raise ColibriStage2Failure("unsafe_basename_rejected")
+        resolved_parent = require_ordinary_directory(
+            destination.parent, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+        )
+        partial_path = require_direct_child_path(
+            resolved_parent, partial_basename, category="unsafe_directory_rejected"
+        )
+
         url = (
             f"https://huggingface.co/{PINNED_MODEL_REPOSITORY}/resolve/"
             f"{PINNED_MODEL_REVISION}/{basename}"
@@ -264,10 +274,23 @@ class PinnedRevisionFileDownloader:
         digest = hashlib.sha256()
         observed = 0
         started = self.clock()
+
+        # Exclusive creation ("xb", never "wb") is the whole safety
+        # property here: it fails closed if a stale or race-created
+        # partial already exists, and guarantees that any partial file
+        # this method later deletes is one it created itself -- a partial
+        # not owned by this run is never opened, truncated, or removed.
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "odysseus-colibri-stage2"})
-            with urllib.request.urlopen(request, timeout=self.socket_timeout_seconds) as response:
-                with partial_path.open("wb") as handle:
+            handle = partial_path.open("xb")
+        except FileExistsError as exc:
+            raise ColibriStage2Failure("partial_already_exists") from exc
+        except OSError as exc:
+            raise ColibriStage2Failure("shard_download_failed") from exc
+
+        try:
+            with handle:
+                request = urllib.request.Request(url, headers={"User-Agent": "odysseus-colibri-stage2"})
+                with urllib.request.urlopen(request, timeout=self.socket_timeout_seconds) as response:
                     while True:
                         if self.clock() - started > self.absolute_deadline_seconds:
                             raise ColibriStage2Failure("shard_download_failed")
@@ -297,17 +320,35 @@ class PinnedRevisionFileDownloader:
 
 
 def require_reviewed_converter_identity(script_path: Path) -> None:
-    """Fail closed unless ``script_path`` is exactly the one reviewed
-    converter: same basename, same exact size, same SHA-256 -- compared
-    only against the fixed ``common.REVIEWED_CONVERTER_IDENTITY``. A
-    caller-supplied expected hash is never trusted; there is no parameter
-    anywhere that could substitute one."""
+    """Fail closed unless ``script_path`` is an absolute path to exactly
+    the one reviewed converter: an ordinary, non-reparse regular file,
+    inside a directory chain proven free of symlinks/junctions/reparse
+    points all the way to its drive/root anchor, with the exact reviewed
+    basename, exact size, and exact SHA-256 -- compared only against the
+    fixed ``common.REVIEWED_CONVERTER_IDENTITY``. A caller-supplied
+    expected hash is never trusted; there is no parameter anywhere that
+    could substitute one. Called both as a general precondition and
+    again, immediately before every subprocess creation, by
+    ``PinnedScriptConverter.convert``.
+    """
 
     identity = common.REVIEWED_CONVERTER_IDENTITY
+    if not script_path.is_absolute():
+        raise ColibriStage2Failure("unsafe_directory_rejected")
     if script_path.name != identity.basename:
         raise ColibriStage2Failure("conversion_failed")
+
+    resolved_parent = require_ordinary_directory(
+        script_path.parent, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
+    resolved_script_path = require_direct_child_path(
+        resolved_parent, script_path.name, category="unsafe_directory_rejected"
+    )
+    if not _is_regular_no_reparse(resolved_script_path):
+        raise ColibriStage2Failure("conversion_failed")
+
     try:
-        data = script_path.read_bytes()
+        data = resolved_script_path.read_bytes()
     except OSError as exc:
         raise ColibriStage2Failure("conversion_failed") from exc
     if len(data) != identity.size_bytes or hashlib.sha256(data).hexdigest() != identity.sha256:
@@ -362,11 +403,25 @@ class PinnedScriptConverter:
 
 @dataclass(frozen=True, slots=True)
 class ShardTransactionResult:
+    """The complete source-to-converted evidence for one shard.
+
+    ``source_basename``/``source_size_bytes``/``source_sha256`` always
+    come from the reviewed ``SourceShardEntry`` used by the transaction --
+    never recomputed from caller-provided values -- so the capture's
+    source identity is anchored to what was actually reviewed, not to
+    whatever bytes happened to be downloaded.
+    """
+
     source_basename: str
-    converted_basename: str
+    source_size_bytes: int
+    source_sha256: str
+    source_verified: bool
     source_deleted: bool
-    converted_sha256: str
+    converted_basename: str
     converted_size_bytes: int
+    converted_sha256: str
+    partial_cleanup_complete: bool
+    temporary_output_cleanup_complete: bool
     elapsed_ms: int
 
 
@@ -584,13 +639,24 @@ def run_shard_transaction(
     if source_path.exists():
         raise ColibriStage2Failure("source_shard_deletion_unverified")
 
+    # Prove no stray download-partial artifact was left behind next to
+    # the (now-deleted) source shard, regardless of which Downloader
+    # implementation was used.
+    partial_marker = source_path.parent / f"{source_basename}.partial"
+    partial_cleanup_complete = not partial_marker.exists()
+
     elapsed_ms = round((clock() - started) * 1000)
     return ShardTransactionResult(
         source_basename=source_basename,
-        converted_basename=source_basename,
+        source_size_bytes=expected_source.size_bytes,
+        source_sha256=expected_source.sha256,
+        source_verified=True,
         source_deleted=True,
-        converted_sha256=converted_sha256,
+        converted_basename=source_basename,
         converted_size_bytes=converted_size_bytes,
+        converted_sha256=converted_sha256,
+        partial_cleanup_complete=partial_cleanup_complete,
+        temporary_output_cleanup_complete=cleanup_ok,
         elapsed_ms=max(0, elapsed_ms),
     )
 
@@ -673,6 +739,8 @@ def run_approved_conversion(
 
     return build_conversion_capture(
         source_config=config_entry,
+        source_config_verified=True,
+        source_config_moved_to_final=True,
         converted_config_sha256=converted_config_sha256,
         converted_config_size_bytes=converted_config_size_bytes,
         shard_results=shard_results,
@@ -690,6 +758,8 @@ def run_approved_conversion(
 def build_conversion_capture(
     *,
     source_config: SourceShardEntry,
+    source_config_verified: bool,
+    source_config_moved_to_final: bool,
     converted_config_sha256: str,
     converted_config_size_bytes: int,
     shard_results: Sequence[ShardTransactionResult],
@@ -704,6 +774,14 @@ def build_conversion_capture(
     always read live from ``common.REVIEWED_CONVERTER_IDENTITY``, so a
     capture can never claim a converter identity nobody actually reviewed.
 
+    The three shard records are required to be in exactly
+    ``EXPECTED_SHARD_BASENAMES`` order -- this simultaneously rejects
+    duplicates, missing entries, and wrong ordering, since only one
+    3-tuple of distinct basenames can ever equal that fixed order. Every
+    proof boolean (source_verified, source_deleted,
+    partial_cleanup_complete, temporary_output_cleanup_complete,
+    source_config_verified, source_config_moved_to_final) must be true.
+
     Never contains a path, username, environment value, or raw tool
     output, and never validates as an ``OlmoeModelManifest`` -- its keys
     never match that dataclass's constructor, its state is always
@@ -714,6 +792,8 @@ def build_conversion_capture(
     reviewed_converter = common.REVIEWED_CONVERTER_IDENTITY
     if not isinstance(source_config, SourceShardEntry) or source_config.basename != EXPECTED_CONFIG_BASENAME:
         raise ValueError("invalid source config identity")
+    if not source_config_verified or not source_config_moved_to_final:
+        raise ValueError("source config proof booleans must both be true")
     if not is_hex64(converted_config_sha256):
         raise ValueError("invalid converted config sha256")
     if (
@@ -722,8 +802,13 @@ def build_conversion_capture(
         or converted_config_size_bytes <= 0
     ):
         raise ValueError("invalid converted config size_bytes")
-    if len(shard_results) != 3 or {result.source_basename for result in shard_results} != set(EXPECTED_SHARD_BASENAMES):
-        raise ValueError("conversion capture requires exactly the three pinned converted shards")
+
+    if len(shard_results) != 3:
+        raise ValueError("conversion capture requires exactly three shard results")
+    if tuple(result.source_basename for result in shard_results) != EXPECTED_SHARD_BASENAMES:
+        raise ValueError("conversion capture shard results must be in exactly the pinned shard order")
+    if tuple(result.converted_basename for result in shard_results) != EXPECTED_SHARD_BASENAMES:
+        raise ValueError("conversion capture converted basenames must match the pinned shard order")
 
     unknown = set(dependency_versions) - ALLOWED_CONVERSION_DEPENDENCY_NAMES
     if unknown:
@@ -734,15 +819,39 @@ def build_conversion_capture(
 
     shards: list[dict[str, Any]] = []
     for result in shard_results:
-        if not is_hex64(result.converted_sha256):
-            raise ValueError("shard result has an invalid converted SHA-256")
+        if not is_hex64(result.source_sha256) or not is_hex64(result.converted_sha256):
+            raise ValueError("shard result has an invalid SHA-256")
+        if (
+            isinstance(result.source_size_bytes, bool)
+            or not isinstance(result.source_size_bytes, int)
+            or result.source_size_bytes <= 0
+        ):
+            raise ValueError("shard result has a nonpositive source size")
+        if (
+            isinstance(result.converted_size_bytes, bool)
+            or not isinstance(result.converted_size_bytes, int)
+            or result.converted_size_bytes <= 0
+        ):
+            raise ValueError("shard result has a nonpositive converted size")
+        if not (
+            result.source_verified
+            and result.source_deleted
+            and result.partial_cleanup_complete
+            and result.temporary_output_cleanup_complete
+        ):
+            raise ValueError("shard result proof booleans must all be true")
         shards.append(
             {
                 "source_basename": result.source_basename,
-                "converted_basename": result.converted_basename,
+                "source_size_bytes": int(result.source_size_bytes),
+                "source_sha256": result.source_sha256,
+                "source_verified": bool(result.source_verified),
                 "source_deleted": bool(result.source_deleted),
+                "converted_basename": result.converted_basename,
+                "converted_size_bytes": int(result.converted_size_bytes),
                 "converted_sha256": result.converted_sha256,
-                "converted_size_bytes": max(0, int(result.converted_size_bytes)),
+                "partial_cleanup_complete": bool(result.partial_cleanup_complete),
+                "temporary_output_cleanup_complete": bool(result.temporary_output_cleanup_complete),
                 "elapsed_ms": max(0, int(result.elapsed_ms)),
             }
         )
@@ -760,6 +869,8 @@ def build_conversion_capture(
         "source_config_basename": source_config.basename,
         "source_config_size_bytes": source_config.size_bytes,
         "source_config_sha256": source_config.sha256,
+        "source_config_verified": bool(source_config_verified),
+        "source_config_moved_to_final": bool(source_config_moved_to_final),
         "converted_config_size_bytes": max(0, int(converted_config_size_bytes)),
         "converted_config_sha256": converted_config_sha256,
         "shards": shards,
@@ -869,10 +980,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(output)
         return 0
 
-    # The reviewed source manifest gate is checked first, before anything
-    # else -- no directory is created, no converter file opened, no
-    # dependency probed, and no network/process call made until this
-    # passes.
+    def _reject(category: str) -> int:
+        _print_json({"mode": "approved_rejected", "rejection_category": category})
+        return 1
+
+    # 1. The reviewed source manifest gate -- always first. No directory
+    # is created, no converter file opened, no dependency probed, and no
+    # network/process call made until this passes.
     try:
         require_reviewed_source_manifest()
     except ColibriStage2Failure as exc:
@@ -881,42 +995,93 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(output)
         return 1
 
-    # 1. Validate the converter identity.
+    # 2. --approve was already required to reach this branch at all.
+
+    # 3. Both stdin and stdout must be interactive -- checked before any
+    # dependency import, converter read, directory validation, disk
+    # probe, or network/process call.
+    if not _default_interactive_check():
+        return _reject("noninteractive_approval_rejected")
+
+    # 4. Detect the isolated virtual environment.
+    isolated_python_env_ready = _default_isolated_python_env_ready()
+    if not isolated_python_env_ready:
+        return _reject("python_environment_unavailable")
+
+    # 5. Collect and validate dependency versions. This is the first
+    # point at which torch/safetensors are imported -- never before the
+    # interactive check above.
+    dependency_versions = _default_dependency_versions()
+    missing_dependencies = {"torch", "safetensors"} - set(dependency_versions)
+    if missing_dependencies:
+        return _reject("dependency_unavailable")
+    for name, version in dependency_versions.items():
+        if not is_safe_basename(name) or not is_simple_version(version):
+            return _reject("dependency_unavailable")
+
+    # 6. Validate the converter path and its reviewed identity.
     converter_script_path = Path(args.converter_script) if args.converter_script else None
-    if converter_script_path is None:
-        _print_json({"mode": "approved_rejected", "rejection_category": "conversion_failed"})
-        return 1
+    if converter_script_path is None or not converter_script_path.is_absolute():
+        return _reject("conversion_failed")
     try:
         require_reviewed_converter_identity(converter_script_path)
     except ColibriStage2Failure as exc:
-        _print_json({"mode": "approved_rejected", "rejection_category": exc.category})
-        return 1
+        return _reject(exc.category)
 
-    # 2. Safely create or validate the source, converted, and private
-    # temporary-output roots. The temp root is always a sibling of
+    # 7. Validate the existing PARENT directory of every leaf this run
+    # might create -- never mkdir(parents=True). Every parent must
+    # already exist and pass ordinary-directory/path-chain validation
+    # before any leaf is created. The temp root is always a sibling of
     # --destination, never nested inside it or --converted-destination --
-    # nesting it there would make check_approved_preconditions' "new or
-    # empty" check fail against our own scratch directory.
+    # nesting it there would make step 8's "absent or empty" check fail
+    # against our own scratch directory.
     temp_output_parent = (
         Path(args.temp_output_parent)
         if args.temp_output_parent
         else destination.parent / f"{destination.name}-stage2-temp"
     )
+    leaves = (destination, converted_destination, temp_output_parent)
     try:
-        for directory in (destination, converted_destination, temp_output_parent):
-            directory.mkdir(parents=True, exist_ok=True)
+        for leaf in leaves:
             require_ordinary_directory(
-                directory, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+                leaf.parent,
+                missing_category="unsafe_directory_rejected",
+                reparse_category="unsafe_directory_rejected",
             )
     except ColibriStage2Failure as exc:
-        _print_json({"mode": "approved_rejected", "rejection_category": exc.category})
-        return 1
+        return _reject(exc.category)
 
-    # 3/4. Construct the default real adapters.
+    # 8. The source and converted roots must be absent or empty.
+    for directory in (destination, converted_destination):
+        if directory.exists() and any(directory.iterdir()):
+            return _reject("destination_not_empty")
+
+    # 9. Check free space.
+    if _default_free_bytes_probe(destination) < REQUIRED_FREE_SPACE_BYTES:
+        return _reject("insufficient_disk_space")
+
+    # 10. Only now create the intended leaf directories -- each parent
+    # was already proven to exist above, so no mkdir(parents=True) is
+    # ever needed. Every newly-created (or pre-existing, already-proven-
+    # empty) leaf is re-validated immediately.
+    try:
+        for leaf in leaves:
+            leaf.mkdir(exist_ok=True)
+            require_ordinary_directory(
+                leaf, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+            )
+    except OSError:
+        return _reject("unsafe_directory_rejected")
+    except ColibriStage2Failure as exc:
+        return _reject(exc.category)
+
+    # 11. Only now construct the default real adapters and perform any
+    # network/process work. The venv/dependency values already computed
+    # in steps 4-5 are reused as-is -- never re-evaluated as call
+    # arguments here.
     downloader = PinnedRevisionFileDownloader()
     converter = PinnedScriptConverter(converter_script_path=converter_script_path)
 
-    # 5. The complete real approved sequence.
     try:
         capture = run_approved_conversion(
             interactive_check=_default_interactive_check,
@@ -925,16 +1090,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             final_converted_dir=converted_destination,
             temp_output_parent=temp_output_parent,
             free_bytes_probe=_default_free_bytes_probe,
-            isolated_python_env_ready=_default_isolated_python_env_ready(),
-            dependency_versions=_default_dependency_versions(),
+            isolated_python_env_ready=isolated_python_env_ready,
+            dependency_versions=dependency_versions,
             downloader=downloader,
             converter=converter,
         )
     except ColibriStage2Failure as exc:
-        _print_json({"mode": "approved_rejected", "rejection_category": exc.category})
-        return 1
+        return _reject(exc.category)
 
-    # 6. Print only the closed conversion capture on success.
+    # 12. Print only the closed conversion capture on success.
     _print_json(capture)
     return 0
 

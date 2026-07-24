@@ -22,7 +22,7 @@ def _valid_kwargs(**overrides: object) -> dict[str, object]:
         model_revision=common.PINNED_MODEL_REVISION,
         license_identifier=common.PINNED_LICENSE_IDENTIFIER,
         colibri_commit=common.PINNED_COLIBRI_COMMIT,
-        converter_source_sha256=HASH64,
+        converter_source_sha256=common.REVIEWED_CONVERTER_IDENTITY.sha256,
         engine_basename=common.REVIEWED_ENGINE_IDENTITY.basename,
         engine_size_bytes=common.REVIEWED_ENGINE_IDENTITY.size_bytes,
         engine_sha256=common.REVIEWED_ENGINE_IDENTITY.sha256,
@@ -197,3 +197,54 @@ def test_manifest_cannot_authorize_an_arbitrary_but_well_formed_engine() -> None
         manifest_mod.OlmoeModelManifest(
             **_valid_kwargs(engine_size_bytes=999999, engine_sha256=arbitrary_sha256)
         )
+
+
+# ---------------------------------------------------------------------------
+# Exact converter binding (Blocker 2)
+# ---------------------------------------------------------------------------
+
+
+def test_reviewed_converter_identity_carries_the_pinned_colibri_commit() -> None:
+    identity = common.REVIEWED_CONVERTER_IDENTITY
+    assert identity.colibri_commit == common.PINNED_COLIBRI_COMMIT
+
+
+def test_reviewed_converter_identity_rejects_a_foreign_commit() -> None:
+    with pytest.raises(ValueError):
+        common.ReviewedConverterIdentity(
+            basename=common.EXPECTED_CONVERTER_SCRIPT_BASENAME,
+            size_bytes=4469,
+            sha256=common.REVIEWED_CONVERTER_IDENTITY.sha256,
+            colibri_commit="1" * 40,
+        )
+
+
+def test_manifest_rejects_a_well_formed_but_arbitrary_converter_sha256() -> None:
+    # A caller-supplied 64-hex-character value that merely LOOKS like a
+    # hash must still be rejected -- it must equal
+    # common.REVIEWED_CONVERTER_IDENTITY.sha256 exactly.
+    with pytest.raises(ValueError, match="converter_source_sha256"):
+        manifest_mod.OlmoeModelManifest(**_valid_kwargs(converter_source_sha256="7" * 64))
+
+
+def test_manifest_rejects_when_reviewed_converter_commit_disagrees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Even when converter_source_sha256 matches the reviewed converter's
+    # hash exactly, a manifest must still be rejected if that reviewed
+    # converter identity's own colibri_commit disagrees with the
+    # manifest's colibri_commit -- the two pins must always agree.
+    # ReviewedConverterIdentity's own constructor requires colibri_commit
+    # to equal PINNED_COLIBRI_COMMIT, so a foreign value is forced onto an
+    # already-constructed (frozen) instance to simulate the only way this
+    # disagreement could arise: a stale/mismatched reviewed identity.
+    foreign_identity = common.ReviewedConverterIdentity(
+        basename=common.EXPECTED_CONVERTER_SCRIPT_BASENAME,
+        size_bytes=common.REVIEWED_CONVERTER_IDENTITY.size_bytes,
+        sha256=common.REVIEWED_CONVERTER_IDENTITY.sha256,
+        colibri_commit=common.PINNED_COLIBRI_COMMIT,
+    )
+    object.__setattr__(foreign_identity, "colibri_commit", "3" * 40)
+    monkeypatch.setattr(common, "REVIEWED_CONVERTER_IDENTITY", foreign_identity)
+    with pytest.raises(ValueError, match="colibri_commit"):
+        manifest_mod.OlmoeModelManifest(**_valid_kwargs())

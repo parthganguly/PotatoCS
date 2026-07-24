@@ -76,8 +76,19 @@ class OlmoeModelManifest:
             raise ValueError("manifest license_identifier does not match the pinned license")
         if not is_hex40(self.colibri_commit) or self.colibri_commit != PINNED_COLIBRI_COMMIT:
             raise ValueError("manifest colibri_commit does not match the pinned Colibrì commit")
-        if not is_hex64(self.converter_source_sha256):
-            raise ValueError("manifest converter_source_sha256 is not a SHA-256")
+
+        # The converter identity must equal the one reviewed converter
+        # exactly -- a well-formed-but-arbitrary 64-character hash is not
+        # enough. The reviewed converter's own pinned Colibrì commit must
+        # also agree with this manifest's colibri_commit, so a manifest
+        # can never bind to a converter reviewed against a different
+        # commit. Looked up live via the `common` module so tests can
+        # monkeypatch `common.REVIEWED_CONVERTER_IDENTITY`.
+        reviewed_converter = common.REVIEWED_CONVERTER_IDENTITY
+        if self.converter_source_sha256 != reviewed_converter.sha256:
+            raise ValueError("manifest converter_source_sha256 does not match the reviewed converter identity")
+        if reviewed_converter.colibri_commit != self.colibri_commit:
+            raise ValueError("reviewed converter identity colibri_commit does not match the manifest")
 
         # The engine identity must equal the one reviewed, real,
         # deterministic-build result exactly -- a caller cannot authorize

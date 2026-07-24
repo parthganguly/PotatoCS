@@ -6,8 +6,60 @@ and no real `olmoe.exe` launch has been performed. This document is not a
 claim of real language generation.
 
 Date: 2026-07-24 (corrected same day: four execution-blocker fixes, then a
-second pass recording real build evidence and closing the final
-pre-download conversion defects).
+second pass recording real build evidence and closing further
+pre-download conversion defects, then a third pass closing the four
+remaining pre-download defects below).
+
+## Correction pass 3 — remaining pre-download defects
+
+1. **Approved-mode preflight ordering**: `main --approve` now performs an
+   explicit, side-effect-ordered preflight instead of relying on
+   argument evaluation into `run_approved_conversion`: (1) reviewed
+   source manifest, (2) `--approve` flag (structural), (3) interactive
+   stdin+stdout, (4) isolated venv detection, (5) dependency version
+   collection/validation, (6) converter path + reviewed identity, (7)
+   existing-parent-directory validation (never `mkdir(parents=True)`),
+   (8) source/converted roots absent-or-empty, (9) free space, (10) leaf
+   directory creation, (11) adapter construction and network/process
+   work. A noninteractive approved invocation now causes zero mkdir
+   calls, converter reads, dependency imports, disk-space probes,
+   network calls, or subprocess calls -- proven by regression.
+2. **Exact converter binding**: `common.ReviewedConverterIdentity` now
+   also carries `colibri_commit` (validated against
+   `PINNED_COLIBRI_COMMIT`). `OlmoeModelManifest.converter_source_sha256`
+   must equal `common.REVIEWED_CONVERTER_IDENTITY.sha256` exactly (not
+   merely a valid 64-character hash), and the reviewed converter
+   identity's own `colibri_commit` must equal the manifest's.
+3. **Complete source-to-converted capture**: `ShardTransactionResult` and
+   the closed capture now carry, per shard, in exactly
+   `EXPECTED_SHARD_BASENAMES` order: `source_basename`,
+   `source_size_bytes`, `source_sha256`, `source_verified`,
+   `source_deleted`, `converted_basename`, `converted_size_bytes`,
+   `converted_sha256`, `partial_cleanup_complete`,
+   `temporary_output_cleanup_complete`, `elapsed_ms`. The source fields
+   come from the reviewed `SourceShardEntry`, never from caller-supplied
+   capture parameters. `build_conversion_capture` rejects duplicates,
+   missing entries, wrong ordering, nonpositive sizes, malformed hashes,
+   or any false proof boolean. `source_config_verified` and
+   `source_config_moved_to_final` were added alongside the existing
+   source-config identity. The capture remains
+   `unreviewed_conversion_capture` and never authorizes inference.
+4. **Partial and converter path safety**: the downloader now validates
+   the `.partial` basename as a direct child, rejects reparse points, and
+   creates it with exclusive `"xb"` (never `"wb"`) -- failing closed with
+   the new `partial_already_exists` category if a stale or race-created
+   partial exists, and never overwriting or deleting a partial it did not
+   itself create. `require_reviewed_converter_identity` now requires an
+   absolute path, validates the containing directory and original
+   ancestor chain, rejects symlinks/junctions/reparse points, requires a
+   regular non-reparse file, and is called again immediately before every
+   subprocess creation (once per shard conversion). Argv, `shell=False`,
+   and the absolute conversion timeout are unchanged.
+
+`colibri_stage2_path_safety.py` and `colibri_stage2_runner.py` were not
+modified in this pass -- the existing `require_ordinary_directory`/
+`require_direct_child_path` primitives were sufficient once reused inside
+the downloader and converter-identity checks.
 
 ## Correction pass 2 — real build evidence + final pre-download defects
 

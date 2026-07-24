@@ -77,6 +77,7 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "dependency_unavailable",
         "unsafe_basename_rejected",
         "unsafe_directory_rejected",
+        "partial_already_exists",
         "shard_download_failed",
         "shard_verification_failed",
         "conversion_failed",
@@ -230,11 +231,15 @@ REVIEWED_ENGINE_IDENTITY = ReviewedEngineIdentity(
 class ReviewedConverterIdentity:
     """The one immutable, human-reviewed identity of the pinned
     ``convert_olmoe.py`` from the verified local Colibrì checkout at the
-    pinned commit. Never a caller-supplied override."""
+    pinned commit. Never a caller-supplied override. Carries its own
+    ``colibri_commit`` so a manifest can bind its converter identity to
+    the exact same pinned commit this script was verified against, not
+    merely to "some" pinned-looking 40-character hex string."""
 
     basename: str
     size_bytes: int
     sha256: str
+    colibri_commit: str
 
     def __post_init__(self) -> None:
         if self.basename != EXPECTED_CONVERTER_SCRIPT_BASENAME:
@@ -243,6 +248,8 @@ class ReviewedConverterIdentity:
             raise ValueError("reviewed converter identity size_bytes is out of bounds")
         if not is_hex64(self.sha256):
             raise ValueError("reviewed converter identity sha256 is not a SHA-256")
+        if not is_hex40(self.colibri_commit) or self.colibri_commit != PINNED_COLIBRI_COMMIT:
+            raise ValueError("reviewed converter identity colibri_commit does not match the pinned commit")
 
 
 # Computed directly from the verified local pinned checkout
@@ -251,4 +258,5 @@ REVIEWED_CONVERTER_IDENTITY = ReviewedConverterIdentity(
     basename=EXPECTED_CONVERTER_SCRIPT_BASENAME,
     size_bytes=4469,
     sha256="43f3ed1bad0cd89656c1a2ee17843d86ff33f670ff12c51a803f2b6361a5e168",
+    colibri_commit=PINNED_COLIBRI_COMMIT,
 )

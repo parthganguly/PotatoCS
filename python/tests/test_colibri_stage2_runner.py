@@ -196,7 +196,7 @@ def _make_manifest(*, engine_bytes: bytes, config_bytes: bytes, shard_bytes: tup
         model_revision=common.PINNED_MODEL_REVISION,
         license_identifier=common.PINNED_LICENSE_IDENTIFIER,
         colibri_commit=common.PINNED_COLIBRI_COMMIT,
-        converter_source_sha256="a" * 64,
+        converter_source_sha256=common.REVIEWED_CONVERTER_IDENTITY.sha256,
         engine_basename=common.EXPECTED_ENGINE_BASENAME,
         engine_size_bytes=len(engine_bytes),
         engine_sha256=_sha256_bytes(engine_bytes),
