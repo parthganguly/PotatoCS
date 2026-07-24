@@ -3,14 +3,17 @@ Stage 2A.
 
 This module never downloads model weights and never runs a converter with
 its default (real) adapters unless the approved-execution gate passes --
-which, in this commit, it structurally cannot, because
-``REVIEWED_SOURCE_SHARD_MANIFEST`` is empty. It provides:
+which still requires explicit ``--approve``, interactive stdin/stdout, an
+isolated Python environment with torch and safetensors already installed,
+safe existing parents, an absent or empty output root, and at least 18
+GiB free, none of which this module supplies on its own. It provides:
 
 * a process-free, network-free dry-run plan describing the sequential
   download -> verify -> convert -> delete-source-shard sequence;
 * the closed, immutable reviewed *source* manifest gate (basename, exact
   size, and SHA-256 for each of the four required upstream files), which
-  fails closed with ``source_model_manifest_unreviewed`` while empty;
+  fails closed with ``source_model_manifest_unreviewed`` unless exactly
+  those four entries are present and self-consistent;
 * the approved-execution precondition gate;
 * path-safety-checked transactional per-shard and per-config primitives
   the real approved sequence calls, exercised only with injected fakes in
@@ -101,14 +104,48 @@ class SourceShardEntry:
             raise ValueError("source shard entry sha256 is not a lowercase SHA-256")
 
 
-# Immutable and, in this correction commit, empty: the complete official
+# Immutable and, as of this commit, populated: the complete reviewed
 # upstream identities (exact basename + exact size + SHA-256) for
-# config.json and the three safetensors shards have not yet been reviewed
-# and committed. Populating this requires a separate, dedicated,
-# human-reviewed commit with real, non-truncated, officially published
-# values for every one of the four ``REQUIRED_SOURCE_FILES`` entries --
-# never a caller-supplied override.
-REVIEWED_SOURCE_SHARD_MANIFEST: Mapping[str, SourceShardEntry] = MappingProxyType({})
+# config.json and the three safetensors shards of
+# allenai/OLMoE-1B-7B-0125-Instruct at the immutable, Apache-2.0-licensed
+# revision b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e.
+#
+# Capture method: an ``olmoe_source_manifest_capture`` evidence capture
+# (state ``unreviewed_source_manifest_capture``) confirmed the immutable
+# revision matched, the exact required file set matched, and no
+# safetensor body was requested -- only ``config.json`` content was
+# fetched. The three safetensor identities (basename, exact size, and
+# SHA-256) came from that same immutable revision's LFS metadata; no
+# safetensor body was downloaded. Exact total source size across all
+# four files: 13,838,722,788 bytes. Reviewed and committed 2026-07-24.
+#
+# Values below are hardcoded from that reviewed capture -- never taken
+# from an environment variable, CLI argument, JSON file, network
+# response, caller-provided mapping, regex, or alternate revision.
+REVIEWED_SOURCE_SHARD_MANIFEST: Mapping[str, SourceShardEntry] = MappingProxyType(
+    {
+        "config.json": SourceShardEntry(
+            basename="config.json",
+            size_bytes=828,
+            sha256="272998dd7ba4846dcc682f0b5a46144f4bcd9dde8e94d2f17bd8e5cf2f23d6ce",
+        ),
+        "model-00001-of-00003.safetensors": SourceShardEntry(
+            basename="model-00001-of-00003.safetensors",
+            size_bytes=4997744872,
+            sha256="61874210ca7c360f43f8c622cecc12441083d40190eae3b56bc9d6e1c0a30c1e",
+        ),
+        "model-00002-of-00003.safetensors": SourceShardEntry(
+            basename="model-00002-of-00003.safetensors",
+            size_bytes=4997235176,
+            sha256="c523a43b8a17269d5fab33395048a83633f4d1d89c1958570cea738e2bbe80c9",
+        ),
+        "model-00003-of-00003.safetensors": SourceShardEntry(
+            basename="model-00003-of-00003.safetensors",
+            size_bytes=3843741912,
+            sha256="97ae01e3519c52e63a018bca96ab17a89c4cd5cab1c6d742efed0fa5c0e2bb17",
+        ),
+    }
+)
 
 
 def require_reviewed_source_manifest() -> Mapping[str, SourceShardEntry]:
@@ -682,11 +719,13 @@ def run_approved_conversion(
 ) -> dict[str, Any]:
     """The complete approved download/conversion sequence.
 
-    Unreachable while ``REVIEWED_SOURCE_SHARD_MANIFEST`` is empty --
     ``check_approved_preconditions`` (via ``require_reviewed_source_manifest``)
     is the very first thing this calls, before any directory is even
-    validated. Once a reviewed manifest is committed, this is the complete,
-    real, executable path: no second implementation is required.
+    validated. With the reviewed source manifest now committed, this is the
+    complete, real, executable path -- still gated behind every other
+    approved-execution precondition (explicit approval, interactive
+    stdin/stdout, isolated environment, disk space, safe paths) checked by
+    ``check_approved_preconditions``.
     """
 
     reviewed = check_approved_preconditions(
@@ -930,12 +969,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     the converter identity, safely create/validate the source/converted/
     private-temp-output roots, construct the default real adapters, and
     run ``run_approved_conversion`` -- printing only the closed conversion
-    capture on success. While ``REVIEWED_SOURCE_SHARD_MANIFEST`` is empty,
-    this fails closed with ``source_model_manifest_unreviewed`` before any
-    directory is created, any converter file opened, any dependency
-    probed, or any network/process call made -- the manifest gate is
-    always the very first thing checked. No further implementation
-    commit is required once that manifest is populated.
+    capture on success. The reviewed source manifest gate is always the
+    very first thing checked; the remaining approved-execution
+    preconditions (explicit approval, interactive stdin/stdout, isolated
+    environment with torch/safetensors, disk space, safe paths) are
+    checked next, before any directory is created, any converter file
+    opened, any dependency probed, or any network/process call made.
     """
 
     import argparse

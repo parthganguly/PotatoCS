@@ -8,7 +8,47 @@ claim of real language generation.
 Date: 2026-07-24 (corrected same day: four execution-blocker fixes, then a
 second pass recording real build evidence and closing further
 pre-download conversion defects, then a third pass closing the four
-remaining pre-download defects below).
+remaining pre-download defects below, then this reviewed source manifest
+commit).
+
+## Reviewed source manifest (this PR)
+
+`colibri_stage2_conversion.REVIEWED_SOURCE_SHARD_MANIFEST` is now a
+populated, immutable `MappingProxyType` of the four reviewed
+`SourceShardEntry` identities for `allenai/OLMoE-1B-7B-0125-Instruct` at
+the immutable, Apache-2.0-licensed revision
+`b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e`:
+
+| file | size (bytes) | SHA-256 |
+| --- | --- | --- |
+| `config.json` | 828 | `272998dd7ba4846dcc682f0b5a46144f4bcd9dde8e94d2f17bd8e5cf2f23d6ce` |
+| `model-00001-of-00003.safetensors` | 4,997,744,872 | `61874210ca7c360f43f8c622cecc12441083d40190eae3b56bc9d6e1c0a30c1e` |
+| `model-00002-of-00003.safetensors` | 4,997,235,176 | `c523a43b8a17269d5fab33395048a83633f4d1d89c1958570cea738e2bbe80c9` |
+| `model-00003-of-00003.safetensors` | 3,843,741,912 | `97ae01e3519c52e63a018bca96ab17a89c4cd5cab1c6d742efed0fa5c0e2bb17` |
+
+Exact total source bytes across all four files: **13,838,722,788**.
+
+Provenance: an `olmoe_source_manifest_capture` evidence capture (state
+`unreviewed_source_manifest_capture`) confirmed the immutable revision
+matched, the exact required file set matched, and no safetensor body was
+requested — only `config.json` content was fetched. The three safetensor
+identities (basename, exact size, SHA-256) came from that same
+immutable-revision LFS metadata, not from a downloaded body. **No shard
+body was downloaded, no model conversion was performed, and no inference
+was performed by this commit.**
+
+This closes the `source_model_manifest_unreviewed` hard gate: as of this
+commit, `require_reviewed_source_manifest()` succeeds against the
+production registry. This does not by itself download, convert, or run
+anything — every other approved-execution precondition (explicit
+`--approve`, interactive stdin/stdout, isolated Python environment with
+torch/safetensors already installed, safe existing parents, an absent or
+empty output root, at least 18 GiB free) still gates real execution, and
+none of those preconditions were exercised by this commit.
+**`colibri_stage2_manifest.REVIEWED_OLMOE_MODEL_REGISTRY` remains exactly
+empty** — no inference becomes authorized by this source-manifest commit,
+and the real one-token runner still fails closed with
+`reviewed_model_manifest_unavailable`.
 
 ## Correction pass 3 — remaining pre-download defects
 
@@ -263,10 +303,11 @@ files a manifest would describe do not exist yet. The real one-token
 runner (`colibri_stage2_runner.run_one_token_proof`) checks this registry
 first, before opening any file or creating any process, and fails closed
 with the fixed category `reviewed_model_manifest_unavailable` while it
-stays empty. Similarly, `colibri_stage2_conversion.REVIEWED_SOURCE_SHARD_MANIFEST`
-is empty, so any approved-mode download attempt — including the real
-`run_approved_conversion` orchestrator — fails closed with
-`source_model_manifest_unreviewed` before any network activity.
+stays empty. `colibri_stage2_conversion.REVIEWED_SOURCE_SHARD_MANIFEST` is
+no longer empty (see "Reviewed source manifest" above); its hard gate is
+satisfied, but that only permits an approved-mode attempt to pass the
+manifest check — it does not perform, and this commit did not perform,
+any download, conversion, or network activity.
 
 ## No download or inference performed
 
@@ -281,13 +322,23 @@ A. ~~Run the two-build `olmoe.exe` verifier~~ **Done.** The real
    deterministic engine hash is recorded above and pinned as
    `common.REVIEWED_ENGINE_IDENTITY`.
 
-B. A human approves dependency setup and the sequential, transactional
-   download/verify/convert/delete sequence (Part 3), which requires a
-   separately reviewed, non-empty `REVIEWED_SOURCE_SHARD_MANIFEST` (exact
-   basename, exact size, and SHA-256 for `config.json` and all three
-   shards). Once that manifest lands, `run_approved_conversion` (invoked
-   automatically by `main --approve` with the real default adapters) is
-   the complete real path — no second implementation is required.
+B1. ~~Source manifest evidence capture~~ **Done.** The
+    `olmoe_source_manifest_capture` evidence capture confirmed the
+    immutable revision, exact file set, and config-only fetch described
+    above.
+
+B2. ~~Reviewed source manifest commit~~ **Done by this PR.**
+    `REVIEWED_SOURCE_SHARD_MANIFEST` now holds the four reviewed
+    `SourceShardEntry` identities; `source_model_manifest_unreviewed` is
+    satisfied against the production registry.
+
+B3. **Not done.** A human must still separately approve isolated
+    dependency setup (torch/safetensors in an isolated Python
+    environment) and the real, sequential ~13.84 GB download/verify/
+    convert/delete sequence. `run_approved_conversion` (invoked
+    automatically by `main --approve` with the real default adapters) is
+    the complete real path once that approval happens — no second
+    implementation is required.
 
 C. Review the resulting conversion capture (privacy-safe, hashes/sizes
    only).
@@ -315,10 +366,12 @@ F. Integrate or freeze Colibrì based on the result.
   naming convention, since the task did not specify one; the reviewing
   commit (step D above) must supply real names alongside real hashes.
 - **`REVIEWED_SOURCE_SHARD_MANIFEST` and `REVIEWED_OLMOE_MODEL_REGISTRY`
-  remain the two hard gates.** Both are empty by design in this commit and
-  must be populated only by dedicated, separately reviewed commits with
-  real, non-truncated, officially published basenames/sizes/hashes — never
-  a caller-supplied override.
+  remain the two hard gates.** `REVIEWED_SOURCE_SHARD_MANIFEST` is now
+  populated by this commit (see "Reviewed source manifest" above).
+  `REVIEWED_OLMOE_MODEL_REGISTRY` remains exactly empty and must still be
+  populated only by a dedicated, separately reviewed commit with real,
+  non-truncated, officially published basenames/sizes/hashes for the
+  converted model — never a caller-supplied override.
 - **The default real adapters
   (`PinnedRevisionFileDownloader`/`PinnedScriptConverter`) are untested
   against a real network or a real `convert_olmoe.py`.** They are
