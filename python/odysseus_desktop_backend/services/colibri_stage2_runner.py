@@ -42,6 +42,10 @@ from odysseus_desktop_backend.services.colibri_stage2_manifest import (
     OlmoeModelManifest,
     require_reviewed_manifest,
 )
+from odysseus_desktop_backend.services.colibri_stage2_path_safety import (
+    require_direct_child_path,
+    require_ordinary_directory,
+)
 from odysseus_desktop_backend.services.colibri_stage2_reference import (
     ReferenceArtifact,
     canonical_reference_sha256,
@@ -60,6 +64,22 @@ _CLEANUP_DEADLINE_SECONDS = 30.0
 _WAIT_SLICE_MS = 50
 
 CHILD_ENV_FIXED_KEYS = frozenset({"SNAP", "OMP_NUM_THREADS", "SystemRoot", "SystemDrive", "WINDIR", "TEMP", "TMP"})
+
+# A truthful translation from the PR #40 isolated-server lifecycle failure
+# vocabulary into this runner's own closed Stage 2 categories -- never a
+# single blanket category regardless of what actually failed.
+_ISOLATED_SERVER_FAILURE_CATEGORY_MAP: Mapping[str, str] = {
+    "process_create_failed": "process_create_failed",
+    "process_attribute_list_failed": "process_create_failed",
+    "process_attribute_list_cleanup_failed": "process_create_failed",
+    "job_create_failed": "job_create_failed",
+    "job_limit_configuration_failed": "job_create_failed",
+    "job_assignment_failed": "job_assignment_failed",
+    "process_resume_failed": "process_resume_failed",
+    "io_cancellation_failed": "cleanup_failed",
+    "pending_io_cleanup_timeout": "cleanup_failed",
+}
+_DEFAULT_ISOLATED_SERVER_FAILURE_CATEGORY = "process_create_failed"
 
 
 class LifecycleApi(Protocol):
@@ -271,26 +291,29 @@ def _pick_env(inherited: Mapping[str, str], *names: str) -> str | None:
 
 
 def build_runner_environment(
-    *, converted_model_dir: Path, parent_environment: Mapping[str, str] | None = None
+    *, converted_model_dir: Path, session_dir: Path, parent_environment: Mapping[str, str] | None = None
 ) -> dict[str, str]:
-    """The exact, closed seven-key child environment. No user env inherited."""
+    """The exact, closed seven-key child environment. No user env is
+    inherited except the fixed platform keys every Windows process needs;
+    TEMP/TMP always point at this run's own private reference session
+    directory, never the caller's general (and much less isolated) temp
+    directory."""
 
     inherited = os.environ if parent_environment is None else parent_environment
     system_root = _pick_env(inherited, "SystemRoot", "WINDIR")
     system_drive = _pick_env(inherited, "SystemDrive")
     windir = _pick_env(inherited, "WINDIR", "SystemRoot")
-    temp = _pick_env(inherited, "TEMP")
-    tmp = _pick_env(inherited, "TMP")
-    if not all((system_root, system_drive, windir, temp, tmp)):
+    if not all((system_root, system_drive, windir)):
         raise ColibriStage2Failure("platform_unsupported")
+    session_path = str(session_dir)
     env = {
         "SNAP": str(converted_model_dir),
         "OMP_NUM_THREADS": "12",
         "SystemRoot": system_root,
         "SystemDrive": system_drive,
         "WINDIR": windir,
-        "TEMP": temp,
-        "TMP": tmp,
+        "TEMP": session_path,
+        "TMP": session_path,
     }
     if set(env) != CHILD_ENV_FIXED_KEYS:
         raise AssertionError("runner child environment is not closed")
@@ -330,6 +353,19 @@ def run_one_token_proof(
     if not approved or not interactive_check():
         raise ColibriStage2Failure("noninteractive_approval_rejected")
 
+    # Validate every approved directory chain -- ordinary directory, no
+    # symlink/junction/reparse point anywhere down to the drive/root
+    # anchor -- before any file is opened or any process is launched.
+    require_ordinary_directory(
+        olmoe_exe.parent, missing_category="executable_not_found", reparse_category="reparse_point_rejected"
+    )
+    resolved_model_dir = require_ordinary_directory(
+        converted_model_dir, missing_category="missing_converted_shard", reparse_category="reparse_point_rejected"
+    )
+    require_direct_child_path(resolved_model_dir, manifest.config_basename, category="reparse_point_rejected")
+    for basename in manifest.shard_basenames:
+        require_direct_child_path(resolved_model_dir, basename, category="reparse_point_rejected")
+
     _verify_identity(
         olmoe_exe,
         expected_basename=manifest.engine_basename,
@@ -360,9 +396,16 @@ def run_one_token_proof(
     if canonical_reference_sha256() != manifest.ref_sha256:
         raise ColibriStage2Failure("reference_hash_mismatch")
 
-    environment = build_runner_environment(converted_model_dir=converted_model_dir)
-
+    # The private reference session is created -- and its own directory
+    # chain validated -- before the child environment is built, since the
+    # child's TEMP/TMP point directly at this session directory rather
+    # than the caller's general temporary directory.
     session_dir = create_private_reference_session(reference_session_parent)
+    require_ordinary_directory(
+        session_dir, missing_category="reference_write_failed", reparse_category="reference_write_failed"
+    )
+    environment = build_runner_environment(converted_model_dir=converted_model_dir, session_dir=session_dir)
+
     reference: ReferenceArtifact | None = None
     process: CreatedProcess | None = None
     job: Any = None
@@ -373,6 +416,7 @@ def run_one_token_proof(
     reference_removed = False
     matched_count: int | None = None
     exit_code: int | None = None
+    resources = _UNAVAILABLE_RESOURCE_EVIDENCE
     started = clock()
 
     try:
@@ -451,13 +495,22 @@ def run_one_token_proof(
             raise ColibriStage2Failure("token_identity_mismatch")
     except ColibriStage2Failure as exc:
         primary_failure = exc
-    except IsolatedServerFailure:
+    except IsolatedServerFailure as exc:
         # A real WindowsLifecycleApi call failed with its own (PR #40)
         # closed category. This runner exposes only its own closed
-        # vocabulary, so the underlying category is not propagated.
-        primary_failure = ColibriStage2Failure("process_create_failed")
+        # vocabulary, so the underlying category string is never
+        # propagated directly -- but it is translated truthfully rather
+        # than collapsed into one blanket category regardless of cause.
+        primary_failure = ColibriStage2Failure(
+            _ISOLATED_SERVER_FAILURE_CATEGORY_MAP.get(exc.category, _DEFAULT_ISOLATED_SERVER_FAILURE_CATEGORY)
+        )
     finally:
         cleanup_deadline = clock() + _CLEANUP_DEADLINE_SECONDS
+        if process is not None and resource_probe is not None:
+            try:
+                resources = resource_probe(job, process)
+            except Exception:  # noqa: BLE001 - resource evidence is always best-effort
+                resources = _UNAVAILABLE_RESOURCE_EVIDENCE
         if process is not None:
             try:
                 if job is not None and job_assigned:
@@ -500,12 +553,6 @@ def run_one_token_proof(
             cleanup_failed = True
 
     orphan_free = not cleanup_failed
-    resources = _UNAVAILABLE_RESOURCE_EVIDENCE
-    if resource_probe is not None and process is not None:
-        try:
-            resources = resource_probe(job, process)
-        except Exception:  # noqa: BLE001 - resource evidence is always best-effort
-            resources = _UNAVAILABLE_RESOURCE_EVIDENCE
 
     if cleanup_failed:
         raise ColibriStage2Failure("cleanup_failed")
@@ -514,7 +561,20 @@ def run_one_token_proof(
 
     elapsed_ms = round((clock() - started) * 1000)
     matching_line = f"Matching tokens: {matched_count}/1".encode("ascii")
-    evidence_sha256 = hashlib.sha256(manifest.ref_sha256.encode("ascii") + b":" + matching_line).hexdigest()
+    # Bound to the reviewed engine identity, every reviewed model identity
+    # (config + all three shards), the reference identity, and the exact
+    # 1/1 evidence -- not just the reference hash and the matching line --
+    # so the evidence changes if any pinned identity changes.
+    evidence_payload = b"|".join(
+        (
+            manifest.engine_sha256.encode("ascii"),
+            manifest.config_sha256.encode("ascii"),
+            *(digest.encode("ascii") for digest in manifest.shard_sha256),
+            manifest.ref_sha256.encode("ascii"),
+            matching_line,
+        )
+    )
+    evidence_sha256 = hashlib.sha256(evidence_payload).hexdigest()
     return OneTokenRunResult(
         category="passed",
         ok=True,

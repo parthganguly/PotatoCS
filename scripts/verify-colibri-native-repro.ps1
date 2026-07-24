@@ -18,9 +18,11 @@ $ExpectedStdout = [Text.Encoding]::ASCII.GetBytes(
     "idot kernel exactness (avx2): ok`r`nidot driver exactness (avx2): ok`r`n"
 )
 $MaxStreamBytes = 4096
+$MaxBuildStreamBytes = 65536
 $TimeoutMilliseconds = 30000
 $ExpectedOlmoeBasename = 'olmoe.exe'
 $BuildTimeoutMilliseconds = 900000
+$BuildTerminationWaitMilliseconds = 5000
 
 function Invoke-CheckedGit {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
@@ -151,11 +153,73 @@ function Invoke-BoundedOracle {
     }
 }
 
+function Get-DescendantProcessIds {
+    # A breadth-first walk of the live process table rooted at
+    # $ProcessId, used only to *prove* (after a kill attempt) that no
+    # compiler descendant is knowingly left running -- never to perform
+    # the termination itself.
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $descendants = [Collections.Generic.List[int]]::new()
+    $frontier = [Collections.Generic.Queue[int]]::new()
+    $frontier.Enqueue($ProcessId)
+    while ($frontier.Count -gt 0) {
+        $current = $frontier.Dequeue()
+        $children = Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$current" -ErrorAction SilentlyContinue
+        foreach ($child in $children) {
+            $childId = [int]$child.ProcessId
+            if (Get-Process -Id $childId -ErrorAction SilentlyContinue) {
+                $descendants.Add($childId)
+                $frontier.Enqueue($childId)
+            }
+        }
+    }
+    return $descendants
+}
+
+function Stop-ProcessTree {
+    # Kills the complete process tree rooted at $ProcessId. Prefers
+    # Process.Kill(true) (recursive tree kill), available where the
+    # hosting PowerShell runtime targets .NET Core 3+; falls back to
+    # `taskkill /PID /T /F`, which performs the same recursive tree kill
+    # on every supported Windows PowerShell edition.
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $target = $null
+    try {
+        $target = Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch {
+        return
+    }
+    $killWithTree = $target.GetType().GetMethod('Kill', [Type[]]@([bool]))
+    if ($null -ne $killWithTree) {
+        try {
+            $killWithTree.Invoke($target, @($true)) | Out-Null
+            return
+        } catch {
+            # Fall through to the taskkill fallback below.
+        }
+    }
+    & taskkill.exe /PID $ProcessId /T /F *> $null
+}
+
 function Invoke-BoundedBuild {
-    # Runs one MSYS2 UCRT64 make invocation under a fixed absolute time
-    # limit and returns the elapsed milliseconds. SOURCE_DATE_EPOCH is
-    # inherited from the caller's process environment.
-    param([string]$Launcher, [string]$WorkingDirectory, [string]$Command)
+    # Runs one MSYS2 UCRT64 make invocation with bounded, redirected
+    # output under a fixed absolute time limit. SOURCE_DATE_EPOCH is
+    # supplied only to this child process's own environment block --
+    # ProcessStartInfo.EnvironmentVariables starts as a private copy of
+    # the current process environment, so setting a key on it changes
+    # only this child's block and never mutates or deletes the caller's
+    # actual (parent PowerShell) environment.
+    param(
+        [Parameter(Mandatory = $true)][string]$Launcher,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string]$SourceDateEpoch
+    )
+
+    $stdoutFile = Join-Path $WorkingDirectory 'build.stdout.bin'
+    $stderrFile = Join-Path $WorkingDirectory 'build.stderr.bin'
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Launcher
@@ -163,25 +227,79 @@ function Invoke-BoundedBuild {
     $startInfo.Arguments = "-defterm -here -no-start -ucrt64 -c `"$Command`""
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.EnvironmentVariables['SOURCE_DATE_EPOCH'] = $SourceDateEpoch
+
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
-    $timer = [Diagnostics.Stopwatch]::StartNew()
     if (-not $process.Start()) {
         throw 'native build could not be started'
     }
+    $processId = $process.Id
+
+    $stdoutStream = [IO.File]::Create($stdoutFile)
+    $stderrStream = [IO.File]::Create($stderrFile)
+    $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
+    $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $failureReason = $null
     try {
-        if (-not $process.WaitForExit($BuildTimeoutMilliseconds)) {
-            $process.Kill()
-            throw 'native build exceeded the fixed time limit'
+        while (-not $process.WaitForExit(10)) {
+            $stdoutStream.Flush()
+            $stderrStream.Flush()
+            if ($stdoutStream.Length -gt $MaxBuildStreamBytes -or
+                $stderrStream.Length -gt $MaxBuildStreamBytes) {
+                $failureReason = 'native build output exceeded the fixed limit'
+                break
+            }
+            if ($timer.ElapsedMilliseconds -ge $BuildTimeoutMilliseconds) {
+                $failureReason = 'native build exceeded the fixed time limit'
+                break
+            }
         }
-        $timer.Stop()
-        if ($process.ExitCode -ne 0) {
-            throw 'native build failed'
+
+        if ($null -ne $failureReason) {
+            # Bounded or overflowing output means raw build output is
+            # never allowed to reach the caller -- the process tree is
+            # terminated below and only a fixed, path-free error is ever
+            # raised, never the captured bytes themselves.
+            Stop-ProcessTree -ProcessId $processId
+            if (-not $process.WaitForExit($BuildTerminationWaitMilliseconds)) {
+                throw 'native build launcher did not exit after termination'
+            }
+            if ((Get-DescendantProcessIds -ProcessId $processId).Count -gt 0) {
+                throw 'native build left a compiler descendant running'
+            }
+            throw $failureReason
         }
+
+        [void]$stdoutCopy.GetAwaiter().GetResult()
+        [void]$stderrCopy.GetAwaiter().GetResult()
+        $stdoutStream.Flush()
+        $stderrStream.Flush()
+        $exitCode = $process.ExitCode
     } finally {
+        $stdoutStream.Dispose()
+        $stderrStream.Dispose()
         $process.Dispose()
     }
-    return $timer.ElapsedMilliseconds
+    $timer.Stop()
+
+    $stdoutBytes = (Get-Item -LiteralPath $stdoutFile).Length
+    $stderrBytes = (Get-Item -LiteralPath $stderrFile).Length
+    if ($stdoutBytes -gt $MaxBuildStreamBytes -or $stderrBytes -gt $MaxBuildStreamBytes) {
+        throw 'native build output exceeded the fixed limit'
+    }
+    if ($exitCode -ne 0) {
+        throw 'native build failed'
+    }
+
+    return [pscustomobject]@{
+        ElapsedMs = $timer.ElapsedMilliseconds
+        StdoutBytes = $stdoutBytes
+        StderrBytes = $stderrBytes
+    }
 }
 
 $launcher = Join-Path $Msys2Root 'msys2_shell.cmd'
@@ -215,18 +333,11 @@ foreach ($label in @('build-a', 'build-b')) {
     Invoke-CheckedGit -C $target checkout --quiet --detach $PinnedCommit
 
     $cRoot = Join-Path $target 'c'
-    Push-Location $cRoot
-    try {
-        $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
-        $buildDurationMs = Invoke-BoundedBuild -Launcher $launcher -WorkingDirectory $cRoot -Command (
-            'make glm.exe ARCH=x86-64-v3 && ' +
-            'make tests/test_idot.exe ARCH=x86-64-v3 && ' +
-            'make olmoe.exe ARCH=x86-64-v3'
-        )
-    } finally {
-        Remove-Item Env:SOURCE_DATE_EPOCH -ErrorAction SilentlyContinue
-        Pop-Location
-    }
+    $buildResult = Invoke-BoundedBuild -Launcher $launcher -WorkingDirectory $cRoot -SourceDateEpoch $sourceDateEpoch -Command (
+        'make glm.exe ARCH=x86-64-v3 && ' +
+        'make tests/test_idot.exe ARCH=x86-64-v3 && ' +
+        'make olmoe.exe ARCH=x86-64-v3'
+    )
 
     $engine = Join-Path $cRoot 'glm.exe'
     $oracle = Join-Path $cRoot 'tests\test_idot.exe'
@@ -257,7 +368,9 @@ foreach ($label in @('build-a', 'build-b')) {
         StderrBytes = $runResult.StderrBytes
         OlmoeSha256 = Get-Sha256 $olmoe
         OlmoeBytes = (Get-Item -LiteralPath $olmoe).Length
-        OlmoeBuildDurationMs = $buildDurationMs
+        OlmoeBuildDurationMs = $buildResult.ElapsedMs
+        OlmoeBuildStdoutBytes = $buildResult.StdoutBytes
+        OlmoeBuildStderrBytes = $buildResult.StderrBytes
     }
 }
 
@@ -280,7 +393,7 @@ if (-not $olmoeDeterministicallyEqual) {
     throw 'olmoe.exe clean builds are not byte-identical'
 }
 
-[pscustomobject]@{
+$result = [pscustomobject]@{
     Category = 'passed'
     Commit = $PinnedCommit
     SourceDateEpoch = $sourceDateEpoch
@@ -305,5 +418,12 @@ if (-not $olmoeDeterministicallyEqual) {
         DeterministicallyEqual = $olmoeDeterministicallyEqual
         BuildDurationMsA = $first.OlmoeBuildDurationMs
         BuildDurationMsB = $second.OlmoeBuildDurationMs
+        BuildStdoutBytesA = $first.OlmoeBuildStdoutBytes
+        BuildStdoutBytesB = $second.OlmoeBuildStdoutBytes
+        BuildStderrBytesA = $first.OlmoeBuildStderrBytes
+        BuildStderrBytesB = $second.OlmoeBuildStderrBytes
+        MaxBuildStreamBytes = $MaxBuildStreamBytes
     }
 }
+
+$result | ConvertTo-Json -Depth 8

@@ -42,7 +42,7 @@ MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v1"
 CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v1"
 CONVERSION_CAPTURE_STATE = "unreviewed_conversion_capture"
 
-ALLOWED_CONVERSION_DEPENDENCY_NAMES = frozenset({"python", "torch", "transformers", "safetensors", "numpy"})
+ALLOWED_CONVERSION_DEPENDENCY_NAMES = frozenset({"python", "torch", "safetensors"})
 
 EXPECTED_CONVERTER_SCRIPT_BASENAME = "convert_olmoe.py"
 DEVIATION_STATEMENT = (
@@ -74,13 +74,17 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "insufficient_disk_space",
         "python_environment_unavailable",
         "dependency_unavailable",
+        "unsafe_basename_rejected",
+        "unsafe_directory_rejected",
         "shard_download_failed",
         "shard_verification_failed",
         "conversion_failed",
+        "conversion_output_unexpected",
         "converted_shard_missing",
         "converted_shard_already_exists",
         "source_shard_deletion_failed",
         "source_shard_deletion_unverified",
+        "temporary_output_cleanup_failed",
         # Derived reference (Part 4)
         "reference_write_failed",
         "reference_cleanup_failed",

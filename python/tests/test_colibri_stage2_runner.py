@@ -532,8 +532,36 @@ def test_underlying_isolated_server_failure_is_translated(
             raise IsolatedServerFailure("job_create_failed")
 
     api = RaisingApi()
-    with pytest.raises(runner.ColibriStage2Failure, match="process_create_failed"):
+    with pytest.raises(runner.ColibriStage2Failure, match="job_create_failed"):
         _run(registered, api)
+
+
+def test_isolated_server_failure_mapping_is_not_indiscriminate(registered: _Fixture) -> None:
+    # Different underlying PR #40 categories must map to different, truthful
+    # Stage 2 categories -- never one blanket category regardless of cause.
+    class ResumeFailsApi(FakeApi):
+        def resume_process(self, process: Any) -> None:
+            raise IsolatedServerFailure("process_resume_failed")
+
+    class AssignmentFailsApi(FakeApi):
+        def assign_process(self, job: str, process: Any) -> None:
+            raise IsolatedServerFailure("job_assignment_failed")
+
+    with pytest.raises(runner.ColibriStage2Failure, match="process_resume_failed"):
+        _run(registered, ResumeFailsApi())
+    with pytest.raises(runner.ColibriStage2Failure, match="job_assignment_failed"):
+        _run(registered, AssignmentFailsApi())
+
+
+def test_unmapped_isolated_server_failure_falls_back_to_process_create_failed(
+    registered: _Fixture,
+) -> None:
+    class UnmappedFailsApi(FakeApi):
+        def create_suspended(self, executable: Path, arguments: tuple, environment) -> CreatedProcess:
+            raise IsolatedServerFailure("port_bind_failed")
+
+    with pytest.raises(runner.ColibriStage2Failure, match="process_create_failed"):
+        _run(registered, UnmappedFailsApi())
 
 
 def test_successful_run_removes_temporary_reference(registered: _Fixture) -> None:
@@ -573,3 +601,273 @@ def test_environment_never_inherits_arbitrary_user_variables(registered: _Fixtur
     assert "HTTP_PROXY" not in environment
     assert "PATH" not in environment
     assert "USERPROFILE" not in environment
+
+
+# ---------------------------------------------------------------------------
+# Directory-chain path safety (Blocker 3)
+# ---------------------------------------------------------------------------
+
+
+def test_olmoe_exe_directory_reparse_point_is_rejected(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_lstat = runner.os.lstat
+    reparse_target = registered.exe.parent
+
+    class _FakeStatResult:
+        def __init__(self, real_result: Any) -> None:
+            self.st_mode = real_result.st_mode
+            self.st_file_attributes = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+
+    def _fake_lstat(path: Any, *args: object, **kwargs: object):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) == reparse_target:
+            return _FakeStatResult(result)
+        return result
+
+    monkeypatch.setattr(runner.os, "lstat", _fake_lstat)
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="reparse_point_rejected"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_converted_model_dir_reparse_point_is_rejected(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_lstat = runner.os.lstat
+    reparse_target = registered.model_dir
+
+    class _FakeStatResult:
+        def __init__(self, real_result: Any) -> None:
+            self.st_mode = real_result.st_mode
+            self.st_file_attributes = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+
+    def _fake_lstat(path: Any, *args: object, **kwargs: object):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) == reparse_target:
+            return _FakeStatResult(result)
+        return result
+
+    monkeypatch.setattr(runner.os, "lstat", _fake_lstat)
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="reparse_point_rejected"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_missing_converted_model_dir_is_rejected_before_process_creation(
+    registered: _Fixture,
+) -> None:
+    import shutil
+
+    shutil.rmtree(registered.model_dir)
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="missing_converted_shard"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Private session TEMP/TMP isolation (runner correction)
+# ---------------------------------------------------------------------------
+
+
+def test_environment_temp_and_tmp_point_to_private_session(registered: _Fixture) -> None:
+    api = FakeApi()
+    _run(registered, api)
+    _, _, environment = api.create_suspended_calls[0]
+    assert environment["TEMP"] == environment["TMP"]
+    session_path = Path(environment["TEMP"])
+    assert session_path.parent == registered.root
+    assert session_path.name.startswith("odysseus-colibri-stage2-ref-")
+
+
+# ---------------------------------------------------------------------------
+# Resource probe ordering (runner correction)
+# ---------------------------------------------------------------------------
+
+
+def test_resource_probe_runs_before_handles_are_closed(registered: _Fixture) -> None:
+    api = FakeApi()
+    closed_handle_counts_at_probe_time: list[int] = []
+
+    def probe(job: Any, process: CreatedProcess) -> runner.ResourceEvidence:
+        closed_handle_counts_at_probe_time.append(len(api.closed_handles))
+        return runner._UNAVAILABLE_RESOURCE_EVIDENCE
+
+    result = _run(registered, api, resource_probe=probe)
+    assert result.ok is True
+    assert closed_handle_counts_at_probe_time == [0]
+    assert len(api.closed_handles) > 0
+
+
+def test_resource_probe_is_not_invoked_when_absent(registered: _Fixture) -> None:
+    api = FakeApi()
+    result = _run(registered, api)
+    assert result.resources.cpu_time_state == "unavailable"
+    assert result.resources.process_memory_state == "unavailable"
+    assert result.resources.disk_read_state == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Evidence hash binding (runner correction)
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_hash_changes_if_engine_identity_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_a = tmp_path / "engine-a"
+    root_a.mkdir()
+    root_b = tmp_path / "engine-b"
+    root_b.mkdir()
+    fixture_a = _Fixture(root_a)
+    fixture_b = _Fixture(root_b)
+    fixture_b.exe.write_bytes(b"a completely different fake engine")
+    fixture_b.manifest = _make_manifest(
+        engine_bytes=fixture_b.exe.read_bytes(),
+        config_bytes=fixture_b.config.read_bytes(),
+        shard_bytes=fixture_b.shard_bytes,
+    )
+
+    monkeypatch.setattr(
+        manifest_mod,
+        "REVIEWED_OLMOE_MODEL_REGISTRY",
+        MappingProxyType({common.PINNED_MODEL_REVISION: fixture_a.manifest}),
+    )
+    result_a = _run(fixture_a, FakeApi())
+
+    monkeypatch.setattr(
+        manifest_mod,
+        "REVIEWED_OLMOE_MODEL_REGISTRY",
+        MappingProxyType({common.PINNED_MODEL_REVISION: fixture_b.manifest}),
+    )
+    result_b = _run(fixture_b, FakeApi())
+
+    assert result_a.evidence_sha256 is not None
+    assert result_b.evidence_sha256 is not None
+    assert result_a.evidence_sha256 != result_b.evidence_sha256
+
+
+def test_evidence_hash_changes_if_shard_identity_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_a = tmp_path / "shard-a"
+    root_a.mkdir()
+    root_b = tmp_path / "shard-b"
+    root_b.mkdir()
+    fixture_a = _Fixture(root_a)
+    fixture_b = _Fixture(root_b)
+    tampered_shard_bytes = (b"different-shard-0", fixture_b.shard_bytes[1], fixture_b.shard_bytes[2])
+    for name, data in zip(common.EXPECTED_SHARD_BASENAMES, tampered_shard_bytes):
+        (fixture_b.model_dir / name).write_bytes(data)
+    fixture_b.manifest = _make_manifest(
+        engine_bytes=fixture_b.exe.read_bytes(),
+        config_bytes=fixture_b.config.read_bytes(),
+        shard_bytes=tampered_shard_bytes,
+    )
+
+    monkeypatch.setattr(
+        manifest_mod,
+        "REVIEWED_OLMOE_MODEL_REGISTRY",
+        MappingProxyType({common.PINNED_MODEL_REVISION: fixture_a.manifest}),
+    )
+    result_a = _run(fixture_a, FakeApi())
+
+    monkeypatch.setattr(
+        manifest_mod,
+        "REVIEWED_OLMOE_MODEL_REGISTRY",
+        MappingProxyType({common.PINNED_MODEL_REVISION: fixture_b.manifest}),
+    )
+    result_b = _run(fixture_b, FakeApi())
+
+    assert result_a.evidence_sha256 != result_b.evidence_sha256
+
+
+# ---------------------------------------------------------------------------
+# Native build verifier script contract (Blocker 1) -- structural
+# assertions only; the real MSYS2/gcc/make toolchain is never invoked.
+# ---------------------------------------------------------------------------
+
+
+_NATIVE_VERIFIER_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "verify-colibri-native-repro.ps1"
+
+
+def _native_verifier_text() -> str:
+    return _NATIVE_VERIFIER_SCRIPT.read_text(encoding="utf-8")
+
+
+def test_native_verifier_script_exists() -> None:
+    assert _NATIVE_VERIFIER_SCRIPT.is_file()
+
+
+def test_native_verifier_never_mutates_parent_environment() -> None:
+    text = _native_verifier_text()
+    assert "$env:SOURCE_DATE_EPOCH" not in text
+    assert "Env:SOURCE_DATE_EPOCH" not in text
+    assert "EnvironmentVariables['SOURCE_DATE_EPOCH']" in text
+
+
+def test_native_verifier_redirects_and_bounds_build_output() -> None:
+    text = _native_verifier_text()
+    assert "$startInfo.RedirectStandardOutput = $true" in text
+    assert "$startInfo.RedirectStandardError = $true" in text
+    assert "MaxBuildStreamBytes" in text
+
+
+def test_native_verifier_kills_full_process_tree_on_timeout_or_overflow() -> None:
+    text = _native_verifier_text()
+    assert "function Stop-ProcessTree" in text
+    assert "Kill', [Type[]]@([bool])" in text
+    assert "taskkill" in text.lower()
+    assert "function Get-DescendantProcessIds" in text
+
+
+def test_native_verifier_waits_bounded_after_termination_and_fails_if_not_confirmed() -> None:
+    text = _native_verifier_text()
+    assert "$BuildTerminationWaitMilliseconds" in text
+    assert "native build launcher did not exit after termination" in text
+    assert "native build left a compiler descendant running" in text
+
+
+def test_native_verifier_final_output_is_json_only() -> None:
+    text = _native_verifier_text()
+    stripped = text.rstrip()
+    assert stripped.endswith("ConvertTo-Json -Depth 8")
+    assert "Format-Table" not in text
+    assert "Write-Host" not in text
+    assert "Out-Default" not in text
+
+
+def test_native_verifier_json_object_carries_no_paths() -> None:
+    text = _native_verifier_text()
+    result_block = text[text.index("$result = [pscustomobject]@{") :]
+    forbidden = (
+        "$target",
+        "$cRoot",
+        "$resolvedSource",
+        "$resolvedBuildRoot",
+        "$launcher",
+        "$gcc",
+        "$make",
+        "SourceRoot",
+        "BuildRoot",
+        "WorkingDirectory",
+    )
+    for token in forbidden:
+        assert token not in result_block
+
+
+def test_native_verifier_preserves_two_build_independence_and_olmoe_double_build() -> None:
+    text = _native_verifier_text()
+    assert "clean build target already exists" in text
+    assert "make olmoe.exe ARCH=x86-64-v3" in text
+    assert "DeterministicallyEqual" in text
+    assert text.count("Invoke-BoundedBuild -Launcher") == 1  # single call site, looped for build-a/build-b
+
+
+def test_native_verifier_preserves_oracle_proof_semantics() -> None:
+    text = _native_verifier_text()
+    assert "function Invoke-BoundedOracle" in text
+    assert "idot kernel exactness (avx2): ok" in text
