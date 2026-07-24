@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
 
+from odysseus_desktop_backend.services import colibri_stage2_common as common
 from odysseus_desktop_backend.services.colibri_stage2_common import (
     ALLOWED_CONVERSION_DEPENDENCY_NAMES,
     EXPECTED_CONFIG_BASENAME,
-    EXPECTED_ENGINE_BASENAME,
     EXPECTED_REF_BASENAME,
     EXPECTED_SHARD_BASENAMES,
     MANIFEST_EVIDENCE_SCHEMA_VERSION,
@@ -33,7 +33,6 @@ from odysseus_desktop_backend.services.colibri_stage2_common import (
     is_simple_version,
 )
 
-_MAX_ENGINE_BYTES = 200 * 1024 * 1024
 _MAX_CONFIG_BYTES = 1 * 1024 * 1024
 _MAX_SHARD_BYTES = 20 * 1024 * 1024 * 1024
 _MAX_REF_BYTES = 4 * 1024
@@ -80,11 +79,19 @@ class OlmoeModelManifest:
         if not is_hex64(self.converter_source_sha256):
             raise ValueError("manifest converter_source_sha256 is not a SHA-256")
 
-        if self.engine_basename != EXPECTED_ENGINE_BASENAME:
-            raise ValueError("manifest engine_basename does not match the expected engine")
-        _require_bounded_size(self.engine_size_bytes, _MAX_ENGINE_BYTES, "engine_size_bytes")
-        if not is_hex64(self.engine_sha256):
-            raise ValueError("manifest engine_sha256 is not a SHA-256")
+        # The engine identity must equal the one reviewed, real,
+        # deterministic-build result exactly -- a caller cannot authorize
+        # some other engine by supplying an arbitrary (but well-formed)
+        # basename/size/hash. Looked up live via the `common` module (not
+        # a name imported at module load time) so tests can monkeypatch
+        # `common.REVIEWED_ENGINE_IDENTITY` for their own synthetic fixtures.
+        reviewed_engine = common.REVIEWED_ENGINE_IDENTITY
+        if self.engine_basename != reviewed_engine.basename:
+            raise ValueError("manifest engine_basename does not match the reviewed engine identity")
+        if self.engine_size_bytes != reviewed_engine.size_bytes:
+            raise ValueError("manifest engine_size_bytes does not match the reviewed engine identity")
+        if self.engine_sha256 != reviewed_engine.sha256:
+            raise ValueError("manifest engine_sha256 does not match the reviewed engine identity")
 
         if self.config_basename != EXPECTED_CONFIG_BASENAME:
             raise ValueError("manifest config_basename does not match the expected config")

@@ -5,9 +5,88 @@ implemented and tested with synthetic fixtures; no download, no conversion,
 and no real `olmoe.exe` launch has been performed. This document is not a
 claim of real language generation.
 
-Date: 2026-07-24 (corrected same day: four execution-blocker fixes below).
+Date: 2026-07-24 (corrected same day: four execution-blocker fixes, then a
+second pass recording real build evidence and closing the final
+pre-download conversion defects).
 
-## Correction pass (four execution blockers)
+## Correction pass 2 — real build evidence + final pre-download defects
+
+**The two-build `olmoe.exe` verifier has been run for real** (step A of the
+remaining finite sequence below, not re-run by this correction commit —
+its result is recorded here and pinned in code). Pinned Colibrì commit
+`72d3d37231e922a6fa9afca16e08fa45842d5eb4`, `SOURCE_DATE_EPOCH=1784223580`:
+`olmoe.exe`, 704275 bytes, clean-build A and B SHA-256 both
+`d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d`
+(byte-identical; build durations 117029ms / 101571ms). The existing
+`glm.exe`/`test_idot.exe` identities reproduced without change. **This
+proves reproducible compilation only — it is not a claim about model
+loading or token generation**, which remain gated behind steps B-E below.
+This result is now pinned as `common.REVIEWED_ENGINE_IDENTITY`, and
+`OlmoeModelManifest.__post_init__` requires its `engine_basename`/
+`engine_size_bytes`/`engine_sha256` fields to equal that identity exactly
+— a caller cannot authorize a different engine by supplying an arbitrary
+(even well-formed) basename/size/hash. `REVIEWED_OLMOE_MODEL_REGISTRY`
+itself stays empty.
+
+**The pinned `convert_olmoe.py` converter identity is now recorded**,
+computed directly from the verified local checkout
+(`c/tools/convert_olmoe.py` at the pinned commit): basename
+`convert_olmoe.py`, size 4469 bytes, SHA-256
+`43f3ed1bad0cd89656c1a2ee17843d86ff33f670ff12c51a803f2b6361a5e168`, pinned
+as `common.REVIEWED_CONVERTER_IDENTITY`. `PinnedScriptConverter` now reads
+and hashes its configured script and requires an exact match against that
+fixed identity before ever invoking a subprocess — never a
+caller-supplied expected hash.
+
+**The converter argv bug is fixed**: the real upstream grammar is
+`--model <source> --out <output>` (confirmed by reading the pinned local
+`convert_olmoe.py`'s own `argparse` definition) — `PinnedScriptConverter`
+previously passed `--output`, which the real script does not accept.
+`--repo` is never used (a local `--model` directory is always supplied).
+
+**The approved CLI is now fully executable**, not a preconditions-only
+check: `main --approve` validates the converter identity, safely
+creates/validates the source/converted/private-temp-output roots (the
+temp root is always a sibling of `--destination`, never nested inside it
+or `--converted-destination`), constructs the default real adapters
+(`PinnedRevisionFileDownloader`, `PinnedScriptConverter`), calls
+`run_approved_conversion`, prints only the closed conversion capture on
+success, and returns nonzero on any closed rejection/failure. While
+`REVIEWED_SOURCE_SHARD_MANIFEST` stays empty, the manifest gate is
+checked first, before any directory is created, any converter file
+opened, any dependency probed, or any network/process call made — proven
+by a regression that wires every one of those to explode if reached. No
+further implementation commit is required once that manifest is
+populated.
+
+**Path-safety ancestor-walk-order bug fixed** in
+`colibri_stage2_path_safety.require_ordinary_directory`: the previous
+implementation resolved the directory *before* walking its ancestor
+chain, which could silently erase a symlinked/junctioned ancestor segment
+from the chain before it was ever inspected (a real escape). The
+corrected version walks the *original*, lexical path — the directory
+itself and every existing ancestor down to its drive/root anchor — via
+`lstat` (rejecting both `stat.S_ISLNK` and the Windows
+`FILE_ATTRIBUTE_REPARSE_POINT`) strictly before any resolution occurs, and
+only resolves afterward, confirming the resolution lands nowhere but the
+same already-approved location. `require_direct_child_path` now also
+rejects both `/` and `\` unconditionally (not just the local platform's
+separator), plus drive-qualification (`:`) and dot/dot-dot names.
+
+**Atomic no-overwrite placement**: `atomic_no_replace_move` (new, in
+`colibri_stage2_path_safety.py`) replaces every check-then-`os.replace`
+pattern with one true no-replace primitive — on Windows, `os.rename()`
+(unlike `os.replace()`) already refuses to replace an existing
+destination (CPython calls `MoveFileExW` without
+`MOVEFILE_REPLACE_EXISTING`); on other platforms, a hardlink-then-unlink
+sequence is used instead. Applied to all three placement points: the
+downloaded `.partial` file into its verified destination, the converted
+temporary shard into its final directory, and the verified config into
+its final directory. A destination introduced by a race immediately
+before placement now survives completely untouched instead of being
+silently overwritten.
+
+## Correction pass 1 (four execution blockers)
 
 This revision fixes four concrete execution blockers found before any real
 run could be attempted, without changing the selected model, pinned
@@ -146,16 +225,17 @@ the network, the ordinary model store, or a real Windows process.
 
 ## Remaining finite sequence
 
-A. Run the two-build `olmoe.exe` verifier (extended
-   `scripts/verify-colibri-native-repro.ps1`) to produce the real
-   deterministic engine hash.
+A. ~~Run the two-build `olmoe.exe` verifier~~ **Done.** The real
+   deterministic engine hash is recorded above and pinned as
+   `common.REVIEWED_ENGINE_IDENTITY`.
 
 B. A human approves dependency setup and the sequential, transactional
    download/verify/convert/delete sequence (Part 3), which requires a
    separately reviewed, non-empty `REVIEWED_SOURCE_SHARD_MANIFEST` (exact
    basename, exact size, and SHA-256 for `config.json` and all three
-   shards). Once that manifest lands, `run_approved_conversion` is the
-   complete real path — no second implementation is required.
+   shards). Once that manifest lands, `run_approved_conversion` (invoked
+   automatically by `main --approve` with the real default adapters) is
+   the complete real path — no second implementation is required.
 
 C. Review the resulting conversion capture (privacy-safe, hashes/sizes
    only).

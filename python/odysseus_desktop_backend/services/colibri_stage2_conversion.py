@@ -36,6 +36,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from odysseus_desktop_backend.services import colibri_stage2_common as common
 from odysseus_desktop_backend.services.colibri_stage2_common import (
     ALLOWED_CONVERSION_DEPENDENCY_NAMES,
     APPROVAL_STATEMENT,
@@ -57,6 +58,7 @@ from odysseus_desktop_backend.services.colibri_stage2_common import (
     is_simple_version,
 )
 from odysseus_desktop_backend.services.colibri_stage2_path_safety import (
+    atomic_no_replace_move,
     require_direct_child_path,
     require_ordinary_directory,
 )
@@ -287,7 +289,29 @@ class PinnedRevisionFileDownloader:
         if observed != expected_size_bytes or digest.hexdigest() != expected_sha256:
             partial_path.unlink(missing_ok=True)
             raise ColibriStage2Failure("shard_verification_failed")
-        os.replace(partial_path, destination)
+        try:
+            atomic_no_replace_move(partial_path, destination, exists_category="shard_download_failed")
+        except ColibriStage2Failure:
+            partial_path.unlink(missing_ok=True)
+            raise
+
+
+def require_reviewed_converter_identity(script_path: Path) -> None:
+    """Fail closed unless ``script_path`` is exactly the one reviewed
+    converter: same basename, same exact size, same SHA-256 -- compared
+    only against the fixed ``common.REVIEWED_CONVERTER_IDENTITY``. A
+    caller-supplied expected hash is never trusted; there is no parameter
+    anywhere that could substitute one."""
+
+    identity = common.REVIEWED_CONVERTER_IDENTITY
+    if script_path.name != identity.basename:
+        raise ColibriStage2Failure("conversion_failed")
+    try:
+        data = script_path.read_bytes()
+    except OSError as exc:
+        raise ColibriStage2Failure("conversion_failed") from exc
+    if len(data) != identity.size_bytes or hashlib.sha256(data).hexdigest() != identity.sha256:
+        raise ColibriStage2Failure("conversion_failed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,7 +322,9 @@ class PinnedScriptConverter:
     venv's Python interpreter (``sys.executable``), with explicit argv and
     ``shell=False``, under one absolute deadline. stdout/stderr are
     discarded rather than retained -- their content is never needed for
-    pass/fail and must never appear in any evidence capture.
+    pass/fail and must never appear in any evidence capture. The exact
+    upstream argument grammar is ``--model <source> --out <output>`` --
+    never ``--output`` and never ``--repo``.
     """
 
     converter_script_path: Path
@@ -307,14 +333,13 @@ class PinnedScriptConverter:
     def convert(self, *, model_dir: Path, output_dir: Path) -> None:
         import subprocess
 
-        if self.converter_script_path.name != EXPECTED_CONVERTER_SCRIPT_BASENAME:
-            raise ColibriStage2Failure("conversion_failed")
+        require_reviewed_converter_identity(self.converter_script_path)
         argv = [
             sys.executable,
             str(self.converter_script_path),
             "--model",
             str(model_dir),
-            "--output",
+            "--out",
             str(output_dir),
         ]
         try:
@@ -459,6 +484,10 @@ def run_shard_transaction(
         raise ColibriStage2Failure("unsafe_directory_rejected")
 
     if final_converted_path.exists():
+        # A fast, early fail -- avoids downloading and converting the
+        # shard again when the final artifact is already present. The
+        # actual no-overwrite guarantee against a race is enforced again,
+        # atomically, at the real placement step below (3h).
         raise ColibriStage2Failure("converted_shard_already_exists")
 
     started = clock()
@@ -482,8 +511,13 @@ def run_shard_transaction(
     ):
         raise ColibriStage2Failure("shard_verification_failed")
 
-    # 3b: a fresh, empty per-shard converter-output directory.
+    # 3b: a fresh, empty per-shard converter-output directory -- validated
+    # immediately, since a newly created private directory is not exempt
+    # from the same ordinary-directory proof as any other.
     temp_output_dir = Path(tempfile.mkdtemp(prefix="colibri-stage2-shard-", dir=resolved_temp_parent))
+    temp_output_dir = require_ordinary_directory(
+        temp_output_dir, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
 
     primary_failure: ColibriStage2Failure | None = None
     converted_sha256 = ""
@@ -518,13 +552,11 @@ def run_shard_transaction(
         converted_sha256 = _sha256_file(temp_shard_path)
         converted_size_bytes = temp_shard_path.stat().st_size
 
-        # 3h: atomically move into the final directory, only if absent.
-        if final_converted_path.exists():
-            raise ColibriStage2Failure("converted_shard_already_exists")
-        try:
-            os.replace(temp_shard_path, final_converted_path)
-        except OSError as exc:
-            raise ColibriStage2Failure("conversion_failed") from exc
+        # 3h: atomically move into the final directory, only if absent --
+        # one no-replace primitive, not a check-then-replace race.
+        atomic_no_replace_move(
+            temp_shard_path, final_converted_path, exists_category="converted_shard_already_exists"
+        )
     except ColibriStage2Failure as exc:
         primary_failure = exc
     finally:
@@ -578,9 +610,6 @@ def run_approved_conversion(
     free_bytes_probe: Callable[[Path], int],
     isolated_python_env_ready: bool,
     dependency_versions: Mapping[str, str],
-    converter_basename: str,
-    converter_size_bytes: int,
-    converter_sha256: str,
     downloader: Downloader,
     converter: Converter,
     clock: Callable[[], float] = time.monotonic,
@@ -636,19 +665,13 @@ def run_approved_conversion(
     )
     if final_config_path.exists():
         raise ColibriStage2Failure("converted_shard_already_exists")
-    try:
-        os.replace(config_path, final_config_path)
-    except OSError as exc:
-        raise ColibriStage2Failure("conversion_failed") from exc
+    atomic_no_replace_move(config_path, final_config_path, exists_category="converted_shard_already_exists")
 
     converted_config_size_bytes = final_config_path.stat().st_size
     converted_config_sha256 = _sha256_file(final_config_path)
     total_elapsed_ms = round((clock() - total_started) * 1000)
 
     return build_conversion_capture(
-        converter_basename=converter_basename,
-        converter_size_bytes=converter_size_bytes,
-        converter_sha256=converter_sha256,
         source_config=config_entry,
         converted_config_sha256=converted_config_sha256,
         converted_config_size_bytes=converted_config_size_bytes,
@@ -666,9 +689,6 @@ def run_approved_conversion(
 
 def build_conversion_capture(
     *,
-    converter_basename: str,
-    converter_size_bytes: int,
-    converter_sha256: str,
     source_config: SourceShardEntry,
     converted_config_sha256: str,
     converted_config_size_bytes: int,
@@ -680,6 +700,10 @@ def build_conversion_capture(
     """A closed, privacy-safe capture with the complete reviewable identity
     set the next tiny registry-pinning commit needs.
 
+    The converter identity is never a caller-supplied parameter -- it is
+    always read live from ``common.REVIEWED_CONVERTER_IDENTITY``, so a
+    capture can never claim a converter identity nobody actually reviewed.
+
     Never contains a path, username, environment value, or raw tool
     output, and never validates as an ``OlmoeModelManifest`` -- its keys
     never match that dataclass's constructor, its state is always
@@ -687,10 +711,7 @@ def build_conversion_capture(
     real run.
     """
 
-    if converter_basename != EXPECTED_CONVERTER_SCRIPT_BASENAME or not is_hex64(converter_sha256):
-        raise ValueError("invalid converter identity")
-    if isinstance(converter_size_bytes, bool) or not isinstance(converter_size_bytes, int) or converter_size_bytes <= 0:
-        raise ValueError("invalid converter size_bytes")
+    reviewed_converter = common.REVIEWED_CONVERTER_IDENTITY
     if not isinstance(source_config, SourceShardEntry) or source_config.basename != EXPECTED_CONFIG_BASENAME:
         raise ValueError("invalid source config identity")
     if not is_hex64(converted_config_sha256):
@@ -733,9 +754,9 @@ def build_conversion_capture(
         "model_revision": PINNED_MODEL_REVISION,
         "license_identifier": PINNED_LICENSE_IDENTIFIER,
         "colibri_commit": PINNED_COLIBRI_COMMIT,
-        "converter_basename": converter_basename,
-        "converter_size_bytes": max(0, int(converter_size_bytes)),
-        "converter_sha256": converter_sha256,
+        "converter_basename": reviewed_converter.basename,
+        "converter_size_bytes": reviewed_converter.size_bytes,
+        "converter_sha256": reviewed_converter.sha256,
         "source_config_basename": source_config.basename,
         "source_config_size_bytes": source_config.size_bytes,
         "source_config_sha256": source_config.sha256,
@@ -785,19 +806,44 @@ def _default_dependency_versions() -> dict[str, str]:
     return versions
 
 
+def _print_json(payload: Mapping[str, Any]) -> None:
+    import json
+
+    print(json.dumps(dict(payload), indent=2, sort_keys=True))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Developer-only CLI. Defaults to dry-run; ``--approve`` requests the
-    approved-execution gate, which fails closed in this correction commit
-    because ``REVIEWED_SOURCE_SHARD_MANIFEST`` is empty -- using real
-    (not hard-coded) venv and dependency detection either way."""
+    """Developer-only CLI. Defaults to dry-run (network-free, process-free).
+
+    ``--approve`` requests the complete, real approved sequence: validate
+    the converter identity, safely create/validate the source/converted/
+    private-temp-output roots, construct the default real adapters, and
+    run ``run_approved_conversion`` -- printing only the closed conversion
+    capture on success. While ``REVIEWED_SOURCE_SHARD_MANIFEST`` is empty,
+    this fails closed with ``source_model_manifest_unreviewed`` before any
+    directory is created, any converter file opened, any dependency
+    probed, or any network/process call made -- the manifest gate is
+    always the very first thing checked. No further implementation
+    commit is required once that manifest is populated.
+    """
 
     import argparse
-    import json
 
     parser = argparse.ArgumentParser(description="Colibrì Stage 2A OLMoE download/conversion plan")
     parser.add_argument("--destination", required=True, help="Target directory for the source download")
     parser.add_argument(
         "--converted-destination", required=True, help="Target directory for the final converted model"
+    )
+    parser.add_argument(
+        "--converter-script", help="Path to the reviewed convert_olmoe.py (required with --approve)"
+    )
+    parser.add_argument(
+        "--temp-output-parent",
+        help=(
+            "Private scratch root for per-shard temporary converter output "
+            "(defaults to a sibling of --destination; must not be nested "
+            "inside --destination or --converted-destination)"
+        ),
     )
     parser.add_argument("--approve", action="store_true", help="Request approved execution")
     args = parser.parse_args(argv)
@@ -819,22 +865,77 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mode": "dry_run",
     }
 
-    if args.approve:
-        try:
-            check_approved_preconditions(
-                interactive_check=_default_interactive_check,
-                approved=True,
-                destination_dir=destination,
-                converted_dir=converted_destination,
-                free_bytes_probe=_default_free_bytes_probe,
-                isolated_python_env_ready=_default_isolated_python_env_ready(),
-                dependency_versions=_default_dependency_versions(),
-            )
-        except ColibriStage2Failure as exc:
-            output["mode"] = "approved_rejected"
-            output["rejection_category"] = exc.category
+    if not args.approve:
+        _print_json(output)
+        return 0
 
-    print(json.dumps(output, indent=2, sort_keys=True))
+    # The reviewed source manifest gate is checked first, before anything
+    # else -- no directory is created, no converter file opened, no
+    # dependency probed, and no network/process call made until this
+    # passes.
+    try:
+        require_reviewed_source_manifest()
+    except ColibriStage2Failure as exc:
+        output["mode"] = "approved_rejected"
+        output["rejection_category"] = exc.category
+        _print_json(output)
+        return 1
+
+    # 1. Validate the converter identity.
+    converter_script_path = Path(args.converter_script) if args.converter_script else None
+    if converter_script_path is None:
+        _print_json({"mode": "approved_rejected", "rejection_category": "conversion_failed"})
+        return 1
+    try:
+        require_reviewed_converter_identity(converter_script_path)
+    except ColibriStage2Failure as exc:
+        _print_json({"mode": "approved_rejected", "rejection_category": exc.category})
+        return 1
+
+    # 2. Safely create or validate the source, converted, and private
+    # temporary-output roots. The temp root is always a sibling of
+    # --destination, never nested inside it or --converted-destination --
+    # nesting it there would make check_approved_preconditions' "new or
+    # empty" check fail against our own scratch directory.
+    temp_output_parent = (
+        Path(args.temp_output_parent)
+        if args.temp_output_parent
+        else destination.parent / f"{destination.name}-stage2-temp"
+    )
+    try:
+        for directory in (destination, converted_destination, temp_output_parent):
+            directory.mkdir(parents=True, exist_ok=True)
+            require_ordinary_directory(
+                directory, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+            )
+    except ColibriStage2Failure as exc:
+        _print_json({"mode": "approved_rejected", "rejection_category": exc.category})
+        return 1
+
+    # 3/4. Construct the default real adapters.
+    downloader = PinnedRevisionFileDownloader()
+    converter = PinnedScriptConverter(converter_script_path=converter_script_path)
+
+    # 5. The complete real approved sequence.
+    try:
+        capture = run_approved_conversion(
+            interactive_check=_default_interactive_check,
+            approved=True,
+            destination_dir=destination,
+            final_converted_dir=converted_destination,
+            temp_output_parent=temp_output_parent,
+            free_bytes_probe=_default_free_bytes_probe,
+            isolated_python_env_ready=_default_isolated_python_env_ready(),
+            dependency_versions=_default_dependency_versions(),
+            downloader=downloader,
+            converter=converter,
+        )
+    except ColibriStage2Failure as exc:
+        _print_json({"mode": "approved_rejected", "rejection_category": exc.category})
+        return 1
+
+    # 6. Print only the closed conversion capture on success.
+    _print_json(capture)
     return 0
 
 

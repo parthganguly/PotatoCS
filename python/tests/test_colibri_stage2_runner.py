@@ -226,16 +226,44 @@ class _Fixture:
         self.shard_bytes = (b"shard-0", b"shard-1", b"shard-2")
         for name, data in zip(common.EXPECTED_SHARD_BASENAMES, self.shard_bytes):
             (self.model_dir / name).write_bytes(data)
-        self.manifest = _make_manifest(
-            engine_bytes=self.exe.read_bytes(),
-            config_bytes=self.config.read_bytes(),
-            shard_bytes=self.shard_bytes,
-        )
+        # Assigned by `_build_fixture`, which first patches
+        # common.REVIEWED_ENGINE_IDENTITY to match this fixture's own
+        # synthetic engine bytes -- OlmoeModelManifest now requires an
+        # exact match against the reviewed engine identity, so a fixture
+        # using arbitrary fake engine content can only construct a valid
+        # manifest once that identity is patched to agree with it.
+        self.manifest: manifest_mod.OlmoeModelManifest
+
+
+def _patch_reviewed_engine_identity(monkeypatch: pytest.MonkeyPatch, engine_bytes: bytes) -> None:
+    monkeypatch.setattr(
+        common,
+        "REVIEWED_ENGINE_IDENTITY",
+        common.ReviewedEngineIdentity(
+            colibri_commit=common.PINNED_COLIBRI_COMMIT,
+            basename=common.EXPECTED_ENGINE_BASENAME,
+            size_bytes=len(engine_bytes),
+            sha256=_sha256_bytes(engine_bytes),
+            source_date_epoch=common.REVIEWED_ENGINE_IDENTITY.source_date_epoch,
+            deterministic_build_count=2,
+        ),
+    )
+
+
+def _build_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Fixture:
+    result = _Fixture(tmp_path)
+    _patch_reviewed_engine_identity(monkeypatch, result.exe.read_bytes())
+    result.manifest = _make_manifest(
+        engine_bytes=result.exe.read_bytes(),
+        config_bytes=result.config.read_bytes(),
+        shard_bytes=result.shard_bytes,
+    )
+    return result
 
 
 @pytest.fixture()
-def fixture(tmp_path: Path) -> _Fixture:
-    return _Fixture(tmp_path)
+def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Fixture:
+    return _build_fixture(tmp_path, monkeypatch)
 
 
 @pytest.fixture()
@@ -722,9 +750,11 @@ def test_evidence_hash_changes_if_engine_identity_changes(
     root_a.mkdir()
     root_b = tmp_path / "engine-b"
     root_b.mkdir()
-    fixture_a = _Fixture(root_a)
+    fixture_a = _build_fixture(root_a, monkeypatch)
+
     fixture_b = _Fixture(root_b)
     fixture_b.exe.write_bytes(b"a completely different fake engine")
+    _patch_reviewed_engine_identity(monkeypatch, fixture_b.exe.read_bytes())
     fixture_b.manifest = _make_manifest(
         engine_bytes=fixture_b.exe.read_bytes(),
         config_bytes=fixture_b.config.read_bytes(),
@@ -757,11 +787,13 @@ def test_evidence_hash_changes_if_shard_identity_changes(
     root_a.mkdir()
     root_b = tmp_path / "shard-b"
     root_b.mkdir()
-    fixture_a = _Fixture(root_a)
+    fixture_a = _build_fixture(root_a, monkeypatch)
+
     fixture_b = _Fixture(root_b)
     tampered_shard_bytes = (b"different-shard-0", fixture_b.shard_bytes[1], fixture_b.shard_bytes[2])
     for name, data in zip(common.EXPECTED_SHARD_BASENAMES, tampered_shard_bytes):
         (fixture_b.model_dir / name).write_bytes(data)
+    _patch_reviewed_engine_identity(monkeypatch, fixture_b.exe.read_bytes())
     fixture_b.manifest = _make_manifest(
         engine_bytes=fixture_b.exe.read_bytes(),
         config_bytes=fixture_b.config.read_bytes(),

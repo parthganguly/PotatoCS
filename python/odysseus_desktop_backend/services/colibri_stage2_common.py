@@ -10,6 +10,7 @@ converts, or executes anything.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 # --- Pinned upstream contract (Stage 2A) -----------------------------------
@@ -167,3 +168,87 @@ def is_safe_basename(value: str) -> bool:
 
 def is_simple_version(value: str) -> bool:
     return isinstance(value, str) and bool(_SIMPLE_VERSION.fullmatch(value))
+
+
+# --- Reviewed real build evidence ------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedEngineIdentity:
+    """The one immutable, human-reviewed identity of the real,
+    deterministically-built ``olmoe.exe`` -- proven byte-identical across
+    two independent clean builds of the pinned Colibrì commit under a
+    fixed ``SOURCE_DATE_EPOCH``.
+
+    This proves reproducible compilation only. It is not a claim about
+    model loading or token generation.
+    """
+
+    colibri_commit: str
+    basename: str
+    size_bytes: int
+    sha256: str
+    source_date_epoch: int
+    deterministic_build_count: int
+
+    def __post_init__(self) -> None:
+        if not is_hex40(self.colibri_commit) or self.colibri_commit != PINNED_COLIBRI_COMMIT:
+            raise ValueError("reviewed engine identity colibri_commit does not match the pinned commit")
+        if self.basename != EXPECTED_ENGINE_BASENAME:
+            raise ValueError("reviewed engine identity basename does not match the expected engine")
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int) or self.size_bytes <= 0:
+            raise ValueError("reviewed engine identity size_bytes is out of bounds")
+        if not is_hex64(self.sha256):
+            raise ValueError("reviewed engine identity sha256 is not a SHA-256")
+        if (
+            isinstance(self.source_date_epoch, bool)
+            or not isinstance(self.source_date_epoch, int)
+            or self.source_date_epoch <= 0
+        ):
+            raise ValueError("reviewed engine identity source_date_epoch is out of bounds")
+        if self.deterministic_build_count != 2:
+            raise ValueError("reviewed engine identity must record exactly two deterministic builds")
+
+
+# Populated from the real, reviewed two-build verifier result: pinned
+# Colibrì commit `72d3d37231e922a6fa9afca16e08fa45842d5eb4`,
+# SOURCE_DATE_EPOCH `1784223580`, clean-build A and B SHA-256 both
+# `d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d`
+# (byte-identical). Never a caller-supplied override -- OlmoeModelManifest
+# requires its engine fields to equal this identity exactly.
+REVIEWED_ENGINE_IDENTITY = ReviewedEngineIdentity(
+    colibri_commit=PINNED_COLIBRI_COMMIT,
+    basename=EXPECTED_ENGINE_BASENAME,
+    size_bytes=704275,
+    sha256="d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d",
+    source_date_epoch=1784223580,
+    deterministic_build_count=2,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedConverterIdentity:
+    """The one immutable, human-reviewed identity of the pinned
+    ``convert_olmoe.py`` from the verified local Colibrì checkout at the
+    pinned commit. Never a caller-supplied override."""
+
+    basename: str
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.basename != EXPECTED_CONVERTER_SCRIPT_BASENAME:
+            raise ValueError("reviewed converter identity basename does not match the expected converter")
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int) or self.size_bytes <= 0:
+            raise ValueError("reviewed converter identity size_bytes is out of bounds")
+        if not is_hex64(self.sha256):
+            raise ValueError("reviewed converter identity sha256 is not a SHA-256")
+
+
+# Computed directly from the verified local pinned checkout
+# (`c/tools/convert_olmoe.py` at commit `72d3d37231e922a6fa9afca16e08fa45842d5eb4`).
+REVIEWED_CONVERTER_IDENTITY = ReviewedConverterIdentity(
+    basename=EXPECTED_CONVERTER_SCRIPT_BASENAME,
+    size_bytes=4469,
+    sha256="43f3ed1bad0cd89656c1a2ee17843d86ff33f670ff12c51a803f2b6361a5e168",
+)

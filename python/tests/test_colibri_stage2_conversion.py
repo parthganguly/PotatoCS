@@ -21,6 +21,7 @@ import pytest
 from odysseus_desktop_backend.services import colibri_stage2_common as common
 from odysseus_desktop_backend.services import colibri_stage2_conversion as conv
 from odysseus_desktop_backend.services import colibri_stage2_manifest as manifest_mod
+from odysseus_desktop_backend.services import colibri_stage2_path_safety as path_safety
 
 HASH_A = "a" * 64
 HASH_B = "b" * 64
@@ -342,11 +343,48 @@ def test_cli_approve_never_touches_network_and_fails_closed(
     exit_code = conv.main(
         ["--destination", str(destination), "--converted-destination", str(converted), "--approve"]
     )
-    assert exit_code == 0
+    assert exit_code != 0  # nonzero on a closed rejection
     out = capsys.readouterr().out
     assert '"mode": "approved_rejected"' in out
     assert '"rejection_category": "source_model_manifest_unreviewed"' in out
     assert not destination.exists()
+
+
+def test_cli_approve_blocks_before_every_side_effect_while_manifest_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With the source manifest empty, the CLI must fail closed before
+    # creating directories, opening the converter file, probing
+    # dependencies, making a network request, or launching a subprocess --
+    # so every one of those is wired to explode if reached.
+    import subprocess as subprocess_module
+    import urllib.request
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("must not run before the source manifest gate")
+
+    monkeypatch.setattr(conv, "_default_dependency_versions", _boom)
+    monkeypatch.setattr(conv, "_default_isolated_python_env_ready", _boom)
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+    monkeypatch.setattr(Path, "mkdir", _boom)
+
+    destination = tmp_path / "dest"
+    converted = tmp_path / "converted"
+    converter_script = tmp_path / "convert_olmoe.py"
+    exit_code = conv.main(
+        [
+            "--destination", str(destination),
+            "--converted-destination", str(converted),
+            "--converter-script", str(converter_script),
+            "--approve",
+        ]
+    )
+    assert exit_code != 0
+    out = capsys.readouterr().out
+    assert '"rejection_category": "source_model_manifest_unreviewed"' in out
+    assert not destination.exists()
+    assert not converted.exists()
     assert not converted.exists()
 
 
@@ -757,9 +795,6 @@ def test_run_approved_conversion_is_unreachable_while_manifest_is_empty(tmp_path
             free_bytes_probe=lambda path: 2**40,
             isolated_python_env_ready=True,
             dependency_versions={"torch": "2.3.0", "safetensors": "0.4.2"},
-            converter_basename=common.EXPECTED_CONVERTER_SCRIPT_BASENAME,
-            converter_size_bytes=10,
-            converter_sha256=HASH_A,
             downloader=_NeverCallDownloader(),
             converter=_NeverCallConverter(),
         )
@@ -804,14 +839,13 @@ def test_run_approved_conversion_full_sequence_with_reviewed_manifest(
         free_bytes_probe=lambda path: 2**40,
         isolated_python_env_ready=True,
         dependency_versions={"torch": "2.3.0", "safetensors": "0.4.2"},
-        converter_basename=common.EXPECTED_CONVERTER_SCRIPT_BASENAME,
-        converter_size_bytes=4096,
-        converter_sha256=HASH_B,
         downloader=downloader,
         converter=converter,
     )
 
     assert capture["state"] == "unreviewed_conversion_capture"
+    assert capture["converter_basename"] == common.REVIEWED_CONVERTER_IDENTITY.basename
+    assert capture["converter_sha256"] == common.REVIEWED_CONVERTER_IDENTITY.sha256
     assert len(capture["shards"]) == 3
     assert {shard["source_basename"] for shard in capture["shards"]} == set(SHARD_BASENAMES)
     assert downloader.calls == [CONFIG_BASENAME, *SHARD_BASENAMES]
@@ -824,6 +858,71 @@ def test_run_approved_conversion_full_sequence_with_reviewed_manifest(
         assert not (destination_dir / basename).exists()
     assert not (destination_dir / CONFIG_BASENAME).exists()  # moved, not copied
     assert list(temp_output_parent.iterdir()) == []
+
+
+def test_run_approved_conversion_never_overwrites_an_existing_final_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payloads = {
+        CONFIG_BASENAME: b'{"real": true}',
+        SHARD_BASENAMES[0]: b"source-0",
+        SHARD_BASENAMES[1]: b"source-1",
+        SHARD_BASENAMES[2]: b"source-2",
+    }
+    converted_payloads = {
+        SHARD_BASENAMES[0]: b"converted-0",
+        SHARD_BASENAMES[1]: b"converted-1",
+        SHARD_BASENAMES[2]: b"converted-2",
+    }
+    _reviewed_manifest(
+        monkeypatch,
+        shard_bytes=(payloads[SHARD_BASENAMES[0]], payloads[SHARD_BASENAMES[1]], payloads[SHARD_BASENAMES[2]]),
+        config_bytes=payloads[CONFIG_BASENAME],
+    )
+
+    destination_dir = tmp_path / "source"
+    final_converted_dir = tmp_path / "converted"
+    temp_output_parent = tmp_path / "scratch"
+    destination_dir.mkdir()
+    final_converted_dir.mkdir()
+    temp_output_parent.mkdir()
+
+    downloader = _FullRunDownloader(payloads)
+    converter = _FullRunConverter(converted_payloads)
+
+    # Simulate a race: something else places a config.json into the final
+    # directory exactly at the moment of the fourth (and last) atomic
+    # placement -- the config move itself. check_approved_preconditions
+    # already requires converted_dir to start empty, so the only way this
+    # scenario arises for real is a race occurring mid-run, not a
+    # pre-existing file before the run starts.
+    import unittest.mock as mock
+
+    real_atomic_move = conv.atomic_no_replace_move
+    call_count = {"n": 0}
+
+    def _racy_atomic_move(source: Path, destination: Path, *, exists_category: str) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 4:  # three shard placements, then the config placement
+            destination.write_bytes(b"a race-created, unrelated config")
+        real_atomic_move(source, destination, exists_category=exists_category)
+
+    with mock.patch.object(conv, "atomic_no_replace_move", side_effect=_racy_atomic_move):
+        with pytest.raises(conv.ColibriStage2Failure, match="converted_shard_already_exists"):
+            conv.run_approved_conversion(
+                interactive_check=lambda: True,
+                approved=True,
+                destination_dir=destination_dir,
+                final_converted_dir=final_converted_dir,
+                temp_output_parent=temp_output_parent,
+                free_bytes_probe=lambda path: 2**40,
+                isolated_python_env_ready=True,
+                dependency_versions={"torch": "2.3.0", "safetensors": "0.4.2"},
+                downloader=downloader,
+                converter=converter,
+            )
+    # The race-created final config survives completely untouched.
+    assert (final_converted_dir / CONFIG_BASENAME).read_bytes() == b"a race-created, unrelated config"
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1024,31 @@ def test_pinned_script_converter_rejects_wrong_script_basename(tmp_path: Path) -
         converter.convert(model_dir=tmp_path, output_dir=tmp_path)
 
 
+def _patch_reviewed_converter_identity(monkeypatch: pytest.MonkeyPatch, script_path: Path) -> None:
+    data = script_path.read_bytes()
+    monkeypatch.setattr(
+        common,
+        "REVIEWED_CONVERTER_IDENTITY",
+        common.ReviewedConverterIdentity(
+            basename=script_path.name,
+            size_bytes=len(data),
+            sha256=_sha256(data),
+        ),
+    )
+
+
+def test_pinned_script_converter_rejects_content_not_matching_reviewed_hash(tmp_path: Path) -> None:
+    # Correct basename, but the CLI never trusts a caller-provided expected
+    # hash -- the real bytes must match common.REVIEWED_CONVERTER_IDENTITY,
+    # which this test deliberately leaves unpatched (still the real pinned
+    # identity), so this synthetic 4-byte script cannot possibly match it.
+    script = tmp_path / "convert_olmoe.py"
+    script.write_text("pass")
+    converter = conv.PinnedScriptConverter(converter_script_path=script)
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        converter.convert(model_dir=tmp_path, output_dir=tmp_path)
+
+
 def test_pinned_script_converter_uses_shell_free_argv_with_current_interpreter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -933,6 +1057,7 @@ def test_pinned_script_converter_uses_shell_free_argv_with_current_interpreter(
 
     script = tmp_path / "convert_olmoe.py"
     script.write_text("pass")
+    _patch_reviewed_converter_identity(monkeypatch, script)
     recorded: dict[str, object] = {}
 
     def _fake_run(argv: list[str], **kwargs: object) -> None:
@@ -946,6 +1071,59 @@ def test_pinned_script_converter_uses_shell_free_argv_with_current_interpreter(
     assert recorded["argv"][0] == sys.executable
     assert recorded["argv"][1] == str(script)
     assert recorded["kwargs"]["shell"] is False
+
+
+def test_converter_argv_uses_model_and_out_never_output_or_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as subprocess_module
+
+    script = tmp_path / "convert_olmoe.py"
+    script.write_text("pass")
+    _patch_reviewed_converter_identity(monkeypatch, script)
+    recorded: dict[str, object] = {}
+
+    def _fake_run(argv: list[str], **kwargs: object) -> None:
+        recorded["argv"] = argv
+
+    monkeypatch.setattr(subprocess_module, "run", _fake_run)
+    converter = conv.PinnedScriptConverter(converter_script_path=script)
+    model_dir = tmp_path / "model"
+    output_dir = tmp_path / "out"
+    converter.convert(model_dir=model_dir, output_dir=output_dir)
+
+    argv = recorded["argv"]
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == str(model_dir)
+    assert "--out" in argv
+    assert argv[argv.index("--out") + 1] == str(output_dir)
+    assert "--output" not in argv
+    assert "--repo" not in argv
+
+
+def test_reviewed_converter_identity_matches_the_verified_local_checkout() -> None:
+    checkout_script = Path(
+        r"C:\Users\Parth Ganguly\Documents\Codex\odysseus-colibri-proof-deps\colibri-72d3d372\c\tools\convert_olmoe.py"
+    )
+    if not checkout_script.is_file():
+        pytest.skip("verified local Colibrì checkout is not present on this machine")
+    data = checkout_script.read_bytes()
+    assert checkout_script.name == common.REVIEWED_CONVERTER_IDENTITY.basename
+    assert len(data) == common.REVIEWED_CONVERTER_IDENTITY.size_bytes
+    assert hashlib.sha256(data).hexdigest() == common.REVIEWED_CONVERTER_IDENTITY.sha256
+
+
+def test_require_reviewed_converter_identity_rejects_tampered_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = tmp_path / "convert_olmoe.py"
+    script.write_bytes(b"original-bytes-x")
+    _patch_reviewed_converter_identity(monkeypatch, script)
+    conv.require_reviewed_converter_identity(script)  # matches -- no raise
+
+    script.write_bytes(b"tampered-bytes-x")  # same length, different content/hash
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        conv.require_reviewed_converter_identity(script)
 
 
 # ---------------------------------------------------------------------------
@@ -966,9 +1144,6 @@ def _capture_kwargs(**overrides: object) -> dict[str, object]:
         for basename in SHARD_BASENAMES
     ]
     kwargs: dict[str, object] = dict(
-        converter_basename=common.EXPECTED_CONVERTER_SCRIPT_BASENAME,
-        converter_size_bytes=4096,
-        converter_sha256=HASH_B,
         source_config=_entry(CONFIG_BASENAME, b'{"fake": true}'),
         converted_config_sha256=HASH_A,
         converted_config_size_bytes=64,
@@ -1022,3 +1197,276 @@ def test_conversion_capture_never_validates_as_a_reviewed_manifest() -> None:
         manifest_mod.OlmoeModelManifest(**capture)  # type: ignore[arg-type]
     assert "schema_version" in capture  # a key OlmoeModelManifest does not accept
     assert "shards" in capture
+
+
+# ---------------------------------------------------------------------------
+# Path-safety ancestor-walk-order correction (Blocker/Part 5)
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_ancestor_is_rejected_before_resolution(tmp_path: Path) -> None:
+    # The real regression: an ANCESTOR of the target directory (not the
+    # leaf itself) is a symlink. The old, buggy implementation resolved
+    # the leaf path first and only then walked the *resolved* path's
+    # ancestors -- silently erasing this symlinked segment from the chain
+    # before it was ever inspected, which would have incorrectly PASSED
+    # this case. The corrected implementation walks the original lexical
+    # chain first.
+    real_target = tmp_path / "real-ancestor"
+    real_target.mkdir()
+    leaf = real_target / "actual-dir"
+    leaf.mkdir()
+    link_ancestor = tmp_path / "link-ancestor"
+    try:
+        link_ancestor.symlink_to(real_target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is not permitted on this machine")
+
+    candidate = link_ancestor / "actual-dir"
+    with pytest.raises(conv.ColibriStage2Failure, match="unsafe_directory_rejected"):
+        path_safety.require_ordinary_directory(
+            candidate, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+        )
+
+
+def test_synthetic_reparse_ancestor_is_rejected_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A Windows-reparse-point analog of the symlink-ancestor test above,
+    # for machines where creating real symlinks is not permitted. Only the
+    # ANCESTOR is tampered -- the leaf itself is an ordinary directory.
+    ancestor = tmp_path / "junction-like-ancestor"
+    ancestor.mkdir()
+    leaf = ancestor / "child"
+    leaf.mkdir()
+
+    real_lstat = path_safety.os.lstat
+
+    class _FakeStatResult:
+        def __init__(self, real_result: object) -> None:
+            self.st_mode = real_result.st_mode  # type: ignore[attr-defined]
+            self.st_file_attributes = 0x400
+
+    def _fake_lstat(path: object, *args: object, **kwargs: object):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) == ancestor:  # type: ignore[arg-type]
+            return _FakeStatResult(result)
+        return result
+
+    monkeypatch.setattr(path_safety.os, "lstat", _fake_lstat)
+    with pytest.raises(conv.ColibriStage2Failure, match="unsafe_directory_rejected"):
+        path_safety.require_ordinary_directory(
+            leaf, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+        )
+
+
+def test_require_ordinary_directory_accepts_a_clean_nested_path(tmp_path: Path) -> None:
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    resolved = path_safety.require_ordinary_directory(
+        nested, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
+    assert resolved.is_dir()
+
+
+def test_require_ordinary_directory_rejects_relative_paths() -> None:
+    with pytest.raises(conv.ColibriStage2Failure, match="unsafe_directory_rejected"):
+        path_safety.require_ordinary_directory(
+            Path("relative/path"),
+            missing_category="unsafe_directory_rejected",
+            reparse_category="unsafe_directory_rejected",
+        )
+
+
+@pytest.mark.parametrize(
+    "basename",
+    [
+        "a/b",
+        "a\\b",
+        "/etc/passwd",
+        "\\\\server\\share",
+        "C:foo",
+        "C:\\foo",
+        ".",
+        "..",
+        "..\\config.json",
+        "../config.json",
+        "",
+    ],
+    ids=[
+        "forward-slash",
+        "backslash",
+        "posix-absolute",
+        "unc-style",
+        "drive-qualified-relative",
+        "drive-qualified-absolute",
+        "dot",
+        "dot-dot",
+        "traversal-backslash",
+        "traversal-forward-slash",
+        "empty",
+    ],
+)
+def test_require_direct_child_path_rejects_unsafe_basenames(tmp_path: Path, basename: str) -> None:
+    resolved_dir = path_safety.require_ordinary_directory(
+        tmp_path, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
+    with pytest.raises(conv.ColibriStage2Failure, match="unsafe_directory_rejected"):
+        path_safety.require_direct_child_path(resolved_dir, basename, category="unsafe_directory_rejected")
+
+
+def test_require_direct_child_path_accepts_an_ordinary_basename(tmp_path: Path) -> None:
+    resolved_dir = path_safety.require_ordinary_directory(
+        tmp_path, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
+    candidate = path_safety.require_direct_child_path(
+        resolved_dir, "config.json", category="unsafe_directory_rejected"
+    )
+    assert candidate == resolved_dir / "config.json"
+
+
+# ---------------------------------------------------------------------------
+# Atomic no-replace placement (Blocker/Part 6)
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_no_replace_move_happy_path(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+    path_safety.atomic_no_replace_move(source, destination, exists_category="converted_shard_already_exists")
+    assert destination.read_bytes() == b"payload"
+    assert not source.exists()
+
+
+def test_atomic_no_replace_move_rejects_a_race_created_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+    # Simulate a destination introduced by a concurrent racer immediately
+    # before placement.
+    destination.write_bytes(b"race winner content")
+
+    with pytest.raises(conv.ColibriStage2Failure, match="converted_shard_already_exists"):
+        path_safety.atomic_no_replace_move(source, destination, exists_category="converted_shard_already_exists")
+
+    # The race-created destination survives completely unchanged, and the
+    # source is never consumed by a failed attempt.
+    assert destination.read_bytes() == b"race winner content"
+    assert source.read_bytes() == b"payload"
+
+
+def test_shard_transaction_no_replace_rejects_race_created_final_shard(tmp_path: Path) -> None:
+    # A destination file introduced immediately before the atomic move
+    # step (after the "already exists" pre-check has already passed) must
+    # still be rejected, not silently overwritten.
+    destination_dir, config_path, final_converted_dir, temp_output_parent = _shard_setup(tmp_path)
+    shard_payload = b"source shard bytes"
+    entry = _entry(SHARD_BASENAMES[0], shard_payload)
+    downloader = _RecordingDownloader({SHARD_BASENAMES[0]: shard_payload})
+    converted_payload = b"converted bytes"
+    converter = _RecordingConverter(converted_payload)
+
+    real_atomic_move = conv.atomic_no_replace_move
+
+    def _racy_atomic_move(source: Path, destination: Path, *, exists_category: str) -> None:
+        destination.write_bytes(b"race winner content")
+        real_atomic_move(source, destination, exists_category=exists_category)
+
+    import unittest.mock as mock
+
+    with mock.patch.object(conv, "atomic_no_replace_move", side_effect=_racy_atomic_move):
+        with pytest.raises(conv.ColibriStage2Failure, match="converted_shard_already_exists"):
+            conv.run_shard_transaction(
+                expected_source=entry,
+                destination_dir=destination_dir,
+                config_path=config_path,
+                final_converted_dir=final_converted_dir,
+                temp_output_parent=temp_output_parent,
+                downloader=downloader,
+                converter=converter,
+            )
+    assert (final_converted_dir / SHARD_BASENAMES[0]).read_bytes() == b"race winner content"
+
+
+# ---------------------------------------------------------------------------
+# Approved CLI full integration (Part 4/7) -- fake network/subprocess only
+# ---------------------------------------------------------------------------
+
+
+def test_cli_approve_invokes_orchestrator_when_gates_are_synthetically_satisfied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import subprocess as subprocess_module
+    import urllib.request
+
+    payloads = {
+        CONFIG_BASENAME: b'{"real": true}',
+        SHARD_BASENAMES[0]: b"source-0",
+        SHARD_BASENAMES[1]: b"source-1",
+        SHARD_BASENAMES[2]: b"source-2",
+    }
+    _reviewed_manifest(
+        monkeypatch,
+        shard_bytes=(payloads[SHARD_BASENAMES[0]], payloads[SHARD_BASENAMES[1]], payloads[SHARD_BASENAMES[2]]),
+        config_bytes=payloads[CONFIG_BASENAME],
+    )
+
+    converter_script = tmp_path / "convert_olmoe.py"
+    converter_script.write_text("pass")
+    _patch_reviewed_converter_identity(monkeypatch, converter_script)
+
+    monkeypatch.setattr(conv, "_default_isolated_python_env_ready", lambda: True)
+    monkeypatch.setattr(conv, "_default_dependency_versions", lambda: {"torch": "2.3.0", "safetensors": "0.4.2"})
+    monkeypatch.setattr(conv, "_default_interactive_check", lambda: True)
+    monkeypatch.setattr(conv, "_default_free_bytes_probe", lambda path: 2**40)
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes) -> None:
+            self._remaining = payload
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self, size: int) -> bytes:
+            chunk, self._remaining = self._remaining[:size], self._remaining[size:]
+            return chunk
+
+    def _fake_urlopen(request: urllib.request.Request, timeout: float) -> _FakeResponse:
+        requested_basename = request.full_url.rsplit("/", 1)[-1]
+        return _FakeResponse(payloads[requested_basename])
+
+    def _fake_subprocess_run(argv: list[str], **kwargs: object) -> None:
+        model_dir = Path(argv[argv.index("--model") + 1])
+        output_dir = Path(argv[argv.index("--out") + 1])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / CONFIG_BASENAME).write_bytes((model_dir / CONFIG_BASENAME).read_bytes())
+        shard_names = [entry.name for entry in model_dir.iterdir() if entry.name != CONFIG_BASENAME]
+        assert len(shard_names) == 1
+        (output_dir / shard_names[0]).write_bytes(b"converted-" + shard_names[0].encode("ascii"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(subprocess_module, "run", _fake_subprocess_run)
+
+    destination = tmp_path / "dest"
+    converted = tmp_path / "converted"
+    exit_code = conv.main(
+        [
+            "--destination", str(destination),
+            "--converted-destination", str(converted),
+            "--converter-script", str(converter_script),
+            "--approve",
+        ]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert '"state": "unreviewed_conversion_capture"' in out
+    assert '"mode"' not in out  # only the closed capture is printed on success
+    assert (converted / CONFIG_BASENAME).exists()
+    for basename in SHARD_BASENAMES:
+        assert (converted / basename).exists()
+        assert not (destination / basename).exists()

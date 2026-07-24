@@ -23,9 +23,9 @@ def _valid_kwargs(**overrides: object) -> dict[str, object]:
         license_identifier=common.PINNED_LICENSE_IDENTIFIER,
         colibri_commit=common.PINNED_COLIBRI_COMMIT,
         converter_source_sha256=HASH64,
-        engine_basename=common.EXPECTED_ENGINE_BASENAME,
-        engine_size_bytes=1024,
-        engine_sha256=HASH64_B,
+        engine_basename=common.REVIEWED_ENGINE_IDENTITY.basename,
+        engine_size_bytes=common.REVIEWED_ENGINE_IDENTITY.size_bytes,
+        engine_sha256=common.REVIEWED_ENGINE_IDENTITY.sha256,
         config_basename=common.EXPECTED_CONFIG_BASENAME,
         config_size_bytes=64,
         config_sha256=HASH64_C,
@@ -141,3 +141,59 @@ def test_stage2_failure_rejects_unknown_category() -> None:
 def test_stage2_failure_rejects_non_numeric_metadata() -> None:
     with pytest.raises(ValueError):
         manifest_mod.ColibriStage2Failure("reviewed_model_manifest_unavailable", detail="leaky string")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Reviewed real engine identity (Part 1)
+# ---------------------------------------------------------------------------
+
+
+def test_reviewed_engine_identity_contains_the_real_size_and_sha() -> None:
+    identity = common.REVIEWED_ENGINE_IDENTITY
+    assert identity.colibri_commit == common.PINNED_COLIBRI_COMMIT
+    assert identity.basename == "olmoe.exe"
+    assert identity.size_bytes == 704275
+    assert identity.sha256 == "d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d"
+    assert identity.source_date_epoch == 1784223580
+    assert identity.deterministic_build_count == 2
+
+
+def test_reviewed_engine_identity_requires_exactly_two_builds() -> None:
+    with pytest.raises(ValueError):
+        common.ReviewedEngineIdentity(
+            colibri_commit=common.PINNED_COLIBRI_COMMIT,
+            basename=common.EXPECTED_ENGINE_BASENAME,
+            size_bytes=704275,
+            sha256="d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d",
+            source_date_epoch=1784223580,
+            deterministic_build_count=1,
+        )
+
+
+def test_manifest_rejects_any_other_engine_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="engine_size_bytes"):
+        manifest_mod.OlmoeModelManifest(
+            **_valid_kwargs(engine_size_bytes=common.REVIEWED_ENGINE_IDENTITY.size_bytes + 1)
+        )
+
+
+def test_manifest_rejects_any_other_engine_sha256() -> None:
+    with pytest.raises(ValueError, match="engine_sha256"):
+        manifest_mod.OlmoeModelManifest(**_valid_kwargs(engine_sha256="1" * 64))
+
+
+def test_manifest_rejects_any_other_engine_basename() -> None:
+    with pytest.raises(ValueError):
+        manifest_mod.OlmoeModelManifest(**_valid_kwargs(engine_basename="glm.exe"))
+
+
+def test_manifest_cannot_authorize_an_arbitrary_but_well_formed_engine() -> None:
+    # A caller supplying a perfectly well-formed (right length, hex,
+    # positive size) but DIFFERENT engine identity must still be rejected
+    # -- well-formedness alone is not enough to authorize a different
+    # engine than the one actually reviewed.
+    arbitrary_sha256 = "9" * 64
+    with pytest.raises(ValueError):
+        manifest_mod.OlmoeModelManifest(
+            **_valid_kwargs(engine_size_bytes=999999, engine_sha256=arbitrary_sha256)
+        )
