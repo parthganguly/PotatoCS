@@ -19,6 +19,8 @@ $ExpectedStdout = [Text.Encoding]::ASCII.GetBytes(
 )
 $MaxStreamBytes = 4096
 $TimeoutMilliseconds = 30000
+$ExpectedOlmoeBasename = 'olmoe.exe'
+$BuildTimeoutMilliseconds = 900000
 
 function Invoke-CheckedGit {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
@@ -44,6 +46,37 @@ function Test-ExactBytes {
     for ($index = 0; $index -lt $Expected.Length; $index++) {
         if ($Actual[$index] -ne $Expected[$index]) {
             return $false
+        }
+    }
+    return $true
+}
+
+function Test-NoEmbeddedBuildRoot {
+    # Deterministic (SOURCE_DATE_EPOCH-pinned) builds must not bake the
+    # absolute clean-build directory into the produced binary; otherwise two
+    # builds performed under different roots could never be byte-identical
+    # for a reason unrelated to actual reproducibility.
+    param([string]$BinaryPath, [string]$ForbiddenRoot)
+
+    $bytes = [IO.File]::ReadAllBytes($BinaryPath)
+    $needleAnsi = [Text.Encoding]::ASCII.GetBytes($ForbiddenRoot)
+    $needleUtf8 = [Text.Encoding]::UTF8.GetBytes($ForbiddenRoot)
+    foreach ($needle in @($needleAnsi, $needleUtf8)) {
+        if ($needle.Length -eq 0) {
+            continue
+        }
+        $limit = $bytes.Length - $needle.Length
+        for ($offset = 0; $offset -le $limit; $offset++) {
+            $matched = $true
+            for ($index = 0; $index -lt $needle.Length; $index++) {
+                if ($bytes[$offset + $index] -ne $needle[$index]) {
+                    $matched = $false
+                    break
+                }
+            }
+            if ($matched) {
+                return $false
+            }
         }
     }
     return $true
@@ -118,6 +151,39 @@ function Invoke-BoundedOracle {
     }
 }
 
+function Invoke-BoundedBuild {
+    # Runs one MSYS2 UCRT64 make invocation under a fixed absolute time
+    # limit and returns the elapsed milliseconds. SOURCE_DATE_EPOCH is
+    # inherited from the caller's process environment.
+    param([string]$Launcher, [string]$WorkingDirectory, [string]$Command)
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Launcher
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.Arguments = "-defterm -here -no-start -ucrt64 -c `"$Command`""
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    if (-not $process.Start()) {
+        throw 'native build could not be started'
+    }
+    try {
+        if (-not $process.WaitForExit($BuildTimeoutMilliseconds)) {
+            $process.Kill()
+            throw 'native build exceeded the fixed time limit'
+        }
+        $timer.Stop()
+        if ($process.ExitCode -ne 0) {
+            throw 'native build failed'
+        }
+    } finally {
+        $process.Dispose()
+    }
+    return $timer.ElapsedMilliseconds
+}
+
 $launcher = Join-Path $Msys2Root 'msys2_shell.cmd'
 $gcc = Join-Path $Msys2Root 'ucrt64\bin\gcc.exe'
 $make = Join-Path $Msys2Root 'usr\bin\make.exe'
@@ -152,11 +218,11 @@ foreach ($label in @('build-a', 'build-b')) {
     Push-Location $cRoot
     try {
         $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
-        & $launcher -defterm -here -no-start -ucrt64 -c `
-            'make glm.exe ARCH=x86-64-v3 && make tests/test_idot.exe ARCH=x86-64-v3'
-        if ($LASTEXITCODE -ne 0) {
-            throw 'native build failed'
-        }
+        $buildDurationMs = Invoke-BoundedBuild -Launcher $launcher -WorkingDirectory $cRoot -Command (
+            'make glm.exe ARCH=x86-64-v3 && ' +
+            'make tests/test_idot.exe ARCH=x86-64-v3 && ' +
+            'make olmoe.exe ARCH=x86-64-v3'
+        )
     } finally {
         Remove-Item Env:SOURCE_DATE_EPOCH -ErrorAction SilentlyContinue
         Pop-Location
@@ -165,6 +231,14 @@ foreach ($label in @('build-a', 'build-b')) {
     $engine = Join-Path $cRoot 'glm.exe'
     $oracle = Join-Path $cRoot 'tests\test_idot.exe'
     $fixture = Join-Path $cRoot 'tests\test_idot.c'
+    $olmoe = Join-Path $cRoot $ExpectedOlmoeBasename
+    if (-not (Test-Path -LiteralPath $olmoe -PathType Leaf) -or
+        (Get-Item -LiteralPath $olmoe).Name -cne $ExpectedOlmoeBasename) {
+        throw 'olmoe.exe was not produced with the exact expected basename'
+    }
+    if (-not (Test-NoEmbeddedBuildRoot -BinaryPath $olmoe -ForbiddenRoot $target)) {
+        throw 'olmoe.exe embeds the clean-build root path'
+    }
     $run = @(Invoke-BoundedOracle -Executable $oracle -WorkingDirectory (Split-Path $oracle))
     if ($run.Count -ne 1 -or $run[0].PSObject.Properties.Name -notcontains 'ExitCode') {
         throw 'oracle result metadata is invalid'
@@ -181,6 +255,9 @@ foreach ($label in @('build-a', 'build-b')) {
         OracleExitCode = $runResult.ExitCode
         StdoutBytes = $runResult.StdoutBytes
         StderrBytes = $runResult.StderrBytes
+        OlmoeSha256 = Get-Sha256 $olmoe
+        OlmoeBytes = (Get-Item -LiteralPath $olmoe).Length
+        OlmoeBuildDurationMs = $buildDurationMs
     }
 }
 
@@ -195,6 +272,12 @@ if ($first.EngineSha256 -ne $second.EngineSha256 -or
 if ($first.FixtureSha256 -ne $ExpectedFixtureSha256 -or
     $second.FixtureSha256 -ne $ExpectedFixtureSha256) {
     throw 'fixture hash does not match the pinned source'
+}
+$olmoeDeterministicallyEqual = (
+    $first.OlmoeSha256 -eq $second.OlmoeSha256 -and $first.OlmoeBytes -eq $second.OlmoeBytes
+)
+if (-not $olmoeDeterministicallyEqual) {
+    throw 'olmoe.exe clean builds are not byte-identical'
 }
 
 [pscustomobject]@{
@@ -212,4 +295,15 @@ if ($first.FixtureSha256 -ne $ExpectedFixtureSha256 -or
     StdoutBytes = $first.StdoutBytes
     StderrBytes = $first.StderrBytes
     MaxStreamBytes = $MaxStreamBytes
+    Olmoe = [pscustomobject]@{
+        Category = 'passed'
+        Commit = $PinnedCommit
+        OlmoeBasename = $ExpectedOlmoeBasename
+        OlmoeBytes = $first.OlmoeBytes
+        OlmoeSha256A = $first.OlmoeSha256
+        OlmoeSha256B = $second.OlmoeSha256
+        DeterministicallyEqual = $olmoeDeterministicallyEqual
+        BuildDurationMsA = $first.OlmoeBuildDurationMs
+        BuildDurationMsB = $second.OlmoeBuildDurationMs
+    }
 }
