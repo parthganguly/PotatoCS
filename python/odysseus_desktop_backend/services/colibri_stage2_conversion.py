@@ -19,15 +19,35 @@ GiB free, none of which this module supplies on its own. It provides:
   the real approved sequence calls, exercised only with injected fakes in
   tests;
 * default real adapters (a pinned-revision single-file downloader and a
-  pinned-converter-script invoker) used only once a reviewed manifest and
-  explicit approval are both present;
+  converter invoker) used only once a reviewed manifest and explicit
+  approval are both present;
+* safe resumability: a run interrupted at any point continues from what
+  was already *proven*, never from what merely exists. Every reused file
+  -- source shard, config, or converted artifact -- must first pass a
+  complete identity proof (pinned basename, exact size, exact SHA-256,
+  ordinary regular file, direct child, non-reparse). A partial file
+  always fails that proof, so it is never trusted; an existing converted
+  artifact is never overwritten;
+* closed, distinguished conversion-failure evidence: a converter that
+  timed out, one that exited nonzero, and one the OS killed with a native
+  exception are three separate categories carrying only bounded numbers
+  (return code, elapsed time, peak memory) -- never raw output, an
+  environment value, a username, or a path;
 * a closed, privacy-safe conversion capture shape distinct from
   ``OlmoeModelManifest`` -- it can never itself authorize inference.
+
+The default converter is the in-repo memory-bounded
+``colibri_stage2_bounded_convert``, which reproduces the pinned upstream
+converter's quantization arithmetic exactly while bounding peak memory by
+a chunk budget rather than by shard size. The unmodified upstream script
+remains available behind ``--converter pinned-script``, but needs roughly
+10 GiB of resident memory per shard and cannot complete on a 16 GiB host.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat as stat_module
@@ -39,6 +59,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded_convert
 from odysseus_desktop_backend.services import colibri_stage2_common as common
 from odysseus_desktop_backend.services.colibri_stage2_common import (
     ALLOWED_CONVERSION_DEPENDENCY_NAMES,
@@ -55,6 +76,8 @@ from odysseus_desktop_backend.services.colibri_stage2_common import (
     PINNED_MODEL_REPOSITORY,
     PINNED_MODEL_REVISION,
     REQUIRED_FREE_SPACE_BYTES,
+    RESUME_LEDGER_BASENAME,
+    RESUME_LEDGER_SCHEMA_VERSION,
     ColibriStage2Failure,
     is_hex64,
     is_safe_basename,
@@ -197,12 +220,16 @@ def build_dry_run_plan(destination: Path) -> DryRunPlan:
         destination=str(destination),
         steps=(
             "download config.json once from the immutable revision and keep it available",
+            "reuse any already-present source or converted file only after its exact "
+            "pinned basename, size, and SHA-256 all verify; never trust a partial file",
             "for each of the three shards, in order: download and verify only that shard",
             "create a new empty per-shard converter-output directory",
-            f"run the unmodified pinned {EXPECTED_CONVERTER_SCRIPT_BASENAME} through the current venv Python",
+            "run the memory-bounded converter through the current venv Python as a child "
+            "process, with peak memory bounded by a chunk budget rather than by shard size",
             "verify the temporary output contains exactly config.json and that one converted shard",
             "verify the converted config remains byte-identical, then hash and record the converted shard",
             "atomically move the converted shard into the final directory only if absent",
+            "record the proven converted shard identity in the resume ledger immediately",
             "delete the corresponding source shard only after the above succeeds, and verify the deletion",
             "remove and verify removal of the per-shard temporary output",
             "copy the verified config into the final directory exactly once, after every shard succeeds",
@@ -226,20 +253,28 @@ def check_approved_preconditions(
     free_bytes_probe: Callable[[Path], int],
     isolated_python_env_ready: bool,
     dependency_versions: Mapping[str, str],
+    allow_resume: bool = False,
 ) -> Mapping[str, SourceShardEntry]:
     """The full approved-mode gate, checked before any network activity.
 
     Returns the reviewed source manifest on success. Every check here runs
     before a single byte is downloaded, and while the reviewed source
     manifest stays empty, no other check result can ever unblock a run.
+
+    ``allow_resume`` relaxes exactly one check -- the "roots must be
+    absent or empty" precondition -- and nothing else. It never weakens
+    any identity proof: a resumed run still verifies every reused file's
+    basename, exact size, and SHA-256 before touching it. Non-resume runs
+    keep the original strict behaviour, so the default is unchanged.
     """
 
     reviewed = require_reviewed_source_manifest()
     if not approved or not interactive_check():
         raise ColibriStage2Failure("noninteractive_approval_rejected")
-    for directory in (destination_dir, converted_dir):
-        if directory.exists() and any(directory.iterdir()):
-            raise ColibriStage2Failure("destination_not_empty")
+    if not allow_resume:
+        for directory in (destination_dir, converted_dir):
+            if directory.exists() and any(directory.iterdir()):
+                raise ColibriStage2Failure("destination_not_empty")
     if free_bytes_probe(destination_dir) < REQUIRED_FREE_SPACE_BYTES:
         raise ColibriStage2Failure("insufficient_disk_space")
     if not isolated_python_env_ready:
@@ -265,7 +300,10 @@ class Downloader(Protocol):
 
 
 class Converter(Protocol):
-    def convert(self, *, model_dir: Path, output_dir: Path) -> None: ...
+    """A converter may return bounded run evidence, or ``None`` when it has
+    none to offer (every synthetic test fake takes the latter path)."""
+
+    def convert(self, *, model_dir: Path, output_dir: Path) -> ConversionRunEvidence | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +394,270 @@ class PinnedRevisionFileDownloader:
             raise
 
 
+# ---------------------------------------------------------------------------
+# Closed, privacy-safe converter-process evidence
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ConversionRunEvidence:
+    """Bounded, structured evidence about one converter child process.
+
+    Only numbers: how long it ran and how much memory it peaked at. Never
+    stdout, never stderr, never an environment value, never a path.
+    ``peak_*`` are ``None`` whenever the OS would not report them -- they
+    are evidence, never a pass/fail input.
+    """
+
+    elapsed_ms: int
+    peak_memory_bytes: int | None
+    peak_commit_bytes: int | None
+
+
+def classify_process_exit(returncode: int) -> tuple[str, dict[str, int]]:
+    """Turn a raw child return code into a closed category plus numbers.
+
+    Three outcomes that the previous single ``conversion_failed`` category
+    could not tell apart:
+
+    * ``ok`` -- clean exit;
+    * ``conversion_process_crashed`` -- the OS killed it. On Windows a
+      process terminated by an unhandled native exception reports the
+      NTSTATUS as its exit code with the severity bits set, so the real
+      access violation observed on the target host surfaces as
+      ``0xc0000005`` (3221225477), not as some ordinary small exit code.
+      On POSIX a signalled child reports a negative return code.
+    * ``conversion_nonzero_exit`` -- it exited under its own control with
+      a nonzero status (a bad argument, a missing dependency, an
+      unreadable shard).
+    """
+
+    if returncode == 0:
+        return "ok", {}
+    if returncode < 0:
+        return "conversion_process_crashed", {"exit_code": -returncode}
+    unsigned = returncode & 0xFFFFFFFF
+    if unsigned & 0x80000000:
+        return "conversion_process_crashed", {"win32_code": unsigned}
+    return "conversion_nonzero_exit", {"exit_code": unsigned}
+
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+
+def _create_memory_accounting_job() -> Any:
+    """A Windows Job Object used purely to *account* for memory.
+
+    No limit is ever configured on it -- it imposes nothing on the
+    converter and cannot cause a failure. It exists because a per-process
+    handle probe measures the wrong process: a virtual environment's
+    ``Scripts\\python.exe`` is a redirector stub that runs the real
+    interpreter as a *grandchild*, so ``GetProcessMemoryInfo`` on the
+    handle returned by ``Popen`` reports only the few MiB of the stub. A
+    job accounts for the whole tree, and its peak counters stay readable
+    after every member has exited -- exactly the case that matters when a
+    converter is killed for exhausting memory.
+
+    Returns ``None`` on any failure; this is evidence, never a gate.
+    """
+
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        job = kernel32.CreateJobObjectW(None, None)
+        return job or None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _assign_process_to_job(job: Any, process: Any) -> None:
+    if job is None or sys.platform != "win32":
+        return
+    handle = getattr(process, "_handle", None)
+    if handle is None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject(wintypes.HANDLE(int(job)), wintypes.HANDLE(int(handle)))
+    except (AttributeError, OSError, ValueError):
+        return
+
+
+def _peak_job_memory(job: Any) -> tuple[int | None, int | None]:
+    """Best-effort ``(peak per-process, peak whole-job)`` memory in bytes.
+
+    Both are plain byte counts; neither can carry a path, an environment
+    value, or any converter output. Any failure yields ``(None, None)``.
+    """
+
+    if job is None or sys.platform != "win32":
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # argtypes are mandatory, not cosmetic: without them ctypes passes
+        # the struct pointer as a 32-bit int, so the call still returns
+        # TRUE while filling a truncated address and reporting nonsense.
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+
+        information = _ExtendedLimitInformation()
+        returned = wintypes.DWORD(0)
+        if not kernel32.QueryInformationJobObject(
+            wintypes.HANDLE(int(job)),
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            ctypes.byref(returned),
+        ):
+            return None, None
+        return int(information.PeakProcessMemoryUsed), int(information.PeakJobMemoryUsed)
+    except (AttributeError, OSError, ValueError):
+        return None, None
+
+
+def _close_job(job: Any) -> None:
+    if job is None or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(int(job)))
+    except (AttributeError, OSError, ValueError):
+        return
+
+
+def _bounded_metadata(
+    peak_memory_bytes: int | None, peak_commit_bytes: int | None
+) -> dict[str, int]:
+    metadata: dict[str, int] = {}
+    if isinstance(peak_memory_bytes, int) and peak_memory_bytes >= 0:
+        metadata["peak_memory_bytes"] = peak_memory_bytes
+    if isinstance(peak_commit_bytes, int) and peak_commit_bytes >= 0:
+        metadata["peak_commit_bytes"] = peak_commit_bytes
+    return metadata
+
+
+def run_converter_child(
+    argv: Sequence[str],
+    *,
+    deadline_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> ConversionRunEvidence:
+    """Run one converter child process, with explicit argv and ``shell=False``.
+
+    stdin/stdout/stderr are all ``DEVNULL``: the converter's own text is
+    never needed for pass/fail and must never reach an evidence capture.
+    What is retained instead is the closed, numeric outcome -- category,
+    return code, elapsed time, and peak memory.
+    """
+
+    import subprocess
+
+    started = clock()
+    job = _create_memory_accounting_job()
+    try:
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, ValueError) as exc:
+            raise ColibriStage2Failure("conversion_failed") from exc
+
+        _assign_process_to_job(job, process)
+
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=deadline_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            returncode = process.wait()
+        except OSError as exc:
+            process.kill()
+            process.wait()
+            raise ColibriStage2Failure("conversion_failed") from exc
+
+        peak_memory_bytes, peak_commit_bytes = _peak_job_memory(job)
+    finally:
+        _close_job(job)
+
+    elapsed_ms = max(0, round((clock() - started) * 1000))
+    metadata = _bounded_metadata(peak_memory_bytes, peak_commit_bytes)
+
+    if timed_out:
+        raise ColibriStage2Failure(
+            "conversion_timeout",
+            elapsed_ms=elapsed_ms,
+            timeout_ms=max(0, round(deadline_seconds * 1000)),
+            **metadata,
+        )
+    category, exit_metadata = classify_process_exit(returncode)
+    if category != "ok":
+        raise ColibriStage2Failure(category, elapsed_ms=elapsed_ms, **exit_metadata, **metadata)
+    return ConversionRunEvidence(
+        elapsed_ms=elapsed_ms,
+        peak_memory_bytes=peak_memory_bytes,
+        peak_commit_bytes=peak_commit_bytes,
+    )
+
+
 def require_reviewed_converter_identity(script_path: Path) -> None:
     """Fail closed unless ``script_path`` is an absolute path to exactly
     the one reviewed converter: an ordinary, non-reparse regular file,
@@ -408,9 +710,7 @@ class PinnedScriptConverter:
     converter_script_path: Path
     absolute_deadline_seconds: float = 1800.0
 
-    def convert(self, *, model_dir: Path, output_dir: Path) -> None:
-        import subprocess
-
+    def convert(self, *, model_dir: Path, output_dir: Path) -> ConversionRunEvidence:
         require_reviewed_converter_identity(self.converter_script_path)
         argv = [
             sys.executable,
@@ -420,17 +720,236 @@ class PinnedScriptConverter:
             "--out",
             str(output_dir),
         ]
+        return run_converter_child(
+            argv, deadline_seconds=self.absolute_deadline_seconds
+        )
+
+
+def bounded_converter_script_path() -> Path:
+    """The one in-repo bounded converter, located from the imported module
+    itself.
+
+    There is deliberately no parameter, environment variable, or argument
+    anywhere that could point this at a different script: it is whatever
+    ``colibri_stage2_bounded_convert`` this process already imported, and
+    it is then held to the same path-safety proof as every other file this
+    module opens.
+    """
+
+    module_file = getattr(bounded_convert, "__file__", None)
+    if not module_file:
+        raise ColibriStage2Failure("conversion_failed")
+    script_path = Path(module_file).resolve()
+    resolved_parent = require_ordinary_directory(
+        script_path.parent,
+        missing_category="unsafe_directory_rejected",
+        reparse_category="unsafe_directory_rejected",
+    )
+    resolved_script = require_direct_child_path(
+        resolved_parent, script_path.name, category="unsafe_directory_rejected"
+    )
+    if not _is_regular_no_reparse(resolved_script):
+        raise ColibriStage2Failure("conversion_failed")
+    return resolved_script
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedScriptConverter:
+    """The default real converter for a 16 GiB host.
+
+    Runs the in-repo ``colibri_stage2_bounded_convert`` script -- which
+    reproduces the pinned converter's quantization arithmetic exactly and
+    writes a byte-identical safetensors artifact, but with peak memory
+    bounded by ``chunk_target_bytes`` instead of by the shard size -- in a
+    child process, through the same explicit-argv, ``shell=False``,
+    deadlined, output-discarding path as ``PinnedScriptConverter``.
+
+    Running it as a child rather than in-process is deliberate: the
+    failure being fixed here killed its process with a native access
+    violation inside ``torch_cpu.dll``, and an orchestrator that dies with
+    its converter cannot record why it died or leave a resumable state
+    behind.
+    """
+
+    chunk_target_bytes: int = bounded_convert.DEFAULT_CHUNK_TARGET_BYTES
+    absolute_deadline_seconds: float = 1800.0
+
+    def convert(self, *, model_dir: Path, output_dir: Path) -> ConversionRunEvidence:
+        argv = [
+            sys.executable,
+            str(bounded_converter_script_path()),
+            "--model",
+            str(model_dir),
+            "--out",
+            str(output_dir),
+            "--chunk-bytes",
+            str(int(self.chunk_target_bytes)),
+        ]
+        return run_converter_child(
+            argv, deadline_seconds=self.absolute_deadline_seconds
+        )
+
+
+# ---------------------------------------------------------------------------
+# Resume ledger: the recorded identity of already-converted artifacts
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ConvertedShardRecord:
+    """The recorded identity of one already-converted shard."""
+
+    basename: str
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.basename not in EXPECTED_SHARD_BASENAMES:
+            raise ValueError("converted shard record basename is not a pinned shard")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or not 0 < self.size_bytes <= _MAX_SHARD_SOURCE_BYTES
+        ):
+            raise ValueError("converted shard record size_bytes is out of bounds")
+        if not is_hex64(self.sha256):
+            raise ValueError("converted shard record sha256 is not a lowercase SHA-256")
+
+
+def read_resume_ledger(converted_dir: Path) -> dict[str, ConvertedShardRecord]:
+    """Read the resume ledger, or return an empty mapping when absent.
+
+    The ledger records nothing but pinned basenames, sizes, and digests --
+    no path, no username, no environment value, no timing. It is treated
+    as a *hint*, never as authority: a recorded shard is still re-verified
+    against the file on disk before anything is reused, so a tampered or
+    stale ledger can at worst cause redundant work, never a wrong reuse. A
+    malformed ledger fails closed rather than being silently discarded.
+    """
+
+    resolved_dir = require_ordinary_directory(
+        converted_dir, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
+    ledger_path = require_direct_child_path(
+        resolved_dir, RESUME_LEDGER_BASENAME, category="unsafe_directory_rejected"
+    )
+    if not ledger_path.exists():
+        return {}
+    if not _is_regular_no_reparse(ledger_path):
+        raise ColibriStage2Failure("resume_state_invalid")
+    try:
+        document = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ColibriStage2Failure("resume_state_invalid") from exc
+
+    if not isinstance(document, dict):
+        raise ColibriStage2Failure("resume_state_invalid")
+    if document.get("schema_version") != RESUME_LEDGER_SCHEMA_VERSION:
+        raise ColibriStage2Failure("resume_state_invalid")
+    if (
+        document.get("model_repository") != PINNED_MODEL_REPOSITORY
+        or document.get("model_revision") != PINNED_MODEL_REVISION
+        or document.get("colibri_commit") != PINNED_COLIBRI_COMMIT
+    ):
+        # A ledger written for a different model, revision, or Colibrì
+        # commit describes artifacts this run must never reuse.
+        raise ColibriStage2Failure("resume_state_invalid")
+
+    shards = document.get("converted_shards")
+    if not isinstance(shards, list):
+        raise ColibriStage2Failure("resume_state_invalid")
+    records: dict[str, ConvertedShardRecord] = {}
+    for item in shards:
+        if not isinstance(item, dict):
+            raise ColibriStage2Failure("resume_state_invalid")
         try:
-            subprocess.run(
-                argv,
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=self.absolute_deadline_seconds,
-                check=True,
+            record = ConvertedShardRecord(
+                basename=item.get("basename"),
+                size_bytes=item.get("size_bytes"),
+                sha256=item.get("sha256"),
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ColibriStage2Failure("conversion_failed") from exc
+        except (TypeError, ValueError) as exc:
+            raise ColibriStage2Failure("resume_state_invalid") from exc
+        if record.basename in records:
+            raise ColibriStage2Failure("resume_state_invalid")
+        records[record.basename] = record
+    return records
+
+
+def write_resume_ledger(converted_dir: Path, records: Mapping[str, ConvertedShardRecord]) -> None:
+    """Rewrite the resume ledger atomically.
+
+    Written to a direct-child temporary file and then ``os.replace``d into
+    position -- the one place in this module that deliberately replaces an
+    existing file, because the ledger is bookkeeping *about* artifacts and
+    never an artifact itself. No converted shard, source shard, or config
+    is ever replaced anywhere.
+    """
+
+    resolved_dir = require_ordinary_directory(
+        converted_dir, missing_category="unsafe_directory_rejected", reparse_category="unsafe_directory_rejected"
+    )
+    ledger_path = require_direct_child_path(
+        resolved_dir, RESUME_LEDGER_BASENAME, category="unsafe_directory_rejected"
+    )
+    temporary_path = require_direct_child_path(
+        resolved_dir, f"{RESUME_LEDGER_BASENAME}.tmp", category="unsafe_directory_rejected"
+    )
+    document = {
+        "schema_version": RESUME_LEDGER_SCHEMA_VERSION,
+        "model_repository": PINNED_MODEL_REPOSITORY,
+        "model_revision": PINNED_MODEL_REVISION,
+        "colibri_commit": PINNED_COLIBRI_COMMIT,
+        "converted_shards": [
+            {
+                "basename": records[basename].basename,
+                "size_bytes": records[basename].size_bytes,
+                "sha256": records[basename].sha256,
+            }
+            for basename in EXPECTED_SHARD_BASENAMES
+            if basename in records
+        ],
+    }
+    try:
+        temporary_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(temporary_path, ledger_path)
+    except OSError as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise ColibriStage2Failure("resume_state_invalid") from exc
+
+
+def verify_existing_converted_shard(path: Path, record: ConvertedShardRecord) -> bool:
+    """Prove an already-converted artifact matches its recorded identity.
+
+    Same shape as ``verify_existing_source_file``: ordinary regular file,
+    exact recorded size, exact recorded SHA-256. Absent returns ``False``
+    (convert it). Present-but-not-matching raises, because a converted
+    artifact that does not match its own record is exactly the situation
+    in which overwriting would destroy evidence.
+    """
+
+    if path.name != record.basename:
+        raise ColibriStage2Failure("unsafe_basename_rejected")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ColibriStage2Failure("resume_state_invalid") from exc
+    attrs = getattr(info, "st_file_attributes", 0)
+    if attrs & _FILE_ATTRIBUTE_REPARSE_POINT or not stat_module.S_ISREG(info.st_mode):
+        raise ColibriStage2Failure("resume_state_invalid")
+    if info.st_size != record.size_bytes:
+        raise ColibriStage2Failure("resume_state_invalid")
+    try:
+        digest = _sha256_file(path)
+    except OSError as exc:
+        raise ColibriStage2Failure("resume_state_invalid") from exc
+    if digest != record.sha256:
+        raise ColibriStage2Failure("resume_state_invalid")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +979,15 @@ class ShardTransactionResult:
     partial_cleanup_complete: bool
     temporary_output_cleanup_complete: bool
     elapsed_ms: int
+    # Resume evidence. ``source_reused`` means the source shard was already
+    # on disk and passed the full pinned-identity proof, so no byte was
+    # downloaded again. ``converted_reused`` means the converted artifact
+    # was already present *and* matched a recorded, re-verified identity,
+    # so it was left exactly as it was.
+    source_reused: bool = False
+    converted_reused: bool = False
+    conversion_peak_memory_bytes: int | None = None
+    conversion_peak_commit_bytes: int | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -481,12 +1009,72 @@ def _is_regular_no_reparse(path: Path) -> bool:
     return stat_module.S_ISREG(info.st_mode)
 
 
+def verify_existing_source_file(path: Path, expected: SourceShardEntry) -> bool:
+    """The single, complete reuse proof for one already-present source file.
+
+    Returns ``True`` only when *every* one of these holds, in this order:
+
+    * the basename is exactly the pinned reviewed basename;
+    * the file is an ordinary regular file, not a directory, device,
+      symlink, junction, or any other reparse point;
+    * ``st_size`` equals the reviewed size *exactly* -- so a partially
+      written file is rejected here, before a single byte is hashed;
+    * the full SHA-256 over the whole file equals the reviewed digest.
+
+    Anything absent returns ``False`` (nothing to reuse -- download it).
+    Anything *present but not matching* raises, because silently deleting
+    and re-fetching a file the operator did not expect to be wrong would
+    hide a real problem -- and on this machine it would also throw away a
+    5 GB download. Callers therefore never reuse a partial file: a partial
+    always fails the exact-size check, and a truncated-then-padded file
+    fails the digest.
+
+    ``require_direct_child_path`` is applied to the caller's approved
+    parent before this is ever called, so a reparse point cannot smuggle
+    the read outside the approved directory.
+    """
+
+    if path.name != expected.basename or not is_safe_basename(expected.basename):
+        raise ColibriStage2Failure("unsafe_basename_rejected")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ColibriStage2Failure("stale_source_file_rejected") from exc
+
+    attrs = getattr(info, "st_file_attributes", 0)
+    if attrs & _FILE_ATTRIBUTE_REPARSE_POINT or not stat_module.S_ISREG(info.st_mode):
+        raise ColibriStage2Failure("stale_source_file_rejected")
+    if info.st_size != expected.size_bytes:
+        # A partial download, a truncated file, or a different file
+        # altogether. Never trusted, and never silently repaired.
+        raise ColibriStage2Failure("stale_source_file_rejected")
+    try:
+        digest = _sha256_file(path)
+    except OSError as exc:
+        raise ColibriStage2Failure("stale_source_file_rejected") from exc
+    if digest != expected.sha256:
+        raise ColibriStage2Failure("shard_verification_failed")
+    return True
+
+
 def download_and_verify_config(
-    *, expected_config: SourceShardEntry, destination_dir: Path, downloader: Downloader
-) -> Path:
-    """Step 1 of the approved sequence: download and verify config.json
-    exactly once. The returned path stays available (never deleted here)
-    for every subsequent converter call."""
+    *,
+    expected_config: SourceShardEntry,
+    destination_dir: Path,
+    downloader: Downloader,
+    allow_resume: bool = True,
+) -> tuple[Path, bool]:
+    """Step 1 of the approved sequence: make a fully verified config.json
+    available. The returned path stays available (never deleted here) for
+    every subsequent converter call.
+
+    Returns ``(path, reused)``. When ``allow_resume`` and an existing
+    config passes the complete ``verify_existing_source_file`` proof, it is
+    reused as-is and nothing is downloaded; an existing file that fails
+    that proof always raises rather than being overwritten.
+    """
 
     if expected_config.basename != EXPECTED_CONFIG_BASENAME:
         raise ColibriStage2Failure("unsafe_basename_rejected")
@@ -497,7 +1085,11 @@ def download_and_verify_config(
         resolved_destination_dir, expected_config.basename, category="unsafe_directory_rejected"
     )
     if config_path.exists():
-        raise ColibriStage2Failure("destination_not_empty")
+        if not allow_resume:
+            raise ColibriStage2Failure("destination_not_empty")
+        if verify_existing_source_file(config_path, expected_config):
+            return config_path, True
+        raise ColibriStage2Failure("stale_source_file_rejected")
 
     try:
         downloader.download(
@@ -516,7 +1108,7 @@ def download_and_verify_config(
         or _sha256_file(config_path) != expected_config.sha256
     ):
         raise ColibriStage2Failure("shard_verification_failed")
-    return config_path
+    return config_path, False
 
 
 def run_shard_transaction(
@@ -529,6 +1121,8 @@ def run_shard_transaction(
     downloader: Downloader,
     converter: Converter,
     clock: Callable[[], float] = time.monotonic,
+    allow_resume: bool = True,
+    converted_record: ConvertedShardRecord | None = None,
 ) -> ShardTransactionResult:
     """One fully transactional shard, matching the approved sequence 3a-3j:
 
@@ -544,6 +1138,17 @@ def run_shard_transaction(
     converted shard is never overwritten. ``converted_basename`` is always
     exactly ``expected_source.basename`` -- Stage 2A never renames a
     shard during conversion.
+
+    Resume behaviour (``allow_resume``, the default):
+
+    * If ``converted_record`` is supplied and the converted artifact on
+      disk re-verifies against it, the shard is already done: nothing is
+      downloaded, nothing is converted, and the existing artifact is left
+      byte-for-byte untouched.
+    * Otherwise, an already-present source shard that passes the complete
+      pinned-identity proof is reused, so a conversion that crashed does
+      not cost another 5 GB download. A present source shard that fails
+      that proof -- including any partial file -- always raises.
     """
 
     source_basename = expected_source.basename
@@ -575,33 +1180,81 @@ def run_shard_transaction(
     if resolved_config_path != config_path_resolved:
         raise ColibriStage2Failure("unsafe_directory_rejected")
 
-    if final_converted_path.exists():
-        # A fast, early fail -- avoids downloading and converting the
-        # shard again when the final artifact is already present. The
-        # actual no-overwrite guarantee against a race is enforced again,
-        # atomically, at the real placement step below (3h).
-        raise ColibriStage2Failure("converted_shard_already_exists")
-
     started = clock()
 
-    # 3a: download and verify only this source shard.
-    try:
-        downloader.download(
-            basename=source_basename,
-            expected_size_bytes=expected_source.size_bytes,
-            expected_sha256=expected_source.sha256,
-            destination=source_path,
-        )
-    except OSError as exc:
-        raise ColibriStage2Failure("shard_download_failed") from exc
-    if not _is_regular_no_reparse(source_path):
-        raise ColibriStage2Failure("shard_download_failed")
-    if (
-        source_path.name != source_basename
-        or source_path.stat().st_size != expected_source.size_bytes
-        or _sha256_file(source_path) != expected_source.sha256
-    ):
-        raise ColibriStage2Failure("shard_verification_failed")
+    if final_converted_path.exists():
+        # Already converted. With a recorded identity that re-verifies,
+        # this is a completed step being resumed -- report it as reused
+        # and leave the artifact exactly as it is. Without one, fail
+        # closed: an unrecognised artifact is never overwritten and never
+        # trusted.
+        if allow_resume and converted_record is not None:
+            if verify_existing_converted_shard(final_converted_path, converted_record):
+                # A previous run may have crashed between placing the
+                # converted artifact (3h) and deleting its source shard
+                # (3i). The conversion for this shard is proven complete,
+                # so finish that interrupted transaction rather than
+                # leaving it half-done -- but only after the leftover
+                # source re-verifies against its pinned identity, so a
+                # file that is not the shard we converted is never
+                # deleted. A leftover that fails that proof raises.
+                if source_path.exists():
+                    verify_existing_source_file(source_path, expected_source)
+                    try:
+                        source_path.unlink()
+                    except OSError as exc:
+                        raise ColibriStage2Failure("source_shard_deletion_failed") from exc
+                    if source_path.exists():
+                        raise ColibriStage2Failure("source_shard_deletion_unverified")
+                return ShardTransactionResult(
+                    source_basename=source_basename,
+                    source_size_bytes=expected_source.size_bytes,
+                    source_sha256=expected_source.sha256,
+                    source_verified=True,
+                    source_deleted=True,
+                    converted_basename=source_basename,
+                    converted_size_bytes=converted_record.size_bytes,
+                    converted_sha256=converted_record.sha256,
+                    partial_cleanup_complete=not (
+                        source_path.parent / f"{source_basename}.partial"
+                    ).exists(),
+                    temporary_output_cleanup_complete=True,
+                    elapsed_ms=max(0, round((clock() - started) * 1000)),
+                    source_reused=True,
+                    converted_reused=True,
+                )
+        raise ColibriStage2Failure("converted_shard_already_exists")
+
+    # 3a: make a fully verified source shard available. An existing shard
+    # is reused only after the complete pinned-identity proof (basename,
+    # exact size, SHA-256, ordinary file, direct child, non-reparse);
+    # anything present that fails that proof raises rather than being
+    # overwritten or silently re-fetched.
+    source_reused = False
+    if source_path.exists():
+        if not allow_resume:
+            raise ColibriStage2Failure("destination_not_empty")
+        source_reused = verify_existing_source_file(source_path, expected_source)
+        if not source_reused:
+            raise ColibriStage2Failure("stale_source_file_rejected")
+    else:
+        try:
+            downloader.download(
+                basename=source_basename,
+                expected_size_bytes=expected_source.size_bytes,
+                expected_sha256=expected_source.sha256,
+                destination=source_path,
+            )
+        except OSError as exc:
+            raise ColibriStage2Failure("shard_download_failed") from exc
+        if not _is_regular_no_reparse(source_path):
+            raise ColibriStage2Failure("shard_download_failed")
+        if (
+            source_path.name != source_basename
+            or source_path.stat().st_size != expected_source.size_bytes
+            or _sha256_file(source_path) != expected_source.sha256
+        ):
+            raise ColibriStage2Failure("shard_verification_failed")
 
     # 3b: a fresh, empty per-shard converter-output directory -- validated
     # immediately, since a newly created private directory is not exempt
@@ -614,11 +1267,14 @@ def run_shard_transaction(
     primary_failure: ColibriStage2Failure | None = None
     converted_sha256 = ""
     converted_size_bytes = 0
+    run_evidence: ConversionRunEvidence | None = None
     try:
         # 3c/3d: the exact pinned converter, explicit argv, shell=False,
         # bounded/deadlined -- enforced by the adapter itself.
         try:
-            converter.convert(model_dir=resolved_destination_dir, output_dir=temp_output_dir)
+            run_evidence = converter.convert(
+                model_dir=resolved_destination_dir, output_dir=temp_output_dir
+            )
         except OSError as exc:
             raise ColibriStage2Failure("conversion_failed") from exc
 
@@ -695,6 +1351,14 @@ def run_shard_transaction(
         partial_cleanup_complete=partial_cleanup_complete,
         temporary_output_cleanup_complete=cleanup_ok,
         elapsed_ms=max(0, elapsed_ms),
+        source_reused=source_reused,
+        converted_reused=False,
+        conversion_peak_memory_bytes=(
+            run_evidence.peak_memory_bytes if run_evidence is not None else None
+        ),
+        conversion_peak_commit_bytes=(
+            run_evidence.peak_commit_bytes if run_evidence is not None else None
+        ),
     )
 
 
@@ -716,6 +1380,7 @@ def run_approved_conversion(
     downloader: Downloader,
     converter: Converter,
     clock: Callable[[], float] = time.monotonic,
+    allow_resume: bool = True,
 ) -> dict[str, Any]:
     """The complete approved download/conversion sequence.
 
@@ -726,6 +1391,13 @@ def run_approved_conversion(
     approved-execution precondition (explicit approval, interactive
     stdin/stdout, isolated environment, disk space, safe paths) checked by
     ``check_approved_preconditions``.
+
+    With ``allow_resume`` (the default), a previously interrupted run
+    continues from whatever was already *proven*: each shard's recorded
+    converted artifact is re-verified before reuse, and each source file
+    is re-verified against its pinned identity before reuse. Every shard
+    that completes is recorded in the resume ledger immediately, so a
+    crash on shard 2 never costs shard 1's work or shard 2's download.
     """
 
     reviewed = check_approved_preconditions(
@@ -736,13 +1408,19 @@ def run_approved_conversion(
         free_bytes_probe=free_bytes_probe,
         isolated_python_env_ready=isolated_python_env_ready,
         dependency_versions=dependency_versions,
+        allow_resume=allow_resume,
     )
 
     total_started = clock()
 
+    ledger = read_resume_ledger(final_converted_dir) if allow_resume else {}
+
     config_entry = reviewed[EXPECTED_CONFIG_BASENAME]
-    config_path = download_and_verify_config(
-        expected_config=config_entry, destination_dir=destination_dir, downloader=downloader
+    config_path, config_reused = download_and_verify_config(
+        expected_config=config_entry,
+        destination_dir=destination_dir,
+        downloader=downloader,
+        allow_resume=allow_resume,
     )
 
     shard_results: list[ShardTransactionResult] = []
@@ -757,8 +1435,19 @@ def run_approved_conversion(
             downloader=downloader,
             converter=converter,
             clock=clock,
+            allow_resume=allow_resume,
+            converted_record=ledger.get(basename),
         )
         shard_results.append(result)
+        if allow_resume and not result.converted_reused:
+            # Record the shard the moment it is proven complete, so a
+            # crash on a later shard never costs this one.
+            ledger[basename] = ConvertedShardRecord(
+                basename=result.converted_basename,
+                size_bytes=result.converted_size_bytes,
+                sha256=result.converted_sha256,
+            )
+            write_resume_ledger(final_converted_dir, ledger)
 
     # Step 6: copy/move the verified config into the final directory,
     # exactly once, only after every shard has succeeded.
@@ -769,8 +1458,16 @@ def run_approved_conversion(
         resolved_final_dir, EXPECTED_CONFIG_BASENAME, category="unsafe_directory_rejected"
     )
     if final_config_path.exists():
-        raise ColibriStage2Failure("converted_shard_already_exists")
-    atomic_no_replace_move(config_path, final_config_path, exists_category="converted_shard_already_exists")
+        # On a resumed run the final config may already be in place from
+        # the previous attempt. Reuse it only after it re-verifies against
+        # the reviewed source identity; never overwrite it either way.
+        if not allow_resume or not verify_existing_source_file(final_config_path, config_entry):
+            raise ColibriStage2Failure("converted_shard_already_exists")
+        config_path.unlink(missing_ok=True)
+    else:
+        atomic_no_replace_move(
+            config_path, final_config_path, exists_category="converted_shard_already_exists"
+        )
 
     converted_config_size_bytes = final_config_path.stat().st_size
     converted_config_sha256 = _sha256_file(final_config_path)
@@ -786,6 +1483,7 @@ def run_approved_conversion(
         dependency_versions=dependency_versions,
         total_elapsed_ms=max(0, total_elapsed_ms),
         cleanup_complete=True,
+        source_config_reused=config_reused,
     )
 
 
@@ -805,6 +1503,7 @@ def build_conversion_capture(
     dependency_versions: Mapping[str, str],
     total_elapsed_ms: int,
     cleanup_complete: bool,
+    source_config_reused: bool = False,
 ) -> dict[str, Any]:
     """A closed, privacy-safe capture with the complete reviewable identity
     set the next tiny registry-pinning commit needs.
@@ -879,6 +1578,11 @@ def build_conversion_capture(
             and result.temporary_output_cleanup_complete
         ):
             raise ValueError("shard result proof booleans must all be true")
+        for peak in (result.conversion_peak_memory_bytes, result.conversion_peak_commit_bytes):
+            if peak is not None and (
+                isinstance(peak, bool) or not isinstance(peak, int) or peak < 0
+            ):
+                raise ValueError("shard result peak memory must be a non-negative integer or None")
         shards.append(
             {
                 "source_basename": result.source_basename,
@@ -886,12 +1590,26 @@ def build_conversion_capture(
                 "source_sha256": result.source_sha256,
                 "source_verified": bool(result.source_verified),
                 "source_deleted": bool(result.source_deleted),
+                "source_reused": bool(result.source_reused),
                 "converted_basename": result.converted_basename,
                 "converted_size_bytes": int(result.converted_size_bytes),
                 "converted_sha256": result.converted_sha256,
+                "converted_reused": bool(result.converted_reused),
                 "partial_cleanup_complete": bool(result.partial_cleanup_complete),
                 "temporary_output_cleanup_complete": bool(result.temporary_output_cleanup_complete),
                 "elapsed_ms": max(0, int(result.elapsed_ms)),
+                # Bounded numeric resource evidence only -- never a path,
+                # an environment value, or any converter output.
+                "conversion_peak_memory_bytes": (
+                    None
+                    if result.conversion_peak_memory_bytes is None
+                    else int(result.conversion_peak_memory_bytes)
+                ),
+                "conversion_peak_commit_bytes": (
+                    None
+                    if result.conversion_peak_commit_bytes is None
+                    else int(result.conversion_peak_commit_bytes)
+                ),
             }
         )
 
@@ -910,6 +1628,7 @@ def build_conversion_capture(
         "source_config_sha256": source_config.sha256,
         "source_config_verified": bool(source_config_verified),
         "source_config_moved_to_final": bool(source_config_moved_to_final),
+        "source_config_reused": bool(source_config_reused),
         "converted_config_size_bytes": max(0, int(converted_config_size_bytes)),
         "converted_config_sha256": converted_config_sha256,
         "shards": shards,
@@ -985,7 +1704,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--converted-destination", required=True, help="Target directory for the final converted model"
     )
     parser.add_argument(
-        "--converter-script", help="Path to the reviewed convert_olmoe.py (required with --approve)"
+        "--converter-script",
+        help=(
+            "Path to the reviewed convert_olmoe.py. Only needed with "
+            "--converter pinned-script; the default bounded converter "
+            "takes no path at all."
+        ),
+    )
+    parser.add_argument(
+        "--converter",
+        choices=("bounded", "pinned-script"),
+        default="bounded",
+        help=(
+            "Which converter to run. 'bounded' (default) is the in-repo "
+            "memory-bounded converter, the only one that fits a 16 GiB "
+            "host; 'pinned-script' is the unmodified upstream "
+            "convert_olmoe.py, which needs roughly 10 GiB per shard."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue a previously interrupted run: reuse only files that "
+            "pass their full pinned identity proof (exact basename, size, "
+            "and SHA-256). Never reuses a partial file and never "
+            "overwrites an existing converted artifact."
+        ),
     )
     parser.add_argument(
         "--temp-output-parent",
@@ -1058,14 +1803,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not is_safe_basename(name) or not is_simple_version(version):
             return _reject("dependency_unavailable")
 
-    # 6. Validate the converter path and its reviewed identity.
-    converter_script_path = Path(args.converter_script) if args.converter_script else None
-    if converter_script_path is None or not converter_script_path.is_absolute():
-        return _reject("conversion_failed")
-    try:
-        require_reviewed_converter_identity(converter_script_path)
-    except ColibriStage2Failure as exc:
-        return _reject(exc.category)
+    # 6. Validate the converter. The bounded converter is in-repo and
+    # located from the already-imported module, so it takes no path from
+    # the caller at all; the pinned upstream script must be given as an
+    # absolute path and must match its reviewed identity exactly.
+    converter_script_path: Path | None = None
+    if args.converter == "pinned-script":
+        converter_script_path = Path(args.converter_script) if args.converter_script else None
+        if converter_script_path is None or not converter_script_path.is_absolute():
+            return _reject("conversion_failed")
+        try:
+            require_reviewed_converter_identity(converter_script_path)
+        except ColibriStage2Failure as exc:
+            return _reject(exc.category)
+    else:
+        try:
+            bounded_converter_script_path()
+        except ColibriStage2Failure as exc:
+            return _reject(exc.category)
 
     # 7. Validate the existing PARENT directory of every leaf this run
     # might create -- never mkdir(parents=True). Every parent must
@@ -1090,10 +1845,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ColibriStage2Failure as exc:
         return _reject(exc.category)
 
-    # 8. The source and converted roots must be absent or empty.
-    for directory in (destination, converted_destination):
-        if directory.exists() and any(directory.iterdir()):
-            return _reject("destination_not_empty")
+    # 8. The source and converted roots must be absent or empty -- unless
+    # --resume was given, in which case leftover files are exactly the
+    # point, and each one is instead held to its full identity proof
+    # before any reuse.
+    if not args.resume:
+        for directory in (destination, converted_destination):
+            if directory.exists() and any(directory.iterdir()):
+                return _reject("destination_not_empty")
 
     # 9. Check free space.
     if _default_free_bytes_probe(destination) < REQUIRED_FREE_SPACE_BYTES:
@@ -1119,7 +1878,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # in steps 4-5 are reused as-is -- never re-evaluated as call
     # arguments here.
     downloader = PinnedRevisionFileDownloader()
-    converter = PinnedScriptConverter(converter_script_path=converter_script_path)
+    converter: Converter = (
+        PinnedScriptConverter(converter_script_path=converter_script_path)
+        if converter_script_path is not None
+        else BoundedScriptConverter()
+    )
 
     try:
         capture = run_approved_conversion(
@@ -1133,9 +1896,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             dependency_versions=dependency_versions,
             downloader=downloader,
             converter=converter,
+            allow_resume=bool(args.resume),
         )
     except ColibriStage2Failure as exc:
-        return _reject(exc.category)
+        # The closed category plus its bounded numeric evidence -- return
+        # code, elapsed time, peak memory. Never raw converter output.
+        payload: dict[str, Any] = {
+            "mode": "approved_rejected",
+            "rejection_category": exc.category,
+        }
+        if exc.numeric_metadata:
+            payload["numeric_metadata"] = dict(exc.numeric_metadata)
+        _print_json(payload)
+        return 1
 
     # 12. Print only the closed conversion capture on success.
     _print_json(capture)

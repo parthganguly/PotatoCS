@@ -40,7 +40,10 @@ APPROX_DOWNLOAD_BYTES = 13_840_000_000
 REQUIRED_FREE_SPACE_BYTES = 18 * 1024 * 1024 * 1024
 
 MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v1"
-CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v1"
+# v2 adds the per-shard resume booleans (``source_reused`` /
+# ``converted_reused``) and the bounded per-shard conversion peak-memory
+# evidence. Nothing was removed or renamed relative to v1.
+CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v2"
 CONVERSION_CAPTURE_STATE = "unreviewed_conversion_capture"
 
 ALLOWED_CONVERSION_DEPENDENCY_NAMES = frozenset({"python", "torch", "safetensors"})
@@ -81,9 +84,20 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "shard_download_failed",
         "shard_verification_failed",
         "conversion_failed",
+        # Distinguished conversion-process outcomes: a converter that ran
+        # out of its deadline, one that exited nonzero under its own
+        # control, and one the OS killed with a native exception (on
+        # Windows, an NTSTATUS such as 0xc0000005) are three different
+        # facts and must never collapse into one category.
+        "conversion_timeout",
+        "conversion_nonzero_exit",
+        "conversion_process_crashed",
         "conversion_output_unexpected",
         "converted_shard_missing",
         "converted_shard_already_exists",
+        # Resume gates
+        "stale_source_file_rejected",
+        "resume_state_invalid",
         "source_shard_deletion_failed",
         "source_shard_deletion_unverified",
         "temporary_output_cleanup_failed",
@@ -125,8 +139,16 @@ FAILURE_NUMERIC_METADATA_KEYS = frozenset(
         "matched_count",
         "expected_count",
         "elapsed_ms",
+        # Bounded resource evidence for a converter child process. Both are
+        # plain byte counts read from the OS; neither can carry a path, an
+        # environment value, or any model output.
+        "peak_memory_bytes",
+        "peak_commit_bytes",
     }
 )
+
+RESUME_LEDGER_BASENAME = "colibri-stage2-resume.json"
+RESUME_LEDGER_SCHEMA_VERSION = "colibri-stage2-olmoe-resume-v1"
 
 
 class ColibriStage2Failure(RuntimeError):

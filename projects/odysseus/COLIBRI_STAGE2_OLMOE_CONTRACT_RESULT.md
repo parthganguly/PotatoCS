@@ -9,7 +9,138 @@ Date: 2026-07-24 (corrected same day: four execution-blocker fixes, then a
 second pass recording real build evidence and closing further
 pre-download conversion defects, then a third pass closing the four
 remaining pre-download defects below, then this reviewed source manifest
-commit).
+commit). Amended 2026-07-29 with the memory/resume fix below, after a
+real converter crash on the 16 GiB target host.
+
+## Correction pass 5 — memory-bounded conversion and safe resume (2026-07-29)
+
+### The observed failure
+
+On the real target host (Windows 11, Ryzen 5 4600H, 15.42 GiB RAM, Python
+3.13.12, torch 2.8.0+cpu, safetensors 0.5.3), source shard 1 downloaded
+and verified successfully (`model-00001-of-00003.safetensors`,
+4,997,744,872 bytes), and the converter then died inside `torch_cpu.dll`
+with exception `0xc0000005` — 0.35 GiB physical RAM left and 30.6 GiB of
+the 45.84 GiB pagefile in use. Source config and shard survived; the
+converted and temp roots were empty.
+
+### Root cause — two independent defects, both measured
+
+**1. Peak memory scales with the shard, not with a budget.** The pinned
+`convert_olmoe.py` calls `load_file(shard)` (whole shard resident as
+tensors), accumulates every converted tensor into a second `out_tensors`
+dict while the source dict is still alive, then calls `save_file`, whose
+`_flatten` step makes one further full `bytes` copy of every output
+tensor before anything reaches disk. Peak ≈ source + converted +
+converted again.
+
+Measured on an 850 MB expert-heavy shard of the real shape, via a Windows
+Job Object across the whole process tree:
+
+| converter | peak working set | peak commit | outcome |
+| --- | --- | --- | --- |
+| pinned `convert_olmoe.py` | **1784 MiB** | 1785 MiB | failed |
+| bounded converter (32 MiB chunks) | **196 MiB** | 197 MiB | succeeded |
+| bounded converter (8 MiB chunks) | **196 MiB** | 197 MiB | succeeded |
+| `import torch` alone (baseline) | 157 MiB | 158 MiB | — |
+
+The pinned converter peaked at ~2.1× the shard size *and had not yet
+reached the `_flatten` copy* when it died. Extrapolated to the real 4.65
+GiB shard that is ≥ 9.7 GiB for one shard — which is what exhausted a
+15.42 GiB machine. The bounded converter's peak is flat across a 4×
+change in chunk budget, and only ~39 MiB of its 196 MiB is data; the rest
+is the torch runtime itself.
+
+**2. The pinned converter cannot complete in this environment at all.**
+`save_file` → `_flatten` → `_tobytes` does `import numpy`, and numpy is
+not installed in the isolated Stage 2 venv. Reproduced directly:
+`ModuleNotFoundError: No module named 'numpy'` raised from
+`safetensors/torch.py` line 426. So even with unlimited RAM the pinned
+script could not have written its output.
+
+### The fix
+
+`colibri_stage2_bounded_convert.py` is a standalone, memory-bounded
+converter that is **equivalent, not different**. It reproduces
+`quantize_row` verbatim and writes a safetensors file byte-identical to
+what `safetensors.serialize_file` would produce for the same tensors,
+while holding only `O(chunk_bytes)` resident:
+
+* dense tensors are copied byte-for-byte from the source file range to
+  the output file through a bounded buffer — they never enter torch;
+* expert tensors are read, quantized, and written one row-chunk at a
+  time, so float32 intermediates live only for that chunk;
+* the only whole-shard retained state is the float32 scale vectors — 4
+  bytes per expert row, ~7 MB for a 4.65 GiB shard;
+* it writes bytes directly from tensor storage via `ctypes`, so it needs
+  no numpy.
+
+Row-wise reductions make chunking bit-exact: a row's scale and quantized
+values depend on that row alone, and max/divide/round/clamp are exactly
+determined by IEEE-754, so no chunk boundary can perturb a value.
+
+**Equivalence evidence.** On the 850 MB real-shape shard, the bounded
+output and a true reference built with `safetensors.serialize_file` from
+the pinned `quantize_row` are byte-identical:
+`ed660a5f579eab85409252af7bca9199b0dd33de2ce36eb5802b098315b068a7`,
+427,475,384 bytes, both. Output is also byte-identical across chunk
+budgets from 1 byte to 16 MiB, and across repeated runs.
+
+Unchanged: the model, revision, Colibrì commit, cap (`8`), bit width
+(`8`), the one-token oracle, tensor names/dtypes/shapes/ordering, the
+`.qs` scale suffix, and the `--model`/`--out` grammar. The unmodified
+upstream script is still reachable via `--converter pinned-script`.
+
+### Safe resume
+
+Every reuse is gated on a complete identity proof — exact pinned
+basename, exact size, exact SHA-256, ordinary regular file, direct child,
+non-reparse — before a byte is trusted:
+
+* a partial file always fails the exact-size check, so it is never
+  trusted, never extended in place, and never silently deleted;
+* an existing converted artifact is never overwritten; without a recorded
+  identity that re-verifies, the run fails closed;
+* a `colibri-stage2-resume.json` ledger records each proven converted
+  shard the moment it completes, so a crash on shard 2 costs neither
+  shard 1's work nor shard 2's download. The ledger is a *hint*, never
+  authority: entries are re-verified against the bytes on disk, so a
+  tampered ledger can at worst cause redundant work;
+* `--resume` relaxes exactly one check — "roots must be absent or empty"
+  — and no identity proof. Without it, behaviour is unchanged.
+
+### Failure evidence
+
+`conversion_failed` no longer absorbs three different facts.
+`conversion_timeout`, `conversion_nonzero_exit`, and
+`conversion_process_crashed` are now distinct, with the real observed
+`0xC0000005` (3221225477) classified as a crash rather than an ordinary
+nonzero exit. Captures carry only bounded numbers — return code, elapsed
+time, peak memory — and stdout/stderr remain `DEVNULL`, so no raw output,
+environment value, username, or path can reach evidence.
+
+Peak memory is read from a Windows Job Object rather than the child's
+process handle. A venv `Scripts\python.exe` is a redirector stub that
+runs the real interpreter as a *grandchild*, so a handle probe measures
+only the stub — it reported 5 MiB for a process holding 600 MB. The job
+accounts for the whole tree and stays readable after exit. (`argtypes`
+must be set on the `ctypes` call; without them the struct pointer is
+truncated to 32 bits and the call returns TRUE while filling nonsense.)
+
+### What this commit did not do
+
+No model download, no real conversion, no model deletion, no registry
+promotion, no inference run, and no merge. All memory measurements used
+synthetic shards in a scratch directory.
+**`REVIEWED_OLMOE_MODEL_REGISTRY` remains exactly empty.**
+
+The pre-existing `D:\Colibri` source tree was **not modified**: after all
+work, `model-00001-of-00003.safetensors` is still 4,997,744,872 bytes with
+SHA-256 `61874210ca7c360f43f8c622cecc12441083d40190eae3b56bc9d6e1c0a30c1e`
+and `config.json` still 828 bytes with SHA-256
+`272998dd7ba4846dcc682f0b5a46144f4bcd9dde8e94d2f17bd8e5cf2f23d6ce` — both
+matching the reviewed source manifest exactly. The converted and temp
+roots remain empty.
 
 ## Reviewed source manifest (this PR)
 
