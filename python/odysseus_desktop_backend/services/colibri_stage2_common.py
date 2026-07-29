@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 # --- Pinned upstream contract (Stage 2A) -----------------------------------
 
@@ -40,10 +41,14 @@ APPROX_DOWNLOAD_BYTES = 13_840_000_000
 REQUIRED_FREE_SPACE_BYTES = 18 * 1024 * 1024 * 1024
 
 MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v1"
-# v2 adds the per-shard resume booleans (``source_reused`` /
+# v2 added the per-shard resume booleans (``source_reused`` /
 # ``converted_reused``) and the bounded per-shard conversion peak-memory
-# evidence. Nothing was removed or renamed relative to v1.
-CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v2"
+# evidence. v3 replaces the single top-level ``converter_basename`` /
+# ``converter_size_bytes`` / ``converter_sha256`` triple -- which always
+# named the upstream script even when the bounded converter had actually
+# run -- with a ``converters`` list plus a per-shard ``converter_kind``
+# and identity, both derived from the adapter that really executed.
+CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v3"
 CONVERSION_CAPTURE_STATE = "unreviewed_conversion_capture"
 
 ALLOWED_CONVERSION_DEPENDENCY_NAMES = frozenset({"python", "torch", "safetensors"})
@@ -332,3 +337,40 @@ REVIEWED_BOUNDED_CONVERTER_IDENTITY = ReviewedBoundedConverterIdentity(
     size_bytes=24033,
     sha256="6f8145fc71f060c75d7d04a34c96cfd58d00daa3d51f2406a6de25e167d2266b",
 )
+
+
+# --- Which converter actually ran -------------------------------------------
+
+# Stage 2A has exactly two reviewed converters, and a capture must record
+# the identity of the one that *actually executed* -- never a default.
+# These two constants are the only values that can select between them.
+CONVERTER_KIND_BOUNDED = "bounded"
+CONVERTER_KIND_PINNED_SCRIPT = "pinned_script"
+
+# The closed kind -> reviewed identity binding. This mapping is the single
+# place either identity can enter a capture: a caller supplies at most a
+# *kind*, never a basename, size, hash, or identity object, so no capture
+# can ever claim an identity that was not reviewed, and the bounded
+# converter can never be recorded as the upstream script or vice versa.
+REVIEWED_CONVERTER_IDENTITY_BY_KIND: Mapping[str, Any] = MappingProxyType(
+    {
+        CONVERTER_KIND_BOUNDED: REVIEWED_BOUNDED_CONVERTER_IDENTITY,
+        CONVERTER_KIND_PINNED_SCRIPT: REVIEWED_CONVERTER_IDENTITY,
+    }
+)
+
+CONVERTER_KINDS = frozenset(REVIEWED_CONVERTER_IDENTITY_BY_KIND)
+
+
+def reviewed_identity_for_converter_kind(kind: str) -> Any:
+    """Return the one reviewed identity for ``kind``, or fail closed.
+
+    The only way to obtain a converter identity for a capture. There is
+    deliberately no overload, parameter, or fallback that could return an
+    identity for an unknown kind.
+    """
+
+    identity = REVIEWED_CONVERTER_IDENTITY_BY_KIND.get(kind)
+    if identity is None:
+        raise ValueError(f"unknown converter kind: {kind!r}")
+    return identity

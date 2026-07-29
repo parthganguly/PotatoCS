@@ -67,6 +67,9 @@ from odysseus_desktop_backend.services.colibri_stage2_common import (
     APPROX_DOWNLOAD_BYTES,
     CONVERSION_CAPTURE_SCHEMA_VERSION,
     CONVERSION_CAPTURE_STATE,
+    CONVERTER_KIND_BOUNDED,
+    CONVERTER_KIND_PINNED_SCRIPT,
+    CONVERTER_KINDS,
     DEVIATION_STATEMENT,
     EXPECTED_CONFIG_BASENAME,
     EXPECTED_CONVERTER_SCRIPT_BASENAME,
@@ -82,6 +85,7 @@ from odysseus_desktop_backend.services.colibri_stage2_common import (
     is_hex64,
     is_safe_basename,
     is_simple_version,
+    reviewed_identity_for_converter_kind,
 )
 from odysseus_desktop_backend.services.colibri_stage2_path_safety import (
     atomic_no_replace_move,
@@ -427,10 +431,16 @@ class ConversionRunEvidence:
     peak_memory_bytes: int | None
     peak_commit_bytes: int | None
     peak_memory_state: str = MEMORY_ACCOUNTING_UNAVAILABLE
+    # Which reviewed converter actually ran. Set by the adapter itself,
+    # never by a caller of the adapter, and resolved to an identity only
+    # through the closed ``REVIEWED_CONVERTER_IDENTITY_BY_KIND`` mapping.
+    converter_kind: str | None = None
 
     def __post_init__(self) -> None:
         if self.peak_memory_state not in MEMORY_ACCOUNTING_STATES:
             raise ValueError("unknown conversion memory accounting state")
+        if self.converter_kind is not None and self.converter_kind not in CONVERTER_KINDS:
+            raise ValueError("unknown converter kind")
         if self.peak_memory_state == MEMORY_ACCOUNTING_UNAVAILABLE and not (
             self.peak_memory_bytes is None and self.peak_commit_bytes is None
         ):
@@ -468,20 +478,45 @@ def classify_process_exit(returncode: int) -> tuple[str, dict[str, int]]:
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
 
-def _create_memory_accounting_job() -> Any:
-    """A Windows Job Object used purely to *account* for memory.
+_CREATE_SUSPENDED = 0x00000004
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+_MAX_TRACKED_JOB_PROCESSES = 512
 
-    No limit is ever configured on it -- it imposes nothing on the
-    converter and cannot cause a failure. It exists because a per-process
-    handle probe measures the wrong process: a virtual environment's
-    ``Scripts\\python.exe`` is a redirector stub that runs the real
-    interpreter as a *grandchild*, so ``GetProcessMemoryInfo`` on the
-    handle returned by ``Popen`` reports only the few MiB of the stub. A
-    job accounts for the whole tree, and its peak counters stay readable
-    after every member has exited -- exactly the case that matters when a
-    converter is killed for exhausting memory.
 
-    Returns ``None`` on any failure; this is evidence, never a gate.
+def _kernel32() -> Any:
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _create_owning_job() -> Any:
+    """A Windows Job Object that *owns* the converter's whole process tree.
+
+    Two jobs' worth of duty in one object:
+
+    * **Ownership.** The converter is created suspended and assigned to
+      this job before it is allowed to execute a single instruction, so
+      every process it later spawns is born inside the job. That matters
+      concretely here: a virtual environment's ``Scripts\\python.exe`` is
+      a redirector stub that runs the real interpreter as a *grandchild*,
+      so killing only the handle ``Popen`` returned would leave the actual
+      converter alive -- still holding memory, still writing into the
+      temporary output directory that cleanup is about to remove.
+    * **Accounting.** A job's peak counters cover the whole tree and stay
+      readable after every member has exited, which is exactly the case
+      that matters when a converter is killed for exhausting memory.
+
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` is configured as the final
+    safeguard: if this process dies unexpectedly, or any teardown path is
+    missed, closing the last handle to the job kills whatever is still
+    inside it.
+
+    Returns ``None`` on any failure. A ``None`` job means the run must not
+    proceed on Windows -- an unowned converter is exactly what this
+    exists to prevent.
     """
 
     if sys.platform != "win32":
@@ -490,13 +525,180 @@ def _create_memory_accounting_job() -> Any:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _kernel32()
         kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         kernel32.CreateJobObjectW.restype = wintypes.HANDLE
         job = kernel32.CreateJobObjectW(None, None)
-        return job or None
+        if not job:
+            return None
+
+        information = _extended_limit_information()
+        information.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        if not kernel32.SetInformationJobObject(
+            wintypes.HANDLE(int(job)),
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            # Without kill-on-close the job cannot guarantee cleanup, so
+            # it is not fit for purpose -- discard it rather than proceed
+            # with a weaker guarantee than advertised.
+            _close_job(job)
+            return None
+        return job
     except (AttributeError, OSError, ValueError):
         return None
+
+
+def _resume_process_tree(process_id: int) -> bool:
+    """Resume every thread of the suspended process, returning success.
+
+    ``subprocess.Popen`` closes the initial thread handle before it
+    returns, so the thread is reached by enumerating the process's threads
+    rather than by keeping that handle. A newly created suspended process
+    has exactly one thread; resuming every thread it owns is therefore
+    both sufficient and precise.
+    """
+
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", ctypes.c_long),
+                ("tpDeltaPri", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        kernel32 = _kernel32()
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenThread.restype = wintypes.HANDLE
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+            return False
+        resumed = 0
+        try:
+            entry = _ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+                return False
+            while True:
+                if int(entry.th32OwnerProcessID) == int(process_id):
+                    thread = kernel32.OpenThread(
+                        _THREAD_SUSPEND_RESUME, False, entry.th32ThreadID
+                    )
+                    if thread:
+                        try:
+                            if kernel32.ResumeThread(wintypes.HANDLE(int(thread))) != 0xFFFFFFFF:
+                                resumed += 1
+                        finally:
+                            kernel32.CloseHandle(wintypes.HANDLE(int(thread)))
+                if not kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(wintypes.HANDLE(int(snapshot)))
+        return resumed > 0
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _job_process_count(job: Any) -> int | None:
+    """How many processes the job still contains, or ``None`` if unknown."""
+
+    if job is None or sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicProcessIdList(ctypes.Structure):
+            _fields_ = [
+                ("NumberOfAssignedProcesses", wintypes.DWORD),
+                ("NumberOfProcessIdsInList", wintypes.DWORD),
+                ("ProcessIdList", ctypes.c_size_t * _MAX_TRACKED_JOB_PROCESSES),
+            ]
+
+        kernel32 = _kernel32()
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+
+        listing = _BasicProcessIdList()
+        returned = wintypes.DWORD(0)
+        if not kernel32.QueryInformationJobObject(
+            wintypes.HANDLE(int(job)),
+            _JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+            ctypes.byref(listing),
+            ctypes.sizeof(listing),
+            ctypes.byref(returned),
+        ):
+            return None
+        return int(listing.NumberOfAssignedProcesses)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _terminate_job_tree(job: Any) -> None:
+    if job is None or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = _kernel32()
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, ctypes.c_uint]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject(wintypes.HANDLE(int(job)), 1)
+    except (AttributeError, OSError, ValueError):
+        return
+
+
+def _await_empty_job(
+    job: Any, *, deadline_seconds: float = 30.0, clock: Callable[[], float] = time.monotonic
+) -> bool:
+    """Wait until the job holds no processes, returning whether it emptied.
+
+    This is the "verify no converter member survives" step: terminating a
+    job is asynchronous, and returning before every member has actually
+    gone would hand the caller a directory a dying grandchild can still
+    write into.
+    """
+
+    if job is None or sys.platform != "win32":
+        return True
+    started = clock()
+    while True:
+        remaining = _job_process_count(job)
+        if remaining == 0:
+            return True
+        if remaining is None:
+            # The count is unknowable; do not claim the tree is gone.
+            return False
+        if clock() - started > deadline_seconds:
+            return False
+        time.sleep(0.05)
 
 
 def _assign_process_to_job(job: Any, process: Any) -> bool:
@@ -518,16 +720,73 @@ def _assign_process_to_job(job: Any, process: Any) -> bool:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _kernel32()
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        return bool(
-            kernel32.AssignProcessToJobObject(
-                wintypes.HANDLE(int(job)), wintypes.HANDLE(int(handle))
-            )
-        )
+        if not kernel32.AssignProcessToJobObject(
+            wintypes.HANDLE(int(job)), wintypes.HANDLE(int(handle))
+        ):
+            return False
+
+        # Assignment reporting success is not by itself proof of
+        # membership -- confirm it with the kernel before the process is
+        # ever allowed to run.
+        kernel32.IsProcessInJob.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        kernel32.IsProcessInJob.restype = wintypes.BOOL
+        member = ctypes.c_int(0)
+        if not kernel32.IsProcessInJob(
+            wintypes.HANDLE(int(handle)), wintypes.HANDLE(int(job)), ctypes.byref(member)
+        ):
+            return False
+        return bool(member.value)
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def _extended_limit_information() -> Any:
+    """A fresh ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` structure."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    return _ExtendedLimitInformation()
 
 
 def _peak_job_memory(job: Any) -> tuple[int | None, int | None]:
@@ -543,40 +802,7 @@ def _peak_job_memory(job: Any) -> tuple[int | None, int | None]:
         import ctypes
         from ctypes import wintypes
 
-        class _IoCounters(ctypes.Structure):
-            _fields_ = [
-                ("ReadOperationCount", ctypes.c_ulonglong),
-                ("WriteOperationCount", ctypes.c_ulonglong),
-                ("OtherOperationCount", ctypes.c_ulonglong),
-                ("ReadTransferCount", ctypes.c_ulonglong),
-                ("WriteTransferCount", ctypes.c_ulonglong),
-                ("OtherTransferCount", ctypes.c_ulonglong),
-            ]
-
-        class _BasicLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class _ExtendedLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", _BasicLimitInformation),
-                ("IoInfo", _IoCounters),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _kernel32()
         # argtypes are mandatory, not cosmetic: without them ctypes passes
         # the struct pointer as a 32-bit int, so the call still returns
         # TRUE while filling a truncated address and reporting nonsense.
@@ -589,7 +815,7 @@ def _peak_job_memory(job: Any) -> tuple[int | None, int | None]:
         ]
         kernel32.QueryInformationJobObject.restype = wintypes.BOOL
 
-        information = _ExtendedLimitInformation()
+        information = _extended_limit_information()
         returned = wintypes.DWORD(0)
         if not kernel32.QueryInformationJobObject(
             wintypes.HANDLE(int(job)),
@@ -630,56 +856,110 @@ def run_converter_child(
     argv: Sequence[str],
     *,
     deadline_seconds: float,
+    converter_kind: str | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> ConversionRunEvidence:
-    """Run one converter child process, with explicit argv and ``shell=False``.
+    """Run one converter child process, owning its entire process tree.
 
-    stdin/stdout/stderr are all ``DEVNULL``: the converter's own text is
-    never needed for pass/fail and must never reach an evidence capture.
-    What is retained instead is the closed, numeric outcome -- category,
-    return code, elapsed time, and peak memory.
+    Explicit argv, ``shell=False``, and ``DEVNULL`` on all three standard
+    streams: the converter's own text is never needed for pass/fail and
+    must never reach an evidence capture. What is retained instead is the
+    closed, numeric outcome -- category, return code, elapsed time, and
+    peak memory.
+
+    Ownership on Windows is established *before the converter is allowed
+    to execute at all*:
+
+    1. create the process suspended, so it has run no instruction yet;
+    2. assign it to a kill-on-close Job Object and confirm membership with
+       ``IsProcessInJob``;
+    3. only then resume it.
+
+    If assignment cannot be confirmed the process is killed while still
+    suspended and the run fails closed -- an unowned converter is never
+    permitted to run, because the thing that must be preventable is
+    precisely a converter nobody can reliably kill. Because the assignment
+    happens before the first instruction, every process the converter
+    later spawns is born inside the job; this is what makes the venv
+    launcher's grandchild interpreter owned rather than orphaned.
+
+    On timeout the *whole job* is terminated, not just the launcher, and
+    this waits for every member to actually exit before returning. That
+    ordering is load-bearing: the caller removes the temporary output
+    directory next, and a surviving grandchild would still be writing
+    into it.
+
+    On POSIX the equivalent guarantee comes from a dedicated process
+    group: the child starts its own session and the timeout path signals
+    the entire group.
     """
 
     import subprocess
 
+    if converter_kind is not None and converter_kind not in CONVERTER_KINDS:
+        raise ValueError("unknown converter kind")
+
     started = clock()
-    job = _create_memory_accounting_job()
+    on_windows = sys.platform == "win32"
+    job = _create_owning_job()
+    if on_windows and job is None:
+        # No job means no ownership, and no ownership means a converter
+        # that could survive its own timeout.
+        raise ColibriStage2Failure("job_create_failed")
+
+    popen_kwargs: dict[str, Any] = {
+        "shell": False,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if on_windows:
+        popen_kwargs["creationflags"] = _CREATE_SUSPENDED
+    else:
+        # A new session gives the child its own process group, so the
+        # timeout path can signal the whole tree rather than one process.
+        popen_kwargs["start_new_session"] = True
+
     try:
         try:
-            process = subprocess.Popen(
-                list(argv),
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            process = subprocess.Popen(list(argv), **popen_kwargs)
         except (OSError, ValueError) as exc:
             raise ColibriStage2Failure("conversion_failed") from exc
 
-        # Only a *confirmed* assignment licenses a whole-tree memory
-        # claim. An unassigned job still answers queries -- with numbers
-        # describing an empty job, not the converter -- so an ignored
-        # failure here would turn "no measurement" into a confident wrong
-        # one.
-        assigned = _assign_process_to_job(job, process)
+        assigned = True
+        if on_windows:
+            assigned = _assign_process_to_job(job, process)
+            if not assigned:
+                # Still suspended: it has executed nothing and spawned
+                # nothing. Kill it before it ever can.
+                _kill_unowned_process(process)
+                raise ColibriStage2Failure("job_assignment_failed")
+            if not _resume_process_tree(process.pid):
+                _terminate_job_tree(job)
+                _await_empty_job(job)
+                raise ColibriStage2Failure("process_resume_failed")
 
         timed_out = False
         try:
             returncode = process.wait(timeout=deadline_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
-            returncode = process.wait()
+            returncode = _terminate_process_tree(process, job, on_windows=on_windows)
         except OSError as exc:
-            process.kill()
-            process.wait()
+            _terminate_process_tree(process, job, on_windows=on_windows)
             raise ColibriStage2Failure("conversion_failed") from exc
 
+        # Read the peaks before the job handle is closed, and only when
+        # membership was confirmed: an unassigned job still answers
+        # queries, with numbers describing an empty job rather than the
+        # converter.
         if assigned:
             peak_memory_bytes, peak_commit_bytes = _peak_job_memory(job)
         else:
             peak_memory_bytes, peak_commit_bytes = None, None
     finally:
+        # Closing the last handle to a kill-on-close job is the final
+        # safeguard for anything still alive on any path above.
         _close_job(job)
 
     # The query itself can still fail after a confirmed assignment, so the
@@ -707,7 +987,53 @@ def run_converter_child(
         peak_memory_bytes=peak_memory_bytes,
         peak_commit_bytes=peak_commit_bytes,
         peak_memory_state=peak_memory_state,
+        converter_kind=converter_kind,
     )
+
+
+def _kill_unowned_process(process: Any) -> None:
+    """Destroy a process that could not be brought under ownership."""
+
+    try:
+        process.kill()
+        process.wait()
+    except OSError:
+        return
+
+
+def _terminate_process_tree(process: Any, job: Any, *, on_windows: bool) -> int:
+    """Terminate the converter's whole tree and wait for it to be gone.
+
+    Returns the launcher's return code. On Windows the job is terminated
+    (covering the grandchild interpreter) and this blocks until the job
+    reports no remaining members; on POSIX the child's process group is
+    signalled.
+    """
+
+    if on_windows:
+        _terminate_job_tree(job)
+    else:
+        import os
+        import signal
+
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, AttributeError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    try:
+        returncode = process.wait()
+    except OSError:
+        returncode = -1
+
+    if on_windows and not _await_empty_job(job):
+        # The tree could not be proven gone, so the caller must not go on
+        # to delete a directory something may still be writing into.
+        raise ColibriStage2Failure("cleanup_failed")
+    return returncode
 
 
 def require_reviewed_converter_identity(script_path: Path) -> None:
@@ -762,6 +1088,10 @@ class PinnedScriptConverter:
     converter_script_path: Path
     absolute_deadline_seconds: float = 1800.0
 
+    # Fixed on the class: this adapter can only ever run the pinned
+    # upstream script, so it can only ever report that identity.
+    converter_kind: str = CONVERTER_KIND_PINNED_SCRIPT
+
     def convert(self, *, model_dir: Path, output_dir: Path) -> ConversionRunEvidence:
         require_reviewed_converter_identity(self.converter_script_path)
         argv = [
@@ -773,7 +1103,9 @@ class PinnedScriptConverter:
             str(output_dir),
         ]
         return run_converter_child(
-            argv, deadline_seconds=self.absolute_deadline_seconds
+            argv,
+            deadline_seconds=self.absolute_deadline_seconds,
+            converter_kind=CONVERTER_KIND_PINNED_SCRIPT,
         )
 
 
@@ -874,6 +1206,10 @@ class BoundedScriptConverter:
     chunk_target_bytes: int = bounded_convert.DEFAULT_CHUNK_TARGET_BYTES
     absolute_deadline_seconds: float = 1800.0
 
+    # Fixed on the class: this adapter can only ever run the in-repo
+    # bounded converter, so it can only ever report that identity.
+    converter_kind: str = CONVERTER_KIND_BOUNDED
+
     def convert(self, *, model_dir: Path, output_dir: Path) -> ConversionRunEvidence:
         # Re-verified here, immediately before argv is built and the
         # subprocess is created -- a converter edited between two launches
@@ -890,7 +1226,9 @@ class BoundedScriptConverter:
             str(int(self.chunk_target_bytes)),
         ]
         return run_converter_child(
-            argv, deadline_seconds=self.absolute_deadline_seconds
+            argv,
+            deadline_seconds=self.absolute_deadline_seconds,
+            converter_kind=CONVERTER_KIND_BOUNDED,
         )
 
 
@@ -901,11 +1239,21 @@ class BoundedScriptConverter:
 
 @dataclass(frozen=True, slots=True)
 class ConvertedShardRecord:
-    """The recorded identity of one already-converted shard."""
+    """The recorded identity of one already-converted shard.
+
+    ``converter_kind`` records *which* reviewed converter produced the
+    artifact, so a resumed run reports the identity of the converter that
+    actually created it rather than whichever converter this run happens
+    to be configured with. A resumed run may legitimately use a different
+    converter than the interrupted one -- switching from the upstream
+    script to the bounded converter is exactly why this PR exists -- and
+    the capture has to stay truthful about both.
+    """
 
     basename: str
     size_bytes: int
     sha256: str
+    converter_kind: str
 
     def __post_init__(self) -> None:
         if self.basename not in EXPECTED_SHARD_BASENAMES:
@@ -918,6 +1266,8 @@ class ConvertedShardRecord:
             raise ValueError("converted shard record size_bytes is out of bounds")
         if not is_hex64(self.sha256):
             raise ValueError("converted shard record sha256 is not a lowercase SHA-256")
+        if self.converter_kind not in CONVERTER_KINDS:
+            raise ValueError("converted shard record converter_kind is not a reviewed converter")
 
 
 def read_resume_ledger(converted_dir: Path) -> dict[str, ConvertedShardRecord]:
@@ -971,6 +1321,7 @@ def read_resume_ledger(converted_dir: Path) -> dict[str, ConvertedShardRecord]:
                 basename=item.get("basename"),
                 size_bytes=item.get("size_bytes"),
                 sha256=item.get("sha256"),
+                converter_kind=item.get("converter_kind"),
             )
         except (TypeError, ValueError) as exc:
             raise ColibriStage2Failure("resume_state_invalid") from exc
@@ -1009,6 +1360,7 @@ def write_resume_ledger(converted_dir: Path, records: Mapping[str, ConvertedShar
                 "basename": records[basename].basename,
                 "size_bytes": records[basename].size_bytes,
                 "sha256": records[basename].sha256,
+                "converter_kind": records[basename].converter_kind,
             }
             for basename in EXPECTED_SHARD_BASENAMES
             if basename in records
@@ -1095,6 +1447,18 @@ class ShardTransactionResult:
     conversion_peak_memory_bytes: int | None = None
     conversion_peak_commit_bytes: int | None = None
     conversion_peak_memory_state: str = MEMORY_ACCOUNTING_UNAVAILABLE
+    # Which reviewed converter produced this shard's artifact. For a
+    # reused shard this is the kind recorded when the artifact was
+    # originally created, not the converter configured for this run.
+    converter_kind: str | None = None
+
+    def __post_init__(self) -> None:
+        # Rejected at construction, not merely at capture time, so a
+        # forged converter kind cannot exist in a result object at all.
+        if self.converter_kind is not None and self.converter_kind not in CONVERTER_KINDS:
+            raise ValueError("shard result converter_kind is not a reviewed converter")
+        if self.conversion_peak_memory_state not in MEMORY_ACCOUNTING_STATES:
+            raise ValueError("shard result has an unknown memory accounting state")
 
 
 def _sha256_file(path: Path) -> str:
@@ -1329,6 +1693,9 @@ def run_shard_transaction(
                     elapsed_ms=max(0, round((clock() - started) * 1000)),
                     source_reused=True,
                     converted_reused=True,
+                    # The converter that actually made this artifact,
+                    # taken from its record -- never this run's converter.
+                    converter_kind=converted_record.converter_kind,
                 )
         raise ColibriStage2Failure("converted_shard_already_exists")
 
@@ -1471,6 +1838,15 @@ def run_shard_transaction(
             if run_evidence is not None
             else MEMORY_ACCOUNTING_UNAVAILABLE
         ),
+        # Taken from the adapter that actually ran. A converter reporting
+        # no kind (every synthetic test fake) leaves this ``None``, and a
+        # capture cannot then be built -- which is the intended outcome:
+        # an unattributable conversion must not claim any identity.
+        converter_kind=(
+            run_evidence.converter_kind
+            if run_evidence is not None
+            else getattr(converter, "converter_kind", None)
+        ),
     )
 
 
@@ -1554,10 +1930,16 @@ def run_approved_conversion(
         if allow_resume and not result.converted_reused:
             # Record the shard the moment it is proven complete, so a
             # crash on a later shard never costs this one.
+            if result.converter_kind is None:
+                # An artifact whose producing converter cannot be named
+                # must not be recorded as resumable -- a later run would
+                # have no truthful identity to report for it.
+                raise ColibriStage2Failure("resume_state_invalid")
             ledger[basename] = ConvertedShardRecord(
                 basename=result.converted_basename,
                 size_bytes=result.converted_size_bytes,
                 sha256=result.converted_sha256,
+                converter_kind=result.converter_kind,
             )
             write_resume_ledger(final_converted_dir, ledger)
 
@@ -1620,9 +2002,13 @@ def build_conversion_capture(
     """A closed, privacy-safe capture with the complete reviewable identity
     set the next tiny registry-pinning commit needs.
 
-    The converter identity is never a caller-supplied parameter -- it is
-    always read live from ``common.REVIEWED_CONVERTER_IDENTITY``, so a
-    capture can never claim a converter identity nobody actually reviewed.
+    The converter identity is never a caller-supplied parameter. Each
+    shard names the *kind* of converter that produced it, and the identity
+    is resolved from that through the closed
+    ``common.REVIEWED_CONVERTER_IDENTITY_BY_KIND`` mapping -- so a capture
+    can never claim an identity nobody reviewed, and can never attribute
+    a bounded conversion to the upstream script. A shard that cannot say
+    which converter produced it is rejected rather than defaulted.
 
     The three shard records are required to be in exactly
     ``EXPECTED_SHARD_BASENAMES`` order -- this simultaneously rejects
@@ -1639,7 +2025,6 @@ def build_conversion_capture(
     real run.
     """
 
-    reviewed_converter = common.REVIEWED_CONVERTER_IDENTITY
     if not isinstance(source_config, SourceShardEntry) or source_config.basename != EXPECTED_CONFIG_BASENAME:
         raise ValueError("invalid source config identity")
     if not source_config_verified or not source_config_moved_to_final:
@@ -1704,6 +2089,15 @@ def build_conversion_capture(
             # A capture may never present an unconfirmed number as if it
             # were a measurement.
             raise ValueError("unavailable memory accounting must not carry peak values")
+        # Resolve this shard's producing converter to its reviewed
+        # identity. ``reviewed_identity_for_converter_kind`` is the only
+        # route by which any identity reaches a capture, and it accepts a
+        # closed kind rather than a basename, size, hash, or identity
+        # object -- so a bounded conversion can never be recorded as the
+        # upstream script, and neither can be caller-substituted.
+        if result.converter_kind is None:
+            raise ValueError("shard result does not record which converter produced it")
+        shard_identity = reviewed_identity_for_converter_kind(result.converter_kind)
         shards.append(
             {
                 "source_basename": result.source_basename,
@@ -1734,6 +2128,12 @@ def build_conversion_capture(
                 # Says whether the two peaks above are a confirmed
                 # whole-tree measurement or simply absent.
                 "conversion_peak_memory_state": result.conversion_peak_memory_state,
+                # The reviewed identity of the converter that actually
+                # produced this shard.
+                "converter_kind": result.converter_kind,
+                "converter_basename": shard_identity.basename,
+                "converter_size_bytes": shard_identity.size_bytes,
+                "converter_sha256": shard_identity.sha256,
             }
         )
 
@@ -1744,9 +2144,20 @@ def build_conversion_capture(
         "model_revision": PINNED_MODEL_REVISION,
         "license_identifier": PINNED_LICENSE_IDENTIFIER,
         "colibri_commit": PINNED_COLIBRI_COMMIT,
-        "converter_basename": reviewed_converter.basename,
-        "converter_size_bytes": reviewed_converter.size_bytes,
-        "converter_sha256": reviewed_converter.sha256,
+        # Every reviewed converter that contributed to this model, derived
+        # from the shards themselves. A resumed run may legitimately mix
+        # the two (that is the upstream-script -> bounded migration this
+        # PR enables), so this is a list rather than one identity, and it
+        # never names a converter that did not actually run.
+        "converters": [
+            {
+                "converter_kind": kind,
+                "basename": reviewed_identity_for_converter_kind(kind).basename,
+                "size_bytes": reviewed_identity_for_converter_kind(kind).size_bytes,
+                "sha256": reviewed_identity_for_converter_kind(kind).sha256,
+            }
+            for kind in sorted({result.converter_kind for result in shard_results})
+        ],
         "source_config_basename": source_config.basename,
         "source_config_size_bytes": source_config.size_bytes,
         "source_config_sha256": source_config.sha256,

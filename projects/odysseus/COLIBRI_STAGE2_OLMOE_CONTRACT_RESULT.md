@@ -165,6 +165,66 @@ resumed shard that ran no converter is `unavailable` by construction.
 The 1784 MiB / 196 MiB figures above were taken through a confirmed
 assignment (verified against a known 600 MB allocation) and are unaffected.
 
+### Correction pass 5b — review findings (2026-07-29)
+
+**Converter provenance in the capture.** `build_conversion_capture` always
+recorded `REVIEWED_CONVERTER_IDENTITY`, so a bounded conversion claimed the
+upstream `convert_olmoe.py`'s basename, size, and SHA-256 — a false
+provenance claim in exactly the runs this PR makes the default.
+
+Each shard now carries the `converter_kind` of the adapter that actually
+ran, and the identity is resolved through the closed
+`common.REVIEWED_CONVERTER_IDENTITY_BY_KIND` mapping. Both real adapters fix
+their kind on the class (`BoundedScriptConverter` → `bounded`,
+`PinnedScriptConverter` → `pinned_script`), so an adapter can only ever
+report its own identity. `build_conversion_capture` takes no converter
+parameter at all: a caller supplies at most a closed *kind*, never a
+basename, size, hash, or identity object, and a forged kind is rejected at
+`ShardTransactionResult` construction. A shard that cannot name its
+converter is rejected rather than defaulted.
+
+The single top-level `converter_basename`/`converter_size_bytes`/
+`converter_sha256` triple is replaced by a `converters` list derived from
+the shards, because a resumed run may legitimately mix both — switching
+from the upstream script to the bounded converter is precisely the
+migration this PR enables. The resume ledger persists each artifact's
+producing converter, so a resumed shard keeps the identity of whatever
+actually created it, not of this run's converter. A ledger without a
+converter kind, or naming an unreviewed one, fails closed. Capture schema
+bumped to **v3**.
+
+**Whole process-tree ownership.** `run_converter_child` started the venv
+launcher normally, assigned it to the job afterwards, and on timeout called
+`process.kill()` only. Because a venv `Scripts\python.exe` runs the real
+interpreter as a *grandchild*, the actual converter survived. Reproduced
+directly as a negative control: under the old path the grandchild's counter
+kept advancing (41 → 70) after the launcher was killed, while it still held
+files in the temporary output directory that cleanup removes next.
+
+Ownership is now established before the converter executes anything:
+
+1. create the process **suspended**;
+2. assign it to a kill-on-close Job Object and confirm with
+   `IsProcessInJob`;
+3. only then resume it.
+
+A failed assignment kills the still-suspended process and fails closed with
+`job_assignment_failed` — an unowned converter never runs, since a converter
+nobody can reliably kill is the thing being prevented. Because assignment
+precedes the first instruction, every process the converter spawns is born
+inside the job. On timeout the whole job is terminated and the call blocks
+until the job reports zero remaining members before returning; if that
+cannot be proven it raises `cleanup_failed` rather than letting the caller
+delete a directory something may still be writing into. Kill-on-close is
+the final safeguard. On POSIX the child gets its own session and the
+timeout path signals the entire process group.
+
+Measured directly: the job held **2 PIDs** (launcher + grandchild),
+`TerminateJobObject` emptied it to 0, and the grandchild stopped writing.
+Peak memory is still only reported when assignment and query were both
+proven. The 1784 MiB / 196 MiB figures and the byte-identical equivalence
+result were re-verified unchanged through the new owned-tree path.
+
 ### What this commit did not do
 
 No model download, no real conversion, no model deletion, no registry

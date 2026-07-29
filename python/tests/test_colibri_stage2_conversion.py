@@ -53,6 +53,7 @@ class _FakePopen:
         self.argv = list(argv)
         self.kwargs = dict(kwargs)
         self._handle = None
+        self.pid = 4242
         self.killed = False
         type(self).recorded.append({"argv": self.argv, "kwargs": self.kwargs})
 
@@ -64,9 +65,20 @@ class _FakePopen:
 
 
 def _patch_popen(monkeypatch: pytest.MonkeyPatch, factory: object = None) -> type[_FakePopen]:
-    """Install a fresh recording ``Popen`` fake and return its class."""
+    """Install a fresh recording ``Popen`` fake and return its class.
+
+    Also stands in for Windows job ownership: a synthetic Popen has no real
+    process handle, so the genuine assign/resume path cannot apply to it.
+    Ownership is covered by its own tests, which use real processes.
+    """
 
     import subprocess as subprocess_module
+
+    monkeypatch.setattr(conv, "_create_owning_job", lambda: object())
+    monkeypatch.setattr(conv, "_assign_process_to_job", lambda job, process: True)
+    monkeypatch.setattr(conv, "_resume_process_tree", lambda pid: True)
+    monkeypatch.setattr(conv, "_peak_job_memory", lambda job: (None, None))
+    monkeypatch.setattr(conv, "_close_job", lambda job: None)
 
     class _Recorder(_FakePopen):
         recorded: list[dict[str, object]] = []
@@ -526,6 +538,8 @@ class _RecordingDownloader:
 
 
 class _RecordingConverter:
+    converter_kind = common.CONVERTER_KIND_PINNED_SCRIPT
+
     """A fake standing in for the unmodified pinned convert_olmoe.py: given
     a model_dir containing config.json plus exactly one source shard, it
     writes config.json (copied unchanged) plus the converted shard into
@@ -868,6 +882,8 @@ class _FullRunDownloader:
 
 
 class _FullRunConverter:
+    converter_kind = common.CONVERTER_KIND_PINNED_SCRIPT
+
     def __init__(self, converted_payloads: dict[str, bytes]) -> None:
         self.converted_payloads = converted_payloads
         self.calls: list[Path] = []
@@ -943,8 +959,20 @@ def test_run_approved_conversion_full_sequence_with_reviewed_manifest(
     )
 
     assert capture["state"] == "unreviewed_conversion_capture"
-    assert capture["converter_basename"] == common.REVIEWED_CONVERTER_IDENTITY.basename
-    assert capture["converter_sha256"] == common.REVIEWED_CONVERTER_IDENTITY.sha256
+    # This run used a stand-in for the pinned upstream script, so that --
+    # and only that -- is the identity the capture may claim.
+    assert capture["converters"] == [
+        {
+            "converter_kind": common.CONVERTER_KIND_PINNED_SCRIPT,
+            "basename": common.REVIEWED_CONVERTER_IDENTITY.basename,
+            "size_bytes": common.REVIEWED_CONVERTER_IDENTITY.size_bytes,
+            "sha256": common.REVIEWED_CONVERTER_IDENTITY.sha256,
+        }
+    ]
+    assert all(
+        shard["converter_sha256"] == common.REVIEWED_CONVERTER_IDENTITY.sha256
+        for shard in capture["shards"]
+    )
     assert len(capture["shards"]) == 3
     assert {shard["source_basename"] for shard in capture["shards"]} == set(SHARD_BASENAMES)
     assert downloader.calls == [CONFIG_BASENAME, *SHARD_BASENAMES]
@@ -1234,6 +1262,7 @@ def _valid_shard_result(basename: str, **overrides: object) -> conv.ShardTransac
         partial_cleanup_complete=True,
         temporary_output_cleanup_complete=True,
         elapsed_ms=10,
+        converter_kind=common.CONVERTER_KIND_PINNED_SCRIPT,
     )
     kwargs.update(overrides)
     return conv.ShardTransactionResult(**kwargs)
