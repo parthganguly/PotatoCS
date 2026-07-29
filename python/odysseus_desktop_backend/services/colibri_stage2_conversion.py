@@ -399,19 +399,42 @@ class PinnedRevisionFileDownloader:
 # ---------------------------------------------------------------------------
 
 
+MEMORY_ACCOUNTING_MEASURED = "measured"
+MEMORY_ACCOUNTING_UNAVAILABLE = "unavailable"
+MEMORY_ACCOUNTING_STATES = frozenset({MEMORY_ACCOUNTING_MEASURED, MEMORY_ACCOUNTING_UNAVAILABLE})
+
+
 @dataclass(frozen=True, slots=True)
 class ConversionRunEvidence:
     """Bounded, structured evidence about one converter child process.
 
     Only numbers: how long it ran and how much memory it peaked at. Never
     stdout, never stderr, never an environment value, never a path.
-    ``peak_*`` are ``None`` whenever the OS would not report them -- they
-    are evidence, never a pass/fail input.
+
+    ``peak_memory_state`` is the honesty boundary. Peak memory is
+    whole-*tree* evidence only when the child was positively confirmed to
+    have joined the accounting job: a job the process never joined still
+    answers queries, with small plausible numbers describing an empty job
+    rather than the converter. So the peaks are populated **only** in the
+    ``measured`` state; in the ``unavailable`` state both are ``None`` and
+    no memory claim is made at all. A number is never emitted as proven
+    whole-tree evidence unless it actually is one.
+
+    Neither field is ever a pass/fail input.
     """
 
     elapsed_ms: int
     peak_memory_bytes: int | None
     peak_commit_bytes: int | None
+    peak_memory_state: str = MEMORY_ACCOUNTING_UNAVAILABLE
+
+    def __post_init__(self) -> None:
+        if self.peak_memory_state not in MEMORY_ACCOUNTING_STATES:
+            raise ValueError("unknown conversion memory accounting state")
+        if self.peak_memory_state == MEMORY_ACCOUNTING_UNAVAILABLE and not (
+            self.peak_memory_bytes is None and self.peak_commit_bytes is None
+        ):
+            raise ValueError("unavailable memory accounting must not carry peak values")
 
 
 def classify_process_exit(returncode: int) -> tuple[str, dict[str, int]]:
@@ -476,12 +499,21 @@ def _create_memory_accounting_job() -> Any:
         return None
 
 
-def _assign_process_to_job(job: Any, process: Any) -> None:
+def _assign_process_to_job(job: Any, process: Any) -> bool:
+    """Assign ``process`` to ``job``, returning whether that *succeeded*.
+
+    The return value is the whole point. If assignment fails, the job
+    contains nothing, and its peak counters describe an empty job -- they
+    would read as small, plausible numbers that are not measurements of
+    the converter at all. Reporting those as whole-tree evidence would be
+    worse than reporting nothing, so every caller must gate on this.
+    """
+
     if job is None or sys.platform != "win32":
-        return
+        return False
     handle = getattr(process, "_handle", None)
     if handle is None:
-        return
+        return False
     try:
         import ctypes
         from ctypes import wintypes
@@ -489,9 +521,13 @@ def _assign_process_to_job(job: Any, process: Any) -> None:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        kernel32.AssignProcessToJobObject(wintypes.HANDLE(int(job)), wintypes.HANDLE(int(handle)))
+        return bool(
+            kernel32.AssignProcessToJobObject(
+                wintypes.HANDLE(int(job)), wintypes.HANDLE(int(handle))
+            )
+        )
     except (AttributeError, OSError, ValueError):
-        return
+        return False
 
 
 def _peak_job_memory(job: Any) -> tuple[int | None, int | None]:
@@ -620,7 +656,12 @@ def run_converter_child(
         except (OSError, ValueError) as exc:
             raise ColibriStage2Failure("conversion_failed") from exc
 
-        _assign_process_to_job(job, process)
+        # Only a *confirmed* assignment licenses a whole-tree memory
+        # claim. An unassigned job still answers queries -- with numbers
+        # describing an empty job, not the converter -- so an ignored
+        # failure here would turn "no measurement" into a confident wrong
+        # one.
+        assigned = _assign_process_to_job(job, process)
 
         timed_out = False
         try:
@@ -634,9 +675,19 @@ def run_converter_child(
             process.wait()
             raise ColibriStage2Failure("conversion_failed") from exc
 
-        peak_memory_bytes, peak_commit_bytes = _peak_job_memory(job)
+        if assigned:
+            peak_memory_bytes, peak_commit_bytes = _peak_job_memory(job)
+        else:
+            peak_memory_bytes, peak_commit_bytes = None, None
     finally:
         _close_job(job)
+
+    # The query itself can still fail after a confirmed assignment, so the
+    # state is derived from what was actually obtained, never from intent.
+    measured = peak_memory_bytes is not None or peak_commit_bytes is not None
+    peak_memory_state = MEMORY_ACCOUNTING_MEASURED if measured else MEMORY_ACCOUNTING_UNAVAILABLE
+    if not measured:
+        peak_memory_bytes = peak_commit_bytes = None
 
     elapsed_ms = max(0, round((clock() - started) * 1000))
     metadata = _bounded_metadata(peak_memory_bytes, peak_commit_bytes)
@@ -655,6 +706,7 @@ def run_converter_child(
         elapsed_ms=elapsed_ms,
         peak_memory_bytes=peak_memory_bytes,
         peak_commit_bytes=peak_commit_bytes,
+        peak_memory_state=peak_memory_state,
     )
 
 
@@ -727,19 +779,53 @@ class PinnedScriptConverter:
 
 def bounded_converter_script_path() -> Path:
     """The one in-repo bounded converter, located from the imported module
-    itself.
+    itself, and proven to be exactly the reviewed file.
 
     There is deliberately no parameter, environment variable, or argument
     anywhere that could point this at a different script: it is whatever
-    ``colibri_stage2_bounded_convert`` this process already imported, and
-    it is then held to the same path-safety proof as every other file this
-    module opens.
+    ``colibri_stage2_bounded_convert`` this process already imported.
+
+    Locating it safely is necessary but *not* sufficient. A path-safety
+    proof establishes only where a file is, never what it contains -- a
+    working tree can be edited and a reviewed file can be patched after
+    review. So the located file is then held to
+    ``common.REVIEWED_BOUNDED_CONVERTER_IDENTITY``: exact basename, exact
+    size, exact SHA-256 over its full bytes. A caller-supplied expected
+    hash is never accepted; there is no parameter that could supply one.
     """
 
     module_file = getattr(bounded_convert, "__file__", None)
     if not module_file:
         raise ColibriStage2Failure("conversion_failed")
-    script_path = Path(module_file).resolve()
+    return require_reviewed_bounded_converter_identity(Path(module_file).resolve())
+
+
+def require_reviewed_bounded_converter_identity(script_path: Path) -> Path:
+    """Fail closed unless ``script_path`` is exactly the one reviewed
+    bounded converter.
+
+    The same proof ``require_reviewed_converter_identity`` applies to the
+    pinned upstream script: an absolute path to an ordinary, non-reparse
+    regular file, inside a directory chain proven free of
+    symlinks/junctions/reparse points down to its drive/root anchor, with
+    the exact reviewed basename, exact reviewed size, and exact reviewed
+    SHA-256 -- compared only against the fixed
+    ``common.REVIEWED_BOUNDED_CONVERTER_IDENTITY``.
+
+    Called both as a CLI precondition and again, immediately before every
+    subprocess creation, by ``BoundedScriptConverter.convert``, so a file
+    edited between two launches is rejected at the second one rather than
+    silently trusted from a first-call result.
+
+    Returns the resolved, verified path.
+    """
+
+    identity = common.REVIEWED_BOUNDED_CONVERTER_IDENTITY
+    if not script_path.is_absolute():
+        raise ColibriStage2Failure("unsafe_directory_rejected")
+    if script_path.name != identity.basename:
+        raise ColibriStage2Failure("conversion_failed")
+
     resolved_parent = require_ordinary_directory(
         script_path.parent,
         missing_category="unsafe_directory_rejected",
@@ -749,6 +835,17 @@ def bounded_converter_script_path() -> Path:
         resolved_parent, script_path.name, category="unsafe_directory_rejected"
     )
     if not _is_regular_no_reparse(resolved_script):
+        raise ColibriStage2Failure("conversion_failed")
+
+    # Size is checked before the bytes are read, so a wildly oversized
+    # file is rejected without being pulled into memory.
+    try:
+        if resolved_script.stat().st_size != identity.size_bytes:
+            raise ColibriStage2Failure("conversion_failed")
+        data = resolved_script.read_bytes()
+    except OSError as exc:
+        raise ColibriStage2Failure("conversion_failed") from exc
+    if len(data) != identity.size_bytes or hashlib.sha256(data).hexdigest() != identity.sha256:
         raise ColibriStage2Failure("conversion_failed")
     return resolved_script
 
@@ -769,15 +866,22 @@ class BoundedScriptConverter:
     violation inside ``torch_cpu.dll``, and an orchestrator that dies with
     its converter cannot record why it died or leave a resumable state
     behind.
+
+    The reviewed-identity proof is re-run immediately before every launch,
+    never cached from a previous call.
     """
 
     chunk_target_bytes: int = bounded_convert.DEFAULT_CHUNK_TARGET_BYTES
     absolute_deadline_seconds: float = 1800.0
 
     def convert(self, *, model_dir: Path, output_dir: Path) -> ConversionRunEvidence:
+        # Re-verified here, immediately before argv is built and the
+        # subprocess is created -- a converter edited between two launches
+        # must be rejected at the second one.
+        script_path = bounded_converter_script_path()
         argv = [
             sys.executable,
-            str(bounded_converter_script_path()),
+            str(script_path),
             "--model",
             str(model_dir),
             "--out",
@@ -986,8 +1090,11 @@ class ShardTransactionResult:
     # so it was left exactly as it was.
     source_reused: bool = False
     converted_reused: bool = False
+    # Peak memory is populated only when whole-tree accounting was
+    # positively confirmed; ``conversion_peak_memory_state`` says which.
     conversion_peak_memory_bytes: int | None = None
     conversion_peak_commit_bytes: int | None = None
+    conversion_peak_memory_state: str = MEMORY_ACCOUNTING_UNAVAILABLE
 
 
 def _sha256_file(path: Path) -> str:
@@ -1359,6 +1466,11 @@ def run_shard_transaction(
         conversion_peak_commit_bytes=(
             run_evidence.peak_commit_bytes if run_evidence is not None else None
         ),
+        conversion_peak_memory_state=(
+            run_evidence.peak_memory_state
+            if run_evidence is not None
+            else MEMORY_ACCOUNTING_UNAVAILABLE
+        ),
     )
 
 
@@ -1583,6 +1695,15 @@ def build_conversion_capture(
                 isinstance(peak, bool) or not isinstance(peak, int) or peak < 0
             ):
                 raise ValueError("shard result peak memory must be a non-negative integer or None")
+        if result.conversion_peak_memory_state not in MEMORY_ACCOUNTING_STATES:
+            raise ValueError("shard result has an unknown memory accounting state")
+        if result.conversion_peak_memory_state == MEMORY_ACCOUNTING_UNAVAILABLE and (
+            result.conversion_peak_memory_bytes is not None
+            or result.conversion_peak_commit_bytes is not None
+        ):
+            # A capture may never present an unconfirmed number as if it
+            # were a measurement.
+            raise ValueError("unavailable memory accounting must not carry peak values")
         shards.append(
             {
                 "source_basename": result.source_basename,
@@ -1610,6 +1731,9 @@ def build_conversion_capture(
                     if result.conversion_peak_commit_bytes is None
                     else int(result.conversion_peak_commit_bytes)
                 ),
+                # Says whether the two peaks above are a confirmed
+                # whole-tree measurement or simply absent.
+                "conversion_peak_memory_state": result.conversion_peak_memory_state,
             }
         )
 

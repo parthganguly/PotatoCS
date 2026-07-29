@@ -127,6 +127,44 @@ accounts for the whole tree and stays readable after exit. (`argtypes`
 must be set on the `ctypes` call; without them the struct pointer is
 truncated to 32 bits and the call returns TRUE while filling nonsense.)
 
+### Correction pass 5a — review findings (2026-07-29)
+
+**Reviewed bounded-converter identity.** The bounded converter is launched
+as a subprocess exactly like the pinned upstream script, so it needs the
+same strength of proof. Path safety establishes only *where* a file is,
+never *what it contains*: a working tree can be edited and a reviewed file
+patched after review. `common.REVIEWED_BOUNDED_CONVERTER_IDENTITY` now pins
+basename `colibri_stage2_bounded_convert.py`, size **24,033 bytes**, SHA-256
+`6f8145fc71f060c75d7d04a34c96cfd58d00daa3d51f2406a6de25e167d2266b`, and
+`require_reviewed_bounded_converter_identity` re-verifies it — ordinary,
+direct-child, non-reparse, exact size, exact digest — immediately before
+*every* launch, never cached from a previous call.
+
+Pinning a digest exposed a real hazard first. This repository sets
+`core.autocrlf=true` with no `.gitattributes`, so a fresh Windows clone
+checked the file out as **24,670 CRLF bytes** while the working tree held
+**24,033 LF bytes** — two different digests for the same commit, and no
+single pin could match both. A `.gitattributes` rule now forces LF for this
+one file; a fresh clone was re-tested and reproduces the pinned digest
+exactly. A test recomputes the identity from the real file, so editing the
+converter without updating the pin fails the suite rather than silently
+rejecting every launch.
+
+**Job Object accounting boundary.** `AssignProcessToJobObject`'s return
+value was ignored. A job the child never joined still answers queries — with
+small, plausible numbers describing an *empty job*, not the converter — so
+an ignored failure turned "no measurement" into a confident wrong one.
+Assignment is now checked; peak memory is queried only after a confirmed
+assignment, and `ConversionRunEvidence.peak_memory_state` records
+`measured` or `unavailable`. In the `unavailable` state both peaks are
+`None` and no memory claim is made; the dataclass and
+`build_conversion_capture` both reject the incoherent combination, so no
+code path can present an unconfirmed number as whole-tree evidence. A
+resumed shard that ran no converter is `unavailable` by construction.
+
+The 1784 MiB / 196 MiB figures above were taken through a confirmed
+assignment (verified against a known 600 MB allocation) and are unaffected.
+
 ### What this commit did not do
 
 No model download, no real conversion, no model deletion, no registry

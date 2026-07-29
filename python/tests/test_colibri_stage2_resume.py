@@ -901,6 +901,7 @@ def test_capture_records_resume_and_peak_memory_fields(tmp_path: Path) -> None:
             converted_reused=False,
             conversion_peak_memory_bytes=205_520_896,
             conversion_peak_commit_bytes=206_569_472,
+            conversion_peak_memory_state=conv.MEMORY_ACCOUNTING_MEASURED,
         )
         for basename in SHARD_BASENAMES
     ]
@@ -922,6 +923,7 @@ def test_capture_records_resume_and_peak_memory_fields(tmp_path: Path) -> None:
         assert shard["source_reused"] is True
         assert shard["converted_reused"] is False
         assert shard["conversion_peak_memory_bytes"] == 205_520_896
+        assert shard["conversion_peak_memory_state"] == "measured"
 
     # Still privacy-safe: no path, username, or free text anywhere.
     serialized = json.dumps(capture)
@@ -1001,6 +1003,386 @@ def test_bounded_converter_takes_no_caller_supplied_script_path() -> None:
     signature = inspect.signature(conv.BoundedScriptConverter)
     assert set(signature.parameters) == {"chunk_target_bytes", "absolute_deadline_seconds"}
     assert not inspect.signature(conv.bounded_converter_script_path).parameters
+
+
+# ---------------------------------------------------------------------------
+# Reviewed bounded-converter identity
+# ---------------------------------------------------------------------------
+
+
+def _copy_bounded_converter(destination_dir: Path) -> Path:
+    """A byte-identical copy of the real reviewed converter, so a test can
+    tamper with the copy without ever touching the repository file."""
+
+    from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded
+
+    destination = destination_dir / common.EXPECTED_BOUNDED_CONVERTER_BASENAME
+    destination.write_bytes(Path(bounded.__file__).read_bytes())
+    return destination
+
+
+def test_reviewed_bounded_converter_identity_matches_the_file_on_disk() -> None:
+    """The pin must describe the real file. If the converter is edited
+    without updating the reviewed identity, this fails loudly rather than
+    letting the gate silently reject every launch."""
+
+    from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded
+
+    identity = common.REVIEWED_BOUNDED_CONVERTER_IDENTITY
+    data = Path(bounded.__file__).read_bytes()
+    assert Path(bounded.__file__).name == identity.basename
+    assert len(data) == identity.size_bytes
+    assert hashlib.sha256(data).hexdigest() == identity.sha256
+
+
+def test_reviewed_bounded_converter_identity_is_immutable_and_validated() -> None:
+    identity = common.REVIEWED_BOUNDED_CONVERTER_IDENTITY
+    with pytest.raises(AttributeError):
+        identity.sha256 = "b" * 64  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        common.ReviewedBoundedConverterIdentity(
+            basename="something_else.py", size_bytes=1, sha256="a" * 64
+        )
+    with pytest.raises(ValueError):
+        common.ReviewedBoundedConverterIdentity(
+            basename=common.EXPECTED_BOUNDED_CONVERTER_BASENAME, size_bytes=0, sha256="a" * 64
+        )
+    with pytest.raises(ValueError):
+        common.ReviewedBoundedConverterIdentity(
+            basename=common.EXPECTED_BOUNDED_CONVERTER_BASENAME,
+            size_bytes=1,
+            sha256="not-a-sha256",
+        )
+
+
+def test_the_real_converter_passes_its_own_reviewed_identity_gate() -> None:
+    from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded
+
+    resolved = conv.require_reviewed_bounded_converter_identity(Path(bounded.__file__).resolve())
+    assert resolved == Path(bounded.__file__).resolve()
+
+
+def test_modified_bounded_converter_is_rejected_before_subprocess_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single appended byte must stop the launch -- and must stop it
+    *before* any process is created, not after."""
+
+    import subprocess
+
+    script = _copy_bounded_converter(tmp_path)
+    script.write_bytes(script.read_bytes() + b"\n# injected\n")
+
+    def _never(*args: object, **kwargs: object) -> None:
+        raise AssertionError("no subprocess may be created for a modified converter")
+
+    monkeypatch.setattr(subprocess, "Popen", _never)
+    monkeypatch.setattr(conv, "bounded_converter_script_path", lambda: script)
+
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        conv.require_reviewed_bounded_converter_identity(script)
+
+
+def test_bounded_converter_launch_is_blocked_when_the_module_file_is_modified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the adapter: a tampered converter never reaches
+    ``Popen``."""
+
+    import subprocess
+
+    from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded
+
+    script = _copy_bounded_converter(tmp_path)
+    script.write_bytes(script.read_bytes().replace(b"row_max / QUANT_DIVISOR", b"row_max / 64.0"))
+    monkeypatch.setattr(bounded, "__file__", str(script))
+
+    def _never(*args: object, **kwargs: object) -> None:
+        raise AssertionError("no subprocess may be created for a modified converter")
+
+    monkeypatch.setattr(subprocess, "Popen", _never)
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        conv.BoundedScriptConverter().convert(model_dir=tmp_path / "m", output_dir=tmp_path / "o")
+
+
+def test_wrong_bounded_converter_size_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Right digest pin, wrong length: truncation must be caught."""
+
+    script = _copy_bounded_converter(tmp_path)
+    script.write_bytes(script.read_bytes()[:-100])
+    assert script.stat().st_size != common.REVIEWED_BOUNDED_CONVERTER_IDENTITY.size_bytes
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        conv.require_reviewed_bounded_converter_identity(script)
+
+
+def test_wrong_bounded_converter_hash_at_identical_size_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """The size check alone is not the gate: a same-length substitution
+    must still fail on the digest."""
+
+    script = _copy_bounded_converter(tmp_path)
+    data = bytearray(script.read_bytes())
+    # Flip one byte inside a comment, preserving the exact length.
+    for index, byte in enumerate(data):
+        if byte == ord("#"):
+            data[index] = ord("!")
+            break
+    script.write_bytes(bytes(data))
+    assert len(data) == common.REVIEWED_BOUNDED_CONVERTER_IDENTITY.size_bytes
+    assert hashlib.sha256(bytes(data)).hexdigest() != (
+        common.REVIEWED_BOUNDED_CONVERTER_IDENTITY.sha256
+    )
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        conv.require_reviewed_bounded_converter_identity(script)
+
+
+def test_wrong_bounded_converter_basename_is_rejected(tmp_path: Path) -> None:
+    from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded
+
+    renamed = tmp_path / "not_the_bounded_converter.py"
+    renamed.write_bytes(Path(bounded.__file__).read_bytes())
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        conv.require_reviewed_bounded_converter_identity(renamed)
+
+
+def test_relative_bounded_converter_path_is_rejected() -> None:
+    with pytest.raises(conv.ColibriStage2Failure, match="unsafe_directory_rejected"):
+        conv.require_reviewed_bounded_converter_identity(
+            Path(common.EXPECTED_BOUNDED_CONVERTER_BASENAME)
+        )
+
+
+def test_bounded_converter_identity_is_rechecked_immediately_before_each_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recheck must re-read and re-hash the file every time. A first
+    successful launch must never license a second one."""
+
+    import subprocess
+
+    from odysseus_desktop_backend.services import colibri_stage2_bounded_convert as bounded
+
+    script = _copy_bounded_converter(tmp_path)
+    monkeypatch.setattr(bounded, "__file__", str(script))
+
+    launches = 0
+
+    class _FakePopen:
+        def __init__(self, argv, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal launches
+            launches += 1
+            self._handle = None
+
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    converter = conv.BoundedScriptConverter()
+    converter.convert(model_dir=tmp_path / "m", output_dir=tmp_path / "o")
+    assert launches == 1
+
+    # Tamper AFTER the first successful launch, preserving the byte count
+    # so only the digest recheck can catch it.
+    data = bytearray(script.read_bytes())
+    data[-2] = ord("X") if data[-2] != ord("X") else ord("Y")
+    script.write_bytes(bytes(data))
+    assert script.stat().st_size == common.REVIEWED_BOUNDED_CONVERTER_IDENTITY.size_bytes
+
+    with pytest.raises(conv.ColibriStage2Failure, match="conversion_failed"):
+        converter.convert(model_dir=tmp_path / "m", output_dir=tmp_path / "o")
+    assert launches == 1, "the tampered second launch must never have created a process"
+
+
+def test_bounded_converter_identity_has_no_caller_supplied_expected_hash() -> None:
+    """There must be no parameter through which a caller could supply the
+    hash to compare against."""
+
+    import inspect
+
+    parameters = inspect.signature(conv.require_reviewed_bounded_converter_identity).parameters
+    assert list(parameters) == ["script_path"]
+
+
+# ---------------------------------------------------------------------------
+# Job Object accounting boundary
+# ---------------------------------------------------------------------------
+
+
+def test_failed_job_assignment_yields_no_peak_evidence_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claim-boundary requirement: if assignment fails, the run may
+    report *no* peak numbers, and must say accounting was unavailable --
+    never present an empty job's counters as whole-tree evidence."""
+
+    import sys
+
+    monkeypatch.setattr(conv, "_assign_process_to_job", lambda job, process: False)
+
+    def _must_not_query(job: object) -> tuple[int, int]:
+        raise AssertionError("peak memory must not be queried without a confirmed assignment")
+
+    monkeypatch.setattr(conv, "_peak_job_memory", _must_not_query)
+
+    evidence = conv.run_converter_child([sys.executable, "-c", "pass"], deadline_seconds=60)
+    assert evidence.peak_memory_state == conv.MEMORY_ACCOUNTING_UNAVAILABLE
+    assert evidence.peak_memory_bytes is None
+    assert evidence.peak_commit_bytes is None
+
+
+def test_failed_job_assignment_omits_peak_metadata_from_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setattr(conv, "_assign_process_to_job", lambda job, process: False)
+    with pytest.raises(conv.ColibriStage2Failure) as excinfo:
+        conv.run_converter_child([sys.executable, "-c", "raise SystemExit(4)"], deadline_seconds=60)
+    metadata = excinfo.value.numeric_metadata
+    assert metadata["exit_code"] == 4
+    assert "peak_memory_bytes" not in metadata
+    assert "peak_commit_bytes" not in metadata
+
+
+def test_confirmed_assignment_reports_measured_peak_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setattr(conv, "_assign_process_to_job", lambda job, process: True)
+    monkeypatch.setattr(conv, "_peak_job_memory", lambda job: (205_520_896, 206_569_472))
+
+    evidence = conv.run_converter_child([sys.executable, "-c", "pass"], deadline_seconds=60)
+    assert evidence.peak_memory_state == conv.MEMORY_ACCOUNTING_MEASURED
+    assert evidence.peak_memory_bytes == 205_520_896
+    assert evidence.peak_commit_bytes == 206_569_472
+
+
+def test_a_confirmed_assignment_whose_query_fails_is_still_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assignment succeeding does not guarantee the query does. The state
+    is derived from what was actually obtained, never from intent."""
+
+    import sys
+
+    monkeypatch.setattr(conv, "_assign_process_to_job", lambda job, process: True)
+    monkeypatch.setattr(conv, "_peak_job_memory", lambda job: (None, None))
+
+    evidence = conv.run_converter_child([sys.executable, "-c", "pass"], deadline_seconds=60)
+    assert evidence.peak_memory_state == conv.MEMORY_ACCOUNTING_UNAVAILABLE
+    assert evidence.peak_memory_bytes is None
+
+
+def test_assign_process_to_job_returns_false_when_the_api_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect being fixed: a false return from
+    ``AssignProcessToJobObject`` must be observed, not discarded."""
+
+    assert conv._assign_process_to_job(None, object()) is False
+
+    class _NoHandle:
+        _handle = None
+
+    assert conv._assign_process_to_job(1234, _NoHandle()) is False
+
+
+def test_evidence_cannot_be_constructed_claiming_unavailable_with_values() -> None:
+    """The dataclass itself refuses the incoherent combination, so no code
+    path can assemble a misleading record."""
+
+    with pytest.raises(ValueError):
+        conv.ConversionRunEvidence(
+            elapsed_ms=1,
+            peak_memory_bytes=123,
+            peak_commit_bytes=456,
+            peak_memory_state=conv.MEMORY_ACCOUNTING_UNAVAILABLE,
+        )
+    with pytest.raises(ValueError):
+        conv.ConversionRunEvidence(
+            elapsed_ms=1, peak_memory_bytes=None, peak_commit_bytes=None, peak_memory_state="guess"
+        )
+
+
+def test_capture_rejects_unavailable_accounting_that_carries_peak_values() -> None:
+    """Same boundary at the capture layer, so a hand-built shard result
+    cannot smuggle an unconfirmed number into evidence."""
+
+    results = [
+        conv.ShardTransactionResult(
+            source_basename=basename,
+            source_size_bytes=1,
+            source_sha256="a" * 64,
+            source_verified=True,
+            source_deleted=True,
+            converted_basename=basename,
+            converted_size_bytes=1,
+            converted_sha256="b" * 64,
+            partial_cleanup_complete=True,
+            temporary_output_cleanup_complete=True,
+            elapsed_ms=1,
+            conversion_peak_memory_bytes=999,
+            conversion_peak_memory_state=conv.MEMORY_ACCOUNTING_UNAVAILABLE,
+        )
+        for basename in SHARD_BASENAMES
+    ]
+    with pytest.raises(ValueError, match="unavailable memory accounting"):
+        conv.build_conversion_capture(
+            source_config=_entry(CONFIG_BASENAME, b"{}"),
+            source_config_verified=True,
+            source_config_moved_to_final=True,
+            converted_config_sha256="c" * 64,
+            converted_config_size_bytes=2,
+            shard_results=results,
+            dependency_versions={"torch": "2.8.0"},
+            total_elapsed_ms=1,
+            cleanup_complete=True,
+        )
+
+
+def test_capture_defaults_to_unavailable_accounting_for_a_reused_shard() -> None:
+    """A reused shard ran no converter, so it has no memory measurement --
+    and must not imply one."""
+
+    results = [
+        conv.ShardTransactionResult(
+            source_basename=basename,
+            source_size_bytes=1,
+            source_sha256="a" * 64,
+            source_verified=True,
+            source_deleted=True,
+            converted_basename=basename,
+            converted_size_bytes=1,
+            converted_sha256="b" * 64,
+            partial_cleanup_complete=True,
+            temporary_output_cleanup_complete=True,
+            elapsed_ms=1,
+            converted_reused=True,
+        )
+        for basename in SHARD_BASENAMES
+    ]
+    capture = conv.build_conversion_capture(
+        source_config=_entry(CONFIG_BASENAME, b"{}"),
+        source_config_verified=True,
+        source_config_moved_to_final=True,
+        converted_config_sha256="c" * 64,
+        converted_config_size_bytes=2,
+        shard_results=results,
+        dependency_versions={"torch": "2.8.0"},
+        total_elapsed_ms=1,
+        cleanup_complete=True,
+    )
+    for shard in capture["shards"]:
+        assert shard["conversion_peak_memory_state"] == "unavailable"
+        assert shard["conversion_peak_memory_bytes"] is None
+        assert shard["conversion_peak_commit_bytes"] is None
 
 
 def test_bounded_converter_builds_shell_free_argv_with_the_current_interpreter(

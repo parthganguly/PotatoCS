@@ -49,6 +49,7 @@ CONVERSION_CAPTURE_STATE = "unreviewed_conversion_capture"
 ALLOWED_CONVERSION_DEPENDENCY_NAMES = frozenset({"python", "torch", "safetensors"})
 
 EXPECTED_CONVERTER_SCRIPT_BASENAME = "convert_olmoe.py"
+EXPECTED_BOUNDED_CONVERTER_BASENAME = "colibri_stage2_bounded_convert.py"
 DEVIATION_STATEMENT = (
     "Selecting allenai/OLMoE-1B-7B-0125-Instruct instead of the 0924 release "
     "is deliberate: 0125-Instruct is the reviewed, instruction-tuned revision "
@@ -281,4 +282,53 @@ REVIEWED_CONVERTER_IDENTITY = ReviewedConverterIdentity(
     size_bytes=4469,
     sha256="43f3ed1bad0cd89656c1a2ee17843d86ff33f670ff12c51a803f2b6361a5e168",
     colibri_commit=PINNED_COLIBRI_COMMIT,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedBoundedConverterIdentity:
+    """The one immutable, human-reviewed identity of the in-repo
+    memory-bounded converter ``colibri_stage2_bounded_convert.py``.
+
+    The bounded converter is launched as a subprocess exactly like the
+    pinned upstream script, so it needs exactly the same strength of
+    proof. Being in-repo is not itself a guarantee: a working tree can be
+    edited, a file can be patched after review, and a path-safety check
+    proves only *where* a file is, never *what it contains*. This identity
+    is what makes "the reviewed bounded converter" a checkable claim.
+
+    Never a caller-supplied override -- there is no parameter anywhere
+    that could substitute a different basename, size, or digest.
+    """
+
+    basename: str
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.basename != EXPECTED_BOUNDED_CONVERTER_BASENAME:
+            raise ValueError(
+                "reviewed bounded converter identity basename does not match the expected converter"
+            )
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int) or self.size_bytes <= 0:
+            raise ValueError("reviewed bounded converter identity size_bytes is out of bounds")
+        if not is_hex64(self.sha256):
+            raise ValueError("reviewed bounded converter identity sha256 is not a SHA-256")
+
+
+# Computed directly from the reviewed file in this repository. The digest
+# is over the file's exact checked-out bytes, which a `.gitattributes`
+# rule pins to LF on every platform -- without that rule this repository's
+# `core.autocrlf=true` would hand a fresh Windows clone 24,670 CRLF bytes
+# while a Linux checkout got 24,033 LF bytes, and no single pinned digest
+# could ever match both.
+#
+# A `test_reviewed_bounded_converter_identity_matches_the_file_on_disk`
+# test recomputes this from the real file, so editing the converter
+# without updating this identity fails the suite rather than silently
+# weakening the gate.
+REVIEWED_BOUNDED_CONVERTER_IDENTITY = ReviewedBoundedConverterIdentity(
+    basename=EXPECTED_BOUNDED_CONVERTER_BASENAME,
+    size_bytes=24033,
+    sha256="6f8145fc71f060c75d7d04a34c96cfd58d00daa3d51f2406a6de25e167d2266b",
 )
