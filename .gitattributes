@@ -1,0 +1,13 @@
+# The Colibrì Stage 2A bounded converter is pinned by an immutable
+# reviewed SHA-256 in colibri_stage2_common.REVIEWED_BOUNDED_CONVERTER_IDENTITY
+# and is re-verified immediately before every subprocess launch. Its
+# checked-out bytes must therefore be identical on every platform and in
+# every clone.
+#
+# Without this rule the repository's core.autocrlf=true would rewrite the
+# file's line endings on checkout: a fresh clone produces 24,670 CRLF
+# bytes while a Linux checkout produces 24,033 LF bytes, so no single
+# pinned hash could ever match both. Forcing LF makes the working-tree
+# bytes equal the stored blob bytes exactly, which is what the pinned
+# digest is computed over.
+python/odysseus_desktop_backend/services/colibri_stage2_bounded_convert.py text eol=lf

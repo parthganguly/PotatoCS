@@ -37,6 +37,61 @@ def _entry(basename: str, data: bytes) -> conv.SourceShardEntry:
     return conv.SourceShardEntry(basename=basename, size_bytes=len(data), sha256=_sha256(data))
 
 
+class _FakePopen:
+    """A synthetic ``subprocess.Popen`` stand-in.
+
+    The real adapters moved from ``subprocess.run`` to ``Popen`` so the
+    child's peak memory can be read from its handle after it exits. These
+    tests therefore patch ``Popen``; nothing here ever creates a real
+    process. ``_handle`` is ``None`` so the peak-memory probe declines
+    cleanly, exactly as it does on a non-Windows host.
+    """
+
+    recorded: list[dict[str, object]] = []
+
+    def __init__(self, argv: list[str], **kwargs: object) -> None:
+        self.argv = list(argv)
+        self.kwargs = dict(kwargs)
+        self._handle = None
+        self.pid = 4242
+        self.killed = False
+        type(self).recorded.append({"argv": self.argv, "kwargs": self.kwargs})
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _patch_popen(monkeypatch: pytest.MonkeyPatch, factory: object = None) -> type[_FakePopen]:
+    """Install a fresh recording ``Popen`` fake and return its class.
+
+    Also stands in for Windows job ownership: a synthetic Popen has no real
+    process handle, so the genuine assign/resume path cannot apply to it.
+    Ownership is covered by its own tests, which use real processes.
+    """
+
+    import subprocess as subprocess_module
+
+    monkeypatch.setattr(conv, "_create_owning_job", lambda: object())
+    monkeypatch.setattr(conv, "_assign_process_to_job", lambda job, process: True)
+    monkeypatch.setattr(conv, "_resume_process_tree", lambda pid: True)
+    monkeypatch.setattr(conv, "_peak_job_memory", lambda job: (None, None))
+    monkeypatch.setattr(conv, "_close_job", lambda job: None)
+
+    class _Recorder(_FakePopen):
+        recorded: list[dict[str, object]] = []
+
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            super().__init__(argv, **kwargs)
+            if factory is not None:
+                factory(self.argv)
+
+    monkeypatch.setattr(subprocess_module, "Popen", _Recorder)
+    return _Recorder
+
+
 class _NeverCallDownloader:
     def download(self, *, basename: str, expected_size_bytes: int, expected_sha256: str, destination: Path) -> None:
         raise AssertionError("downloader must never be called")
@@ -416,6 +471,9 @@ def test_cli_approve_blocks_before_every_side_effect_while_manifest_is_empty(
     monkeypatch.setattr(conv, "_default_isolated_python_env_ready", _boom)
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
     monkeypatch.setattr(subprocess_module, "run", _boom)
+    # Popen too: the real adapters launch via Popen, so guarding only
+    # subprocess.run would let this assertion pass vacuously.
+    monkeypatch.setattr(subprocess_module, "Popen", _boom)
     monkeypatch.setattr(Path, "mkdir", _boom)
 
     destination = tmp_path / "dest"
@@ -480,6 +538,8 @@ class _RecordingDownloader:
 
 
 class _RecordingConverter:
+    converter_kind = common.CONVERTER_KIND_PINNED_SCRIPT
+
     """A fake standing in for the unmodified pinned convert_olmoe.py: given
     a model_dir containing config.json plus exactly one source shard, it
     writes config.json (copied unchanged) plus the converted shard into
@@ -785,10 +845,11 @@ def test_download_and_verify_config_happy_path(tmp_path: Path) -> None:
     entry = _entry(CONFIG_BASENAME, payload)
     downloader = _RecordingDownloader({CONFIG_BASENAME: payload})
 
-    config_path = conv.download_and_verify_config(
+    config_path, reused = conv.download_and_verify_config(
         expected_config=entry, destination_dir=destination_dir, downloader=downloader
     )
     assert config_path.read_bytes() == payload
+    assert reused is False
     assert downloader.calls == [CONFIG_BASENAME]
 
 
@@ -821,6 +882,8 @@ class _FullRunDownloader:
 
 
 class _FullRunConverter:
+    converter_kind = common.CONVERTER_KIND_PINNED_SCRIPT
+
     def __init__(self, converted_payloads: dict[str, bytes]) -> None:
         self.converted_payloads = converted_payloads
         self.calls: list[Path] = []
@@ -896,8 +959,20 @@ def test_run_approved_conversion_full_sequence_with_reviewed_manifest(
     )
 
     assert capture["state"] == "unreviewed_conversion_capture"
-    assert capture["converter_basename"] == common.REVIEWED_CONVERTER_IDENTITY.basename
-    assert capture["converter_sha256"] == common.REVIEWED_CONVERTER_IDENTITY.sha256
+    # This run used a stand-in for the pinned upstream script, so that --
+    # and only that -- is the identity the capture may claim.
+    assert capture["converters"] == [
+        {
+            "converter_kind": common.CONVERTER_KIND_PINNED_SCRIPT,
+            "basename": common.REVIEWED_CONVERTER_IDENTITY.basename,
+            "size_bytes": common.REVIEWED_CONVERTER_IDENTITY.size_bytes,
+            "sha256": common.REVIEWED_CONVERTER_IDENTITY.sha256,
+        }
+    ]
+    assert all(
+        shard["converter_sha256"] == common.REVIEWED_CONVERTER_IDENTITY.sha256
+        for shard in capture["shards"]
+    )
     assert len(capture["shards"]) == 3
     assert {shard["source_basename"] for shard in capture["shards"]} == set(SHARD_BASENAMES)
     assert downloader.calls == [CONFIG_BASENAME, *SHARD_BASENAMES]
@@ -1105,47 +1180,37 @@ def test_pinned_script_converter_rejects_content_not_matching_reviewed_hash(tmp_
 def test_pinned_script_converter_uses_shell_free_argv_with_current_interpreter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import subprocess as subprocess_module
     import sys
 
     script = tmp_path / "convert_olmoe.py"
     script.write_text("pass")
     _patch_reviewed_converter_identity(monkeypatch, script)
-    recorded: dict[str, object] = {}
+    recorder = _patch_popen(monkeypatch)
 
-    def _fake_run(argv: list[str], **kwargs: object) -> None:
-        recorded["argv"] = argv
-        recorded["kwargs"] = kwargs
-
-    monkeypatch.setattr(subprocess_module, "run", _fake_run)
     converter = conv.PinnedScriptConverter(converter_script_path=script)
     converter.convert(model_dir=tmp_path / "model", output_dir=tmp_path / "out")
 
-    assert recorded["argv"][0] == sys.executable
-    assert recorded["argv"][1] == str(script)
-    assert recorded["kwargs"]["shell"] is False
+    assert len(recorder.recorded) == 1
+    call = recorder.recorded[0]
+    assert call["argv"][0] == sys.executable
+    assert call["argv"][1] == str(script)
+    assert call["kwargs"]["shell"] is False
 
 
 def test_converter_argv_uses_model_and_out_never_output_or_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import subprocess as subprocess_module
-
     script = tmp_path / "convert_olmoe.py"
     script.write_text("pass")
     _patch_reviewed_converter_identity(monkeypatch, script)
-    recorded: dict[str, object] = {}
+    recorder = _patch_popen(monkeypatch)
 
-    def _fake_run(argv: list[str], **kwargs: object) -> None:
-        recorded["argv"] = argv
-
-    monkeypatch.setattr(subprocess_module, "run", _fake_run)
     converter = conv.PinnedScriptConverter(converter_script_path=script)
     model_dir = tmp_path / "model"
     output_dir = tmp_path / "out"
     converter.convert(model_dir=model_dir, output_dir=output_dir)
 
-    argv = recorded["argv"]
+    argv = recorder.recorded[0]["argv"]
     assert "--model" in argv
     assert argv[argv.index("--model") + 1] == str(model_dir)
     assert "--out" in argv
@@ -1197,6 +1262,7 @@ def _valid_shard_result(basename: str, **overrides: object) -> conv.ShardTransac
         partial_cleanup_complete=True,
         temporary_output_cleanup_complete=True,
         elapsed_ms=10,
+        converter_kind=common.CONVERTER_KIND_PINNED_SCRIPT,
     )
     kwargs.update(overrides)
     return conv.ShardTransactionResult(**kwargs)
@@ -1502,7 +1568,7 @@ def test_cli_approve_invokes_orchestrator_when_gates_are_synthetically_satisfied
         requested_basename = request.full_url.rsplit("/", 1)[-1]
         return _FakeResponse(payloads[requested_basename])
 
-    def _fake_subprocess_run(argv: list[str], **kwargs: object) -> None:
+    def _fake_convert(argv: list[str]) -> None:
         model_dir = Path(argv[argv.index("--model") + 1])
         output_dir = Path(argv[argv.index("--out") + 1])
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1512,7 +1578,7 @@ def test_cli_approve_invokes_orchestrator_when_gates_are_synthetically_satisfied
         (output_dir / shard_names[0]).write_bytes(b"converted-" + shard_names[0].encode("ascii"))
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setattr(subprocess_module, "run", _fake_subprocess_run)
+    _patch_popen(monkeypatch, _fake_convert)
 
     destination = tmp_path / "dest"
     converted = tmp_path / "converted"
@@ -1520,6 +1586,7 @@ def test_cli_approve_invokes_orchestrator_when_gates_are_synthetically_satisfied
         [
             "--destination", str(destination),
             "--converted-destination", str(converted),
+            "--converter", "pinned-script",
             "--converter-script", str(converter_script),
             "--approve",
         ]
@@ -1558,6 +1625,9 @@ def test_noninteractive_approved_mode_has_zero_side_effects(
     monkeypatch.setattr(Path, "mkdir", _boom)
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
     monkeypatch.setattr(subprocess_module, "run", _boom)
+    # Popen too: the real adapters launch via Popen, so guarding only
+    # subprocess.run would let this assertion pass vacuously.
+    monkeypatch.setattr(subprocess_module, "Popen", _boom)
 
     destination = tmp_path / "dest"
     converted = tmp_path / "converted"
@@ -1611,6 +1681,7 @@ def test_dependency_probe_occurs_only_after_interactive_and_venv_checks(
         [
             "--destination", str(destination),
             "--converted-destination", str(converted),
+            "--converter", "pinned-script",
             "--converter-script", str(converter_script),
             "--approve",
         ]
@@ -1673,6 +1744,9 @@ def test_leaf_directories_are_created_only_after_every_precondition_passes(
 
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
     monkeypatch.setattr(subprocess_module, "run", _boom)
+    # Popen too: the real adapters launch via Popen, so guarding only
+    # subprocess.run would let this assertion pass vacuously.
+    monkeypatch.setattr(subprocess_module, "Popen", _boom)
 
     destination = tmp_path / "dest"
     converted = tmp_path / "converted"
@@ -1999,6 +2073,7 @@ def test_converter_reparse_point_is_rejected_before_subprocess_creation(
         raise AssertionError("must not launch a subprocess for a reparse-point converter script")
 
     monkeypatch.setattr(subprocess_module, "run", _boom_run)
+    monkeypatch.setattr(subprocess_module, "Popen", _boom_run)
 
     converter = conv.PinnedScriptConverter(converter_script_path=script)
     # Caught by require_direct_child_path's own reparse-point check on the
@@ -2010,13 +2085,11 @@ def test_converter_reparse_point_is_rejected_before_subprocess_creation(
 def test_converter_identity_is_rechecked_immediately_before_each_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import subprocess as subprocess_module
-
     script = tmp_path / "convert_olmoe.py"
     script.write_bytes(b"original content")
     _patch_reviewed_converter_identity(monkeypatch, script)
 
-    monkeypatch.setattr(subprocess_module, "run", lambda *args, **kwargs: None)
+    _patch_popen(monkeypatch)
     converter = conv.PinnedScriptConverter(converter_script_path=script)
     converter.convert(model_dir=tmp_path, output_dir=tmp_path)  # succeeds -- identity matches
 

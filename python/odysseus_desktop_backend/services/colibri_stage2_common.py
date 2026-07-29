@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 # --- Pinned upstream contract (Stage 2A) -----------------------------------
 
@@ -40,12 +41,20 @@ APPROX_DOWNLOAD_BYTES = 13_840_000_000
 REQUIRED_FREE_SPACE_BYTES = 18 * 1024 * 1024 * 1024
 
 MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v1"
-CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v1"
+# v2 added the per-shard resume booleans (``source_reused`` /
+# ``converted_reused``) and the bounded per-shard conversion peak-memory
+# evidence. v3 replaces the single top-level ``converter_basename`` /
+# ``converter_size_bytes`` / ``converter_sha256`` triple -- which always
+# named the upstream script even when the bounded converter had actually
+# run -- with a ``converters`` list plus a per-shard ``converter_kind``
+# and identity, both derived from the adapter that really executed.
+CONVERSION_CAPTURE_SCHEMA_VERSION = "colibri-stage2-olmoe-conversion-capture-v3"
 CONVERSION_CAPTURE_STATE = "unreviewed_conversion_capture"
 
 ALLOWED_CONVERSION_DEPENDENCY_NAMES = frozenset({"python", "torch", "safetensors"})
 
 EXPECTED_CONVERTER_SCRIPT_BASENAME = "convert_olmoe.py"
+EXPECTED_BOUNDED_CONVERTER_BASENAME = "colibri_stage2_bounded_convert.py"
 DEVIATION_STATEMENT = (
     "Selecting allenai/OLMoE-1B-7B-0125-Instruct instead of the 0924 release "
     "is deliberate: 0125-Instruct is the reviewed, instruction-tuned revision "
@@ -81,9 +90,20 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "shard_download_failed",
         "shard_verification_failed",
         "conversion_failed",
+        # Distinguished conversion-process outcomes: a converter that ran
+        # out of its deadline, one that exited nonzero under its own
+        # control, and one the OS killed with a native exception (on
+        # Windows, an NTSTATUS such as 0xc0000005) are three different
+        # facts and must never collapse into one category.
+        "conversion_timeout",
+        "conversion_nonzero_exit",
+        "conversion_process_crashed",
         "conversion_output_unexpected",
         "converted_shard_missing",
         "converted_shard_already_exists",
+        # Resume gates
+        "stale_source_file_rejected",
+        "resume_state_invalid",
         "source_shard_deletion_failed",
         "source_shard_deletion_unverified",
         "temporary_output_cleanup_failed",
@@ -125,8 +145,16 @@ FAILURE_NUMERIC_METADATA_KEYS = frozenset(
         "matched_count",
         "expected_count",
         "elapsed_ms",
+        # Bounded resource evidence for a converter child process. Both are
+        # plain byte counts read from the OS; neither can carry a path, an
+        # environment value, or any model output.
+        "peak_memory_bytes",
+        "peak_commit_bytes",
     }
 )
+
+RESUME_LEDGER_BASENAME = "colibri-stage2-resume.json"
+RESUME_LEDGER_SCHEMA_VERSION = "colibri-stage2-olmoe-resume-v1"
 
 
 class ColibriStage2Failure(RuntimeError):
@@ -260,3 +288,89 @@ REVIEWED_CONVERTER_IDENTITY = ReviewedConverterIdentity(
     sha256="43f3ed1bad0cd89656c1a2ee17843d86ff33f670ff12c51a803f2b6361a5e168",
     colibri_commit=PINNED_COLIBRI_COMMIT,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedBoundedConverterIdentity:
+    """The one immutable, human-reviewed identity of the in-repo
+    memory-bounded converter ``colibri_stage2_bounded_convert.py``.
+
+    The bounded converter is launched as a subprocess exactly like the
+    pinned upstream script, so it needs exactly the same strength of
+    proof. Being in-repo is not itself a guarantee: a working tree can be
+    edited, a file can be patched after review, and a path-safety check
+    proves only *where* a file is, never *what it contains*. This identity
+    is what makes "the reviewed bounded converter" a checkable claim.
+
+    Never a caller-supplied override -- there is no parameter anywhere
+    that could substitute a different basename, size, or digest.
+    """
+
+    basename: str
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.basename != EXPECTED_BOUNDED_CONVERTER_BASENAME:
+            raise ValueError(
+                "reviewed bounded converter identity basename does not match the expected converter"
+            )
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int) or self.size_bytes <= 0:
+            raise ValueError("reviewed bounded converter identity size_bytes is out of bounds")
+        if not is_hex64(self.sha256):
+            raise ValueError("reviewed bounded converter identity sha256 is not a SHA-256")
+
+
+# Computed directly from the reviewed file in this repository. The digest
+# is over the file's exact checked-out bytes, which a `.gitattributes`
+# rule pins to LF on every platform -- without that rule this repository's
+# `core.autocrlf=true` would hand a fresh Windows clone 24,670 CRLF bytes
+# while a Linux checkout got 24,033 LF bytes, and no single pinned digest
+# could ever match both.
+#
+# A `test_reviewed_bounded_converter_identity_matches_the_file_on_disk`
+# test recomputes this from the real file, so editing the converter
+# without updating this identity fails the suite rather than silently
+# weakening the gate.
+REVIEWED_BOUNDED_CONVERTER_IDENTITY = ReviewedBoundedConverterIdentity(
+    basename=EXPECTED_BOUNDED_CONVERTER_BASENAME,
+    size_bytes=24033,
+    sha256="6f8145fc71f060c75d7d04a34c96cfd58d00daa3d51f2406a6de25e167d2266b",
+)
+
+
+# --- Which converter actually ran -------------------------------------------
+
+# Stage 2A has exactly two reviewed converters, and a capture must record
+# the identity of the one that *actually executed* -- never a default.
+# These two constants are the only values that can select between them.
+CONVERTER_KIND_BOUNDED = "bounded"
+CONVERTER_KIND_PINNED_SCRIPT = "pinned_script"
+
+# The closed kind -> reviewed identity binding. This mapping is the single
+# place either identity can enter a capture: a caller supplies at most a
+# *kind*, never a basename, size, hash, or identity object, so no capture
+# can ever claim an identity that was not reviewed, and the bounded
+# converter can never be recorded as the upstream script or vice versa.
+REVIEWED_CONVERTER_IDENTITY_BY_KIND: Mapping[str, Any] = MappingProxyType(
+    {
+        CONVERTER_KIND_BOUNDED: REVIEWED_BOUNDED_CONVERTER_IDENTITY,
+        CONVERTER_KIND_PINNED_SCRIPT: REVIEWED_CONVERTER_IDENTITY,
+    }
+)
+
+CONVERTER_KINDS = frozenset(REVIEWED_CONVERTER_IDENTITY_BY_KIND)
+
+
+def reviewed_identity_for_converter_kind(kind: str) -> Any:
+    """Return the one reviewed identity for ``kind``, or fail closed.
+
+    The only way to obtain a converter identity for a capture. There is
+    deliberately no overload, parameter, or fallback that could return an
+    identity for an unknown kind.
+    """
+
+    identity = REVIEWED_CONVERTER_IDENTITY_BY_KIND.get(kind)
+    if identity is None:
+        raise ValueError(f"unknown converter kind: {kind!r}")
+    return identity
