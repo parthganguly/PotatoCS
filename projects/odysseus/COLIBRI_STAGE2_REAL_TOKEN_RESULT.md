@@ -95,17 +95,33 @@ the command line; the engine locates the converted model through the closed
 
 ### 3. The independent token oracle (`colibri_stage2_engine_output.py`)
 
-The pinned engine prints, among banner text:
+The dialect is transcribed from the reviewed `c/olmoe.c` at pinned commit
+`72d3d372`, not inferred from a sample run. Its `main` emits:
 
-    resident weights loaded in <seconds>s
+    == Streaming C engine, cache = <cap> experts/layer, experts @ <bits>-bit ==
+    resident weights loaded in <seconds>s | RSS after load: <gb> GB
+
     Reference: <token ids>
     C engine : <generated token ids>
     Matching tokens: <matched>/<expected>
-    Speed: <rate> tok/s (<seconds>s for 1 tokens)
+
+    PEAK RSS: <gb> GB
+    Expert cache hit rate: <pct>%  (hit=<n> miss=<n>)
+    Speed: <rate> tok/s (<seconds>s for <n> tokens)
 
 Output is decoded **strictly** (UTF-8, no replacement characters) and each of
-those five lines must appear exactly once and be exactly well-formed. Banner
-lines are tolerated and retained nowhere.
+the five required lines must appear exactly once and be exactly well-formed.
+The `resident weights` line is matched **complete**, including its
+`| RSS after load: <gb> GB` half — the source prints one line, so a pattern
+stopping at the seconds value would have rejected every real successful run.
+The RSS value is validated (finite, non-negative, bounded) and recorded as
+engine-reported evidence. The banner, `PEAK RSS`, and cache-hit lines are
+tolerated and parsed for nothing: the authoritative peak-memory figure comes
+from the owning Job Object, not the engine's self-report.
+
+`Reference:` and `C engine :` are emitted as `printf("%d ")` per token, so
+both carry a trailing space and are terminated by the next line's leading
+newline. Both shapes are handled, and the fixtures reproduce them exactly.
 
 The comparison is ours, not the engine's:
 
@@ -120,9 +136,16 @@ The comparison is ours, not the engine's:
    the two token lines. An engine claiming `1/1` while its own token lines
    disagree is `output_internally_inconsistent` and rejected.
 
-`generated_token_id` is always read from the engine's own line. It is never
-assigned from the expected value, and it is `None` on any run that did not
-parse and verify one.
+`generated_token_id` is retained **as soon as it is parsed and before any
+comparison**, so a wrong-token run reports the actual wrong integer — the
+observation is the point of having run it. It is never assigned from the
+expected value, and is `None` only when no single generated token could be
+safely parsed. `matched_count` and `engine_reported_expected_count` are
+likewise retained on failed runs wherever they parsed; `contract_expected_count`
+is always `1` and never engine-supplied, so a run where the engine disagreed
+about how many tokens were expected shows both numbers rather than one
+silently standing in for the other. `evidence_sha256` stays `null` unless the
+proof actually passed.
 
 Rejected with distinct categories: `output_decode_failed`,
 `malformed_output` (a missing token line), `duplicate_output_line`,
@@ -194,7 +217,8 @@ since a closed handle can answer neither query.
 Closed structured fields only: `identities` (model repository/revision,
 Colibrì commit, engine SHA-256, converter kind and SHA-256, config SHA-256,
 all three shard SHA-256s, reference SHA-256, cap, bits), `expected_token_id`,
-the parsed `generated_token_id`, `matched_count`, `exit_category`
+the parsed `generated_token_id`, `matched_count`,
+`contract_expected_count`, `engine_reported_expected_count`, `exit_category`
 (`clean_exit` / `nonzero_exit` / `timed_out` / `not_observed`), the four
 latencies above, `peak_tree_memory_bytes`, and the cleanup proofs
 (`cleanup_complete`, `job_empty_proven`, `job_member_count`,
@@ -229,8 +253,20 @@ on failure, and never a Python traceback:
 - requires interactive stdin/stdout and explicit `--approve`;
 - exit `0` only for a verified token; `1` for a failed attempt; `2` for a
   rejection before launch; `3` for anything unexpected;
-- catches even unexpected exceptions and deliberately discards the exception
-  object, since its message could carry a local path or an environment value;
+- uses a non-printing `ArgumentParser` subclass: every `error`, `exit`,
+  `print_usage`, `print_help`, and `_print_message` path is overridden, so
+  argparse can never put a usage line, an error string, or the offending
+  argument (a local path) onto either stream. `--help` is deliberately
+  unsupported for the same reason and is rejected like any other unrecognised
+  argument, with one closed document. Verified as a real subprocess: **0 bytes
+  on stderr**, one JSON document on stdout;
+- classifies an unexpected internal exception as `unexpected_internal_failure`,
+  never as `malformed_output` — blaming the engine's output for our own defect
+  would be false and would imply output was parsed when it may never have been
+  reached. In that case nothing is claimed: `cleanup_complete` and
+  `pre_launch_rejection` are `null` rather than `true`, and no job-empty or
+  orphan proof is asserted. The exception object is discarded unread, since its
+  message could carry a local path or an environment value;
 - records state/category, reviewed identities, expected and parsed generated
   token, match count, exit category and code, model-load and generation
   latency, end-to-end latency, peak whole-tree memory, cleanup completeness,

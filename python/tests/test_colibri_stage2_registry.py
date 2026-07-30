@@ -297,7 +297,7 @@ def test_cli_exposes_no_identity_option() -> None:
     option_strings = {
         option for action in parser._actions for option in action.option_strings
     }
-    assert option_strings == {"-h", "--help", "--engine", "--converted-model-dir", "--approve"}
+    assert option_strings == {"--engine", "--converted-model-dir", "--approve"}
 
 
 def test_require_reviewed_manifest_takes_only_the_two_pins() -> None:

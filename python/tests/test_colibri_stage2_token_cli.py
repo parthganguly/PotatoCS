@@ -30,6 +30,8 @@ from odysseus_desktop_backend.services.colibri_stage2_runner import (
 # converted-artifact directory.
 ENGINE = r"Q:\synthetic\engine\olmoe.exe"
 MODEL_DIR = r"Q:\synthetic\converted"
+# argparse would put the program name into any usage/error text it printed.
+_PROGRAM_HINT = "colibri-stage2-token-proof"
 ARGV = ["--engine", ENGINE, "--converted-model-dir", MODEL_DIR, "--approve"]
 
 
@@ -55,7 +57,8 @@ def _result(**overrides: Any) -> OneTokenRunResult:
         evidence_schema_version="colibri-stage2-olmoe-token-evidence-v2",
         identities=_identity_evidence(ENTRY),
         matched_count=1,
-        expected_count=1,
+        contract_expected_count=1,
+        engine_reported_expected_count=1,
         expected_token_id=7785,
         generated_token_id=7785,
         exit_category="clean_exit",
@@ -97,6 +100,27 @@ def _invoke(argv: list[str], **kwargs: Any) -> tuple[int, dict[str, Any], str]:
     status = cli.main(argv, **defaults)
     raw = stdout.getvalue()
     return status, json.loads(raw), raw
+
+
+def _invoke_capturing_real_streams(
+    argv: list[str], capsys: pytest.CaptureFixture[str], **kwargs: Any
+) -> tuple[int, dict[str, Any], str, str]:
+    """Drive ``main`` writing to the *real* stdout, and capture both streams.
+
+    This is what proves argparse is not printing behind the tool's back: with
+    no injected stdout, anything argparse emits lands in the captured streams
+    alongside (or instead of) the closed document.
+    """
+
+    defaults: dict[str, Any] = dict(
+        interactive_check=lambda: True,
+        attempt=lambda **_: _result(),
+        api_factory=lambda: object(),
+    )
+    defaults.update(kwargs)
+    status = cli.main(argv, **defaults)
+    captured = capsys.readouterr()
+    return status, json.loads(captured.out), captured.out, captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -247,24 +271,135 @@ def test_closed_precondition_failure_becomes_a_rejected_document() -> None:
     assert "Traceback" not in raw
 
 
-def test_unexpected_exception_never_leaks_a_traceback_or_its_message() -> None:
+def test_unexpected_exception_never_leaks_a_traceback_or_its_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     def exploding(**_: Any) -> OneTokenRunResult:
         raise RuntimeError(r"boom in C:\Users\someone\secret\path with TOKEN=abc123")
 
-    status, document, raw = _invoke(ARGV, attempt=exploding)
+    status, document, out, err = _invoke_capturing_real_streams(
+        ARGV, capsys, attempt=exploding
+    )
     assert status == 3
     assert document["state"] == "rejected"
-    assert "Traceback" not in raw
-    assert "secret" not in raw
-    assert "TOKEN=abc123" not in raw
-    assert "someone" not in raw
+    assert err == ""
+    for stream in (out, err):
+        assert "Traceback" not in stream
+        assert "RuntimeError" not in stream
+        assert "secret" not in stream
+        assert "TOKEN=abc123" not in stream
+        assert "someone" not in stream
+
+
+def test_unexpected_exception_is_not_classified_as_malformed_output() -> None:
+    def exploding(**_: Any) -> OneTokenRunResult:
+        raise RuntimeError("internal defect")
+
+    _, document, _ = _invoke(ARGV, attempt=exploding)
+    # Blaming the engine's output for our own bug would be false, and would
+    # imply output was parsed when it may never have been reached.
+    assert document["category"] == "unexpected_internal_failure"
+    assert document["category"] != "malformed_output"
+
+
+def test_unexpected_exception_claims_no_cleanup_or_prelaunch_facts() -> None:
+    def exploding(**_: Any) -> OneTokenRunResult:
+        raise RuntimeError("internal defect")
+
+    _, document, _ = _invoke(ARGV, attempt=exploding)
+    # The failure could have happened anywhere, including after a launch, so
+    # nothing about cleanup or the job may be asserted.
+    assert document["cleanup"]["cleanup_complete"] is None
+    assert document["pre_launch_rejection"] is None
+    assert document["cleanup"]["job_empty_proven"] is False
+    assert document["cleanup"]["job_member_count"] is None
+    assert document["cleanup"]["orphan_free"] is False
+    assert document["cleanup"]["root_exit_confirmed"] is False
+
+
+def test_closed_prelaunch_rejection_may_state_the_facts_it_established() -> None:
+    def raising(**_: Any) -> OneTokenRunResult:
+        raise ColibriStage2Failure("reviewed_model_manifest_unavailable")
+
+    _, document, _ = _invoke(ARGV, attempt=raising)
+    # A closed failure out of the attempt can only come from a precondition
+    # checked before process creation, so "nothing was launched" is known.
+    assert document["pre_launch_rejection"] is True
+    assert document["cleanup"]["cleanup_complete"] is True
+    assert document["cleanup"]["job_empty_proven"] is False
 
 
 def test_argparse_failure_still_emits_one_closed_document() -> None:
     status, document, raw = _invoke(["--engine", ENGINE])
     assert status == 2
     assert document["state"] == "rejected"
+    assert document["category"] == "cli_arguments_rejected"
     assert "Traceback" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Argparse must never write to the real streams
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--engine", ENGINE],                                  # missing required option
+        ["--converted-model-dir", MODEL_DIR, "--approve"],     # missing required option
+        ["--engine", ENGINE, "--converted-model-dir", MODEL_DIR, "--nonsense"],
+        ["--engine"],                                          # option expects a value
+        [],                                                    # nothing at all
+    ],
+)
+def test_argument_rejection_writes_nothing_but_the_document(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, document, out, err = _invoke_capturing_real_streams(argv, capsys)
+    assert status == 2
+    assert document["category"] == "cli_arguments_rejected"
+    # stderr is completely empty -- no usage line, no error text.
+    assert err == ""
+    # stdout is the document and nothing else.
+    assert out.strip().startswith("{")
+    assert out.strip().endswith("}")
+    assert json.loads(out) == document
+    for leaked in ("usage:", "error:", _PROGRAM_HINT, ENGINE, MODEL_DIR, "--nonsense"):
+        assert leaked not in out
+        assert leaked not in err
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_is_unsupported_and_emits_one_closed_document(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Help text is not the closed document, so it is deliberately unsupported.
+    status, document, out, err = _invoke_capturing_real_streams([flag], capsys)
+    assert status == 2
+    assert document["state"] == "rejected"
+    assert document["category"] == "cli_arguments_rejected"
+    assert err == ""
+    assert json.loads(out) == document
+    assert "usage:" not in out
+    assert "show this help message" not in out
+
+
+def test_a_successful_run_writes_nothing_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    status, document, out, err = _invoke_capturing_real_streams(ARGV, capsys)
+    assert status == 0
+    assert err == ""
+    assert json.loads(out) == document
+
+
+def test_parser_never_formats_usage_or_help_text() -> None:
+    parser = cli._build_parser()
+    assert parser.format_usage() == ""
+    assert parser.format_help() == ""
+    # And its error/exit paths raise rather than printing and exiting.
+    with pytest.raises(cli._ArgumentsRejected):
+        parser.error("boom in C:\\Users\\someone\\path")
+    with pytest.raises(cli._ArgumentsRejected):
+        parser.exit(2, "message")
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +449,8 @@ def test_rejected_document_also_carries_no_paths() -> None:
 def test_cli_accepts_only_the_two_paths_and_approve() -> None:
     parser = cli._build_parser()
     options = {action.dest for action in parser._actions}
-    assert options == {"help", "engine", "converted_model_dir", "approve"}
+    # No `help` action: auto-help would print non-JSON to stdout.
+    assert options == {"engine", "converted_model_dir", "approve"}
 
 
 def test_attempt_is_called_with_no_identity_arguments() -> None:

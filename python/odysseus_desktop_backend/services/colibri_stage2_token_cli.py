@@ -109,10 +109,12 @@ def build_attempt_document(result: OneTokenRunResult) -> dict[str, Any]:
         "token": {
             "expected_token_id": result.expected_token_id,
             # Read from the engine's own ``C engine :`` line, or null when no
-            # generated token was ever parsed. Never the expected value.
+            # single generated token was parsed. Never the expected value --
+            # on a wrong-token run this is the actual wrong integer.
             "generated_token_id": result.generated_token_id,
             "matched_count": result.matched_count,
-            "expected_count": result.expected_count,
+            "contract_expected_count": result.contract_expected_count,
+            "engine_reported_expected_count": result.engine_reported_expected_count,
         },
         "process": {
             "exit_category": result.exit_category,
@@ -137,24 +139,41 @@ def build_attempt_document(result: OneTokenRunResult) -> dict[str, Any]:
     }
 
 
-def build_rejected_document(category: str, metadata: Mapping[str, int]) -> dict[str, Any]:
-    """The closed record for an attempt that never started.
+def build_rejected_document(
+    category: str, metadata: Mapping[str, int], *, pre_launch_established: bool
+) -> dict[str, Any]:
+    """The closed record for an attempt that produced no result object.
 
-    A precondition rejection (manifest gate, approval, path safety, identity
-    mismatch) has no process, no measurement, and no cleanup to report, so
-    those sections are reported as explicitly unavailable rather than as
-    zeroes that would read like observations.
+    ``pre_launch_established`` says whether it is a *proven* fact that no
+    process was ever created. It is true only for rejections that happen
+    before ``attempt_one_token_proof`` can launch anything -- argument
+    rejection, missing approval, a non-absolute path, or a closed
+    ``ColibriStage2Failure`` raised out of the attempt (which by construction
+    only escapes from preconditions checked before process creation).
+
+    It is false for an unexpected internal failure, which could have occurred
+    anywhere, including after a launch. In that case nothing is claimed:
+    ``cleanup_complete`` and ``pre_launch_rejection`` are ``null`` rather than
+    ``true``, and no proof is asserted. A document must never report a
+    cleanup or job-empty fact that was not established.
     """
 
     return {
         "schema_version": TOKEN_RUN_EVIDENCE_SCHEMA_VERSION,
         "state": STATE_REJECTED,
         "category": category,
+        "pre_launch_rejection": True if pre_launch_established else None,
         "pins": {
             "model_revision": PINNED_MODEL_REVISION,
             "colibri_commit": PINNED_COLIBRI_COMMIT,
         },
-        "token": {"expected_token_id": None, "generated_token_id": None},
+        "token": {
+            "expected_token_id": None,
+            "generated_token_id": None,
+            "matched_count": None,
+            "contract_expected_count": None,
+            "engine_reported_expected_count": None,
+        },
         "process": {"exit_category": "not_observed", "exit_code": None},
         "latency": {
             "model_load_latency_ms": None,
@@ -171,7 +190,9 @@ def build_rejected_document(category: str, metadata: Mapping[str, int]) -> dict[
             "peak_tree_memory_state": EVIDENCE_STATE_UNAVAILABLE,
         },
         "cleanup": {
-            "cleanup_complete": True,
+            # True only where "nothing was launched, so nothing was owed" is
+            # an established fact; null where it is simply not known.
+            "cleanup_complete": True if pre_launch_established else None,
             "job_empty_proven": False,
             "job_member_count": None,
             "root_exit_confirmed": False,
@@ -184,11 +205,53 @@ def build_rejected_document(category: str, metadata: Mapping[str, int]) -> dict[
     }
 
 
+class _ArgumentsRejected(Exception):
+    """Raised instead of argparse printing anything and calling ``exit``."""
+
+
+class _SilentArgumentParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` that never writes to stdout or stderr.
+
+    Stock argparse writes usage, error text, and help directly to the real
+    streams and then calls ``sys.exit``. Any of those would put the offending
+    argument -- which is a local path -- onto a stream this tool promises
+    carries nothing but one closed JSON document. Every printing and exiting
+    path is therefore overridden to raise instead.
+
+    ``--help`` is deliberately unsupported for the same reason: emitting help
+    text would mean emitting something that is not the closed document. It is
+    rejected like any other unrecognised argument.
+    """
+
+    def _print_message(self, message: str, file: Any = None) -> None:  # noqa: D102
+        return
+
+    def print_usage(self, file: Any = None) -> None:  # noqa: D102
+        return
+
+    def print_help(self, file: Any = None) -> None:  # noqa: D102
+        return
+
+    def format_usage(self) -> str:  # noqa: D102
+        return ""
+
+    def format_help(self) -> str:  # noqa: D102
+        return ""
+
+    def error(self, message: str) -> Any:  # noqa: D102
+        # `message` names the offending argument and is discarded unread.
+        raise _ArgumentsRejected()
+
+    def exit(self, status: int = 0, message: str | None = None) -> Any:  # noqa: D102
+        raise _ArgumentsRejected()
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _SilentArgumentParser(
         prog=_PROGRAM,
         description="Run the reviewed Colibri Stage 2 one-token proof exactly once.",
-        add_help=True,
+        # No auto-help: `-h`/`--help` would print non-JSON to stdout.
+        add_help=False,
     )
     parser.add_argument(
         "--engine",
@@ -226,16 +289,23 @@ def main(
     """Emit exactly one closed JSON document and return the exit status."""
 
     out = sys.stdout if stdout is None else stdout
+
+    def emit(document: dict[str, Any], status: int) -> int:
+        json.dump(document, out, indent=2, sort_keys=True)
+        out.write("\n")
+        return status
+
     parser = _build_parser()
     try:
         arguments = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
-    except SystemExit:
-        # argparse already wrote its own usage text to stderr; emit the closed
-        # document on stdout so a caller always gets exactly one record.
-        document = build_rejected_document("unsafe_basename_rejected", {})
-        json.dump(document, out, indent=2, sort_keys=True)
-        out.write("\n")
-        return EXIT_REJECTED
+    except (_ArgumentsRejected, SystemExit):
+        # The silent parser wrote nothing anywhere; the offending argument
+        # (a local path) is discarded unread. `SystemExit` is caught too, so
+        # no argparse path can bypass the closed document.
+        return emit(
+            build_rejected_document("cli_arguments_rejected", {}, pre_launch_established=True),
+            EXIT_REJECTED,
+        )
 
     try:
         if not arguments.approve:
@@ -262,23 +332,27 @@ def main(
             interactive_check=interactive_check,
         )
     except ColibriStage2Failure as exc:
-        document = build_rejected_document(exc.category, exc.numeric_metadata)
-        json.dump(document, out, indent=2, sort_keys=True)
-        out.write("\n")
-        return EXIT_REJECTED
+        # A closed failure escaping `attempt_one_token_proof` can only come
+        # from a precondition checked before process creation, so "nothing was
+        # launched" is an established fact here.
+        return emit(
+            build_rejected_document(exc.category, exc.numeric_metadata, pre_launch_established=True),
+            EXIT_REJECTED,
+        )
     except Exception:  # noqa: BLE001 - a traceback must never reach stdout/stderr
-        # Deliberately swallows the exception object: its message could carry
-        # a local path or an environment value. The closed category says all a
-        # caller may learn.
-        document = build_rejected_document("malformed_output", {})
-        json.dump(document, out, indent=2, sort_keys=True)
-        out.write("\n")
-        return EXIT_UNEXPECTED
+        # A defect in this code, not an engine outcome: classified as
+        # `unexpected_internal_failure`, never as `malformed_output`. The
+        # exception object is deliberately swallowed unread -- its message
+        # could carry a local path or an environment value -- and nothing is
+        # claimed about cleanup, because this could have happened at any point.
+        return emit(
+            build_rejected_document(
+                "unexpected_internal_failure", {}, pre_launch_established=False
+            ),
+            EXIT_UNEXPECTED,
+        )
 
-    document = build_attempt_document(result)
-    json.dump(document, out, indent=2, sort_keys=True)
-    out.write("\n")
-    return EXIT_VERIFIED if result.ok else EXIT_FAILED
+    return emit(build_attempt_document(result), EXIT_VERIFIED if result.ok else EXIT_FAILED)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main(argv=...)

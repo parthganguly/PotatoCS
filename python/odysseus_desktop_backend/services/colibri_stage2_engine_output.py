@@ -1,13 +1,30 @@
 """Strict parser for the pinned Colibrì OLMoE engine's one-token output.
 
-The reviewed engine prints, among banner text, exactly these five lines for a
-one-token run::
+The dialect below is transcribed from the reviewed ``c/olmoe.c`` at the
+pinned Colibrì commit ``72d3d372``, not inferred from a sample run. Its
+``main`` emits, in order::
 
-    resident weights loaded in <seconds>s
+    == Streaming C engine, cache = <cap> experts/layer, experts @ <bits>-bit ==
+    resident weights loaded in <seconds>s | RSS after load: <gb> GB
+
     Reference: <token ids>
     C engine : <generated token ids>
     Matching tokens: <matched>/<expected>
-    Speed: <rate> tok/s (<seconds>s for 1 tokens)
+
+    PEAK RSS: <gb> GB
+    Expert cache hit rate: <pct>%  (hit=<n> miss=<n>)
+    Speed: <rate> tok/s (<seconds>s for <n> tokens)
+
+Five of those lines are required and parsed. The ``resident weights`` line is
+matched **complete**, including its ``| RSS after load: <gb> GB`` half: the
+source prints one line, so a pattern that stopped at the seconds value would
+reject every real successful run. The banner, ``PEAK RSS``, and cache-hit
+lines are tolerated and parsed for nothing -- the authoritative peak-memory
+figure comes from the owning Job Object, not from the engine's self-report.
+
+Note that ``Reference:`` and ``C engine :`` are emitted as ``printf("%d ")``
+per token, so both carry a trailing space and both are terminated by the
+*next* line's leading newline. Both shapes are handled.
 
 This module turns those bytes into a closed structured record and then
 *independently* compares the engine's own generated token against the
@@ -32,13 +49,22 @@ from dataclasses import dataclass
 
 from odysseus_desktop_backend.services.colibri_stage2_common import (
     MAX_ENGINE_REPORTED_RATE,
+    MAX_ENGINE_REPORTED_RSS_GB,
     MAX_ENGINE_REPORTED_SECONDS,
     ColibriStage2Failure,
 )
 
 # Anchored, whitespace-tolerant only where the engine's own formatting is
 # known to vary (the padding around `C engine :`). Everything else is exact.
-_MODEL_LOAD_LINE = re.compile(r"^resident weights loaded in (\d+(?:\.\d+)?)s$")
+#
+# The model-load pattern deliberately requires the *complete* source line:
+#   printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", ...)
+# A pattern ending after the seconds value matches nothing the real engine
+# ever prints, so it would turn every successful run into
+# `timing_evidence_invalid`.
+_MODEL_LOAD_LINE = re.compile(
+    r"^resident weights loaded in (\d+(?:\.\d+)?)s \| RSS after load: (\d+(?:\.\d+)?) GB$"
+)
 _REFERENCE_LINE = re.compile(r"^Reference:[ \t]*(.*)$")
 _C_ENGINE_LINE = re.compile(r"^C engine[ \t]*:[ \t]*(.*)$")
 _MATCH_LINE = re.compile(r"^Matching tokens: (\d+)/(\d+)$")
@@ -66,6 +92,7 @@ class ParsedEngineOutput:
     matched_count: int
     expected_count: int
     model_load_seconds: float
+    rss_after_load_gb: float
     generation_seconds: float
     generation_rate_tokens_per_second: float
     reported_generated_token_count: int
@@ -120,6 +147,23 @@ def _require_bounded_rate(text: str) -> float:
     except ValueError as exc:
         raise ColibriStage2Failure("timing_evidence_invalid") from exc
     if not math.isfinite(value) or value < 0.0 or value > MAX_ENGINE_REPORTED_RATE:
+        raise ColibriStage2Failure("timing_evidence_invalid")
+    return value
+
+
+def _require_bounded_rss_gb(text: str) -> float:
+    """Validate the engine's reported resident-set size.
+
+    Recorded as engine-reported evidence rather than discarded, but it is
+    never the authoritative memory figure -- that comes from the owning Job
+    Object. Non-finite, negative, or absurd readings are rejected outright.
+    """
+
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ColibriStage2Failure("timing_evidence_invalid") from exc
+    if not math.isfinite(value) or value < 0.0 or value > MAX_ENGINE_REPORTED_RSS_GB:
         raise ColibriStage2Failure("timing_evidence_invalid")
     return value
 
@@ -199,6 +243,7 @@ def parse_engine_output(data: bytes) -> ParsedEngineOutput:
         raise ColibriStage2Failure("malformed_output")
 
     model_load_seconds = _require_bounded_seconds(model_load_match.group(1))  # type: ignore[union-attr]
+    rss_after_load_gb = _require_bounded_rss_gb(model_load_match.group(2))  # type: ignore[union-attr]
     generation_rate = _require_bounded_rate(speed_match.group(1))  # type: ignore[union-attr]
     generation_seconds = _require_bounded_seconds(speed_match.group(2))  # type: ignore[union-attr]
     reported_generated = int(speed_match.group(3))  # type: ignore[union-attr]
@@ -211,6 +256,7 @@ def parse_engine_output(data: bytes) -> ParsedEngineOutput:
         matched_count=matched_count,
         expected_count=expected_count,
         model_load_seconds=model_load_seconds,
+        rss_after_load_gb=rss_after_load_gb,
         generation_seconds=generation_seconds,
         generation_rate_tokens_per_second=generation_rate,
         reported_generated_token_count=reported_generated,

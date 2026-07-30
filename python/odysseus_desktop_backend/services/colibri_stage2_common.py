@@ -146,6 +146,15 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "output_internally_inconsistent",
         "timing_evidence_invalid",
         "output_decode_failed",
+        # Developer CLI surface. `cli_arguments_rejected` covers anything the
+        # argument parser refuses (including an unsupported --help), and is
+        # deliberately distinct from a path or identity rejection.
+        "cli_arguments_rejected",
+        # A defect in this code, not a closed operational outcome. Never
+        # collapsed into `malformed_output`: that would blame the engine for
+        # our own bug, and would imply output was parsed when it may not have
+        # been reached at all.
+        "unexpected_internal_failure",
         "cleanup_failed",
         "orphan_detected",
         "platform_unsupported",
@@ -187,6 +196,10 @@ TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v2"
 # rather than clamped: a clamped number would look like a measurement.
 MAX_ENGINE_REPORTED_SECONDS = 86_400.0
 MAX_ENGINE_REPORTED_RATE = 1_000_000_000.0
+# The engine reports resident-set size in GB with two decimals. A bound in
+# the petabyte range is absurd for any real host and still leaves every
+# plausible reading valid.
+MAX_ENGINE_REPORTED_RSS_GB = 1_048_576.0
 
 # Every optional measurement in the run evidence carries its own state, so a
 # missing number is always distinguishable from a measured zero and can never

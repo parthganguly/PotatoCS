@@ -15,26 +15,51 @@ EXPECTED_TOKEN = 7785
 
 def engine_output(
     *,
-    reference_ids: str = "7785",
-    generated_ids: str = "7785",
+    reference_ids: str = "7785 ",
+    generated_ids: str = "7785 ",
     matched: str = "1",
     expected: str = "1",
-    model_load_seconds: str = "12.500",
+    model_load_seconds: str = "12.5",
+    rss_after_load_gb: str = "6.42",
+    peak_rss_gb: str = "6.51",
     rate: str = "1.85",
-    generation_seconds: str = "0.540",
+    generation_seconds: str = "0.5",
     generated_count: str = "1",
     banner: bool = True,
+    model_load_line: str | None = None,
 ) -> bytes:
+    """The exact stdout shape of the pinned ``c/olmoe.c`` at commit 72d3d372.
+
+    Transcribed from its ``main``: the streaming-engine banner, the complete
+    resident-weights/RSS line, a blank line, the ``Reference``/``C engine``
+    pair (each emitted as ``printf("%d ")`` per token, hence the trailing
+    space), ``Matching tokens``, a blank line, ``PEAK RSS``, the cache-hit
+    line, and ``Speed``.
+    """
+
     lines: list[str] = []
     if banner:
-        lines.append("olmoe cap=8 bits=8 (avx2)")
-        lines.append("snap dir resolved")
-    lines.append(f"resident weights loaded in {model_load_seconds}s")
+        lines.append("== Streaming C engine, cache = 8 experts/layer, experts @ 8-bit ==")
+    if model_load_line is None:
+        model_load_line = (
+            f"resident weights loaded in {model_load_seconds}s"
+            f" | RSS after load: {rss_after_load_gb} GB"
+        )
+    lines.append(model_load_line)
+    lines.append("")
     lines.append(f"Reference: {reference_ids}")
     lines.append(f"C engine : {generated_ids}")
     lines.append(f"Matching tokens: {matched}/{expected}")
+    lines.append("")
+    lines.append(f"PEAK RSS: {peak_rss_gb} GB")
+    lines.append("Expert cache hit rate: 92.3%  (hit=1187 miss=98)")
     lines.append(f"Speed: {rate} tok/s ({generation_seconds}s for {generated_count} tokens)")
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+# The shortened line the tests previously used. The real engine never prints
+# it, and the parser must reject it.
+SHORTENED_MODEL_LOAD_LINE = "resident weights loaded in 12.5s"
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +74,74 @@ def test_parses_the_full_reviewed_dialect() -> None:
     assert parsed.matched_count == 1
     assert parsed.expected_count == 1
     assert parsed.model_load_seconds == pytest.approx(12.5)
-    assert parsed.generation_seconds == pytest.approx(0.54)
+    assert parsed.rss_after_load_gb == pytest.approx(6.42)
+    assert parsed.generation_seconds == pytest.approx(0.5)
     assert parsed.generation_rate_tokens_per_second == pytest.approx(1.85)
     assert parsed.reported_generated_token_count == 1
+
+
+def test_the_real_source_line_shape_is_what_is_accepted() -> None:
+    # Byte-for-byte the line `c/olmoe.c` prints at the pinned commit:
+    #   printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", ...)
+    payload = engine_output()
+    assert b"resident weights loaded in 12.5s | RSS after load: 6.42 GB\n" in payload
+    assert b"== Streaming C engine, cache = 8 experts/layer, experts @ 8-bit ==\n" in payload
+    assert b"\nReference: 7785 \n" in payload
+    assert b"C engine : 7785 \n" in payload
+    assert b"\nPEAK RSS: 6.51 GB\n" in payload
+    assert b"Speed: 1.85 tok/s (0.5s for 1 tokens)\n" in payload
+    parser.parse_engine_output(payload)
+
+
+def test_shortened_model_load_line_is_rejected() -> None:
+    # Regression: the parser previously required the line to END after the
+    # seconds value, which the real engine never prints -- so every real
+    # successful run would have failed as timing_evidence_invalid. The
+    # shortened form must now be rejected outright.
+    shortened = engine_output(model_load_line=SHORTENED_MODEL_LOAD_LINE)
+    assert b"resident weights loaded in 12.5s\n" in shortened
+    assert b"RSS after load" not in shortened
+    with pytest.raises(ColibriStage2Failure, match="timing_evidence_invalid"):
+        parser.parse_engine_output(shortened)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "resident weights loaded in 12.5s |",
+        "resident weights loaded in 12.5s | RSS after load:",
+        "resident weights loaded in 12.5s | RSS after load: 6.42",
+        "resident weights loaded in 12.5s | RSS after load: 6.42 MB",
+        "resident weights loaded in 12.5s | RSS after load: 6.42 GB extra",
+        "resident weights loaded in | RSS after load: 6.42 GB",
+    ],
+)
+def test_partial_or_extended_model_load_lines_are_rejected(line: str) -> None:
+    with pytest.raises(ColibriStage2Failure, match="timing_evidence_invalid"):
+        parser.parse_engine_output(engine_output(model_load_line=line))
+
+
+def test_rss_after_load_is_validated_and_recorded() -> None:
+    parsed = parser.parse_engine_output(engine_output(rss_after_load_gb="0.00"))
+    assert parsed.rss_after_load_gb == 0.0
+    parsed = parser.parse_engine_output(engine_output(rss_after_load_gb="13.75"))
+    assert parsed.rss_after_load_gb == pytest.approx(13.75)
+
+
+@pytest.mark.parametrize("rss", ["nan", "inf", "-1.0", "99999999"])
+def test_out_of_bounds_rss_is_rejected(rss: str) -> None:
+    with pytest.raises(ColibriStage2Failure, match="timing_evidence_invalid"):
+        parser.parse_engine_output(engine_output(rss_after_load_gb=rss))
+
+
+def test_peak_rss_and_cache_hit_lines_are_tolerated_not_parsed() -> None:
+    # They are real engine output but carry no authority here: the peak-memory
+    # figure that matters comes from the owning Job Object.
+    parsed = parser.parse_engine_output(engine_output(peak_rss_gb="123.45"))
+    serialized = repr(parsed)
+    assert "123.45" not in serialized
+    assert "cache hit" not in serialized
+    assert "92.3" not in serialized
 
 
 def test_banner_lines_are_tolerated_and_retained_nowhere() -> None:
@@ -171,7 +261,7 @@ def test_each_required_line_is_required(prefix: bytes, category: str) -> None:
         (b"Reference: 7785\n", "duplicate_output_line"),
         (b"C engine : 7785\n", "duplicate_output_line"),
         (b"Matching tokens: 1/1\n", "duplicate_match_line"),
-        (b"resident weights loaded in 1.0s\n", "timing_evidence_invalid"),
+        (b"resident weights loaded in 1.0s | RSS after load: 1.00 GB\n", "timing_evidence_invalid"),
         (b"Speed: 1.0 tok/s (1.0s for 1 tokens)\n", "timing_evidence_invalid"),
     ],
 )

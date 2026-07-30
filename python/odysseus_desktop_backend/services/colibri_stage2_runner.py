@@ -276,12 +276,22 @@ class OneTokenRunResult:
     ok: bool
     evidence_schema_version: str
     identities: RunIdentityEvidence
+    # Engine-reported: the numerator of its own ``Matching tokens`` line,
+    # retained wherever it was safely parsed -- including on a failed run.
     matched_count: int | None
-    expected_count: int
+    # What the reviewed contract requires. Always 1, never engine-supplied.
+    contract_expected_count: int
+    # Engine-reported: the denominator of its own ``Matching tokens`` line.
+    # Kept separate from ``contract_expected_count`` so a run where the engine
+    # disagreed about how many tokens were even expected shows both numbers
+    # rather than one silently standing in for the other.
+    engine_reported_expected_count: int | None
     expected_token_id: int
-    # Always read from the engine's own ``C engine :`` line. Never assigned
-    # from ``expected_token_id``; ``None`` means no generated token was
-    # parsed, which is exactly what a failed or unverified run should show.
+    # Always read from the engine's own ``C engine :`` line, retained as soon
+    # as it is parsed and before any comparison. On a wrong-token run this
+    # holds the actual wrong integer. It is never assigned from
+    # ``expected_token_id``; ``None`` means no single generated token was
+    # parsed at all.
     generated_token_id: int | None
     exit_category: str
     evidence_sha256: str | None
@@ -761,6 +771,8 @@ def attempt_one_token_proof(
     parsed: ParsedEngineOutput | None = None
     generated_token_id: int | None = None
     matched_count: int | None = None
+    engine_reported_expected_count: int | None = None
+    verified = False
     exit_code: int | None = None
     resumed_at: float | None = None
     exit_observed_at: float | None = None
@@ -833,11 +845,20 @@ def attempt_one_token_proof(
         # bounded stream bytes are consumed here and never retained: only the
         # small parsed record survives this block.
         parsed = parse_engine_output(pump.stdout.bytes_value())
-        generated_token_id = verify_one_token_output(
-            parsed, expected_token_id=manifest.expected_generated_token_id
-        )
+
+        # Retain what the engine actually said *before* judging it. A run that
+        # generated the wrong token must report that wrong token, not a null
+        # and never the expected value -- the observation is the whole point
+        # of having run it.
+        if len(parsed.generated_token_ids) == 1:
+            generated_token_id = parsed.generated_token_ids[0]
         matched_count = parsed.matched_count
+        engine_reported_expected_count = parsed.expected_count
+
+        verify_one_token_output(parsed, expected_token_id=manifest.expected_generated_token_id)
+        verified = True
         if canonical_reference_sha256() != manifest.ref_sha256:
+            verified = False
             raise ColibriStage2Failure("token_identity_mismatch")
     except ColibriStage2Failure as exc:
         primary_failure = exc
@@ -931,10 +952,12 @@ def attempt_one_token_proof(
     elif primary_failure is not None:
         failure = primary_failure
 
-    ok = failure is None and generated_token_id is not None
+    # `verified` -- not "a token was parsed" -- is what makes a run a pass.
+    # A wrong generated token is parsed and reported, and must still fail.
+    ok = failure is None and verified
     if not ok and failure is None:
-        # No closed failure was recorded yet no generated token was verified.
-        # That combination must still fail, and truthfully: the output never
+        # No closed failure was recorded yet nothing was verified. That
+        # combination must still fail, and truthfully: the output never
         # yielded the reviewed token.
         failure = ColibriStage2Failure("malformed_output")
     elapsed_ms = round((clock() - started) * 1000)
@@ -944,7 +967,8 @@ def attempt_one_token_proof(
         evidence_schema_version=TOKEN_RUN_EVIDENCE_SCHEMA_VERSION,
         identities=_identity_evidence(manifest),
         matched_count=matched_count,
-        expected_count=1,
+        contract_expected_count=1,
+        engine_reported_expected_count=engine_reported_expected_count,
         expected_token_id=manifest.expected_generated_token_id,
         generated_token_id=generated_token_id,
         exit_category=classify_process_exit(exit_code=exit_code, timed_out=timed_out),

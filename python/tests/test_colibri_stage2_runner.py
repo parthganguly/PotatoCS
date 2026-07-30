@@ -27,29 +27,42 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-# The pinned engine's real one-token output dialect. Every fixture below uses
-# this shape rather than a bare "Matching tokens: 1/1", because the runner now
-# parses the reference and generated token lines as its actual oracle and
-# reads the two engine-reported timings.
+# The pinned engine's real one-token output dialect, transcribed from
+# `c/olmoe.c` at commit 72d3d372 -- the streaming-engine banner, the complete
+# resident-weights/RSS line, the Reference/C-engine pair (each token emitted
+# as `printf("%d ")`, hence the trailing space), Matching tokens, PEAK RSS,
+# the cache-hit line, and Speed.
 def engine_output(
     *,
-    reference_ids: str = "7785",
-    generated_ids: str = "7785",
+    reference_ids: str = "7785 ",
+    generated_ids: str = "7785 ",
     matched: str = "1",
     expected: str = "1",
-    model_load_seconds: str = "12.500",
+    model_load_seconds: str = "12.5",
+    rss_after_load_gb: str = "6.42",
+    peak_rss_gb: str = "6.51",
     rate: str = "1.85",
-    generation_seconds: str = "0.540",
+    generation_seconds: str = "0.5",
     generated_count: str = "1",
     banner: bool = True,
+    model_load_line: str | None = None,
 ) -> bytes:
     lines: list[str] = []
     if banner:
-        lines.append("olmoe cap=8 bits=8 (avx2)")
-    lines.append(f"resident weights loaded in {model_load_seconds}s")
+        lines.append("== Streaming C engine, cache = 8 experts/layer, experts @ 8-bit ==")
+    if model_load_line is None:
+        model_load_line = (
+            f"resident weights loaded in {model_load_seconds}s"
+            f" | RSS after load: {rss_after_load_gb} GB"
+        )
+    lines.append(model_load_line)
+    lines.append("")
     lines.append(f"Reference: {reference_ids}")
     lines.append(f"C engine : {generated_ids}")
     lines.append(f"Matching tokens: {matched}/{expected}")
+    lines.append("")
+    lines.append(f"PEAK RSS: {peak_rss_gb} GB")
+    lines.append("Expert cache hit rate: 92.3%  (hit=1187 miss=98)")
     lines.append(f"Speed: {rate} tok/s ({generation_seconds}s for {generated_count} tokens)")
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -619,7 +632,8 @@ def test_exact_one_of_one_success(registered: _Fixture) -> None:
     assert result.ok is True
     assert result.category == "passed"
     assert result.matched_count == 1
-    assert result.expected_count == 1
+    assert result.contract_expected_count == 1
+    assert result.engine_reported_expected_count == 1
     assert result.expected_token_id == 7785
     assert result.generated_token_id == 7785
     assert result.exit_code == 0
@@ -1013,20 +1027,52 @@ def test_reference_digest_drift_is_rejected(
     assert api.calls == []
 
 
+def test_wrong_generated_token_is_retained_as_observed_evidence(
+    registered: _Fixture,
+) -> None:
+    # The observation is the point of having run it: a wrong token must be
+    # reported as the actual integer the engine produced, never nulled out and
+    # never replaced by the expected value.
+    failed = _attempt(
+        registered, FakeApi(stdout=engine_output(generated_ids="4242 ", matched="0"))
+    )
+    assert failed.ok is False
+    assert failed.category == "token_identity_mismatch"
+    assert failed.generated_token_id == 4242
+    assert failed.expected_token_id == 7785
+    assert failed.evidence_sha256 is None
+
+
 def test_generated_token_id_is_never_taken_from_the_expected_value(
     registered: _Fixture,
 ) -> None:
-    # A run whose engine generated the wrong token must report no generated
-    # token id at all -- never the expected one.
-    failed = _attempt(registered, FakeApi(stdout=engine_output(generated_ids="4242", matched="0")))
-    assert failed.ok is False
-    assert failed.category == "token_identity_mismatch"
-    assert failed.generated_token_id is None
-    assert failed.evidence_sha256 is None
-
     result = _run(registered, FakeApi(stdout=GOOD_OUTPUT))
     # Equal here, but read from the engine's own line rather than copied.
     assert result.generated_token_id == result.expected_token_id == 7785
+
+
+def test_failed_run_retains_engine_reported_counts(registered: _Fixture) -> None:
+    # An internally inconsistent run still reports what the engine said, with
+    # the contract's own expected count kept separate from the engine's.
+    failed = _attempt(registered, FakeApi(stdout=engine_output(matched="1", expected="3")))
+    assert failed.ok is False
+    assert failed.category == "output_internally_inconsistent"
+    assert failed.matched_count == 1
+    assert failed.engine_reported_expected_count == 3
+    assert failed.contract_expected_count == 1
+    assert failed.generated_token_id == 7785
+    assert failed.evidence_sha256 is None
+
+
+def test_no_generated_token_is_reported_when_none_was_safely_parsed(
+    registered: _Fixture,
+) -> None:
+    # Two generated tokens: there is no single integer to report, so the field
+    # stays null rather than guessing which one to keep.
+    failed = _attempt(registered, FakeApi(stdout=engine_output(generated_ids="7785 42 ")))
+    assert failed.ok is False
+    assert failed.category == "generated_token_count_unexpected"
+    assert failed.generated_token_id is None
 
 
 def test_evidence_digest_depends_on_the_parsed_generated_token(
@@ -1164,8 +1210,17 @@ def test_missing_or_duplicated_timing_lines_are_rejected(registered: _Fixture) -
     with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
         _run(registered, FakeApi(stdout=without_speed))
 
+    duplicate_load = b"resident weights loaded in 1.0s | RSS after load: 1.00 GB\n"
     with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
-        _run(registered, FakeApi(stdout=GOOD_OUTPUT + b"resident weights loaded in 1.0s\n"))
+        _run(registered, FakeApi(stdout=GOOD_OUTPUT + duplicate_load))
+
+
+def test_shortened_model_load_line_is_rejected_end_to_end(registered: _Fixture) -> None:
+    # Regression guard at the runner level: the shortened line the tests used
+    # before this correction is not what the engine prints, and must fail.
+    shortened = engine_output(model_load_line="resident weights loaded in 12.5s")
+    with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
+        _run(registered, FakeApi(stdout=shortened))
 
 
 def test_peak_tree_memory_is_recorded_when_positively_measured(registered: _Fixture) -> None:
