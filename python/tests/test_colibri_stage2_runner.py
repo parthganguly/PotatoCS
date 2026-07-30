@@ -7,6 +7,7 @@ ordinary Ollama/Colibrì model store.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import inspect
 from pathlib import Path
@@ -24,6 +25,36 @@ from odysseus_desktop_backend.services import colibri_stage2_runner as runner
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# The pinned engine's real one-token output dialect. Every fixture below uses
+# this shape rather than a bare "Matching tokens: 1/1", because the runner now
+# parses the reference and generated token lines as its actual oracle and
+# reads the two engine-reported timings.
+def engine_output(
+    *,
+    reference_ids: str = "7785",
+    generated_ids: str = "7785",
+    matched: str = "1",
+    expected: str = "1",
+    model_load_seconds: str = "12.500",
+    rate: str = "1.85",
+    generation_seconds: str = "0.540",
+    generated_count: str = "1",
+    banner: bool = True,
+) -> bytes:
+    lines: list[str] = []
+    if banner:
+        lines.append("olmoe cap=8 bits=8 (avx2)")
+    lines.append(f"resident weights loaded in {model_load_seconds}s")
+    lines.append(f"Reference: {reference_ids}")
+    lines.append(f"C engine : {generated_ids}")
+    lines.append(f"Matching tokens: {matched}/{expected}")
+    lines.append(f"Speed: {rate} tok/s ({generation_seconds}s for {generated_count} tokens)")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+GOOD_OUTPUT = engine_output()
 
 
 class FakePipe:
@@ -48,7 +79,7 @@ class FakeApi:
     def __init__(
         self,
         *,
-        stdout: bytes = b"Matching tokens: 1/1\n",
+        stdout: bytes | None = None,
         stderr: bytes = b"",
         exit_code: int | None = 0,
         descendants: set[int] | None = None,
@@ -57,6 +88,8 @@ class FakeApi:
         image_matches: bool = True,
         job_assignment_ok: bool = True,
     ) -> None:
+        if stdout is None:
+            stdout = GOOD_OUTPUT
         self.stdout_events: list[tuple[str, bytes]] = [("data", stdout)] if stdout else []
         self.stdout_events.append(("eof", b""))
         self.stderr_events: list[tuple[str, bytes]] = [("data", stderr)] if stderr else []
@@ -284,7 +317,7 @@ def registered(fixture: _Fixture, monkeypatch: pytest.MonkeyPatch) -> _Fixture:
     return fixture
 
 
-def _run(fixture: _Fixture, api: FakeApi, **overrides: Any) -> runner.OneTokenRunResult:
+def _run_kwargs(fixture: _Fixture, api: FakeApi, **overrides: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = dict(
         olmoe_exe=fixture.exe,
         converted_model_dir=fixture.model_dir,
@@ -292,11 +325,27 @@ def _run(fixture: _Fixture, api: FakeApi, **overrides: Any) -> runner.OneTokenRu
         approved=True,
         interactive_check=lambda: True,
         reference_session_parent=fixture.root,
+        # The real probe cannot read a synthetic job handle, so tests state
+        # explicitly what the Job Object reports. Zero members is the normal
+        # case; tests that care about an unavailable or non-empty job override
+        # this and say so.
+        job_member_probe=lambda job: 0,
+        # Never a real sleep in tests: advance the fake clock instead, so a
+        # bounded poll loop terminates without wall-clock delay.
+        sleep=(lambda seconds: api.clock.advance(seconds)) if api.clock is not None else (lambda seconds: None),
     )
     kwargs.update(overrides)
     if "clock" not in kwargs and api.clock is not None:
         kwargs["clock"] = api.clock.time
-    return runner.run_one_token_proof(**kwargs)
+    return kwargs
+
+
+def _run(fixture: _Fixture, api: FakeApi, **overrides: Any) -> runner.OneTokenRunResult:
+    return runner.run_one_token_proof(**_run_kwargs(fixture, api, **overrides))
+
+
+def _attempt(fixture: _Fixture, api: FakeApi, **overrides: Any) -> runner.OneTokenRunResult:
+    return runner.attempt_one_token_proof(**_run_kwargs(fixture, api, **overrides))
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +614,7 @@ def test_run_one_token_proof_has_no_external_tokenizer_or_ref_path_parameter() -
 
 
 def test_exact_one_of_one_success(registered: _Fixture) -> None:
-    api = FakeApi(stdout=b"Matching tokens: 1/1\n")
+    api = FakeApi(stdout=GOOD_OUTPUT)
     result = _run(registered, api)
     assert result.ok is True
     assert result.category == "passed"
@@ -580,24 +629,91 @@ def test_exact_one_of_one_success(registered: _Fixture) -> None:
     assert result.reference_removed is True
     assert result.vram_state == "not_applicable"
     assert result.evidence_sha256 is not None
-    assert result.evidence_schema_version == "colibri-stage2-olmoe-token-evidence-v1"
+    assert result.evidence_schema_version == "colibri-stage2-olmoe-token-evidence-v2"
+    assert result.job_empty_proven is True
+    assert result.job_member_count == 0
+    assert result.root_exit_confirmed is True
 
 
-def test_zero_of_one_is_rejected(registered: _Fixture) -> None:
-    api = FakeApi(stdout=b"Matching tokens: 0/1\n")
-    with pytest.raises(runner.ColibriStage2Failure, match="match_count_mismatch"):
+def test_wrong_generated_token_is_rejected_even_when_engine_claims_a_match(
+    registered: _Fixture,
+) -> None:
+    # The engine asserts 1/1 while its own C-engine line shows a different
+    # token. The independent comparison must reject it -- this is precisely
+    # the case a match-line-only oracle would have passed.
+    api = FakeApi(stdout=engine_output(generated_ids="7786", matched="1", expected="1"))
+    with pytest.raises(runner.ColibriStage2Failure, match="token_identity_mismatch"):
+        _run(registered, api)
+
+
+def test_zero_of_one_with_a_differing_token_is_rejected(registered: _Fixture) -> None:
+    api = FakeApi(stdout=engine_output(generated_ids="42", matched="0", expected="1"))
+    with pytest.raises(runner.ColibriStage2Failure, match="token_identity_mismatch"):
+        _run(registered, api)
+
+
+def test_engine_contradicting_its_own_token_lines_is_rejected(registered: _Fixture) -> None:
+    # Identical reference and generated tokens, but the engine reports 0/1.
+    # Its own lines contradict its own count.
+    api = FakeApi(stdout=engine_output(matched="0", expected="1"))
+    with pytest.raises(runner.ColibriStage2Failure, match="output_internally_inconsistent"):
         _run(registered, api)
 
 
 def test_unexpected_denominator_is_rejected(registered: _Fixture) -> None:
-    api = FakeApi(stdout=b"Matching tokens: 1/2\n")
-    with pytest.raises(runner.ColibriStage2Failure, match="match_count_mismatch"):
+    # One reference token but an expected count of 2: internally inconsistent.
+    api = FakeApi(stdout=engine_output(matched="1", expected="2"))
+    with pytest.raises(runner.ColibriStage2Failure, match="output_internally_inconsistent"):
+        _run(registered, api)
+
+
+def test_wrong_reference_line_is_rejected(registered: _Fixture) -> None:
+    # The engine compared against a token that is not the reviewed one, so its
+    # match count is meaningless whatever it says.
+    api = FakeApi(stdout=engine_output(reference_ids="1234", generated_ids="1234"))
+    with pytest.raises(runner.ColibriStage2Failure, match="reference_line_mismatch"):
+        _run(registered, api)
+
+
+def test_extra_generated_tokens_are_rejected(registered: _Fixture) -> None:
+    api = FakeApi(stdout=engine_output(generated_ids="7785 7785", matched="1", expected="1"))
+    with pytest.raises(runner.ColibriStage2Failure, match="generated_token_count_unexpected"):
+        _run(registered, api)
+
+
+def test_missing_generated_token_line_is_rejected(registered: _Fixture) -> None:
+    without_c_engine = b"\n".join(
+        line for line in GOOD_OUTPUT.split(b"\n") if not line.startswith(b"C engine")
+    )
+    api = FakeApi(stdout=without_c_engine)
+    with pytest.raises(runner.ColibriStage2Failure, match="malformed_output"):
+        _run(registered, api)
+
+
+def test_missing_reference_line_is_rejected(registered: _Fixture) -> None:
+    without_reference = b"\n".join(
+        line for line in GOOD_OUTPUT.split(b"\n") if not line.startswith(b"Reference:")
+    )
+    api = FakeApi(stdout=without_reference)
+    with pytest.raises(runner.ColibriStage2Failure, match="malformed_output"):
         _run(registered, api)
 
 
 def test_duplicate_matching_lines_are_rejected(registered: _Fixture) -> None:
-    api = FakeApi(stdout=b"Matching tokens: 1/1\nMatching tokens: 1/1\n")
+    api = FakeApi(stdout=GOOD_OUTPUT + b"Matching tokens: 1/1\n")
     with pytest.raises(runner.ColibriStage2Failure, match="duplicate_match_line"):
+        _run(registered, api)
+
+
+def test_duplicate_reference_line_is_rejected(registered: _Fixture) -> None:
+    api = FakeApi(stdout=GOOD_OUTPUT + b"Reference: 7785\n")
+    with pytest.raises(runner.ColibriStage2Failure, match="duplicate_output_line"):
+        _run(registered, api)
+
+
+def test_duplicate_generated_token_line_is_rejected(registered: _Fixture) -> None:
+    api = FakeApi(stdout=GOOD_OUTPUT + b"C engine : 7785\n")
+    with pytest.raises(runner.ColibriStage2Failure, match="duplicate_output_line"):
         _run(registered, api)
 
 
@@ -607,10 +723,19 @@ def test_malformed_output_is_rejected(registered: _Fixture) -> None:
         _run(registered, api)
 
 
-def test_unexpected_extra_output_around_match_line_still_parses(registered: _Fixture) -> None:
-    api = FakeApi(stdout=b"warming up\nMatching tokens: 1/1\ndone\n")
+def test_undecodable_output_is_rejected(registered: _Fixture) -> None:
+    api = FakeApi(stdout=b"\xff\xfe not utf-8 at all\n")
+    with pytest.raises(runner.ColibriStage2Failure, match="output_decode_failed"):
+        _run(registered, api)
+
+
+def test_unexpected_extra_output_around_the_dialect_still_parses(registered: _Fixture) -> None:
+    api = FakeApi(
+        stdout=b"warming up\n" + GOOD_OUTPUT + b"done\nsome trailing banner\n"
+    )
     result = _run(registered, api)
     assert result.ok is True
+    assert result.generated_token_id == 7785
 
 
 def test_nonzero_exit_is_rejected(registered: _Fixture) -> None:
@@ -756,11 +881,13 @@ def test_successful_run_removes_temporary_reference(registered: _Fixture) -> Non
 
 
 def test_result_never_exposes_paths_or_raw_output(registered: _Fixture) -> None:
-    api = FakeApi(stdout=b"Matching tokens: 1/1\n")
+    api = FakeApi(stdout=GOOD_OUTPUT)
     result = _run(registered, api)
     serialized = repr(result)
     assert str(registered.root) not in serialized
     assert "Matching tokens" not in serialized
+    assert "C engine" not in serialized
+    assert "resident weights" not in serialized
     assert "fake engine bytes" not in serialized
 
 
@@ -768,7 +895,7 @@ def test_result_evidence_is_closed_and_privacy_safe(registered: _Fixture) -> Non
     import getpass
     import os as os_module
 
-    api = FakeApi(stdout=b"warming up with a chatty banner\nMatching tokens: 1/1\ndone\n")
+    api = FakeApi(stdout=b"warming up with a chatty banner\n" + GOOD_OUTPUT + b"done\n")
     result = _run(registered, api)
     serialized = repr(result)
 
@@ -886,12 +1013,35 @@ def test_reference_digest_drift_is_rejected(
     assert api.calls == []
 
 
-def test_generated_token_id_is_only_reported_after_a_confirmed_match(registered: _Fixture) -> None:
-    # A 0/1 run must never yield a generated token id at all.
-    with pytest.raises(runner.ColibriStage2Failure, match="match_count_mismatch"):
-        _run(registered, FakeApi(stdout=b"Matching tokens: 0/1\n"))
-    result = _run(registered, FakeApi(stdout=b"Matching tokens: 1/1\n"))
+def test_generated_token_id_is_never_taken_from_the_expected_value(
+    registered: _Fixture,
+) -> None:
+    # A run whose engine generated the wrong token must report no generated
+    # token id at all -- never the expected one.
+    failed = _attempt(registered, FakeApi(stdout=engine_output(generated_ids="4242", matched="0")))
+    assert failed.ok is False
+    assert failed.category == "token_identity_mismatch"
+    assert failed.generated_token_id is None
+    assert failed.evidence_sha256 is None
+
+    result = _run(registered, FakeApi(stdout=GOOD_OUTPUT))
+    # Equal here, but read from the engine's own line rather than copied.
     assert result.generated_token_id == result.expected_token_id == 7785
+
+
+def test_evidence_digest_depends_on_the_parsed_generated_token(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two runs identical in every reviewed identity but differing in the token
+    # the engine actually produced must not share an evidence digest. Since a
+    # wrong token is rejected outright, this is asserted on the digest helper
+    # with the real manifest.
+    manifest = registered.manifest
+    first = runner._evidence_digest(manifest, 7785, 1)
+    second = runner._evidence_digest(manifest, 7786, 1)
+    assert first != second
+    result = _run(registered, FakeApi(stdout=GOOD_OUTPUT))
+    assert result.evidence_sha256 == first
 
 
 # ---------------------------------------------------------------------------
@@ -909,39 +1059,113 @@ def test_classify_process_exit_covers_the_closed_vocabulary() -> None:
         assert category in common.EXIT_CATEGORIES
 
 
-def test_latency_evidence_is_measured_on_a_successful_run(registered: _Fixture) -> None:
+def test_engine_reported_latencies_come_from_the_engine_output(registered: _Fixture) -> None:
+    api = FakeApi(stdout=engine_output(model_load_seconds="12.500", generation_seconds="0.540"))
+    result = _run(registered, api)
+    latency = result.latency
+    # Exactly the values the engine printed, in milliseconds -- not a
+    # wall-clock approximation of them.
+    assert latency.model_load_latency_state == "measured"
+    assert latency.model_load_latency_ms == 12500
+    assert latency.generation_latency_state == "measured"
+    assert latency.generation_latency_ms == 540
+
+
+def test_independently_measured_latencies_are_recorded_separately(registered: _Fixture) -> None:
     result = _run(registered, FakeApi())
     latency = result.latency
-    assert latency.startup_latency_state == "measured"
-    assert latency.one_token_latency_state == "measured"
-    assert isinstance(latency.startup_latency_ms, int) and latency.startup_latency_ms >= 0
-    assert isinstance(latency.one_token_latency_ms, int) and latency.one_token_latency_ms >= 0
+    assert latency.end_to_end_latency_state == "measured"
+    assert isinstance(latency.end_to_end_latency_ms, int) and latency.end_to_end_latency_ms >= 0
+    assert latency.first_output_latency_state == "measured"
+    assert isinstance(latency.first_output_latency_ms, int) and latency.first_output_latency_ms >= 0
+
+
+def test_first_output_latency_is_not_presented_as_model_load(registered: _Fixture) -> None:
+    # The pinned engine prints its banner before model_init, so first-output
+    # must never stand in for model load. The two are independent fields, and
+    # the engine-reported load time is not derived from the clock at all.
+    api = FakeApi(stdout=engine_output(model_load_seconds="99.000"))
+    result = _run(registered, api)
+    assert result.latency.model_load_latency_ms == 99000
+    assert result.latency.first_output_latency_ms != result.latency.model_load_latency_ms
+    field_names = {field.name for field in dataclasses.fields(result.latency)}
+    assert "startup_latency_ms" not in field_names
+    assert "one_token_latency_ms" not in field_names
 
 
 def test_latency_evidence_reports_unavailable_rather_than_zero() -> None:
     # A missing endpoint yields None plus an explicit state, so an unmeasured
     # latency can never be misread as "0 ms".
-    evidence = runner._latency_evidence(resumed_at=None, first_output_at=None, exit_observed_at=None)
-    assert evidence.startup_latency_ms is None
-    assert evidence.startup_latency_state == "unavailable"
-    assert evidence.one_token_latency_ms is None
-    assert evidence.one_token_latency_state == "unavailable"
+    evidence = runner._latency_evidence(
+        resumed_at=None, first_output_at=None, exit_observed_at=None, parsed=None
+    )
+    assert evidence.end_to_end_latency_ms is None
+    assert evidence.end_to_end_latency_state == "unavailable"
+    assert evidence.first_output_latency_ms is None
+    assert evidence.first_output_latency_state == "unavailable"
+    assert evidence.model_load_latency_ms is None
+    assert evidence.model_load_latency_state == "unavailable"
+    assert evidence.generation_latency_ms is None
+    assert evidence.generation_latency_state == "unavailable"
 
-    partial = runner._latency_evidence(resumed_at=10.0, first_output_at=None, exit_observed_at=10.5)
-    assert partial.startup_latency_state == "unavailable"
-    assert partial.startup_latency_ms is None
-    assert partial.one_token_latency_state == "measured"
-    assert partial.one_token_latency_ms == 500
+    partial = runner._latency_evidence(
+        resumed_at=10.0, first_output_at=None, exit_observed_at=10.5, parsed=None
+    )
+    assert partial.first_output_latency_state == "unavailable"
+    assert partial.first_output_latency_ms is None
+    assert partial.end_to_end_latency_state == "measured"
+    assert partial.end_to_end_latency_ms == 500
 
 
-def test_latency_spans_are_measured_from_resume(registered: _Fixture) -> None:
-    clock = FakeClock()
-    api = FakeApi(clock=clock)
-    result = _run(registered, api, clock=clock.time)
-    # Both spans start at resume, so startup can never exceed end-to-end.
-    assert result.latency.startup_latency_ms is not None
-    assert result.latency.one_token_latency_ms is not None
-    assert result.latency.startup_latency_ms <= result.latency.one_token_latency_ms
+def test_engine_latencies_are_unavailable_when_output_was_never_parsed(
+    registered: _Fixture,
+) -> None:
+    # A run that failed before parsing must not report engine timings at all.
+    result = _attempt(registered, FakeApi(stdout=b"nothing useful here\n"))
+    assert result.ok is False
+    assert result.latency.model_load_latency_state == "unavailable"
+    assert result.latency.model_load_latency_ms is None
+    assert result.latency.generation_latency_state == "unavailable"
+    assert result.latency.generation_latency_ms is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_load_seconds": "-1.0"},
+        {"model_load_seconds": "nan"},
+        {"model_load_seconds": "inf"},
+        {"model_load_seconds": "999999999"},
+        {"generation_seconds": "nan"},
+        {"generation_seconds": "-0.5"},
+        {"rate": "nan"},
+        {"rate": "-3"},
+        {"generated_count": "2"},
+    ],
+)
+def test_out_of_bounds_engine_timings_are_rejected(
+    registered: _Fixture, overrides: dict[str, str]
+) -> None:
+    api = FakeApi(stdout=engine_output(**overrides))
+    with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
+        _run(registered, api)
+
+
+def test_missing_or_duplicated_timing_lines_are_rejected(registered: _Fixture) -> None:
+    without_load = b"\n".join(
+        line for line in GOOD_OUTPUT.split(b"\n") if not line.startswith(b"resident weights")
+    )
+    with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
+        _run(registered, FakeApi(stdout=without_load))
+
+    without_speed = b"\n".join(
+        line for line in GOOD_OUTPUT.split(b"\n") if not line.startswith(b"Speed:")
+    )
+    with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
+        _run(registered, FakeApi(stdout=without_speed))
+
+    with pytest.raises(runner.ColibriStage2Failure, match="timing_evidence_invalid"):
+        _run(registered, FakeApi(stdout=GOOD_OUTPUT + b"resident weights loaded in 1.0s\n"))
 
 
 def test_peak_tree_memory_is_recorded_when_positively_measured(registered: _Fixture) -> None:
@@ -1031,6 +1255,105 @@ def test_timeout_with_a_surviving_descendant_reports_the_orphan(
     with pytest.raises(runner.ColibriStage2Failure, match="orphan_detected"):
         _run(registered, api, clock=clock.time)
     assert api.terminated == ["job-1"]
+
+
+def test_unavailable_job_member_count_fails_closed(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unobtainable member count is never read as zero: it is cleanup
+    # uncertainty, and the run fails closed.
+    monkeypatch.setattr(runner, "_CLEANUP_DEADLINE_SECONDS", 0.2)
+    clock = FakeClock()
+    api = FakeApi(clock=clock)
+    with pytest.raises(runner.ColibriStage2Failure, match="cleanup_failed"):
+        _run(
+            registered,
+            api,
+            clock=clock.time,
+            sleep=lambda seconds: clock.advance(seconds),
+            job_member_probe=lambda job: None,
+        )
+
+
+def test_job_that_never_empties_fails_closed(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "_CLEANUP_DEADLINE_SECONDS", 0.2)
+    clock = FakeClock()
+    api = FakeApi(clock=clock)
+    with pytest.raises(runner.ColibriStage2Failure, match="cleanup_failed"):
+        _run(
+            registered,
+            api,
+            clock=clock.time,
+            sleep=lambda seconds: clock.advance(seconds),
+            job_member_probe=lambda job: 2,
+        )
+
+
+def test_job_emptying_after_a_few_polls_still_succeeds(registered: _Fixture) -> None:
+    # Termination is asynchronous, so the proof polls rather than sampling
+    # once. A job that reports members briefly and then empties is a pass.
+    clock = FakeClock()
+    api = FakeApi(clock=clock)
+    counts = iter([3, 1, 0])
+
+    result = _run(
+        registered,
+        api,
+        clock=clock.time,
+        sleep=lambda seconds: clock.advance(seconds),
+        job_member_probe=lambda job: next(counts, 0),
+    )
+    assert result.ok is True
+    assert result.job_empty_proven is True
+    assert result.job_member_count == 0
+
+
+def test_orphan_free_is_not_asserted_without_the_zero_member_proof(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A descendant snapshot reporting "none" is not, on its own, proof of an
+    # empty tree -- it is an absence-of-evidence argument over a parentage link
+    # that goes stale once the root exits. orphan_free must stay False when the
+    # Job Object never positively reported zero members.
+    monkeypatch.setattr(runner, "_CLEANUP_DEADLINE_SECONDS", 0.2)
+    clock = FakeClock()
+    api = FakeApi(clock=clock, descendants=set())
+    result = _attempt(
+        registered,
+        api,
+        clock=clock.time,
+        sleep=lambda seconds: clock.advance(seconds),
+        job_member_probe=lambda job: None,
+    )
+    assert result.ok is False
+    assert result.category == "cleanup_failed"
+    assert result.job_empty_proven is False
+    assert result.orphan_free is False
+    assert result.descendant_count == 0
+
+
+def test_job_handle_is_closed_only_after_the_zero_member_proof(registered: _Fixture) -> None:
+    api = FakeApi()
+    closed_at_probe_time: list[int] = []
+
+    def probe(job: Any) -> int:
+        closed_at_probe_time.append(len(api.closed_handles))
+        return 0
+
+    result = _run(registered, api, job_member_probe=probe)
+    assert result.ok is True
+    # No handle had been closed when the membership query ran.
+    assert closed_at_probe_time == [0]
+    # And the job handle was closed by the end of the run.
+    assert "job-1" in api.closed_handles
+
+
+def test_complete_job_is_terminated_on_the_success_path_too(registered: _Fixture) -> None:
+    result = _run(registered, FakeApi())
+    assert result.ok is True
+    assert result.job_empty_proven is True
 
 
 def test_timeout_still_removes_the_private_reference(

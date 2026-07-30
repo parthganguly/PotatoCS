@@ -22,6 +22,7 @@ from odysseus_desktop_backend.services import colibri_stage2_common as common
 from odysseus_desktop_backend.services import colibri_stage2_manifest as manifest_mod
 from odysseus_desktop_backend.services import colibri_stage2_reference as ref_mod
 from odysseus_desktop_backend.services import colibri_stage2_runner as runner
+from odysseus_desktop_backend.services import colibri_stage2_token_cli as cli
 
 ENTRY = manifest_mod.REVIEWED_OLMOE_CONVERTED_MODEL
 
@@ -281,10 +282,22 @@ def test_no_stage2_entry_point_accepts_an_identity_or_registry_override() -> Non
         manifest_mod.reviewed_manifest_for_revision,
         manifest_mod.require_wellformed_registry,
         runner.run_one_token_proof,
+        runner.attempt_one_token_proof,
         runner.build_runner_environment,
+        cli.main,
     ):
         names = set(inspect.signature(function).parameters)
         assert not (names & _FORBIDDEN_PARAMETER_NAMES), function.__name__
+
+
+def test_cli_exposes_no_identity_option() -> None:
+    # The operator-facing surface is two paths and an approval flag. Nothing
+    # on it can name a hash, size, revision, converter, token, or registry.
+    parser = cli._build_parser()
+    option_strings = {
+        option for action in parser._actions for option in action.option_strings
+    }
+    assert option_strings == {"-h", "--help", "--engine", "--converted-model-dir", "--approve"}
 
 
 def test_require_reviewed_manifest_takes_only_the_two_pins() -> None:

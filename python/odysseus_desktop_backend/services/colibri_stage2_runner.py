@@ -30,11 +30,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import stat as stat_module
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
 from odysseus_desktop_backend.runtime_bench.isolated_server import (
@@ -55,6 +55,17 @@ from odysseus_desktop_backend.services.colibri_stage2_common import (
     TOKEN_RUN_EVIDENCE_SCHEMA_VERSION,
     ColibriStage2Failure,
 )
+from odysseus_desktop_backend.services.colibri_stage2_engine_output import (
+    ParsedEngineOutput,
+    parse_engine_output,
+    verify_one_token_output,
+)
+from odysseus_desktop_backend.services.colibri_stage2_job_probe import (
+    JobMemberProbe,
+    JobTeardownEvidence,
+    job_active_process_count,
+    terminate_and_prove_job_empty,
+)
 from odysseus_desktop_backend.services.colibri_stage2_manifest import (
     OlmoeModelManifest,
     require_reviewed_manifest,
@@ -74,8 +85,8 @@ from odysseus_desktop_backend.services.colibri_stage2_reference import (
 )
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-_MATCH_LINE = re.compile(r"^Matching tokens: (\d+)/(\d+)$")
 _MAX_STREAM_BYTES = 4096
+MAPPING_NO_METADATA: Mapping[str, int] = MappingProxyType({})
 _SETUP_DEADLINE_SECONDS = 30.0
 _TOTAL_RUN_DEADLINE_SECONDS = 900.0
 _CLEANUP_DEADLINE_SECONDS = 30.0
@@ -205,29 +216,50 @@ class RunIdentityEvidence:
 
 @dataclass(frozen=True, slots=True)
 class LatencyEvidence:
-    """Wall-clock latencies actually observed, each with its own state.
+    """Latencies actually observed, each with its own state and provenance.
 
-    ``startup_latency_ms`` spans process resume to the engine's *first*
-    observed output byte. The engine's only reviewed output is its match
-    line, which it emits after loading the model and generating the token,
-    so this figure is a combined model-load-plus-generation measurement and
-    an upper bound on model load alone -- no finer decomposition is
-    observable from this engine's output, and none is invented here.
+    Two are **engine-reported**, parsed from the pinned engine's own closed
+    output lines:
 
-    ``one_token_latency_ms`` spans process resume to the observed process
-    exit: end-to-end latency for the run that produces and verifies exactly
-    one token.
+    - ``model_load_latency_ms`` from ``resident weights loaded in <s>s``;
+    - ``generation_latency_ms`` from the ``(<s>s for 1 tokens)`` field of the
+      ``Speed:`` line.
 
-    A state of ``unavailable`` means the corresponding endpoint was never
-    observed (e.g. the child produced no output, or timed out without
-    exiting). ``None`` is then the only value, so a missing measurement can
-    never be misread as ``0``.
+    Two are **independently measured** by this process from a monotonic
+    clock:
+
+    - ``end_to_end_latency_ms``, process resume to the observed process exit;
+    - ``first_output_latency_ms``, process resume to the first observed
+      output byte. This is *only* that: the pinned engine prints its banner
+      before ``model_init``, so this figure is neither model-load latency nor
+      an upper bound on it, and no such claim is made for it anywhere.
+
+    A state of ``unavailable`` means the value was not positively observed --
+    the engine timings are unavailable on any run whose output was never
+    successfully parsed. ``None`` is then the only value, so a missing
+    measurement can never be misread as ``0``.
     """
 
-    startup_latency_ms: int | None
-    startup_latency_state: str
-    one_token_latency_ms: int | None
-    one_token_latency_state: str
+    model_load_latency_ms: int | None
+    model_load_latency_state: str
+    generation_latency_ms: int | None
+    generation_latency_state: str
+    end_to_end_latency_ms: int | None
+    end_to_end_latency_state: str
+    first_output_latency_ms: int | None
+    first_output_latency_state: str
+
+
+_UNAVAILABLE_LATENCY_EVIDENCE = LatencyEvidence(
+    model_load_latency_ms=None,
+    model_load_latency_state=EVIDENCE_STATE_UNAVAILABLE,
+    generation_latency_ms=None,
+    generation_latency_state=EVIDENCE_STATE_UNAVAILABLE,
+    end_to_end_latency_ms=None,
+    end_to_end_latency_state=EVIDENCE_STATE_UNAVAILABLE,
+    first_output_latency_ms=None,
+    first_output_latency_state=EVIDENCE_STATE_UNAVAILABLE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +279,9 @@ class OneTokenRunResult:
     matched_count: int | None
     expected_count: int
     expected_token_id: int
+    # Always read from the engine's own ``C engine :`` line. Never assigned
+    # from ``expected_token_id``; ``None`` means no generated token was
+    # parsed, which is exactly what a failed or unverified run should show.
     generated_token_id: int | None
     exit_category: str
     evidence_sha256: str | None
@@ -256,9 +291,14 @@ class OneTokenRunResult:
     peak_tree_memory_bytes: int | None
     peak_tree_memory_state: str
     cleanup_complete: bool
+    job_empty_proven: bool
+    job_member_count: int | None
+    root_exit_confirmed: bool
+    descendant_count: int | None
     orphan_free: bool
     reference_removed: bool
     resources: ResourceEvidence
+    failure_metadata: Mapping[str, int] = MAPPING_NO_METADATA
     vram_state: str = "not_applicable"
 
 
@@ -518,22 +558,42 @@ def classify_process_exit(*, exit_code: int | None, timed_out: bool) -> str:
 
 
 def _latency_evidence(
-    *, resumed_at: float | None, first_output_at: float | None, exit_observed_at: float | None
+    *,
+    resumed_at: float | None,
+    first_output_at: float | None,
+    exit_observed_at: float | None,
+    parsed: ParsedEngineOutput | None,
 ) -> LatencyEvidence:
-    """Derive both latencies from positively observed clock readings only."""
+    """Assemble latency evidence from positively observed values only.
+
+    Engine-reported timings come solely from a successfully parsed output (so
+    they are ``unavailable`` on any unparsed run); the two independently
+    measured spans come solely from monotonic clock readings.
+    """
 
     def span(end: float | None) -> tuple[int | None, str]:
         if resumed_at is None or end is None:
             return None, EVIDENCE_STATE_UNAVAILABLE
         return max(0, round((end - resumed_at) * 1000)), EVIDENCE_STATE_MEASURED
 
-    startup_ms, startup_state = span(first_output_at)
-    one_token_ms, one_token_state = span(exit_observed_at)
+    def engine_ms(seconds: float | None) -> tuple[int | None, str]:
+        if seconds is None:
+            return None, EVIDENCE_STATE_UNAVAILABLE
+        return max(0, round(seconds * 1000)), EVIDENCE_STATE_MEASURED
+
+    end_to_end_ms, end_to_end_state = span(exit_observed_at)
+    first_output_ms, first_output_state = span(first_output_at)
+    model_load_ms, model_load_state = engine_ms(None if parsed is None else parsed.model_load_seconds)
+    generation_ms, generation_state = engine_ms(None if parsed is None else parsed.generation_seconds)
     return LatencyEvidence(
-        startup_latency_ms=startup_ms,
-        startup_latency_state=startup_state,
-        one_token_latency_ms=one_token_ms,
-        one_token_latency_state=one_token_state,
+        model_load_latency_ms=model_load_ms,
+        model_load_latency_state=model_load_state,
+        generation_latency_ms=generation_ms,
+        generation_latency_state=generation_state,
+        end_to_end_latency_ms=end_to_end_ms,
+        end_to_end_latency_state=end_to_end_state,
+        first_output_latency_ms=first_output_ms,
+        first_output_latency_state=first_output_state,
     )
 
 
@@ -562,34 +622,18 @@ def _default_interactive_check() -> bool:
         return False
 
 
-def run_one_token_proof(
-    *,
-    olmoe_exe: Path,
-    converted_model_dir: Path,
-    api: LifecycleApi,
-    approved: bool,
-    interactive_check: Callable[[], bool] = _default_interactive_check,
-    resource_probe: ResourceProbe | None = None,
-    tree_memory_probe: TreeMemoryProbe | None = default_tree_memory_probe,
-    clock: Callable[[], float] = time.monotonic,
-    reference_session_parent: Path | None = None,
-) -> OneTokenRunResult:
-    """Run ``olmoe.exe 8 8 <private-derived-ref-path>`` exactly once.
+def _verify_preconditions(
+    *, olmoe_exe: Path, converted_model_dir: Path, manifest: OlmoeModelManifest
+) -> None:
+    """Every check that must pass before a process can exist.
 
-    Fails closed with ``reviewed_model_manifest_unavailable`` before any
-    file is opened if the reviewed registry has no entry for the pinned
-    model revision. Every other precondition is checked before process
-    creation.
+    Validates each approved directory chain -- ordinary directory, no
+    symlink/junction/reparse point anywhere down to the drive/root anchor --
+    before any file is opened, then the engine, config, whole-directory
+    contents, and every shard against the reviewed registry entry, then the
+    derived reference against the reviewed token contract.
     """
 
-    manifest = require_reviewed_manifest(PINNED_MODEL_REVISION, PINNED_COLIBRI_COMMIT)
-
-    if not approved or not interactive_check():
-        raise ColibriStage2Failure("noninteractive_approval_rejected")
-
-    # Validate every approved directory chain -- ordinary directory, no
-    # symlink/junction/reparse point anywhere down to the drive/root
-    # anchor -- before any file is opened or any process is launched.
     require_ordinary_directory(
         olmoe_exe.parent, missing_category="executable_not_found", reparse_category="reparse_point_rejected"
     )
@@ -629,6 +673,73 @@ def run_one_token_proof(
 
     _verify_reference_contract(manifest)
 
+
+def _evidence_digest(manifest: OlmoeModelManifest, generated_token_id: int, matched_count: int) -> str:
+    """Bind the evidence hash to every reviewed identity and the real result.
+
+    The generated token id folded in here is the one parsed from the engine's
+    own output, so this digest cannot be reproduced by a run that failed to
+    generate the reviewed token.
+    """
+
+    payload = b"|".join(
+        (
+            manifest.model_revision.encode("ascii"),
+            manifest.colibri_commit.encode("ascii"),
+            manifest.engine_sha256.encode("ascii"),
+            manifest.converter_kind.encode("ascii"),
+            manifest.converter_source_sha256.encode("ascii"),
+            manifest.config_sha256.encode("ascii"),
+            *(digest.encode("ascii") for digest in manifest.shard_sha256),
+            manifest.ref_sha256.encode("ascii"),
+            manifest.cap_argument.encode("ascii"),
+            manifest.bits_argument.encode("ascii"),
+            str(manifest.expected_generated_token_id).encode("ascii"),
+            str(generated_token_id).encode("ascii"),
+            f"Matching tokens: {matched_count}/1".encode("ascii"),
+        )
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def attempt_one_token_proof(
+    *,
+    olmoe_exe: Path,
+    converted_model_dir: Path,
+    api: LifecycleApi,
+    approved: bool,
+    interactive_check: Callable[[], bool] = _default_interactive_check,
+    resource_probe: ResourceProbe | None = None,
+    tree_memory_probe: TreeMemoryProbe | None = default_tree_memory_probe,
+    job_member_probe: JobMemberProbe = job_active_process_count,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    reference_session_parent: Path | None = None,
+) -> OneTokenRunResult:
+    """Attempt the one-token proof and always return closed evidence.
+
+    Unlike :func:`run_one_token_proof`, this never raises for a closed
+    operational failure: it returns a result whose ``ok`` is ``False``, whose
+    ``category`` is the closed failure category, and which still carries
+    every measurement and cleanup proof that was actually obtained. That is
+    what lets a caller report a failed attempt without losing the evidence,
+    and without a traceback.
+
+    Precondition failures that occur before a process exists (manifest gate,
+    approval, path safety, identity mismatches) still raise, because there is
+    no attempt to describe: nothing was launched, nothing was measured, and
+    no cleanup was owed.
+    """
+
+    manifest = require_reviewed_manifest(PINNED_MODEL_REVISION, PINNED_COLIBRI_COMMIT)
+
+    if not approved or not interactive_check():
+        raise ColibriStage2Failure("noninteractive_approval_rejected")
+
+    _verify_preconditions(
+        olmoe_exe=olmoe_exe, converted_model_dir=converted_model_dir, manifest=manifest
+    )
+
     # The private reference session is created -- and its own directory
     # chain validated -- before the child environment is built, since the
     # child's TEMP/TMP point directly at this session directory rather
@@ -646,9 +757,9 @@ def run_one_token_proof(
     pump: _SplitStreamPump | None = None
     primary_failure: ColibriStage2Failure | None = None
     cleanup_failed = False
-    orphan_detected = False
-    orphan_check_conclusive = False
     reference_removed = False
+    parsed: ParsedEngineOutput | None = None
+    generated_token_id: int | None = None
     matched_count: int | None = None
     exit_code: int | None = None
     resumed_at: float | None = None
@@ -656,6 +767,7 @@ def run_one_token_proof(
     resources = _UNAVAILABLE_RESOURCE_EVIDENCE
     peak_tree_memory_bytes: int | None = None
     peak_tree_memory_state = EVIDENCE_STATE_UNAVAILABLE
+    teardown: JobTeardownEvidence | None = None
     timed_out = False
     started = clock()
 
@@ -717,22 +829,14 @@ def run_one_token_proof(
         if pump.stderr.bytes_value():
             raise ColibriStage2Failure("stderr_present")
 
-        stdout_text = pump.stdout.bytes_value().decode("utf-8", errors="replace")
-        lines = [line for line in stdout_text.splitlines() if line]
-        matches = [_MATCH_LINE.fullmatch(line) for line in lines]
-        matches = [match for match in matches if match is not None]
-        if len(matches) == 0:
-            raise ColibriStage2Failure("malformed_output")
-        if len(matches) > 1:
-            raise ColibriStage2Failure("duplicate_match_line")
-        matched_count = int(matches[0].group(1))
-        expected_count = int(matches[0].group(2))
-        if matched_count != 1 or expected_count != 1:
-            raise ColibriStage2Failure(
-                "match_count_mismatch",
-                matched_count=max(0, min(matched_count, 2**31 - 1)),
-                expected_count=max(0, min(expected_count, 2**31 - 1)),
-            )
+        # Parse the drained stdout, then run the independent comparison. The
+        # bounded stream bytes are consumed here and never retained: only the
+        # small parsed record survives this block.
+        parsed = parse_engine_output(pump.stdout.bytes_value())
+        generated_token_id = verify_one_token_output(
+            parsed, expected_token_id=manifest.expected_generated_token_id
+        )
+        matched_count = parsed.matched_count
         if canonical_reference_sha256() != manifest.ref_sha256:
             raise ColibriStage2Failure("token_identity_mismatch")
     except ColibriStage2Failure as exc:
@@ -753,8 +857,8 @@ def run_one_token_proof(
                 resources = resource_probe(job, process)
             except Exception:  # noqa: BLE001 - resource evidence is always best-effort
                 resources = _UNAVAILABLE_RESOURCE_EVIDENCE
-        # Sampled while the Job Object handle is still open and before it is
-        # terminated/closed, since a closed job reports nothing.
+        # Sampled while the Job Object handle is still open and before the
+        # job is terminated or closed, since a closed handle reports nothing.
         if process is not None and job is not None and tree_memory_probe is not None:
             try:
                 peak_tree_memory_bytes, peak_tree_memory_state = tree_memory_probe(job)
@@ -763,31 +867,30 @@ def run_one_token_proof(
             if peak_tree_memory_state != EVIDENCE_STATE_MEASURED:
                 peak_tree_memory_bytes = None
         if process is not None:
-            try:
-                if job is not None and job_assigned:
-                    api.terminate_job(job)
-                else:
-                    api.terminate_process(process)
-                wait_ms = int(max(0.0, cleanup_deadline - clock()) * 1000)
-                if not api.wait_process(process, min(5000, wait_ms)):
-                    cleanup_failed = True
-            except (ColibriStage2Failure, IsolatedServerFailure):
+            # Terminate the complete job and prove, under the absolute
+            # cleanup deadline, that the Job Object holds zero processes.
+            # This is the primary ownership proof; the descendant
+            # enumeration inside it is supplementary evidence only.
+            teardown = terminate_and_prove_job_empty(
+                api,
+                job=job,
+                process=process,
+                job_assigned=job_assigned,
+                member_probe=job_member_probe,
+                deadline=cleanup_deadline,
+                clock=clock,
+                sleep=sleep,
+                failure_types=(ColibriStage2Failure, IsolatedServerFailure),
+            )
+            if teardown.cleanup_failed:
                 cleanup_failed = True
             if cancel_pending_pipe_io(
                 api, (process.stdout, process.stderr), deadline=cleanup_deadline, clock=clock
             ):
                 cleanup_failed = True
-            # Orphan evidence is tracked separately from general cleanup
-            # uncertainty: a surviving descendant is a specific, reportable
-            # fact (`orphan_detected`), while a probe that could not answer
-            # is cleanup uncertainty. Both fail closed, and `orphan_free` is
-            # asserted only when the probe positively answered "none".
-            try:
-                if api.descendant_process_ids(process.process_id):
-                    orphan_detected = True
-                orphan_check_conclusive = True
-            except (ColibriStage2Failure, IsolatedServerFailure):
-                cleanup_failed = True
+            # The job handle is closed last, only after the zero-member proof
+            # and the peak-memory measurement have both completed: a closed
+            # handle can answer neither query.
             for handle in (
                 getattr(process, "thread_handle", None),
                 getattr(process, "process_handle", None),
@@ -809,65 +912,109 @@ def run_one_token_proof(
         except ColibriStage2Failure:
             cleanup_failed = True
 
-    orphan_free = orphan_check_conclusive and not orphan_detected
-
-    if orphan_detected:
-        raise ColibriStage2Failure("orphan_detected")
-    if cleanup_failed:
-        raise ColibriStage2Failure("cleanup_failed")
-    if primary_failure is not None:
-        raise primary_failure
-
-    elapsed_ms = round((clock() - started) * 1000)
-    matching_line = f"Matching tokens: {matched_count}/1".encode("ascii")
-    # Bound to every reviewed identity the run depended on -- engine, model
-    # revision, executed converter, config, all three shards, the reference,
-    # and the cap/bits/token contract -- plus the exact 1/1 evidence, so the
-    # evidence hash changes if any pinned identity or argument changes.
-    evidence_payload = b"|".join(
-        (
-            manifest.model_revision.encode("ascii"),
-            manifest.colibri_commit.encode("ascii"),
-            manifest.engine_sha256.encode("ascii"),
-            manifest.converter_kind.encode("ascii"),
-            manifest.converter_source_sha256.encode("ascii"),
-            manifest.config_sha256.encode("ascii"),
-            *(digest.encode("ascii") for digest in manifest.shard_sha256),
-            manifest.ref_sha256.encode("ascii"),
-            manifest.cap_argument.encode("ascii"),
-            manifest.bits_argument.encode("ascii"),
-            str(manifest.expected_generated_token_id).encode("ascii"),
-            matching_line,
-        )
+    # `orphan_free` is asserted only after the Job Object itself reported
+    # zero members: a descendant snapshot alone cannot prove an empty tree.
+    job_empty_proven = teardown is not None and teardown.job_empty_proven
+    orphan_detected = teardown is not None and teardown.orphan_detected
+    orphan_free = (
+        job_empty_proven
+        and teardown is not None
+        and teardown.descendant_probe_conclusive
+        and not teardown.orphan_detected
     )
-    evidence_sha256 = hashlib.sha256(evidence_payload).hexdigest()
+
+    failure: ColibriStage2Failure | None = None
+    if orphan_detected:
+        failure = ColibriStage2Failure("orphan_detected")
+    elif cleanup_failed:
+        failure = ColibriStage2Failure("cleanup_failed")
+    elif primary_failure is not None:
+        failure = primary_failure
+
+    ok = failure is None and generated_token_id is not None
+    if not ok and failure is None:
+        # No closed failure was recorded yet no generated token was verified.
+        # That combination must still fail, and truthfully: the output never
+        # yielded the reviewed token.
+        failure = ColibriStage2Failure("malformed_output")
+    elapsed_ms = round((clock() - started) * 1000)
     return OneTokenRunResult(
-        category="passed",
-        ok=True,
+        category="passed" if ok else failure.category,  # type: ignore[union-attr]
+        ok=ok,
         evidence_schema_version=TOKEN_RUN_EVIDENCE_SCHEMA_VERSION,
         identities=_identity_evidence(manifest),
         matched_count=matched_count,
         expected_count=1,
         expected_token_id=manifest.expected_generated_token_id,
-        # The engine never prints the token id; it prints its own comparison
-        # against the reviewed reference. A confirmed 1/1 against a reference
-        # whose verified digest encodes exactly one expected generated id is
-        # therefore what proves the generated id -- and it is only reported
-        # once that comparison has passed.
-        generated_token_id=manifest.expected_generated_token_id,
+        generated_token_id=generated_token_id,
         exit_category=classify_process_exit(exit_code=exit_code, timed_out=timed_out),
-        evidence_sha256=evidence_sha256,
+        evidence_sha256=(
+            _evidence_digest(manifest, generated_token_id, matched_count)
+            if ok and generated_token_id is not None and matched_count is not None
+            else None
+        ),
         elapsed_ms=max(0, elapsed_ms),
         exit_code=exit_code,
         latency=_latency_evidence(
             resumed_at=resumed_at,
             first_output_at=None if pump is None else pump.first_output_at,
             exit_observed_at=exit_observed_at,
+            parsed=parsed,
         ),
         peak_tree_memory_bytes=peak_tree_memory_bytes,
         peak_tree_memory_state=peak_tree_memory_state,
         cleanup_complete=not cleanup_failed,
+        job_empty_proven=job_empty_proven,
+        job_member_count=None if teardown is None else teardown.job_member_count,
+        root_exit_confirmed=teardown is not None and teardown.root_exit_confirmed,
+        descendant_count=None if teardown is None else teardown.descendant_count,
         orphan_free=orphan_free,
         reference_removed=reference_removed,
         resources=resources,
+        failure_metadata=(
+            MappingProxyType(dict(failure.numeric_metadata))
+            if failure is not None
+            else MAPPING_NO_METADATA
+        ),
     )
+
+
+def run_one_token_proof(
+    *,
+    olmoe_exe: Path,
+    converted_model_dir: Path,
+    api: LifecycleApi,
+    approved: bool,
+    interactive_check: Callable[[], bool] = _default_interactive_check,
+    resource_probe: ResourceProbe | None = None,
+    tree_memory_probe: TreeMemoryProbe | None = default_tree_memory_probe,
+    job_member_probe: JobMemberProbe = job_active_process_count,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    reference_session_parent: Path | None = None,
+) -> OneTokenRunResult:
+    """Run ``olmoe.exe 8 8 <private-derived-ref-path>`` exactly once, or raise.
+
+    The raising form of :func:`attempt_one_token_proof`, kept for callers that
+    want an exception rather than a record. Fails closed with
+    ``reviewed_model_manifest_unavailable`` before any file is opened if the
+    reviewed registry has no entry for the pinned model revision. Every other
+    precondition is checked before process creation.
+    """
+
+    result = attempt_one_token_proof(
+        olmoe_exe=olmoe_exe,
+        converted_model_dir=converted_model_dir,
+        api=api,
+        approved=approved,
+        interactive_check=interactive_check,
+        resource_probe=resource_probe,
+        tree_memory_probe=tree_memory_probe,
+        job_member_probe=job_member_probe,
+        clock=clock,
+        sleep=sleep,
+        reference_session_parent=reference_session_parent,
+    )
+    if not result.ok:
+        raise ColibriStage2Failure(result.category, **dict(result.failure_metadata))
+    return result

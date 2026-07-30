@@ -135,6 +135,17 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "duplicate_match_line",
         "malformed_output",
         "token_identity_mismatch",
+        # Distinguished engine-output defects. Collapsing these into
+        # `malformed_output` would hide *which* part of the reviewed dialect
+        # the engine violated, and the difference between "the engine printed
+        # the wrong reference" and "the engine contradicted itself" matters
+        # for triage.
+        "duplicate_output_line",
+        "reference_line_mismatch",
+        "generated_token_count_unexpected",
+        "output_internally_inconsistent",
+        "timing_evidence_invalid",
+        "output_decode_failed",
         "cleanup_failed",
         "orphan_detected",
         "platform_unsupported",
@@ -164,7 +175,18 @@ RESUME_LEDGER_SCHEMA_VERSION = "colibri-stage2-olmoe-resume-v1"
 
 # --- Closed evidence vocabulary for the real one-token run ------------------
 
-TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v1"
+# v2 replaces the resume-to-first-byte "startup latency" with the engine's
+# own reported model-load and one-token generation timings, keeps
+# resume-to-exit as the independently measured end-to-end figure, records the
+# *parsed* generated token id rather than the expected one, and adds the Job
+# Object zero-member proof.
+TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v2"
+
+# Bounds every engine-reported timing must satisfy to be recorded at all.
+# A value that is negative, non-finite, or absurd is rejected outright
+# rather than clamped: a clamped number would look like a measurement.
+MAX_ENGINE_REPORTED_SECONDS = 86_400.0
+MAX_ENGINE_REPORTED_RATE = 1_000_000_000.0
 
 # Every optional measurement in the run evidence carries its own state, so a
 # missing number is always distinguishable from a measured zero and can never
