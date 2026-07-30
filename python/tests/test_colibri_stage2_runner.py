@@ -191,12 +191,16 @@ class NeverExitsApi(FakeApi):
 
 def _make_manifest(*, engine_bytes: bytes, config_bytes: bytes, shard_bytes: tuple[bytes, bytes, bytes]) -> manifest_mod.OlmoeModelManifest:
     ref_bytes = ref_mod.canonical_reference_bytes()
+    bounded = common.REVIEWED_BOUNDED_CONVERTER_IDENTITY
     return manifest_mod.OlmoeModelManifest(
         model_repository=common.PINNED_MODEL_REPOSITORY,
         model_revision=common.PINNED_MODEL_REVISION,
         license_identifier=common.PINNED_LICENSE_IDENTIFIER,
         colibri_commit=common.PINNED_COLIBRI_COMMIT,
-        converter_source_sha256=common.REVIEWED_CONVERTER_IDENTITY.sha256,
+        converter_kind=common.CONVERTER_KIND_BOUNDED,
+        converter_basename=bounded.basename,
+        converter_size_bytes=bounded.size_bytes,
+        converter_source_sha256=bounded.sha256,
         engine_basename=common.EXPECTED_ENGINE_BASENAME,
         engine_size_bytes=len(engine_bytes),
         engine_sha256=_sha256_bytes(engine_bytes),
@@ -209,6 +213,10 @@ def _make_manifest(*, engine_bytes: bytes, config_bytes: bytes, shard_bytes: tup
         ref_basename=common.EXPECTED_REF_BASENAME,
         ref_size_bytes=len(ref_bytes),
         ref_sha256=ref_mod.canonical_reference_sha256(),
+        cap_argument=common.CAP_ARGUMENT,
+        bits_argument=common.BITS_ARGUMENT,
+        prompt_token_ids=common.PROMPT_TOKEN_IDS,
+        expected_generated_token_id=common.EXPECTED_GENERATED_TOKEN_ID,
         conversion_dependency_versions={"python": "3.11.9"},
         evidence_schema_version=common.MANIFEST_EVIDENCE_SCHEMA_VERSION,
     )
@@ -296,9 +304,23 @@ def _run(fixture: _Fixture, api: FakeApi, **overrides: Any) -> runner.OneTokenRu
 # ---------------------------------------------------------------------------
 
 
-def test_empty_registry_blocks_before_process_creation(fixture: _Fixture) -> None:
+def test_empty_registry_blocks_before_process_creation(
+    fixture: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(manifest_mod, "REVIEWED_OLMOE_MODEL_REGISTRY", MappingProxyType({}))
     api = FakeApi()
     with pytest.raises(runner.ColibriStage2Failure, match="reviewed_model_manifest_unavailable"):
+        _run(fixture, api)
+    assert api.calls == []
+
+
+def test_shipped_registry_cannot_authorize_a_foreign_engine_or_model(fixture: _Fixture) -> None:
+    # With the real reviewed registry in place (no monkeypatching), the
+    # synthetic fixture engine and artifact set must be refused: the entry
+    # authorizes exactly one engine and one artifact set, and nothing here
+    # matches it.
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="runtime_identity_mismatch"):
         _run(fixture, api)
     assert api.calls == []
 
@@ -366,6 +388,65 @@ def test_extra_unexpected_safetensor_shard_is_rejected(registered: _Fixture) -> 
     assert api.calls == []
 
 
+def test_extra_non_shard_file_is_rejected(registered: _Fixture) -> None:
+    # The whole directory listing is checked, not only `*.safetensors`.
+    (registered.model_dir / "notes.txt").write_bytes(b"hello")
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="unknown_converted_shard"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_extra_subdirectory_is_rejected(registered: _Fixture) -> None:
+    (registered.model_dir / "leftover").mkdir()
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="unknown_converted_shard"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_resume_ledger_is_tolerated_but_never_read(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The bounded converter legitimately leaves its resume ledger beside the
+    # artifacts. Its presence must not fail the run -- and it must never be
+    # opened, so a ledger full of contradictory nonsense changes nothing.
+    ledger = registered.model_dir / common.RESUME_LEDGER_BASENAME
+    ledger.write_bytes(b"{ this is not even valid json and claims nothing true }")
+
+    opened: list[str] = []
+    real_open = Path.open
+
+    def tracking_open(self: Path, *args: Any, **kwargs: Any):
+        opened.append(self.name)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    result = _run(registered, FakeApi())
+    assert result.ok is True
+    assert common.RESUME_LEDGER_BASENAME not in opened
+
+
+def test_shard_basename_order_is_fixed_by_the_manifest(registered: _Fixture) -> None:
+    # A reordered shard tuple cannot even be expressed: the manifest pins the
+    # three names in order, so no run can be authorized against a permuted
+    # artifact set.
+    reordered = tuple(reversed(common.EXPECTED_SHARD_BASENAMES))
+    with pytest.raises(ValueError, match="shard_basenames"):
+        manifest_mod.OlmoeModelManifest(
+            **{
+                **{
+                    field: getattr(registered.manifest, field)
+                    for field in registered.manifest.__dataclass_fields__
+                },
+                "shard_basenames": reordered,
+                "conversion_dependency_versions": dict(
+                    registered.manifest.conversion_dependency_versions
+                ),
+            }
+        )
+
+
 def test_config_size_mismatch_is_rejected(registered: _Fixture) -> None:
     registered.config.write_bytes(b'{"fake": true, "padded": "xxxxxxxxxxxxxxxxxxxx"}')
     api = FakeApi()
@@ -424,6 +505,51 @@ def test_cap_and_bits_constants_are_eight() -> None:
     assert common.BITS_ARGUMENT == "8"
 
 
+def test_build_token_command_grammar_is_exactly_exe_cap_bits_ref(registered: _Fixture) -> None:
+    reference = registered.root / common.EXPECTED_REF_BASENAME
+    executable, arguments = runner.build_token_command(
+        registered.manifest, registered.exe, reference
+    )
+    assert executable == registered.exe
+    assert arguments == ("8", "8", str(reference))
+    assert len(arguments) == 3
+
+
+def test_build_token_command_takes_cap_and_bits_from_the_manifest(registered: _Fixture) -> None:
+    # Not from a module constant and not from a caller: the reviewed entry is
+    # the only source, so the command can never be built with another cap or
+    # quantization width.
+    assert registered.manifest.cap_argument == "8"
+    assert registered.manifest.bits_argument == "8"
+    _, arguments = runner.build_token_command(
+        registered.manifest, registered.exe, registered.root / common.EXPECTED_REF_BASENAME
+    )
+    assert arguments[:2] == (registered.manifest.cap_argument, registered.manifest.bits_argument)
+
+
+def test_build_token_command_rejects_a_foreign_reference_basename(registered: _Fixture) -> None:
+    with pytest.raises(runner.ColibriStage2Failure, match="reference_hash_mismatch"):
+        runner.build_token_command(registered.manifest, registered.exe, registered.root / "other.json")
+
+
+def test_build_token_command_rejects_a_foreign_executable_basename(registered: _Fixture) -> None:
+    with pytest.raises(runner.ColibriStage2Failure, match="executable_not_found"):
+        runner.build_token_command(
+            registered.manifest, registered.root / "glm.exe", registered.root / common.EXPECTED_REF_BASENAME
+        )
+
+
+def test_command_line_carries_no_prompt_model_path_or_tokenizer(registered: _Fixture) -> None:
+    api = FakeApi()
+    _run(registered, api)
+    _, arguments, _ = api.create_suspended_calls[0]
+    joined = " ".join(arguments)
+    assert "prompt" not in joined.lower()
+    assert str(registered.model_dir) not in joined
+    assert "tokenizer" not in joined.lower()
+    assert ".safetensors" not in joined
+
+
 def test_run_one_token_proof_has_no_external_tokenizer_or_ref_path_parameter() -> None:
     signature = inspect.signature(runner.run_one_token_proof)
     names = set(signature.parameters)
@@ -445,12 +571,16 @@ def test_exact_one_of_one_success(registered: _Fixture) -> None:
     assert result.category == "passed"
     assert result.matched_count == 1
     assert result.expected_count == 1
-    assert result.token_id == 7785
+    assert result.expected_token_id == 7785
+    assert result.generated_token_id == 7785
     assert result.exit_code == 0
+    assert result.exit_category == "clean_exit"
     assert result.cleanup_complete is True
+    assert result.orphan_free is True
     assert result.reference_removed is True
     assert result.vram_state == "not_applicable"
     assert result.evidence_sha256 is not None
+    assert result.evidence_schema_version == "colibri-stage2-olmoe-token-evidence-v1"
 
 
 def test_zero_of_one_is_rejected(registered: _Fixture) -> None:
@@ -534,7 +664,25 @@ def test_cleanup_failure_from_failed_wait_process_overrides_success(registered: 
 
 
 def test_orphan_descendant_is_detected_and_fails_closed(registered: _Fixture) -> None:
+    # A surviving descendant is reported as its own fact, not folded into
+    # generic cleanup uncertainty.
     api = FakeApi(descendants={12345})
+    with pytest.raises(runner.ColibriStage2Failure, match="orphan_detected"):
+        _run(registered, api)
+    assert "descendant_process_ids" in api.calls
+
+
+def test_inconclusive_orphan_probe_fails_closed_as_cleanup_uncertainty(
+    registered: _Fixture,
+) -> None:
+    class ProbeFailsApi(FakeApi):
+        def descendant_process_ids(self, process_id: int) -> set[int]:
+            self.calls.append("descendant_process_ids")
+            # The exact category the real WindowsLifecycleApi raises when the
+            # process snapshot cannot be taken.
+            raise IsolatedServerFailure("ownership_probe_unavailable")
+
+    api = ProbeFailsApi()
     with pytest.raises(runner.ColibriStage2Failure, match="cleanup_failed"):
         _run(registered, api)
     assert "descendant_process_ids" in api.calls
@@ -614,6 +762,288 @@ def test_result_never_exposes_paths_or_raw_output(registered: _Fixture) -> None:
     assert str(registered.root) not in serialized
     assert "Matching tokens" not in serialized
     assert "fake engine bytes" not in serialized
+
+
+def test_result_evidence_is_closed_and_privacy_safe(registered: _Fixture) -> None:
+    import getpass
+    import os as os_module
+
+    api = FakeApi(stdout=b"warming up with a chatty banner\nMatching tokens: 1/1\ndone\n")
+    result = _run(registered, api)
+    serialized = repr(result)
+
+    # No captured stream content, no path, no environment value, no username.
+    for forbidden in (
+        "Matching tokens",
+        "warming up",
+        "chatty banner",
+        str(registered.root),
+        str(registered.model_dir),
+        str(registered.exe),
+        common.EXPECTED_REF_BASENAME,
+        "OMP_NUM_THREADS",
+        "SNAP",
+    ):
+        assert forbidden not in serialized, forbidden
+    try:
+        username = getpass.getuser()
+    except Exception:  # noqa: BLE001 - not every environment exposes a username
+        username = ""
+    if username:
+        assert username not in serialized
+    assert os_module.fspath(registered.root) not in serialized
+
+    # The prompt itself is never carried: no field of the result (or of its
+    # nested identity record) holds the prompt token sequence. A substring
+    # scan would be meaningless here -- 64-character digests contain short
+    # digit runs by chance -- so this is a structural check on field values.
+    import dataclasses
+
+    def field_values(record: Any) -> list[Any]:
+        values: list[Any] = []
+        for field in dataclasses.fields(record):
+            value = getattr(record, field.name)
+            values.append(value)
+            if dataclasses.is_dataclass(value):
+                values.extend(field_values(value))
+        return values
+
+    values = field_values(result)
+    assert common.PROMPT_TOKEN_IDS not in values
+    assert list(common.PROMPT_TOKEN_IDS) not in values
+    assert common.FULL_TOKEN_IDS not in values
+
+
+def test_identity_evidence_records_every_pinned_identity(registered: _Fixture) -> None:
+    result = _run(registered, FakeApi())
+    identities = result.identities
+    manifest = registered.manifest
+    assert identities.model_repository == manifest.model_repository
+    assert identities.model_revision == manifest.model_revision
+    assert identities.colibri_commit == manifest.colibri_commit
+    assert identities.engine_sha256 == manifest.engine_sha256
+    assert identities.converter_kind == "bounded"
+    assert identities.converter_sha256 == manifest.converter_source_sha256
+    assert identities.config_sha256 == manifest.config_sha256
+    assert identities.shard_sha256 == tuple(manifest.shard_sha256)
+    assert identities.reference_sha256 == manifest.ref_sha256
+    assert identities.cap_argument == "8"
+    assert identities.bits_argument == "8"
+
+
+def test_identity_evidence_is_frozen(registered: _Fixture) -> None:
+    import dataclasses
+
+    result = _run(registered, FakeApi())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.identities.engine_sha256 = "x" * 64  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Token oracle is closed and the reference is bound to it
+# ---------------------------------------------------------------------------
+
+
+def test_reference_contract_mismatch_blocks_before_process_creation(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If the in-process reference derivation ever stopped agreeing with the
+    # reviewed registry entry's token contract, the run must be abandoned
+    # before a process exists -- not "adapted" to whichever side changed.
+    monkeypatch.setattr(
+        runner, "reference_object", lambda: {"prompt_ids": [1, 2, 3, 4, 5], "full_ids": [1, 2, 3, 4, 5, 6]}
+    )
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="token_identity_mismatch"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_expected_token_mismatch_between_reference_and_manifest_is_rejected(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "reference_object",
+        lambda: {
+            "prompt_ids": list(common.PROMPT_TOKEN_IDS),
+            "full_ids": list(common.PROMPT_TOKEN_IDS) + [7786],
+        },
+    )
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="token_identity_mismatch"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_reference_digest_drift_is_rejected(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "canonical_reference_sha256", lambda: "a" * 64)
+    api = FakeApi()
+    with pytest.raises(runner.ColibriStage2Failure, match="reference_hash_mismatch"):
+        _run(registered, api)
+    assert api.calls == []
+
+
+def test_generated_token_id_is_only_reported_after_a_confirmed_match(registered: _Fixture) -> None:
+    # A 0/1 run must never yield a generated token id at all.
+    with pytest.raises(runner.ColibriStage2Failure, match="match_count_mismatch"):
+        _run(registered, FakeApi(stdout=b"Matching tokens: 0/1\n"))
+    result = _run(registered, FakeApi(stdout=b"Matching tokens: 1/1\n"))
+    assert result.generated_token_id == result.expected_token_id == 7785
+
+
+# ---------------------------------------------------------------------------
+# Exit category, latency, and whole-tree memory evidence
+# ---------------------------------------------------------------------------
+
+
+def test_classify_process_exit_covers_the_closed_vocabulary() -> None:
+    assert runner.classify_process_exit(exit_code=0, timed_out=False) == "clean_exit"
+    assert runner.classify_process_exit(exit_code=3, timed_out=False) == "nonzero_exit"
+    assert runner.classify_process_exit(exit_code=None, timed_out=False) == "not_observed"
+    assert runner.classify_process_exit(exit_code=None, timed_out=True) == "timed_out"
+    assert runner.classify_process_exit(exit_code=0, timed_out=True) == "timed_out"
+    for category in ("clean_exit", "nonzero_exit", "not_observed", "timed_out"):
+        assert category in common.EXIT_CATEGORIES
+
+
+def test_latency_evidence_is_measured_on_a_successful_run(registered: _Fixture) -> None:
+    result = _run(registered, FakeApi())
+    latency = result.latency
+    assert latency.startup_latency_state == "measured"
+    assert latency.one_token_latency_state == "measured"
+    assert isinstance(latency.startup_latency_ms, int) and latency.startup_latency_ms >= 0
+    assert isinstance(latency.one_token_latency_ms, int) and latency.one_token_latency_ms >= 0
+
+
+def test_latency_evidence_reports_unavailable_rather_than_zero() -> None:
+    # A missing endpoint yields None plus an explicit state, so an unmeasured
+    # latency can never be misread as "0 ms".
+    evidence = runner._latency_evidence(resumed_at=None, first_output_at=None, exit_observed_at=None)
+    assert evidence.startup_latency_ms is None
+    assert evidence.startup_latency_state == "unavailable"
+    assert evidence.one_token_latency_ms is None
+    assert evidence.one_token_latency_state == "unavailable"
+
+    partial = runner._latency_evidence(resumed_at=10.0, first_output_at=None, exit_observed_at=10.5)
+    assert partial.startup_latency_state == "unavailable"
+    assert partial.startup_latency_ms is None
+    assert partial.one_token_latency_state == "measured"
+    assert partial.one_token_latency_ms == 500
+
+
+def test_latency_spans_are_measured_from_resume(registered: _Fixture) -> None:
+    clock = FakeClock()
+    api = FakeApi(clock=clock)
+    result = _run(registered, api, clock=clock.time)
+    # Both spans start at resume, so startup can never exceed end-to-end.
+    assert result.latency.startup_latency_ms is not None
+    assert result.latency.one_token_latency_ms is not None
+    assert result.latency.startup_latency_ms <= result.latency.one_token_latency_ms
+
+
+def test_peak_tree_memory_is_recorded_when_positively_measured(registered: _Fixture) -> None:
+    probe_calls: list[Any] = []
+
+    def probe(job: Any) -> tuple[int | None, str]:
+        probe_calls.append(job)
+        return 205_520_896, "measured"
+
+    result = _run(registered, FakeApi(), tree_memory_probe=probe)
+    assert probe_calls == ["job-1"]
+    assert result.peak_tree_memory_bytes == 205_520_896
+    assert result.peak_tree_memory_state == "measured"
+
+
+def test_peak_tree_memory_is_unavailable_rather_than_zero(registered: _Fixture) -> None:
+    result = _run(registered, FakeApi(), tree_memory_probe=lambda job: (None, "unavailable"))
+    assert result.peak_tree_memory_bytes is None
+    assert result.peak_tree_memory_state == "unavailable"
+
+
+def test_unmeasured_peak_tree_memory_never_keeps_a_stale_number(registered: _Fixture) -> None:
+    # A probe that hands back a number while admitting it is not a
+    # measurement must not have that number recorded.
+    result = _run(registered, FakeApi(), tree_memory_probe=lambda job: (999, "unavailable"))
+    assert result.peak_tree_memory_bytes is None
+    assert result.peak_tree_memory_state == "unavailable"
+
+
+def test_raising_tree_memory_probe_never_fails_the_run(registered: _Fixture) -> None:
+    def probe(job: Any) -> tuple[int | None, str]:
+        raise RuntimeError("probe exploded")
+
+    result = _run(registered, FakeApi(), tree_memory_probe=probe)
+    assert result.ok is True
+    assert result.peak_tree_memory_state == "unavailable"
+
+
+def test_tree_memory_probe_runs_before_handles_are_closed(registered: _Fixture) -> None:
+    api = FakeApi()
+    closed_at_probe_time: list[int] = []
+
+    def probe(job: Any) -> tuple[int | None, str]:
+        closed_at_probe_time.append(len(api.closed_handles))
+        return 1, "measured"
+
+    _run(registered, api, tree_memory_probe=probe)
+    assert closed_at_probe_time == [0]
+
+
+def test_default_tree_memory_probe_is_unavailable_without_a_job() -> None:
+    assert runner.default_tree_memory_probe(None) == (None, "unavailable")
+
+
+def test_default_tree_memory_probe_never_guesses_for_a_bogus_job() -> None:
+    peak, state = runner.default_tree_memory_probe("not-a-handle")
+    assert peak is None
+    assert state == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Timeout owns the whole native tree
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_terminates_the_job_and_proves_no_orphans(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "_TOTAL_RUN_DEADLINE_SECONDS", 0.2)
+    clock = FakeClock()
+    api = NeverExitsApi(clock=clock)
+    with pytest.raises(runner.ColibriStage2Failure, match="timeout"):
+        _run(registered, api, clock=clock.time)
+    # The whole tree is owned: the kill-on-close Job Object is terminated,
+    # the child is waited for, and descendants are enumerated.
+    assert api.terminated == ["job-1"]
+    assert "wait_process" in api.calls
+    assert "descendant_process_ids" in api.calls
+
+
+def test_timeout_with_a_surviving_descendant_reports_the_orphan(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "_TOTAL_RUN_DEADLINE_SECONDS", 0.2)
+    clock = FakeClock()
+    api = NeverExitsApi(clock=clock, descendants={4242})
+    with pytest.raises(runner.ColibriStage2Failure, match="orphan_detected"):
+        _run(registered, api, clock=clock.time)
+    assert api.terminated == ["job-1"]
+
+
+def test_timeout_still_removes_the_private_reference(
+    registered: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "_TOTAL_RUN_DEADLINE_SECONDS", 0.2)
+    session_parent = registered.root / "timeout-sessions"
+    session_parent.mkdir()
+    clock = FakeClock()
+    api = NeverExitsApi(clock=clock)
+    with pytest.raises(runner.ColibriStage2Failure, match="timeout"):
+        _run(registered, api, clock=clock.time, reference_session_parent=session_parent)
+    assert list(session_parent.iterdir()) == []
 
 
 def test_failure_metadata_never_carries_strings() -> None:

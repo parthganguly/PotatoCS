@@ -16,13 +16,27 @@ HASH64_D = "d" * 64
 HASH64_E = "e" * 64
 
 
+def _converter_kwargs(kind: str) -> dict[str, object]:
+    """The full converter identity a manifest must state for ``kind``."""
+
+    identity = common.reviewed_identity_for_converter_kind(kind)
+    return dict(
+        converter_kind=kind,
+        converter_basename=identity.basename,
+        converter_size_bytes=identity.size_bytes,
+        converter_source_sha256=identity.sha256,
+    )
+
+
 def _valid_kwargs(**overrides: object) -> dict[str, object]:
     kwargs: dict[str, object] = dict(
         model_repository=common.PINNED_MODEL_REPOSITORY,
         model_revision=common.PINNED_MODEL_REVISION,
         license_identifier=common.PINNED_LICENSE_IDENTIFIER,
         colibri_commit=common.PINNED_COLIBRI_COMMIT,
-        converter_source_sha256=common.REVIEWED_CONVERTER_IDENTITY.sha256,
+        # The bounded converter is what actually produced the reviewed
+        # artifacts, so it is the default here too.
+        **_converter_kwargs(common.CONVERTER_KIND_BOUNDED),
         engine_basename=common.REVIEWED_ENGINE_IDENTITY.basename,
         engine_size_bytes=common.REVIEWED_ENGINE_IDENTITY.size_bytes,
         engine_sha256=common.REVIEWED_ENGINE_IDENTITY.sha256,
@@ -35,6 +49,10 @@ def _valid_kwargs(**overrides: object) -> dict[str, object]:
         ref_basename=common.EXPECTED_REF_BASENAME,
         ref_size_bytes=78,
         ref_sha256="0" * 64,
+        cap_argument=common.CAP_ARGUMENT,
+        bits_argument=common.BITS_ARGUMENT,
+        prompt_token_ids=common.PROMPT_TOKEN_IDS,
+        expected_generated_token_id=common.EXPECTED_GENERATED_TOKEN_ID,
         conversion_dependency_versions={"python": "3.11.9"},
         evidence_schema_version=common.MANIFEST_EVIDENCE_SCHEMA_VERSION,
     )
@@ -42,9 +60,11 @@ def _valid_kwargs(**overrides: object) -> dict[str, object]:
     return kwargs
 
 
-def test_registry_starts_empty_and_immutable() -> None:
-    assert dict(manifest_mod.REVIEWED_OLMOE_MODEL_REGISTRY) == {}
-    assert isinstance(manifest_mod.REVIEWED_OLMOE_MODEL_REGISTRY, MappingProxyType)
+def test_registry_holds_exactly_one_immutable_reviewed_entry() -> None:
+    registry = manifest_mod.REVIEWED_OLMOE_MODEL_REGISTRY
+    assert isinstance(registry, MappingProxyType)
+    assert list(registry) == [common.PINNED_MODEL_REVISION]
+    assert registry[common.PINNED_MODEL_REVISION] is manifest_mod.REVIEWED_OLMOE_CONVERTED_MODEL
     with pytest.raises(TypeError):
         manifest_mod.REVIEWED_OLMOE_MODEL_REGISTRY["x"] = None  # type: ignore[index]
 
@@ -64,6 +84,10 @@ def test_valid_manifest_constructs() -> None:
         {"license_identifier": "MIT"},
         {"colibri_commit": "1" * 40},
         {"converter_source_sha256": "not-a-hash"},
+        {"converter_kind": "handwritten"},
+        {"converter_kind": ""},
+        {"converter_basename": "convert_something_else.py"},
+        {"converter_size_bytes": 1},
         {"engine_basename": "olmoe.exe.bak"},
         {"engine_size_bytes": 0},
         {"engine_size_bytes": -1},
@@ -76,6 +100,14 @@ def test_valid_manifest_constructs() -> None:
         {"shard_sha256": (HASH64_D, HASH64_D, HASH64_E)},
         {"ref_basename": "ref.json"},
         {"ref_sha256": "nothex"},
+        {"cap_argument": "16"},
+        {"cap_argument": 8},
+        {"bits_argument": "4"},
+        {"prompt_token_ids": (510, 5347, 273, 6181)},
+        {"prompt_token_ids": (510, 5347, 273, 6181, 311)},
+        {"prompt_token_ids": [510, 5347, 273, 6181, 310]},
+        {"expected_generated_token_id": 7786},
+        {"expected_generated_token_id": "7785"},
         {"conversion_dependency_versions": {"unknown-dep": "1.0"}},
         {"conversion_dependency_versions": {"python": "not a version!"}},
         {"evidence_schema_version": "v0"},
@@ -86,15 +118,27 @@ def test_malformed_manifest_fields_are_rejected(overrides: dict[str, object]) ->
         manifest_mod.OlmoeModelManifest(**_valid_kwargs(**overrides))
 
 
-def test_reviewed_manifest_for_revision_returns_none_when_absent() -> None:
-    assert manifest_mod.reviewed_manifest_for_revision(common.PINNED_MODEL_REVISION) is None
+def test_reviewed_manifest_for_revision_returns_none_for_any_other_revision() -> None:
     assert manifest_mod.reviewed_manifest_for_revision("not-a-revision") is None
+    assert manifest_mod.reviewed_manifest_for_revision("0" * 40) is None
     assert manifest_mod.reviewed_manifest_for_revision(None) is None  # type: ignore[arg-type]
+    assert (
+        manifest_mod.reviewed_manifest_for_revision(common.PINNED_MODEL_REVISION)
+        is manifest_mod.REVIEWED_OLMOE_CONVERTED_MODEL
+    )
 
 
-def test_require_reviewed_manifest_fails_closed_when_registry_empty() -> None:
+def test_require_reviewed_manifest_fails_closed_when_registry_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(manifest_mod, "REVIEWED_OLMOE_MODEL_REGISTRY", MappingProxyType({}))
     with pytest.raises(manifest_mod.ColibriStage2Failure, match="reviewed_model_manifest_unavailable"):
         manifest_mod.require_reviewed_manifest(common.PINNED_MODEL_REVISION, common.PINNED_COLIBRI_COMMIT)
+
+
+def test_require_reviewed_manifest_rejects_any_other_revision() -> None:
+    with pytest.raises(manifest_mod.ColibriStage2Failure, match="reviewed_model_manifest_unavailable"):
+        manifest_mod.require_reviewed_manifest("0" * 40, common.PINNED_COLIBRI_COMMIT)
 
 
 def test_require_reviewed_manifest_rejects_malformed_registry_entry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,8 +265,8 @@ def test_reviewed_converter_identity_rejects_a_foreign_commit() -> None:
 
 def test_manifest_rejects_a_well_formed_but_arbitrary_converter_sha256() -> None:
     # A caller-supplied 64-hex-character value that merely LOOKS like a
-    # hash must still be rejected -- it must equal
-    # common.REVIEWED_CONVERTER_IDENTITY.sha256 exactly.
+    # hash must still be rejected -- it must equal the reviewed identity
+    # for the stated converter kind exactly.
     with pytest.raises(ValueError, match="converter_source_sha256"):
         manifest_mod.OlmoeModelManifest(**_valid_kwargs(converter_source_sha256="7" * 64))
 
@@ -230,10 +274,10 @@ def test_manifest_rejects_a_well_formed_but_arbitrary_converter_sha256() -> None
 def test_manifest_rejects_when_reviewed_converter_commit_disagrees(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Even when converter_source_sha256 matches the reviewed converter's
-    # hash exactly, a manifest must still be rejected if that reviewed
-    # converter identity's own colibri_commit disagrees with the
-    # manifest's colibri_commit -- the two pins must always agree.
+    # Even when the whole converter identity matches the reviewed pinned
+    # script exactly, a manifest must still be rejected if that reviewed
+    # identity's own colibri_commit disagrees with the manifest's
+    # colibri_commit -- the two pins must always agree.
     # ReviewedConverterIdentity's own constructor requires colibri_commit
     # to equal PINNED_COLIBRI_COMMIT, so a foreign value is forced onto an
     # already-constructed (frozen) instance to simulate the only way this
@@ -245,6 +289,85 @@ def test_manifest_rejects_when_reviewed_converter_commit_disagrees(
         colibri_commit=common.PINNED_COLIBRI_COMMIT,
     )
     object.__setattr__(foreign_identity, "colibri_commit", "3" * 40)
-    monkeypatch.setattr(common, "REVIEWED_CONVERTER_IDENTITY", foreign_identity)
+    monkeypatch.setattr(
+        common,
+        "REVIEWED_CONVERTER_IDENTITY_BY_KIND",
+        MappingProxyType(
+            {
+                common.CONVERTER_KIND_BOUNDED: common.REVIEWED_BOUNDED_CONVERTER_IDENTITY,
+                common.CONVERTER_KIND_PINNED_SCRIPT: foreign_identity,
+            }
+        ),
+    )
     with pytest.raises(ValueError, match="colibri_commit"):
-        manifest_mod.OlmoeModelManifest(**_valid_kwargs())
+        manifest_mod.OlmoeModelManifest(
+            **_valid_kwargs(**_converter_kwargs(common.CONVERTER_KIND_PINNED_SCRIPT))
+        )
+
+
+def test_manifest_accepts_either_reviewed_converter_kind() -> None:
+    for kind in sorted(common.CONVERTER_KINDS):
+        manifest = manifest_mod.OlmoeModelManifest(**_valid_kwargs(**_converter_kwargs(kind)))
+        assert manifest.converter_kind == kind
+
+
+def test_manifest_rejects_a_converter_identity_crossed_with_the_other_kind() -> None:
+    # A correct hash paired with the *other* converter's kind must be
+    # rejected: the bounded converter can never be recorded as the upstream
+    # pinned script, or vice versa.
+    bounded = common.REVIEWED_BOUNDED_CONVERTER_IDENTITY
+    pinned = common.REVIEWED_CONVERTER_IDENTITY
+    with pytest.raises(ValueError, match="converter_basename"):
+        manifest_mod.OlmoeModelManifest(
+            **_valid_kwargs(
+                converter_kind=common.CONVERTER_KIND_PINNED_SCRIPT,
+                converter_basename=bounded.basename,
+                converter_size_bytes=bounded.size_bytes,
+                converter_source_sha256=bounded.sha256,
+            )
+        )
+    with pytest.raises(ValueError, match="converter_basename"):
+        manifest_mod.OlmoeModelManifest(
+            **_valid_kwargs(
+                converter_kind=common.CONVERTER_KIND_BOUNDED,
+                converter_basename=pinned.basename,
+                converter_size_bytes=pinned.size_bytes,
+                converter_source_sha256=pinned.sha256,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Whole-registry shape: no substitution, no second model
+# ---------------------------------------------------------------------------
+
+
+def test_require_wellformed_registry_accepts_the_shipped_registry() -> None:
+    manifest_mod.require_wellformed_registry()
+
+
+def test_require_wellformed_registry_rejects_a_second_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = manifest_mod.REVIEWED_OLMOE_CONVERTED_MODEL
+    monkeypatch.setattr(
+        manifest_mod,
+        "REVIEWED_OLMOE_MODEL_REGISTRY",
+        MappingProxyType({common.PINNED_MODEL_REVISION: entry, "1" * 40: entry}),
+    )
+    with pytest.raises(manifest_mod.ColibriStage2Failure, match="malformed_registry"):
+        manifest_mod.require_wellformed_registry()
+    # And the pinned lookup, which on its own would have matched, must also
+    # fail closed rather than authorizing a run from a widened registry.
+    with pytest.raises(manifest_mod.ColibriStage2Failure, match="malformed_registry"):
+        manifest_mod.require_reviewed_manifest(common.PINNED_MODEL_REVISION, common.PINNED_COLIBRI_COMMIT)
+
+
+def test_require_wellformed_registry_rejects_a_non_manifest_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        manifest_mod,
+        "REVIEWED_OLMOE_MODEL_REGISTRY",
+        MappingProxyType({common.PINNED_MODEL_REVISION: "not-a-manifest"}),
+    )
+    with pytest.raises(manifest_mod.ColibriStage2Failure, match="malformed_registry"):
+        manifest_mod.require_wellformed_registry()

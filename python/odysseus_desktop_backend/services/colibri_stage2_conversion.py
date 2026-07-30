@@ -830,6 +830,19 @@ def _peak_job_memory(job: Any) -> tuple[int | None, int | None]:
         return None, None
 
 
+def peak_job_memory_bytes(job: Any) -> tuple[int | None, int | None]:
+    """Public accessor for ``(peak per-process, peak whole-job)`` bytes.
+
+    The real one-token runner owns its child in a Job Object exactly like
+    the converter does, and needs the same whole-tree peak-memory evidence,
+    so it reuses this one reviewed ``QueryInformationJobObject`` path rather
+    than declaring a second copy of the ctypes structures. Returns
+    ``(None, None)`` on any failure or off Windows -- never a guess.
+    """
+
+    return _peak_job_memory(job)
+
+
 def _close_job(job: Any) -> None:
     if job is None or sys.platform != "win32":
         return

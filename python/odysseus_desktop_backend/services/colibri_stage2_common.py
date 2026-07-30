@@ -40,7 +40,12 @@ BITS_ARGUMENT = "8"
 APPROX_DOWNLOAD_BYTES = 13_840_000_000
 REQUIRED_FREE_SPACE_BYTES = 18 * 1024 * 1024 * 1024
 
-MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v1"
+# v2 binds each registry entry to the *executed* converter (kind plus its
+# full reviewed identity, not just the upstream script's digest) and to the
+# token contract itself (cap, bits, the prompt token ids, and the single
+# expected generated token id), so one reviewed record now covers every
+# input the real one-token command depends on.
+MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v2"
 # v2 added the per-shard resume booleans (``source_reused`` /
 # ``converted_reused``) and the bounded per-shard conversion peak-memory
 # evidence. v3 replaces the single top-level ``converter_basename`` /
@@ -155,6 +160,37 @@ FAILURE_NUMERIC_METADATA_KEYS = frozenset(
 
 RESUME_LEDGER_BASENAME = "colibri-stage2-resume.json"
 RESUME_LEDGER_SCHEMA_VERSION = "colibri-stage2-olmoe-resume-v1"
+
+
+# --- Closed evidence vocabulary for the real one-token run ------------------
+
+TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v1"
+
+# Every optional measurement in the run evidence carries its own state, so a
+# missing number is always distinguishable from a measured zero and can never
+# be silently read as "0 ms" or "0 bytes".
+EVIDENCE_STATE_MEASURED = "measured"
+EVIDENCE_STATE_UNAVAILABLE = "unavailable"
+EVIDENCE_STATES = frozenset({EVIDENCE_STATE_MEASURED, EVIDENCE_STATE_UNAVAILABLE})
+
+# The closed process-exit vocabulary. This is a *category*, never a raw
+# status string, message, or captured stream: `clean_exit` means the process
+# was observed exiting with code 0, `nonzero_exit` means it was observed
+# exiting with any other code, `timed_out` means no exit was observed before
+# the absolute deadline, and `not_observed` means the run failed before an
+# exit could be sampled at all (e.g. process creation failed).
+EXIT_CATEGORY_CLEAN = "clean_exit"
+EXIT_CATEGORY_NONZERO = "nonzero_exit"
+EXIT_CATEGORY_TIMED_OUT = "timed_out"
+EXIT_CATEGORY_NOT_OBSERVED = "not_observed"
+EXIT_CATEGORIES = frozenset(
+    {
+        EXIT_CATEGORY_CLEAN,
+        EXIT_CATEGORY_NONZERO,
+        EXIT_CATEGORY_TIMED_OUT,
+        EXIT_CATEGORY_NOT_OBSERVED,
+    }
+)
 
 
 class ColibriStage2Failure(RuntimeError):
