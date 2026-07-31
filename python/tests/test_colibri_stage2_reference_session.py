@@ -7,9 +7,9 @@ created no native process, but it *did* leave an empty
 and validated outside the cleanup-owned block, so the validation failure
 escaped past any teardown.
 
-The validation itself was correct. ``TEMP``/``TMP`` were
-``C:\\Users\\PARTHG~1\\AppData\\Local\\Temp`` -- a Windows 8.3 short-name
-alias whose canonical form is the long ``Parth Ganguly`` spelling -- and
+The validation itself was correct. ``TEMP``/``TMP`` pointed at a temp root
+spelled with a Windows 8.3 short-name alias that canonicalizes to a
+different long-form path -- and
 ``require_ordinary_directory`` compares the original lexical path against its
 resolution precisely to catch a path that is not what it says it is. What was
 wrong was creating the directory before that check could fail, and then
@@ -212,11 +212,11 @@ def test_short_name_alias_temp_root_is_no_longer_selected(
 
     The alias is not fabricated: a directory whose long name exceeds the 8.3
     form is created and Windows generates its own short name for it (the
-    ``PARTHG~1`` shape). ``TEMP``/``TMP`` are pointed at that alias spelling,
+    ``NAME~1`` shape). ``TEMP``/``TMP`` are pointed at that alias spelling,
     reproducing the first real invocation exactly.
     """
 
-    long_named = registered.root / "Parth Ganguly Temp Root"
+    long_named = registered.root / "Long Aliased Temp Root"
     long_named.mkdir()
     alias = _short_path_name(long_named)
     if alias is None:
@@ -453,6 +453,27 @@ def test_successful_run_reports_both_removals(registered: _Fixture, tmp_path: Pa
     assert result.reference_removed is True
     assert result.cleanup_complete is True
     assert _sessions_under(parent) == []
+
+
+def test_session_lifecycle_fields_are_what_v3_identifies(registered: _Fixture, tmp_path: Path) -> None:
+    """The schema identifier and the record shape must move together.
+
+    ``session_created`` / ``reference_session_removed`` are the fields v3 was
+    bumped for. A record carrying them may not claim to be a v2 capture, and
+    the historical v2 attempt -- emitted before these fields existed -- is
+    never relabelled.
+    """
+
+    import dataclasses
+
+    parent = tmp_path / "sessions"
+    parent.mkdir()
+    result = _attempt(registered, FakeApi(stdout=GOOD_OUTPUT), reference_session_parent=parent)
+
+    assert result.evidence_schema_version == "colibri-stage2-olmoe-token-evidence-v3"
+    assert result.evidence_schema_version == common.TOKEN_RUN_EVIDENCE_SCHEMA_VERSION
+    field_names = {field.name for field in dataclasses.fields(result)}
+    assert {"session_created", "reference_session_removed"} <= field_names
 
 
 def test_reference_module_prefix_matches_what_the_tests_scan_for() -> None:

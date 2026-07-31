@@ -704,9 +704,9 @@ def default_reference_session_parent(resolved_model_dir: Path) -> Path:
 
     Derived as the ordinary sibling ``<converted-model-dir>/../runtime-temp``
     and never from ``TEMP``/``TMP``. The caller's temp spelling is not a
-    trustworthy input: the first real invocation was handed
-    ``C:\\Users\\PARTHG~1\\AppData\\Local\\Temp``, a Windows 8.3 short-name
-    alias whose canonical form is the long ``Parth Ganguly`` spelling. The
+    trustworthy input: the first real invocation was handed a temp root under
+    ``C:\\Users\\<8.3-ALIAS>\\AppData\\Local\\Temp``, a Windows short-name
+    alias that canonicalizes to a different long-form spelling. The
     post-creation ordinary-directory check compares the original lexical path
     against its resolution and correctly rejected the mismatch -- but only
     after the directory had been created, so an empty session was left

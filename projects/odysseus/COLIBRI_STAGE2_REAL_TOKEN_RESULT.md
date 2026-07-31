@@ -8,11 +8,16 @@ set into the reviewed registry, binds it immutably to every identity the real
 one-token run depends on, and closes the evidence boundary for the run that
 has **not yet been performed**.
 
-**No token has been generated. One human-approved invocation has been made;
-it was rejected pre-launch and never started the engine — see "First
-human-approved attempt" below. Nothing under `D:\Colibri` was read, modified,
-moved, deleted, or hashed by this work. No download occurred. Nothing was
-merged or marked ready.**
+**No token has been generated and `olmoe.exe` has never been launched.** One
+human-approved invocation has been made; it was rejected pre-launch, before
+any native process existed — see "First human-approved attempt" below. That
+attempt did read and SHA-256 hash the converted artifacts, solely to verify
+their identity against the reviewed registry entry; it did not modify, move,
+delete, or reconvert them, and loaded no model for inference. No download
+occurred. Nothing was merged or marked ready.
+
+*Development of this branch itself never accessed `D:\Colibri` at all: every
+test runs against synthetic fixtures under `tmp_path`.*
 
 ## Root design
 
@@ -316,15 +321,35 @@ generate a token.** There is still no successful token claim.
 | process exit | `not_observed` |
 | CLI exit status | 2 |
 | native process created | **none** |
+| evidence schema of that capture | `colibri-stage2-olmoe-token-evidence-v2` |
 
-No engine executed, no model file was opened for inference, no token was
-produced, and nothing under `D:\Colibri` was modified.
+### What that attempt did and did not touch
+
+The rejection happened at reference-session creation, which is *after*
+`_verify_preconditions`. So the converted artifacts were genuinely read:
+
+- **the config and all three converted shards were read in full and SHA-256
+  hashed**, solely to verify their identity against the reviewed registry
+  entry. The reviewed engine binary was read and hashed for the same reason;
+- they were **not** modified, moved, deleted, or reconverted;
+- **no model file was loaded for inference** — identity hashing reads bytes,
+  it does not initialise a model;
+- **`olmoe.exe` was never launched**; no native process was created;
+- **no token was generated.**
+
+An earlier revision of this document said nothing under `D:\Colibri` was read
+or hashed during that attempt. That was wrong: reading and hashing every
+artifact is precisely what the pre-launch identity gate does, and roughly
+7.4 GB of shard data was read to do it. The claim is corrected here rather
+than quietly dropped.
 
 ### Cause: a Windows 8.3 short-name alias
 
-`TEMP` and `TMP` were `C:\Users\PARTHG~1\AppData\Local\Temp`. `PARTHG~1` is
-the volume's generated 8.3 short name for `Parth Ganguly`, so that spelling
-canonicalizes to a *different* long-form path.
+`TEMP` and `TMP` pointed at `C:\Users\<8.3-ALIAS>\AppData\Local\Temp`, where
+`<8.3-ALIAS>` is the volume's generated short name for a longer account
+directory name — so that spelling canonicalizes to a *different* long-form
+path. (The alias and the long form are both local account names and are not
+reproduced here, for the same privacy reason the engine path is not.)
 
 `require_ordinary_directory` compares the original lexical path against its
 resolution precisely to catch a path that is not what it says it is, and it
@@ -389,6 +414,13 @@ left for guarded manual cleanup. This correction does not delete it.**
    `session_created: false` only where that is established, and `null` for an
    unexpected internal failure that could have occurred anywhere.
 
+4. **Evidence schema bumped to
+   `colibri-stage2-olmoe-token-evidence-v3`.** Those two new fields change the
+   record shape, so reusing the v2 identifier would make it ambiguous. The
+   first attempt's capture was genuinely a v2 document and stays labelled v2 —
+   it is never relabelled to imply it carried session-lifecycle evidence it
+   did not have.
+
 A Windows regression drives the real thing: a long-named directory whose 8.3
 alias Windows itself generates, asserted to resolve to a different spelling
 and to be genuinely rejected by `require_ordinary_directory`, with
@@ -441,17 +473,25 @@ directory; it is validated, never created, by this code.
 The exact operator command, run from `python/` in an interactive terminal, is:
 
 ```
-python -m odysseus_desktop_backend.services.colibri_stage2_token_cli --engine "<REVIEWED_ENGINE_DIR>\olmoe.exe" --converted-model-dir "D:\Colibri\converted" --approve
+python -m odysseus_desktop_backend.services.colibri_stage2_token_cli --engine "<REVIEWED_ENGINE_PATH>" --converted-model-dir "D:\Colibri\converted" --approve
 ```
 
-`<REVIEWED_ENGINE_DIR>` remains a **placeholder**: the location of the
-reviewed binary — the `olmoe.exe` whose SHA-256 is
-`d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d` — has not
-been established by independent review, and this document will not guess at
-it. The placeholder must be replaced with the reviewed path before the command
-is approved. Nothing about the command's safety depends on that path being
-correct: an engine at the wrong location, or a different engine at the right
-one, is rejected on digest before any process is created.
+`<REVIEWED_ENGINE_PATH>` is a **privacy placeholder, not an open question.**
+The reviewed engine's location was independently resolved before the first
+attempt: two byte-identical reviewed `olmoe.exe` copies exist from the
+two-build determinism check, the first attempted command used the build-a
+copy, and its exact size (704,275 bytes) and SHA-256
+(`d7beaf6fe35de265cfaeb1d07914deeea6ceb8b3650e79b76e9c6d77176b528d`) matched
+the registry entry.
+
+The absolute local path is deliberately omitted from tracked evidence because
+it contains a local account name, and this repository's Stage 2 evidence rule
+is that no username or local path is ever persisted. Substitute the resolved
+path at the prompt.
+
+Nothing about the command's safety depends on that path being right: an engine
+at the wrong location, or a different engine at the right one, is rejected on
+digest before any process is created.
 
 Only those two paths are supplied. Every identity, argument, and expectation
 comes from the reviewed registry entry. The command:

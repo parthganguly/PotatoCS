@@ -184,12 +184,22 @@ RESUME_LEDGER_SCHEMA_VERSION = "colibri-stage2-olmoe-resume-v1"
 
 # --- Closed evidence vocabulary for the real one-token run ------------------
 
-# v2 replaces the resume-to-first-byte "startup latency" with the engine's
-# own reported model-load and one-token generation timings, keeps
-# resume-to-exit as the independently measured end-to-end figure, records the
-# *parsed* generated token id rather than the expected one, and adds the Job
+# v2 replaced the resume-to-first-byte "startup latency" with the engine's
+# own reported model-load and one-token generation timings, kept
+# resume-to-exit as the independently measured end-to-end figure, recorded the
+# *parsed* generated token id rather than the expected one, and added the Job
 # Object zero-member proof.
-TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v2"
+#
+# v3 adds explicit private-session lifecycle evidence -- `session_created` and
+# `reference_session_removed` -- after the first real human-approved attempt
+# exposed a pre-launch cleanup defect: a session directory was created outside
+# the cleanup-owned block, leaked when its validation failed, and was then
+# reported as a side-effect-free rejection. Those two fields are what make the
+# difference between "no cleanup was owed" and "cleanup was owed and done"
+# visible in the record, so a v3 document is a genuinely different shape from
+# a v2 one and must not reuse its identifier. Captures emitted before this
+# change remain truthfully labelled v2 and are never relabelled.
+TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v3"
 
 # Bounds every engine-reported timing must satisfy to be recorded at all.
 # A value that is negative, non-finite, or absurd is rejected outright

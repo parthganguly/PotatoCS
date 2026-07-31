@@ -643,7 +643,7 @@ def test_exact_one_of_one_success(registered: _Fixture) -> None:
     assert result.reference_removed is True
     assert result.vram_state == "not_applicable"
     assert result.evidence_sha256 is not None
-    assert result.evidence_schema_version == "colibri-stage2-olmoe-token-evidence-v2"
+    assert result.evidence_schema_version == "colibri-stage2-olmoe-token-evidence-v3"
     assert result.job_empty_proven is True
     assert result.job_member_count == 0
     assert result.root_exit_confirmed is True

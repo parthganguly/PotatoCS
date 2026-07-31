@@ -54,7 +54,7 @@ def _result(**overrides: Any) -> OneTokenRunResult:
     values: dict[str, Any] = dict(
         category="passed",
         ok=True,
-        evidence_schema_version="colibri-stage2-olmoe-token-evidence-v2",
+        evidence_schema_version="colibri-stage2-olmoe-token-evidence-v3",
         identities=_identity_evidence(ENTRY),
         matched_count=1,
         contract_expected_count=1,
