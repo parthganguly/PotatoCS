@@ -301,6 +301,13 @@ class OneTokenRunResult:
     peak_tree_memory_bytes: int | None
     peak_tree_memory_state: str
     cleanup_complete: bool
+    # Whether a private session directory was actually created, and whether
+    # its bounded removal then completed. These are distinct from
+    # ``reference_removed``: a run can create a session and fail before ever
+    # writing a reference file into it, and that session still has to be
+    # removed and accounted for.
+    session_created: bool
+    reference_session_removed: bool
     job_empty_proven: bool
     job_member_count: int | None
     root_exit_confirmed: bool
@@ -634,8 +641,12 @@ def _default_interactive_check() -> bool:
 
 def _verify_preconditions(
     *, olmoe_exe: Path, converted_model_dir: Path, manifest: OlmoeModelManifest
-) -> None:
+) -> Path:
     """Every check that must pass before a process can exist.
+
+    Returns the resolved, canonical converted-model directory. Read-only:
+    nothing here creates a file, a directory, or a process, which is what
+    lets its failures be raised rather than reported as an attempt.
 
     Validates each approved directory chain -- ordinary directory, no
     symlink/junction/reparse point anywhere down to the drive/root anchor --
@@ -682,6 +693,47 @@ def _verify_preconditions(
         )
 
     _verify_reference_contract(manifest)
+    return resolved_model_dir
+
+
+REFERENCE_SESSION_PARENT_BASENAME = "runtime-temp"
+
+
+def default_reference_session_parent(resolved_model_dir: Path) -> Path:
+    """The deterministic private-session parent for the real run.
+
+    Derived as the ordinary sibling ``<converted-model-dir>/../runtime-temp``
+    and never from ``TEMP``/``TMP``. The caller's temp spelling is not a
+    trustworthy input: the first real invocation was handed
+    ``C:\\Users\\PARTHG~1\\AppData\\Local\\Temp``, a Windows 8.3 short-name
+    alias whose canonical form is the long ``Parth Ganguly`` spelling. The
+    post-creation ordinary-directory check compares the original lexical path
+    against its resolution and correctly rejected the mismatch -- but only
+    after the directory had been created, so an empty session was left
+    behind. Deriving the parent from an already-canonicalised, already-proven
+    location removes the whole class of alias mismatch rather than trying to
+    normalise every spelling a shell might supply.
+
+    An environment variable is never consulted, and there is deliberately no
+    CLI option: this is a derived location, not a configurable one.
+
+    The directory must already exist and is validated with the same full
+    lexical-ancestor, ordinary-directory and non-reparse guarantees as every
+    other approved directory, before anything is created inside it. It is
+    never created here -- a missing parent is a failure, not something to
+    provision silently.
+    """
+
+    candidate = require_direct_child_path(
+        resolved_model_dir.parent,
+        REFERENCE_SESSION_PARENT_BASENAME,
+        category="reference_write_failed",
+    )
+    return require_ordinary_directory(
+        candidate,
+        missing_category="reference_write_failed",
+        reparse_category="reference_write_failed",
+    )
 
 
 def _evidence_digest(manifest: OlmoeModelManifest, generated_token_id: int, matched_count: int) -> str:
@@ -746,20 +798,17 @@ def attempt_one_token_proof(
     if not approved or not interactive_check():
         raise ColibriStage2Failure("noninteractive_approval_rejected")
 
-    _verify_preconditions(
+    resolved_model_dir = _verify_preconditions(
         olmoe_exe=olmoe_exe, converted_model_dir=converted_model_dir, manifest=manifest
     )
 
-    # The private reference session is created -- and its own directory
-    # chain validated -- before the child environment is built, since the
-    # child's TEMP/TMP point directly at this session directory rather
-    # than the caller's general temporary directory.
-    session_dir = create_private_reference_session(reference_session_parent)
-    require_ordinary_directory(
-        session_dir, missing_category="reference_write_failed", reparse_category="reference_write_failed"
-    )
-    environment = build_runner_environment(converted_model_dir=converted_model_dir, session_dir=session_dir)
-
+    # Everything from here on may leave something behind, so it all happens
+    # inside the one cleanup-owned block below. `session_dir` is declared
+    # absent first and is only ever read through a `is not None` guard: the
+    # `finally` clause runs even when session creation itself raised.
+    session_dir: Path | None = None
+    session_created = False
+    session_removed = False
     reference: ReferenceArtifact | None = None
     process: CreatedProcess | None = None
     job: Any = None
@@ -784,6 +833,26 @@ def attempt_one_token_proof(
     started = clock()
 
     try:
+        # The session parent is resolved and proven *before* anything is
+        # created inside it; the session itself is then created, validated,
+        # and only afterwards used to build the child environment, since the
+        # child's TEMP/TMP point at this session directory alone.
+        session_parent = (
+            default_reference_session_parent(resolved_model_dir)
+            if reference_session_parent is None
+            else reference_session_parent
+        )
+        session_dir = create_private_reference_session(session_parent)
+        session_created = True
+        require_ordinary_directory(
+            session_dir,
+            missing_category="reference_write_failed",
+            reparse_category="reference_write_failed",
+        )
+        environment = build_runner_environment(
+            converted_model_dir=converted_model_dir, session_dir=session_dir
+        )
+
         reference = write_private_reference(session_dir)
         if reference.sha256 != manifest.ref_sha256 or reference.size_bytes != manifest.ref_size_bytes:
             raise ColibriStage2Failure("reference_hash_mismatch")
@@ -871,6 +940,14 @@ def attempt_one_token_proof(
         primary_failure = ColibriStage2Failure(
             _ISOLATED_SERVER_FAILURE_CATEGORY_MAP.get(exc.category, _DEFAULT_ISOLATED_SERVER_FAILURE_CATEGORY)
         )
+    except Exception:  # noqa: BLE001 - an unexpected defect must not skip cleanup
+        # Once a session directory may exist, no exception may escape this
+        # function: escaping would leave the directory behind *and* let the
+        # caller classify the run as a side-effect-free pre-launch rejection.
+        # The exception object is discarded unread -- its message could carry
+        # a local path -- and the run is reported as an internal failure whose
+        # cleanup evidence is whatever actually happened below.
+        primary_failure = ColibriStage2Failure("unexpected_internal_failure")
     finally:
         cleanup_deadline = clock() + _CLEANUP_DEADLINE_SECONDS
         if process is not None and resource_probe is not None:
@@ -922,16 +999,25 @@ def attempt_one_token_proof(
                         api.close_handle(handle)
                     except (ColibriStage2Failure, IsolatedServerFailure):
                         cleanup_failed = True
+        # `reference_removed` stays False when no reference file was ever
+        # written -- an unwritten file is not a removed one, and claiming
+        # otherwise would report cleanup that never happened.
         if reference is not None:
             try:
                 delete_private_reference(reference)
                 reference_removed = True
             except ColibriStage2Failure:
                 cleanup_failed = True
-        try:
-            teardown_private_reference_session(session_dir)
-        except ColibriStage2Failure:
-            cleanup_failed = True
+        # Bounded removal of the session directory is attempted on *every*
+        # exit path once it may exist -- including a failure of the very
+        # validation that follows its creation, which is what leaked an empty
+        # session directory on the first real invocation.
+        if session_dir is not None:
+            try:
+                teardown_private_reference_session(session_dir)
+                session_removed = True
+            except ColibriStage2Failure:
+                cleanup_failed = True
 
     # `orphan_free` is asserted only after the Job Object itself reported
     # zero members: a descendant snapshot alone cannot prove an empty tree.
@@ -988,6 +1074,8 @@ def attempt_one_token_proof(
         peak_tree_memory_bytes=peak_tree_memory_bytes,
         peak_tree_memory_state=peak_tree_memory_state,
         cleanup_complete=not cleanup_failed,
+        session_created=session_created,
+        reference_session_removed=session_removed,
         job_empty_proven=job_empty_proven,
         job_member_count=None if teardown is None else teardown.job_member_count,
         root_exit_confirmed=teardown is not None and teardown.root_exit_confirmed,

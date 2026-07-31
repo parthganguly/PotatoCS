@@ -8,9 +8,11 @@ set into the reviewed registry, binds it immutably to every identity the real
 one-token run depends on, and closes the evidence boundary for the run that
 has **not yet been performed**.
 
-**No real `olmoe.exe` was launched. No token was generated. Nothing under
-`D:\Colibri` was read, modified, moved, deleted, or hashed by this work. No
-download occurred. Nothing was merged or marked ready.**
+**No token has been generated. One human-approved invocation has been made;
+it was rejected pre-launch and never started the engine — see "First
+human-approved attempt" below. Nothing under `D:\Colibri` was read, modified,
+moved, deleted, or hashed by this work. No download occurred. Nothing was
+merged or marked ready.**
 
 ## Root design
 
@@ -302,6 +304,100 @@ on failure, and never a Python traceback:
 - The CLI supplies only two paths. It has no flag for any identity, and a
   test asserts the attempt function is never called with one.
 
+## First human-approved attempt: pre-launch rejection
+
+One real invocation has been made. **It did not run the engine and did not
+generate a token.** There is still no successful token claim.
+
+| Observed | Value |
+| --- | --- |
+| category | `reference_write_failed` |
+| `pre_launch_rejection` | true |
+| process exit | `not_observed` |
+| CLI exit status | 2 |
+| native process created | **none** |
+
+No engine executed, no model file was opened for inference, no token was
+produced, and nothing under `D:\Colibri` was modified.
+
+### Cause: a Windows 8.3 short-name alias
+
+`TEMP` and `TMP` were `C:\Users\PARTHG~1\AppData\Local\Temp`. `PARTHG~1` is
+the volume's generated 8.3 short name for `Parth Ganguly`, so that spelling
+canonicalizes to a *different* long-form path.
+
+`require_ordinary_directory` compares the original lexical path against its
+resolution precisely to catch a path that is not what it says it is, and it
+correctly rejected the mismatch. **The validation was right.** The defect was
+where it sat.
+
+### Defect: the session was created outside the cleanup-owned block
+
+`attempt_one_token_proof` created the private session directory, then
+validated it, then built the child environment — all *before* the
+`try`/`finally` that owns cleanup:
+
+```python
+session_dir = create_private_reference_session(...)   # side effect
+require_ordinary_directory(session_dir, ...)          # raises here
+environment = ...
+try:
+    ...
+finally:
+    ...  # never reached
+```
+
+So the validation failure escaped past every teardown path, leaving one empty
+`odysseus-colibri-stage2-ref-*` directory under the long-form user Temp
+directory. Worse, the CLI then classified the escaped `ColibriStage2Failure`
+as a side-effect-free pre-launch rejection and emitted `cleanup_complete:
+true` — cleanup was owed and had not occurred.
+
+**The leaked directory is empty, has been independently identified, and is
+left for guarded manual cleanup. This correction does not delete it.**
+
+### Correction
+
+1. **Deterministic session parent.** When no explicit parent is supplied, the
+   private-session parent is derived as the ordinary sibling
+   `<converted-model-dir>/../runtime-temp` and validated with the same full
+   lexical-ancestor, ordinary-directory and non-reparse guarantees before
+   anything is created inside it. It must already exist; it is never
+   provisioned silently. `TEMP`/`TMP` are never consulted as authority, and
+   there is deliberately no CLI option — this is a derived location, not a
+   configurable one. Deriving it from an already-canonical, already-proven
+   path removes the whole class of alias mismatch rather than trying to
+   normalise every spelling a shell might supply. The child's `TEMP`/`TMP`
+   still point only at the created private session.
+
+2. **Cleanup owned from the first side effect.** `session_dir` starts absent;
+   session creation, validation, environment construction, reference writing
+   and all subsequent work now sit inside one cleanup-owned structure, and the
+   directory is only ever read through an `is not None` guard. Bounded removal
+   is attempted on every exit path once the directory may exist — session
+   validation failure, environment failure, reference-write failure, reference
+   identity failure, pre-launch failure, and native execution failure. An
+   unexpected exception after session creation is caught too: escaping would
+   both leak the directory and let the caller misreport the run.
+
+3. **Truthful classification.** The result and the CLI document now carry
+   `session_created` and `reference_session_removed`, distinct from
+   `reference_removed` (a session can be created and removed without a
+   reference file ever being written, which is exactly what happened).
+   `cleanup_complete` is false whenever removal failed and is never
+   manufactured from "no process was launched". A rejection document states
+   `session_created: false` only where that is established, and `null` for an
+   unexpected internal failure that could have occurred anywhere.
+
+A Windows regression drives the real thing: a long-named directory whose 8.3
+alias Windows itself generates, asserted to resolve to a different spelling
+and to be genuinely rejected by `require_ordinary_directory`, with
+`TEMP`/`TMP` pointed at it. The run ignores the environment, selects the
+`runtime-temp` sibling, leaks nothing under either spelling, and — on a forced
+post-create validation failure — creates no process while still removing the
+directory it made.
+
+
 ## Files changed
 
 | File | Change |
@@ -313,6 +409,7 @@ on failure, and never a Python traceback:
 | `python/odysseus_desktop_backend/services/colibri_stage2_job_probe.py` | new — checked Job Object active-process-count query and the bounded zero-member teardown proof |
 | `python/odysseus_desktop_backend/services/colibri_stage2_token_cli.py` | new — closed developer CLI emitting one JSON document, never a traceback |
 | `python/odysseus_desktop_backend/services/colibri_stage2_conversion.py` | public `peak_job_memory_bytes` so the runner reuses the reviewed job-memory query |
+| `python/tests/test_colibri_stage2_reference_session.py` | new — deterministic session parent, real 8.3-alias regression, cleanup ownership on every exit path |
 | `python/tests/test_colibri_stage2_registry.py` | new — the reviewed entry, reference determinism, closed boundary, cannot authorize anything else |
 | `python/tests/test_colibri_stage2_engine_output.py` | new — dialect parsing, independent oracle, every rejection shape, timing bounds |
 | `python/tests/test_colibri_stage2_token_cli.py` | new — exit codes, closed document, privacy, no traceback |
@@ -321,19 +418,25 @@ on failure, and never a Python traceback:
 | `python/tests/test_colibri_stage2_runner.py` | real engine dialect fixtures; command grammar, directory contents, ledger non-authority, independent oracle, evidence, latency attribution, memory, Job Object proof, timeout/tree-cleanup, privacy |
 | `projects/odysseus/COLIBRI_STAGE2_REAL_TOKEN_RESULT.md` | this document |
 
-## Proposed first real token run
+## Proposed next real token run
 
-**Not executed. Requires explicit human approval and an interactive
+**Never yet executed successfully. The one attempt so far was rejected
+pre-launch (above). Requires explicit human approval and an interactive
 terminal.**
 
 The native command the engine will execute is:
 
     olmoe.exe 8 8 <private-session>\olmoe-stage2-one-token-ref.json
 
-with `SNAP=D:\Colibri\converted` and `TEMP`/`TMP` pointing at that same
-private session directory. The reference file is written by this process from
+with `SNAP=D:\Colibri\converted`, and `TEMP`/`TMP` pointing at that same
+private session directory — which now lives under the deterministic
+`D:\Colibri\runtime-temp` sibling rather than anywhere derived from the
+caller's `TEMP` spelling. The reference file is written by this process from
 embedded token arrays immediately before launch and deleted afterwards, so
 its path cannot be supplied or reused.
+
+`D:\Colibri\runtime-temp` must already exist and be an ordinary, non-reparse
+directory; it is validated, never created, by this code.
 
 The exact operator command, run from `python/` in an interactive terminal, is:
 

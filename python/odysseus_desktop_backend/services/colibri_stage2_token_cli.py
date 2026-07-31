@@ -127,6 +127,8 @@ def build_attempt_document(result: OneTokenRunResult) -> dict[str, Any]:
         },
         "cleanup": {
             "cleanup_complete": result.cleanup_complete,
+            "session_created": result.session_created,
+            "reference_session_removed": result.reference_session_removed,
             "job_empty_proven": result.job_empty_proven,
             "job_member_count": result.job_member_count,
             "root_exit_confirmed": result.root_exit_confirmed,
@@ -190,9 +192,19 @@ def build_rejected_document(
             "peak_tree_memory_state": EVIDENCE_STATE_UNAVAILABLE,
         },
         "cleanup": {
-            # True only where "nothing was launched, so nothing was owed" is
-            # an established fact; null where it is simply not known.
+            # True only where "nothing was created, so nothing was owed" is an
+            # established fact; null where it is simply not known.
+            #
+            # A raised `ColibriStage2Failure` reaching here is side-effect
+            # free by construction: `attempt_one_token_proof` only raises
+            # before its cleanup-owned block, and every failure from the first
+            # side effect onward is reported as a result instead. A failure
+            # that created a private session directory therefore never lands
+            # in this document -- it lands in `build_attempt_document` with
+            # the real `session_created` / `reference_session_removed` values.
             "cleanup_complete": True if pre_launch_established else None,
+            "session_created": False if pre_launch_established else None,
+            "reference_session_removed": False,
             "job_empty_proven": False,
             "job_member_count": None,
             "root_exit_confirmed": False,

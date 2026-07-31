@@ -69,6 +69,8 @@ def _result(**overrides: Any) -> OneTokenRunResult:
         peak_tree_memory_bytes=205_520_896,
         peak_tree_memory_state="measured",
         cleanup_complete=True,
+        session_created=True,
+        reference_session_removed=True,
         job_empty_proven=True,
         job_member_count=0,
         root_exit_confirmed=True,
@@ -153,6 +155,8 @@ def test_verified_document_records_every_required_field() -> None:
     assert document["latency"]["end_to_end_latency_ms"] == 13800
     assert document["memory"]["peak_tree_memory_bytes"] == 205_520_896
     assert document["cleanup"]["job_empty_proven"] is True
+    assert document["cleanup"]["session_created"] is True
+    assert document["cleanup"]["reference_session_removed"] is True
     assert document["cleanup"]["job_member_count"] == 0
     assert document["cleanup"]["orphan_free"] is True
     assert document["cleanup"]["reference_removed"] is True
@@ -317,16 +321,82 @@ def test_unexpected_exception_claims_no_cleanup_or_prelaunch_facts() -> None:
     assert document["cleanup"]["root_exit_confirmed"] is False
 
 
+def test_cleanup_fields_report_a_created_and_removed_session() -> None:
+    # The shape of the first real invocation, corrected: pre-launch failure,
+    # no process, but a session directory was created and then removed.
+    failed = _result(
+        category="reference_write_failed",
+        ok=False,
+        generated_token_id=None,
+        matched_count=None,
+        engine_reported_expected_count=None,
+        evidence_sha256=None,
+        exit_category="not_observed",
+        exit_code=None,
+        session_created=True,
+        reference_session_removed=True,
+        reference_removed=False,
+        cleanup_complete=True,
+        job_empty_proven=False,
+        job_member_count=None,
+        root_exit_confirmed=False,
+        descendant_count=None,
+        orphan_free=False,
+    )
+    status, document, _ = _invoke(ARGV, attempt=lambda **_: failed)
+    assert status == 1
+    assert document["state"] == "failed"
+    assert document["cleanup"]["session_created"] is True
+    assert document["cleanup"]["reference_session_removed"] is True
+    # No reference file existed, so none is claimed removed.
+    assert document["cleanup"]["reference_removed"] is False
+    # And no process claim is manufactured.
+    assert document["cleanup"]["job_empty_proven"] is False
+    assert document["cleanup"]["job_member_count"] is None
+    assert document["cleanup"]["orphan_free"] is False
+    assert document["process"]["exit_category"] == "not_observed"
+
+
+def test_failed_session_removal_is_reported_as_incomplete_cleanup() -> None:
+    failed = _result(
+        category="cleanup_failed",
+        ok=False,
+        generated_token_id=None,
+        evidence_sha256=None,
+        session_created=True,
+        reference_session_removed=False,
+        cleanup_complete=False,
+    )
+    _, document, _ = _invoke(ARGV, attempt=lambda **_: failed)
+    # cleanup_complete must never be manufactured as true.
+    assert document["cleanup"]["cleanup_complete"] is False
+    assert document["cleanup"]["session_created"] is True
+    assert document["cleanup"]["reference_session_removed"] is False
+
+
 def test_closed_prelaunch_rejection_may_state_the_facts_it_established() -> None:
     def raising(**_: Any) -> OneTokenRunResult:
         raise ColibriStage2Failure("reviewed_model_manifest_unavailable")
 
     _, document, _ = _invoke(ARGV, attempt=raising)
     # A closed failure out of the attempt can only come from a precondition
-    # checked before process creation, so "nothing was launched" is known.
+    # checked before the cleanup-owned block, so "nothing was created" is
+    # known and may be stated.
     assert document["pre_launch_rejection"] is True
     assert document["cleanup"]["cleanup_complete"] is True
+    assert document["cleanup"]["session_created"] is False
+    assert document["cleanup"]["reference_session_removed"] is False
     assert document["cleanup"]["job_empty_proven"] is False
+
+
+def test_unexpected_failure_claims_nothing_about_a_session() -> None:
+    def exploding(**_: Any) -> OneTokenRunResult:
+        raise RuntimeError("internal defect")
+
+    _, document, _ = _invoke(ARGV, attempt=exploding)
+    # Could have happened anywhere, so session creation is unknown, not False.
+    assert document["cleanup"]["session_created"] is None
+    assert document["cleanup"]["cleanup_complete"] is None
 
 
 def test_argparse_failure_still_emits_one_closed_document() -> None:
