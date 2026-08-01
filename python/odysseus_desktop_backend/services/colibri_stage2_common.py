@@ -40,7 +40,12 @@ BITS_ARGUMENT = "8"
 APPROX_DOWNLOAD_BYTES = 13_840_000_000
 REQUIRED_FREE_SPACE_BYTES = 18 * 1024 * 1024 * 1024
 
-MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v1"
+# v2 binds each registry entry to the *executed* converter (kind plus its
+# full reviewed identity, not just the upstream script's digest) and to the
+# token contract itself (cap, bits, the prompt token ids, and the single
+# expected generated token id), so one reviewed record now covers every
+# input the real one-token command depends on.
+MANIFEST_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-manifest-v2"
 # v2 added the per-shard resume booleans (``source_reused`` /
 # ``converted_reused``) and the bounded per-shard conversion peak-memory
 # evidence. v3 replaces the single top-level ``converter_basename`` /
@@ -130,6 +135,26 @@ STAGE2_FAILURE_CATEGORIES = frozenset(
         "duplicate_match_line",
         "malformed_output",
         "token_identity_mismatch",
+        # Distinguished engine-output defects. Collapsing these into
+        # `malformed_output` would hide *which* part of the reviewed dialect
+        # the engine violated, and the difference between "the engine printed
+        # the wrong reference" and "the engine contradicted itself" matters
+        # for triage.
+        "duplicate_output_line",
+        "reference_line_mismatch",
+        "generated_token_count_unexpected",
+        "output_internally_inconsistent",
+        "timing_evidence_invalid",
+        "output_decode_failed",
+        # Developer CLI surface. `cli_arguments_rejected` covers anything the
+        # argument parser refuses (including an unsupported --help), and is
+        # deliberately distinct from a path or identity rejection.
+        "cli_arguments_rejected",
+        # A defect in this code, not a closed operational outcome. Never
+        # collapsed into `malformed_output`: that would blame the engine for
+        # our own bug, and would imply output was parsed when it may not have
+        # been reached at all.
+        "unexpected_internal_failure",
         "cleanup_failed",
         "orphan_detected",
         "platform_unsupported",
@@ -155,6 +180,62 @@ FAILURE_NUMERIC_METADATA_KEYS = frozenset(
 
 RESUME_LEDGER_BASENAME = "colibri-stage2-resume.json"
 RESUME_LEDGER_SCHEMA_VERSION = "colibri-stage2-olmoe-resume-v1"
+
+
+# --- Closed evidence vocabulary for the real one-token run ------------------
+
+# v2 replaced the resume-to-first-byte "startup latency" with the engine's
+# own reported model-load and one-token generation timings, kept
+# resume-to-exit as the independently measured end-to-end figure, recorded the
+# *parsed* generated token id rather than the expected one, and added the Job
+# Object zero-member proof.
+#
+# v3 adds explicit private-session lifecycle evidence -- `session_created` and
+# `reference_session_removed` -- after the first real human-approved attempt
+# exposed a pre-launch cleanup defect: a session directory was created outside
+# the cleanup-owned block, leaked when its validation failed, and was then
+# reported as a side-effect-free rejection. Those two fields are what make the
+# difference between "no cleanup was owed" and "cleanup was owed and done"
+# visible in the record, so a v3 document is a genuinely different shape from
+# a v2 one and must not reuse its identifier. Captures emitted before this
+# change remain truthfully labelled v2 and are never relabelled.
+TOKEN_RUN_EVIDENCE_SCHEMA_VERSION = "colibri-stage2-olmoe-token-evidence-v3"
+
+# Bounds every engine-reported timing must satisfy to be recorded at all.
+# A value that is negative, non-finite, or absurd is rejected outright
+# rather than clamped: a clamped number would look like a measurement.
+MAX_ENGINE_REPORTED_SECONDS = 86_400.0
+MAX_ENGINE_REPORTED_RATE = 1_000_000_000.0
+# The engine reports resident-set size in GB with two decimals. A bound in
+# the petabyte range is absurd for any real host and still leaves every
+# plausible reading valid.
+MAX_ENGINE_REPORTED_RSS_GB = 1_048_576.0
+
+# Every optional measurement in the run evidence carries its own state, so a
+# missing number is always distinguishable from a measured zero and can never
+# be silently read as "0 ms" or "0 bytes".
+EVIDENCE_STATE_MEASURED = "measured"
+EVIDENCE_STATE_UNAVAILABLE = "unavailable"
+EVIDENCE_STATES = frozenset({EVIDENCE_STATE_MEASURED, EVIDENCE_STATE_UNAVAILABLE})
+
+# The closed process-exit vocabulary. This is a *category*, never a raw
+# status string, message, or captured stream: `clean_exit` means the process
+# was observed exiting with code 0, `nonzero_exit` means it was observed
+# exiting with any other code, `timed_out` means no exit was observed before
+# the absolute deadline, and `not_observed` means the run failed before an
+# exit could be sampled at all (e.g. process creation failed).
+EXIT_CATEGORY_CLEAN = "clean_exit"
+EXIT_CATEGORY_NONZERO = "nonzero_exit"
+EXIT_CATEGORY_TIMED_OUT = "timed_out"
+EXIT_CATEGORY_NOT_OBSERVED = "not_observed"
+EXIT_CATEGORIES = frozenset(
+    {
+        EXIT_CATEGORY_CLEAN,
+        EXIT_CATEGORY_NONZERO,
+        EXIT_CATEGORY_TIMED_OUT,
+        EXIT_CATEGORY_NOT_OBSERVED,
+    }
+)
 
 
 class ColibriStage2Failure(RuntimeError):

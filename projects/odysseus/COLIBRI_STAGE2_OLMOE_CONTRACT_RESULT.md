@@ -601,6 +601,9 @@ F. Integrate or freeze Colibrì based on the result.
   populated only by a dedicated, separately reviewed commit with real,
   non-truncated, officially published basenames/sizes/hashes for the
   converted model — never a caller-supplied override.
+  *(Superseded: that dedicated commit is the `research/colibri-stage2-real-token`
+  unit — see `COLIBRI_STAGE2_REAL_TOKEN_RESULT.md`. The registry now holds
+  exactly one reviewed entry for the disk-attested converted artifact set.)*
 - **The default real adapters
   (`PinnedRevisionFileDownloader`/`PinnedScriptConverter`) are untested
   against a real network or a real `convert_olmoe.py`.** They are
