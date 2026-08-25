@@ -33,7 +33,6 @@
     "chat.send",
     "diagnostics.get",
     "documents.delete",
-    "documents.import",
     "documents.list",
     "documents.ocr",
     "documents.reindex",
