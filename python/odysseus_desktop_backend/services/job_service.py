@@ -543,10 +543,18 @@ class DocumentJobExecutor:
         )
 
         check_cancelled()
-        try:
-            provider = configured_search_provider()
-        except SearchProviderError as exc:
-            raise JobFailure(exc.code) from exc
+        search_mode = str(self.db.get_setting("search_mode", "external") or "external").strip().casefold()
+        if search_mode == "local":
+            from odysseus_desktop_backend.services.local_discovery import LocalDiscoveryProvider
+
+            provider = LocalDiscoveryProvider(self.db)
+        elif search_mode == "external":
+            try:
+                provider = configured_search_provider()
+            except SearchProviderError as exc:
+                raise JobFailure(exc.code) from exc
+        else:
+            raise JobFailure("search_provider_unconfigured")
         on_running()
         search = SearchService(
             self.db,

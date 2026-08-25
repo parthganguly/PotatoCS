@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from odysseus_desktop_backend.cancellation import check_cancelled
@@ -37,6 +37,7 @@ class ProviderSearchResult:
     position: int
     provider: str
     query: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class SearchProvider(Protocol):

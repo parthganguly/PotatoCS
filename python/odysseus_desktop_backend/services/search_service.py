@@ -177,6 +177,21 @@ class SearchMetrics:
     degraded: bool = False
     wall_time_ms: int = 0
     time_to_first_usable_evidence_ms: int | None = None
+    local_fts_hits: int = 0
+    local_dense_hits: int = 0
+    local_fused_candidates: int = 0
+    frontier_candidates: int = 0
+    source_pack_hits: int = 0
+    sitemap_hits: int = 0
+    feed_hits: int = 0
+    local_no_evidence: int = 0
+    page_fetches: int = 0
+    metadata_fetches: int = 0
+    network_requests_total: int = 0
+    bytes_downloaded_total: int = 0
+    source_pack_errors: int = 0
+    robots_denied: int = 0
+    robots_unsupported_patterns: int = 0
 
 
 @dataclass
@@ -210,6 +225,13 @@ class SearchService:
         self.fetcher = fetcher
         self.extractor = extractor or WebContentExtractor()
         self.web_sources = WebSourceStore(documents, rag)
+        self.local_index = None
+        self.discovery_parser = None
+        if getattr(provider, "name", "") == "local":
+            from odysseus_desktop_backend.services.local_discovery import DiscoveryParser, LocalSearchIndex
+
+            self.local_index = LocalSearchIndex(db)
+            self.discovery_parser = DiscoveryParser(db, provider.frontier, limits=provider.limits)
 
     def run(
         self,
@@ -227,14 +249,25 @@ class SearchService:
             raise ValueError("model is required")
         self.sessions.get(session_id)
         budget = SearchBudget.from_database(self.db, second_round_enabled=second_round_enabled)
+        per_response_bytes = budget.max_response_bytes
+        if getattr(self.provider, "name", "") == "local":
+            limits = self.provider.limits
+            divisor = max(1, limits.max_new_urls)
+            per_response_bytes = min(per_response_bytes, max(1024, limits.max_total_bytes // divisor))
         fetcher = self.fetcher or SafeHttpFetcher(
-            max_response_bytes=budget.max_response_bytes,
+            max_response_bytes=per_response_bytes,
             max_redirects=4,
             timeout_seconds=min(20, budget.timeout_seconds),
         )
         run_id = str(uuid.uuid4())
         started = time.monotonic()
         deadline = started + budget.timeout_seconds
+        local_run_budget = None
+        if getattr(self.provider, "name", "") == "local":
+            from odysseus_desktop_backend.services.local_discovery import LocalRunBudget
+
+            local_deadline = min(deadline, started + self.provider.limits.max_wall_time_seconds)
+            local_run_budget = LocalRunBudget(self.provider.limits, local_deadline)
         metrics = SearchMetrics()
         operations: list[TraceOperation] = []
         warnings: list[str] = []
@@ -264,7 +297,7 @@ class SearchService:
             executed_queries.extend(planned_queries)
             metrics.round_count = 1
             metrics.queries_issued += len(planned_queries)
-            local_passages = self._local_passages(clean_question, budget, operations)
+            local_passages = self._local_passages(clean_question, budget, operations, metrics)
             repair_fetch_limit = 0
             first_round_fetch_limit = budget.max_fetches
             if budget.second_round_enabled and budget.max_rounds >= 2:
@@ -280,6 +313,8 @@ class SearchService:
                 remaining_fetches=first_round_fetch_limit,
                 new_document_ids=new_web_document_ids,
                 observed_revisions=observed_web_revisions,
+                local_run_budget=local_run_budget,
+                warnings=warnings,
             )
             all_passages = dedupe_passages([*local_passages, *round_passages])
             dossier = build_dossier(all_passages, planned_queries, budget)
@@ -339,6 +374,8 @@ class SearchService:
                                 remaining_fetches=remaining_fetches,
                                 new_document_ids=new_web_document_ids,
                                 observed_revisions=observed_web_revisions,
+                                local_run_budget=local_run_budget,
+                                warnings=warnings,
                             )
                             existing_passage_ids = {item.passage_id for item in all_passages}
                             added_passages = [item for item in second_passages if item.passage_id not in existing_passage_ids]
@@ -374,6 +411,12 @@ class SearchService:
                         )
 
             if not verified:
+                if getattr(self.provider, "name", "") == "local":
+                    check_cancelled()
+                    self._finalize_local_observations(observed_web_revisions)
+                    metrics.local_no_evidence += 1
+                    operations.append(TraceOperation("search.local_no_evidence", status="completed", count=1))
+                    self._sync_local_budget_metrics(local_run_budget, metrics)
                 raise SearchNoEvidenceError("Search found no deterministically verified evidence")
             answer, synthesis_response = self._synthesize(
                 clean_question,
@@ -386,7 +429,11 @@ class SearchService:
             )
             if metrics.evidence_selection_fallbacks:
                 answer = f"{DEGRADED_EVIDENCE_NOTE}\n\n{answer}"
-            self.web_sources.finalize_success(observed_web_revisions)
+            if getattr(self.provider, "name", "") == "local":
+                self._finalize_local_observations(observed_web_revisions)
+                self._sync_local_budget_metrics(local_run_budget, metrics)
+            else:
+                self.web_sources.finalize_success(observed_web_revisions)
             self._persist_verified(run_id, verified)
             metrics.wall_time_ms = int((time.monotonic() - started) * 1000)
             operations.append(TraceOperation("search.completed", count=len(verified)))
@@ -457,6 +504,25 @@ class SearchService:
             )
             raise
 
+    def _finalize_local_observations(
+        self,
+        revisions: list[tuple[str, str]],
+    ) -> None:
+        if getattr(self.provider, "name", "") != "local" or not revisions:
+            return
+        check_cancelled()
+        self.provider.frontier.finalize_successful_pages(revisions)
+        self.local_index.sync()
+
+    @staticmethod
+    def _sync_local_budget_metrics(local_run_budget: Any, metrics: SearchMetrics) -> None:
+        if local_run_budget is None:
+            return
+        metrics.page_fetches = int(local_run_budget.page_fetches)
+        metrics.metadata_fetches = int(local_run_budget.metadata_fetches)
+        metrics.network_requests_total = int(local_run_budget.network_requests_total)
+        metrics.bytes_downloaded_total = int(local_run_budget.bytes_downloaded_total)
+
     def _plan_queries(
         self,
         question: str,
@@ -504,14 +570,28 @@ class SearchService:
         question: str,
         budget: SearchBudget,
         operations: list[TraceOperation],
+        metrics: SearchMetrics,
     ) -> list[EvidencePassage]:
         started = time.monotonic()
         try:
-            audit = self.rag.search_with_audit(
-                question,
-                limit=min(8, budget.max_passages),
-                include_search_cache=True,
-            )
+            if self.local_index is not None:
+                audit = self.local_index.hybrid_search(question, self.rag, limit=min(12, budget.max_passages))
+                metrics.local_fts_hits += int(audit.get("fts_hits") or 0)
+                metrics.local_dense_hits += int(audit.get("dense_hits") or 0)
+                metrics.local_fused_candidates += int(audit.get("fused_candidates") or 0)
+                operations.extend(
+                    [
+                        TraceOperation("search.local_fts", count=int(audit.get("fts_hits") or 0)),
+                        TraceOperation("search.local_dense", count=int(audit.get("dense_hits") or 0)),
+                        TraceOperation("search.local_fusion", count=int(audit.get("fused_candidates") or 0)),
+                    ]
+                )
+            else:
+                audit = self.rag.search_with_audit(
+                    question,
+                    limit=min(8, budget.max_passages),
+                    include_search_cache=True,
+                )
         except JobCancelledError:
             raise
         except Exception:  # noqa: BLE001 - web Search still works when local retrieval is unavailable
@@ -534,11 +614,11 @@ class SearchService:
                     text=content,
                     source_start=0,
                     source_end=len(content),
-                    title=str(document.get("title") or metadata.get("title") or metadata.get("file_name") or "Local Source"),
-                    source_origin=str(document.get("source_origin") or metadata.get("source_origin") or "local"),
-                    canonical_url=str(document.get("canonical_url") or metadata.get("canonical_url") or ""),
-                    final_url=str(document.get("final_url") or metadata.get("final_url") or ""),
-                    fetched_at=int(document.get("fetched_at") or metadata.get("fetched_at") or 0),
+                    title=str(getattr(result, "title", "") or document.get("title") or metadata.get("title") or metadata.get("file_name") or "Local Source"),
+                    source_origin=str(getattr(result, "source_origin", "") or document.get("source_origin") or metadata.get("source_origin") or "local"),
+                    canonical_url=str(getattr(result, "canonical_url", "") or document.get("canonical_url") or metadata.get("canonical_url") or ""),
+                    final_url=str(getattr(result, "final_url", "") or document.get("final_url") or metadata.get("final_url") or ""),
+                    fetched_at=int(getattr(result, "fetched_at", 0) or document.get("fetched_at") or metadata.get("fetched_at") or 0),
                     provenance_kind=str(metadata.get("provenance_kind") or ("exact_text" if not metadata.get("ocr") else "ocr")),
                     page_number=int(result.page_start) if getattr(result, "page_start", None) else None,
                     retrieval_score=float(result.score),
@@ -566,34 +646,28 @@ class SearchService:
         remaining_fetches: int | None = None,
         new_document_ids: list[str],
         observed_revisions: list[tuple[str, str]],
+        warnings: list[str],
+        local_run_budget: Any = None,
     ) -> list[EvidencePassage]:
         self._ensure_time(deadline)
         discovered: list[ProviderSearchResult] = []
         provider_failures = 0
         provider_errors: list[SearchProviderError] = []
-        with ThreadPoolExecutor(max_workers=min(len(queries), budget.max_concurrent_fetches)) as executor:
-            futures = {}
+        ordered: dict[str, list[ProviderSearchResult]] = {}
+        if getattr(self.provider, "name", "") == "local":
             for query in queries:
-                context = contextvars.copy_context()
                 started = time.monotonic()
-                future = executor.submit(
-                    context.run,
-                    self.provider.search,
-                    query,
-                    limit=budget.results_per_query,
-                    timeout=min(12.0, max(1.0, deadline - time.monotonic())),
-                )
-                futures[future] = (query, started)
-            ordered: dict[str, list[ProviderSearchResult]] = {}
-            for future in as_completed(futures):
-                query, request_started = futures[future]
                 try:
-                    rows = future.result()
+                    rows = self.provider.search(
+                        query,
+                        limit=budget.results_per_query,
+                        timeout=min(12.0, max(1.0, deadline - time.monotonic())),
+                    )
                     ordered[query] = rows
                     operations.append(
                         TraceOperation(
                             "search.provider_request",
-                            elapsed_ms=int((time.monotonic() - request_started) * 1000),
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
                             count=len(rows),
                         )
                     )
@@ -601,71 +675,194 @@ class SearchService:
                     provider_failures += 1
                     provider_errors.append(exc)
                     operations.append(TraceOperation("search.provider_request", status="failed", code=exc.code))
-            for query in queries:
-                discovered.extend(ordered.get(query, []))
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(queries), budget.max_concurrent_fetches)) as executor:
+                futures = {}
+                for query in queries:
+                    context = contextvars.copy_context()
+                    started = time.monotonic()
+                    future = executor.submit(
+                        context.run,
+                        self.provider.search,
+                        query,
+                        limit=budget.results_per_query,
+                        timeout=min(12.0, max(1.0, deadline - time.monotonic())),
+                    )
+                    futures[future] = (query, started)
+                for future in as_completed(futures):
+                    query, request_started = futures[future]
+                    try:
+                        rows = future.result()
+                        ordered[query] = rows
+                        operations.append(
+                            TraceOperation(
+                                "search.provider_request",
+                                elapsed_ms=int((time.monotonic() - request_started) * 1000),
+                                count=len(rows),
+                            )
+                        )
+                    except SearchProviderError as exc:
+                        provider_failures += 1
+                        provider_errors.append(exc)
+                        operations.append(TraceOperation("search.provider_request", status="failed", code=exc.code))
+        for query in queries:
+            discovered.extend(ordered.get(query, []))
         if provider_failures == len(queries) and not discovered:
             raise provider_errors[0] if provider_errors else SearchProviderError("all Search provider requests failed")
         metrics.results_returned += len(discovered)
         operations.append(TraceOperation("search.results_received", count=len(discovered)))
         candidates = prioritize_candidates(discovered, queries)
+        if getattr(self.provider, "name", "") == "local":
+            provider_metrics = getattr(self.provider, "query_metrics", {})
+            metrics.frontier_candidates += len(candidates)
+            metrics.source_pack_hits = int(provider_metrics.get("source_pack_hits", 0))
+            source_pack_errors = int(provider_metrics.get("source_pack_errors", 0))
+            if source_pack_errors and metrics.source_pack_errors == 0:
+                warnings.append(f"{source_pack_errors} malformed Source Pack(s) were skipped.")
+                operations.append(TraceOperation("search.source_pack_invalid", status="degraded", count=source_pack_errors))
+            metrics.source_pack_errors = source_pack_errors
+            operations.append(TraceOperation("search.frontier_candidates", count=len(candidates)))
+            if metrics.source_pack_hits:
+                operations.append(TraceOperation("search.source_pack_match", count=metrics.source_pack_hits))
         metrics.results_deduped += max(0, len(discovered) - len(candidates))
         operations.append(TraceOperation("search.result_deduped", count=len(candidates)))
         fetch_limit = budget.max_fetches if remaining_fetches is None else max(0, remaining_fetches)
-        candidates = candidates[:fetch_limit]
+        if getattr(self.provider, "name", "") == "local":
+            candidates = self.provider.bound_candidates(
+                candidates,
+                fetch_limit,
+                remaining_pages=local_run_budget.remaining_pages,
+                excluded_urls=local_run_budget.observed_urls,
+            )
+        else:
+            candidates = candidates[:fetch_limit]
         if not candidates:
+            self._sync_local_budget_metrics(local_run_budget, metrics)
             return []
         metrics.fetch_attempts += len(candidates)
 
-        acquired: list[tuple[int, dict[str, Any], FetchResponse, ExtractedWebPage]] = []
-        with ThreadPoolExecutor(max_workers=min(len(candidates), budget.max_concurrent_fetches)) as executor:
-            futures = {}
+        acquired: list[tuple[int, dict[str, Any], FetchResponse, ExtractedWebPage | None]] = []
+        if getattr(self.provider, "name", "") == "local":
+            from odysseus_desktop_backend.services.local_discovery import LocalBudgetExhausted
+
             for index, candidate in enumerate(candidates):
-                context = contextvars.copy_context()
-                future = executor.submit(context.run, self._fetch_and_extract, candidate, fetcher, deadline)
-                futures[future] = (index, candidate)
                 operations.append(TraceOperation("search.fetch_started"))
-            for future in as_completed(futures):
-                index, candidate = futures[future]
+                operations.append(TraceOperation("search.frontier_fetch"))
                 try:
-                    fetch, extracted = future.result()
+                    fetch, extracted = self._fetch_and_extract(
+                        candidate, fetcher, deadline, local_run_budget=local_run_budget
+                    )
                     acquired.append((index, candidate, fetch, extracted))
                     metrics.urls_fetched += 1
                     metrics.bytes_downloaded += int(fetch.bytes_downloaded)
-                    metrics.extraction_successes += 1
-                    if extracted.visual_signals:
+                    if extracted is not None:
+                        metrics.extraction_successes += 1
+                    else:
+                        container_kind = str((candidate.get("metadata") or {}).get("container_kind") or "")
+                        container_entries = int((candidate.get("metadata") or {}).get("container_entries") or 0)
+                        if container_kind == "sitemap":
+                            metrics.sitemap_hits += container_entries
+                            operations.append(TraceOperation("search.sitemap_discovered", count=container_entries))
+                        elif container_kind == "feed":
+                            metrics.feed_hits += container_entries
+                            operations.append(TraceOperation("search.feed_discovered", count=container_entries))
+                    if extracted is not None and extracted.visual_signals:
                         metrics.visual_candidates += 1
-                        operations.append(
-                            TraceOperation("search.visual_candidate_detected", count=len(extracted.visual_signals))
-                        )
+                        operations.append(TraceOperation("search.visual_candidate_detected", count=len(extracted.visual_signals)))
                     operations.append(TraceOperation("search.fetch_completed", elapsed_ms=fetch.elapsed_ms))
                     operations.append(TraceOperation("search.extraction_completed"))
                 except FetchBlockedError as exc:
                     metrics.fetch_blocked += 1
+                    code = str(getattr(exc, "code", "fetch_blocked"))
+                    self.provider.frontier.mark_fetch_failure(
+                        str(candidate["canonical_url"]), code, blocked=True
+                    )
+                    if code == "robots_disallowed":
+                        metrics.robots_denied += 1
+                    elif code == "robots_unsupported_pattern":
+                        metrics.robots_unsupported_patterns += 1
                     operations.append(TraceOperation("search.fetch_blocked", status="blocked", code=exc.code))
+                except LocalBudgetExhausted as exc:
+                    self._sync_local_budget_metrics(local_run_budget, metrics)
+                    raise SearchBudgetError(str(exc)) from exc
                 except (FetchError, WebExtractionError) as exc:
                     metrics.fetch_failures += 1
+                    self.provider.frontier.mark_fetch_failure(str(candidate["canonical_url"]), getattr(exc, "code", "fetch_failed"))
                     if isinstance(exc, WebExtractionError):
                         metrics.extraction_failures += 1
                     operations.append(TraceOperation("search.fetch_failed", status="failed", code=getattr(exc, "code", "fetch_failed")))
+                finally:
+                    self._sync_local_budget_metrics(local_run_budget, metrics)
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(candidates), budget.max_concurrent_fetches)) as executor:
+                futures = {}
+                for index, candidate in enumerate(candidates):
+                    context = contextvars.copy_context()
+                    future = executor.submit(context.run, self._fetch_and_extract, candidate, fetcher, deadline)
+                    futures[future] = (index, candidate)
+                    operations.append(TraceOperation("search.fetch_started"))
+                for future in as_completed(futures):
+                    index, candidate = futures[future]
+                    try:
+                        fetch, extracted = future.result()
+                        acquired.append((index, candidate, fetch, extracted))
+                        metrics.urls_fetched += 1
+                        metrics.bytes_downloaded += int(fetch.bytes_downloaded)
+                        if extracted is not None:
+                            metrics.extraction_successes += 1
+                        if extracted is not None and extracted.visual_signals:
+                            metrics.visual_candidates += 1
+                            operations.append(
+                                TraceOperation("search.visual_candidate_detected", count=len(extracted.visual_signals))
+                            )
+                        operations.append(TraceOperation("search.fetch_completed", elapsed_ms=fetch.elapsed_ms))
+                        operations.append(TraceOperation("search.extraction_completed"))
+                    except FetchBlockedError as exc:
+                        metrics.fetch_blocked += 1
+                        operations.append(TraceOperation("search.fetch_blocked", status="blocked", code=exc.code))
+                    except (FetchError, WebExtractionError) as exc:
+                        metrics.fetch_failures += 1
+                        if isinstance(exc, WebExtractionError):
+                            metrics.extraction_failures += 1
+                        operations.append(TraceOperation("search.fetch_failed", status="failed", code=getattr(exc, "code", "fetch_failed")))
         passages: list[EvidencePassage] = []
         for _index, candidate, fetch, extracted in sorted(acquired, key=lambda item: item[0]):
             check_cancelled()
-            document, cache_hit = self.web_sources.persist(
-                canonical_url=str(candidate["canonical_url"]),
-                fetch=fetch,
-                extracted=extracted,
-                provider_metadata={
-                    "provider": candidate["provider"],
-                    "best_position": candidate["position"],
-                    "matched_query_count": len(candidate["queries"]),
-                },
-            )
+            if extracted is None:
+                continue
+            try:
+                document, cache_hit = self.web_sources.persist(
+                    canonical_url=str(candidate["canonical_url"]),
+                    fetch=fetch,
+                    extracted=extracted,
+                    provider_metadata={
+                        "provider": candidate["provider"],
+                        "best_position": candidate["position"],
+                        "matched_query_count": len(candidate["queries"]),
+                    },
+                )
+            except WebSourceStoreError as exc:
+                if getattr(self.provider, "name", "") == "local":
+                    self.provider.frontier.mark_fetch_failure(
+                        str(candidate["canonical_url"]), getattr(exc, "code", "search_cache_failed")
+                    )
+                raise
             if cache_hit:
                 metrics.cache_hits += 1
             if bool(document.get("is_staging")):
                 new_document_ids.append(str(document["id"]))
             observed_revisions.append((str(document["id"]), str(candidate["canonical_url"])))
+            if local_run_budget is not None:
+                local_run_budget.observed_urls.add(str(candidate["canonical_url"]))
             passages.extend(passages_for_web_document(document, extracted, provider=str(candidate["provider"])))
+            if getattr(self.provider, "name", "") == "local" and fetch.content_type in {"text/html", "application/xhtml+xml"}:
+                depth = int((candidate.get("metadata") or {}).get("depth") or 0)
+                self.provider.frontier.discover_links(
+                    source_url=fetch.final_url,
+                    html_body=fetch.body,
+                    source_title=extracted.title,
+                    source_depth=depth,
+                )
         return passages
 
     def _fetch_and_extract(
@@ -673,10 +870,77 @@ class SearchService:
         candidate: dict[str, Any],
         fetcher: SafeHttpFetcher,
         deadline: float,
-    ) -> tuple[FetchResponse, ExtractedWebPage]:
+        *,
+        local_run_budget: Any = None,
+    ) -> tuple[FetchResponse, ExtractedWebPage | None]:
         check_cancelled()
         self._ensure_time(deadline)
-        fetch = fetcher.fetch(str(candidate["canonical_url"]))
+        metadata = dict(candidate.get("metadata") or {})
+        discovery_kind = str(metadata.get("discovery_kind") or "")
+        if self.discovery_parser is not None:
+            from odysseus_desktop_backend.services.local_discovery import (
+                BudgetedMetadataFetcher,
+                DiscoveryBlockedError,
+                DiscoveryTransientError,
+            )
+
+            metadata_fetcher = BudgetedMetadataFetcher(fetcher, local_run_budget)
+            decision = self.discovery_parser.robots_allows(
+                str(candidate["canonical_url"]),
+                metadata_fetcher,
+                explicit_manual=discovery_kind == "manual_seed",
+                deadline=local_run_budget.deadline,
+            )
+            candidate.setdefault("metadata", {})["robots_sitemap_candidates"] = decision.sitemap_candidates
+            if not decision:
+                code = decision.code or "robots_disallowed"
+                if code in {"robots_disallowed", "robots_unsupported_pattern"}:
+                    raise DiscoveryBlockedError(
+                        "robots policy disallows automatic acquisition",
+                        code=code,
+                    )
+                raise DiscoveryTransientError("robots metadata acquisition failed", code=code)
+        is_container = bool(metadata.get("container"))
+        conditional_headers: dict[str, str] = {}
+        if metadata.get("etag"):
+            conditional_headers["If-None-Match"] = str(metadata["etag"])
+        if metadata.get("last_modified"):
+            conditional_headers["If-Modified-Since"] = str(metadata["last_modified"])
+        if is_container:
+            fetch = local_run_budget.fetch(
+                fetcher,
+                str(candidate["canonical_url"]),
+                request_kind="metadata",
+                allowed_content_types={"application/atom+xml", "application/rss+xml", "application/xml", "text/xml", "text/plain"},
+                headers=conditional_headers,
+            )
+            if discovery_kind == "sitemap":
+                rows = self.discovery_parser.parse_sitemap(
+                    fetch.body, source_url=fetch.final_url, deadline=local_run_budget.deadline
+                )
+                operations_name = "sitemap"
+            else:
+                rows = self.discovery_parser.parse_feed(
+                    fetch.body, source_url=fetch.final_url, deadline=local_run_budget.deadline
+                )
+                operations_name = "feed"
+            self.provider.frontier.mark_fetch_success(
+                str(candidate["canonical_url"]), fetch, hashlib.sha256(fetch.body).hexdigest()
+            )
+            candidate.setdefault("metadata", {})["container_entries"] = len(rows)
+            candidate["metadata"]["container_kind"] = operations_name
+            return fetch, None
+        if local_run_budget is not None:
+            fetch = local_run_budget.fetch(
+                fetcher,
+                str(candidate["canonical_url"]),
+                request_kind="page",
+                **({"headers": conditional_headers} if conditional_headers else {}),
+            )
+        elif conditional_headers:
+            fetch = fetcher.fetch(str(candidate["canonical_url"]), headers=conditional_headers)
+        else:
+            fetch = fetcher.fetch(str(candidate["canonical_url"]))
         check_cancelled()
         extracted = self.extractor.extract(
             fetch.body,
@@ -1073,12 +1337,15 @@ def prioritize_candidates(results: list[ProviderSearchResult], queries: list[str
                 "provider": result.provider,
                 "queries": [result.query],
                 "priority": priority,
+                "metadata": dict(getattr(result, "metadata", {}) or {}),
             }
         else:
             existing["priority"] = max(float(existing["priority"]), priority)
             existing["position"] = min(int(existing["position"]), result.position)
             if result.query not in existing["queries"]:
                 existing["queries"].append(result.query)
+            if getattr(result, "metadata", None):
+                existing["metadata"].update(result.metadata)
     return sorted(
         merged.values(),
         key=lambda item: (-float(item["priority"]), int(item["position"]), str(item["canonical_url"])),

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 
 
 def utc_ms() -> int:
@@ -225,6 +225,130 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_search_evidence_source
                 ON search_evidence(source_document_id, passage_id);
+
+            -- Search v1 keeps rag_chunks authoritative. This table only maps
+            -- stable chunk ids to integer FTS rowids; the contentless FTS
+            -- table stores terms, not another retrievable evidence body.
+            CREATE TABLE IF NOT EXISTS local_fts_rows (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                chunk_id TEXT NOT NULL UNIQUE,
+                document_id TEXT NOT NULL,
+                FOREIGN KEY (chunk_id) REFERENCES rag_chunks(id) ON DELETE CASCADE,
+                FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_local_fts_rows_document
+                ON local_fts_rows(document_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS local_fts USING fts5(
+                title,
+                headings,
+                body,
+                content='',
+                contentless_delete=1,
+                tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
+            );
+
+            CREATE TABLE IF NOT EXISTS crawl_frontier (
+                id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                canonical_url TEXT NOT NULL UNIQUE,
+                domain TEXT NOT NULL,
+                discovered_from_url TEXT NOT NULL DEFAULT '',
+                anchor_text TEXT NOT NULL DEFAULT '',
+                surrounding_text TEXT NOT NULL DEFAULT '',
+                source_title TEXT NOT NULL DEFAULT '',
+                discovery_kind TEXT NOT NULL CHECK (
+                    discovery_kind IN ('manual_seed', 'source_pack', 'hyperlink', 'sitemap', 'rss', 'atom', 'cached')
+                ),
+                depth INTEGER NOT NULL DEFAULT 0,
+                priority REAL NOT NULL DEFAULT 0,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_fetch_at INTEGER,
+                etag TEXT NOT NULL DEFAULT '',
+                last_modified TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'unfetched',
+                failure_code TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at INTEGER,
+                next_retry_at INTEGER,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_crawl_frontier_status_priority
+                ON crawl_frontier(status, priority DESC, depth, canonical_url);
+
+            CREATE INDEX IF NOT EXISTS idx_crawl_frontier_domain
+                ON crawl_frontier(domain, status);
+
+            CREATE TABLE IF NOT EXISTS crawl_discoveries (
+                id TEXT PRIMARY KEY,
+                frontier_id TEXT NOT NULL,
+                discovered_from_url TEXT NOT NULL DEFAULT '',
+                anchor_text TEXT NOT NULL DEFAULT '',
+                surrounding_text TEXT NOT NULL DEFAULT '',
+                source_title TEXT NOT NULL DEFAULT '',
+                discovery_kind TEXT NOT NULL,
+                depth INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (frontier_id) REFERENCES crawl_frontier(id) ON DELETE CASCADE,
+                UNIQUE(frontier_id, discovered_from_url, discovery_kind, anchor_text)
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS frontier_fts USING fts5(
+                frontier_id UNINDEXED,
+                canonical_url,
+                anchor_text,
+                surrounding_text,
+                source_title,
+                tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
+            );
+
+            CREATE TABLE IF NOT EXISTS source_packs (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                preferred_domains_json TEXT NOT NULL DEFAULT '[]',
+                notes TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS discovery_feeds (
+                id TEXT PRIMARY KEY,
+                canonical_url TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL CHECK (kind IN ('rss', 'atom')),
+                title TEXT NOT NULL DEFAULT '',
+                last_checked_at INTEGER,
+                etag TEXT NOT NULL DEFAULT '',
+                last_modified TEXT NOT NULL DEFAULT '',
+                failure_code TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS discovery_feed_entries (
+                id TEXT PRIMARY KEY,
+                feed_id TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                published_at TEXT NOT NULL DEFAULT '',
+                updated_at_text TEXT NOT NULL DEFAULT '',
+                observed_at INTEGER NOT NULL,
+                FOREIGN KEY (feed_id) REFERENCES discovery_feeds(id) ON DELETE CASCADE,
+                UNIQUE(feed_id, canonical_url)
+            );
+
+            CREATE TABLE IF NOT EXISTS robots_cache (
+                domain TEXT PRIMARY KEY,
+                robots_url TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                fetched_at INTEGER NOT NULL,
+                allowed INTEGER NOT NULL DEFAULT 0,
+                failure_code TEXT NOT NULL DEFAULT ''
+            );
 
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 content_hash TEXT NOT NULL,
@@ -569,6 +693,9 @@ class Database:
         self.ensure_column("documents", "http_last_modified", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "acquisition_metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self.ensure_column("documents", "web_revision_current", "INTEGER NOT NULL DEFAULT 1")
+        self.ensure_column("crawl_frontier", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("crawl_frontier", "last_attempt_at", "INTEGER")
+        self.ensure_column("crawl_frontier", "next_retry_at", "INTEGER")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_web_revision "
             "ON documents(canonical_url, web_revision_current, fetched_at DESC)"
@@ -665,6 +792,13 @@ class Database:
         self.set_setting_default("search_max_model_calls", "5")
         self.set_setting_default("search_second_round_enabled", "true")
         self.set_setting_default("search_timeout_seconds", "90")
+        self.set_setting_default("search_mode", "external")
+        self.set_setting_default("search_local_max_new_urls", "4")
+        self.set_setting_default("search_local_max_total_bytes", str(4 * 1024 * 1024))
+        self.set_setting_default("search_local_max_depth", "2")
+        self.set_setting_default("search_local_max_urls_per_domain", "3")
+        self.set_setting_default("search_local_max_sitemap_entries", "100")
+        self.set_setting_default("search_local_max_feed_entries", "50")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
         self.conn.commit()
 
