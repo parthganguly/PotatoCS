@@ -82,6 +82,9 @@ export function OperationTrace({
                 ["Deterministic answer", yesNo(trace.pipeline.deterministic_visual_answer)],
                 ["Answer style", valueOrMissing(trace.pipeline.answer_style)],
                 ["Thinking mode", valueOrMissing(trace.pipeline.thinking_mode)],
+                ["Web Search", yesNo(trace.pipeline.search_enabled)],
+                ["Search rounds", numberOrMissing(trace.pipeline.search_rounds)],
+                ["Second round", yesNo(trace.pipeline.second_round_used)],
                 ["Done reason", valueOrMissing(trace.pipeline.done_reason)]
               ]}
               title="Pipeline"
@@ -108,6 +111,49 @@ export function OperationTrace({
               rows={[["Warnings", trace.warnings.length ? trace.warnings.join(" · ") : MISSING_VALUE]]}
               title="Warnings"
             />
+            {trace.search && (
+              <>
+                <TraceSection
+                  rows={[
+                    ["Provider", valueOrMissing(trace.search.provider)],
+                    ["Queries", metricNumber(trace.search.metrics.queries_issued)],
+                    ["Results", metricNumber(trace.search.metrics.results_returned)],
+                    ["Results deduped", metricNumber(trace.search.metrics.results_deduped)],
+                    ["Fetch attempts", metricNumber(trace.search.metrics.fetch_attempts)],
+                    ["Fetched", metricNumber(trace.search.metrics.urls_fetched)],
+                    ["Fetch failures", metricNumber(trace.search.metrics.fetch_failures)],
+                    ["Fetches blocked", metricNumber(trace.search.metrics.fetch_blocked)],
+                    ["Bytes", metricBytes(trace.search.metrics.bytes_downloaded)],
+                    ["Cache hits", metricNumber(trace.search.metrics.cache_hits)],
+                    ["Extraction failures", metricNumber(trace.search.metrics.extraction_failures)],
+                    ["Passages", metricNumber(trace.search.metrics.passages_considered)],
+                    ["Dossier tokens (est.)", metricNumber(trace.search.metrics.dossier_token_estimate)],
+                    ["Verified quotes", metricNumber(trace.search.metrics.verified_evidence)],
+                    ["Rejected quotes", metricNumber(trace.search.metrics.rejected_evidence)],
+                    ["Evidence fallbacks", metricNumber(trace.search.metrics.evidence_selection_fallbacks)],
+                    ["Degraded", metricBoolean(trace.search.metrics.degraded)],
+                    ["Visual candidates", metricNumber(trace.search.metrics.visual_candidates)],
+                    ["Model calls", metricNumber(trace.search.metrics.model_calls)],
+                    ["First usable evidence", metricTiming(trace.search.metrics.time_to_first_usable_evidence_ms)],
+                    ["Search wall time", metricTiming(trace.search.metrics.wall_time_ms)]
+                  ]}
+                  title="Search"
+                />
+                <TraceSection
+                  rows={[["Operations", trace.search.operations.map((item) => {
+                    const detail = [
+                      item.count === null || item.count === undefined ? "" : `count=${item.count}`,
+                      item.elapsed_ms === null || item.elapsed_ms === undefined ? "" : formatTiming(item.elapsed_ms),
+                      item.code || ""
+                    ].filter(Boolean).join(", ");
+                    const status = item.status === "completed" ? "" : item.status;
+                    const suffix = [status, detail].filter(Boolean).join("; ");
+                    return `${item.name}${suffix ? ` (${suffix})` : ""}`;
+                  }).join(" · ") || MISSING_VALUE]]}
+                  title="Search trace"
+                />
+              </>
+            )}
             {trace.model_trace.thinking_returned && (
               <section className="sm:col-span-2">
                 <h4 className="mb-1 font-semibold text-ink">Model trace</h4>
@@ -178,4 +224,23 @@ function yesNo(value: boolean | undefined): string {
 
 function listOrMissing(values: Array<string | number>): string {
   return values.length ? values.join(", ") : MISSING_VALUE;
+}
+
+function metricNumber(value: number | boolean | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : MISSING_VALUE;
+}
+
+function metricBytes(value: number | boolean | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return MISSING_VALUE;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function metricTiming(value: number | boolean | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? formatTiming(value) : MISSING_VALUE;
+}
+
+function metricBoolean(value: number | boolean | null | undefined): string {
+  return typeof value === "boolean" ? (value ? "Yes" : "No") : MISSING_VALUE;
 }

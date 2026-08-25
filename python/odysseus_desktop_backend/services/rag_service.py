@@ -200,6 +200,7 @@ class RAGService:
         limit: int = 5,
         metadata_filter: dict[str, Any] | None = None,
         document_ids: list[str] | None = None,
+        include_search_cache: bool = False,
     ) -> dict[str, Any]:
         text = (query or "").strip()
         started = time.perf_counter()
@@ -214,12 +215,14 @@ class RAGService:
         query_embedding = self.embeddings.embed_query(text)
         candidate_limit = max(limit, RERANK_MIN_CANDIDATES, limit * 8)
         effective_filter = self._source_scoped_filter(metadata_filter, document_ids)
-        candidates = self.vector_store.similarity_search(
-            query_embedding.vector,
-            limit=candidate_limit,
-            embedding_model=query_embedding.model,
-            metadata_filter=effective_filter,
-        )
+        vector_options: dict[str, Any] = {
+            "limit": candidate_limit,
+            "embedding_model": query_embedding.model,
+            "metadata_filter": effective_filter,
+        }
+        if include_search_cache:
+            vector_options["include_search_cache"] = True
+        candidates = self.vector_store.similarity_search(query_embedding.vector, **vector_options)
         ocr_candidates, ocr_diagnostics = self._ocr_lexical_results(
             text,
             metadata_filter=effective_filter,
@@ -281,6 +284,7 @@ class RAGService:
             FROM documents
             WHERE is_deleted = 0
               AND COALESCE(is_staging, 0) = 0
+              AND COALESCE(source_origin, 'local') NOT IN ('web', 'cached_web')
               AND index_status = 'indexed'
             """,
             (current_key,),

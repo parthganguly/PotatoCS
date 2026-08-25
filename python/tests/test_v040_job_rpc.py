@@ -37,6 +37,9 @@ SNAPSHOT_KEYS = {
     "scope",
     "document_id",
     "artifact_id",
+    "session_id",
+    "message_id",
+    "run_id",
     "created_at",
     "started_at",
     "finished_at",
@@ -98,7 +101,7 @@ def wait_rpc_terminal(app: SidecarApp, job_id: str, timeout: float = 5.0) -> dic
 def assert_snapshot_schema(snapshot: dict[str, Any]) -> None:
     assert set(snapshot.keys()) == SNAPSHOT_KEYS
     assert isinstance(snapshot["job_id"], str)
-    assert snapshot["kind"] in {"import", "ocr"}
+    assert snapshot["kind"] in {"import", "ocr", "search"}
     assert snapshot["message_code"] is not None
     json.dumps(snapshot)  # payload must be JSON-serializable as-is
 
@@ -167,6 +170,24 @@ def test_rpc_param_validation(app: SidecarApp):
         app.dispatch("jobs.get", {"job_id": "stale-id"})
 
 
+def test_search_job_is_bounded_private_and_reports_missing_provider_config(
+    app: SidecarApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ODYSSEUS_BRAVE_SEARCH_API_KEY", raising=False)
+    private_query = f"public research question {PRIVATE_SENTINEL}"
+    submitted = app.dispatch(
+        "jobs.submit_search",
+        {"query": private_query, "model": "fixture-model", "second_round_enabled": False},
+    )
+    assert submitted["session"]["id"] == submitted["job"]["session_id"]
+    assert_snapshot_schema(submitted["job"])
+    final = wait_rpc_terminal(app, submitted["job"]["job_id"])
+    assert final["state"] == "failed"
+    assert final["message_code"] == "search_provider_unconfigured"
+    assert PRIVATE_SENTINEL not in json.dumps(submitted["job"])
+    assert PRIVATE_SENTINEL not in json.dumps(final)
+
+
 def test_rpc_job_payloads_and_progress_never_leak_private_input(app: SidecarApp):
     """Hostile path submitted; RPC payloads and stderr progress stay clean."""
     gate = GatedWork()
@@ -210,6 +231,7 @@ def test_rpc_jobs_submit_is_not_on_host_replay_allowlist():
     end = lib_rs.index("}", lib_rs.index("matches!", start))
     allowlist = lib_rs[start:end]
     assert "jobs.submit_import" not in allowlist
+    assert "jobs.submit_search" not in allowlist
     assert "jobs.cancel" not in allowlist
 
 

@@ -1487,6 +1487,7 @@ mod tests {
         assert!(can_restart_and_retry("jobs.get"));
         assert!(can_restart_and_retry("jobs.list"));
         assert!(!can_restart_and_retry("jobs.submit_import"));
+        assert!(!can_restart_and_retry("jobs.submit_search"));
         assert!(!can_restart_and_retry("jobs.cancel"));
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
             .expect("lifecycle log");

@@ -816,6 +816,12 @@ class DocumentService:
         item["is_internal"] = bool(item.get("is_internal", 0))
         item["is_staging"] = bool(item.get("is_staging", 0))
         item["scope"] = str(item.get("scope") or "library")
+        item["source_origin"] = str(item.get("source_origin") or "local")
+        item["web_revision_current"] = bool(item.get("web_revision_current", 1))
+        try:
+            item["acquisition_metadata"] = json.loads(item.get("acquisition_metadata_json") or "{}")
+        except (TypeError, ValueError):
+            item["acquisition_metadata"] = {}
         return item
 
 

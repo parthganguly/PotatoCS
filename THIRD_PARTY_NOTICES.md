@@ -22,6 +22,9 @@ The MVP also uses these major third-party components:
 - lucide-react icons, ISC license.
 - NumPy, BSD-style license.
 - pypdf, BSD-style license.
+- readability-lxml, Apache License 2.0 (web main-content extraction).
+- lxml and cssselect, BSD-3-Clause licenses (HTML parsing used by readability-lxml).
+- chardet, 0BSD license (character encoding detection used by readability-lxml).
 - ReportLab, BSD-style license.
 - Pillow, HPND-style license.
 - arboard Rust crate, MIT or Apache-2.0 license.

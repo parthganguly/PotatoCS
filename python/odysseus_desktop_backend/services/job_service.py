@@ -49,6 +49,12 @@ JOB_MESSAGE_CODES = {
     "ocr_no_text",
     "ocr_page_too_large",
     "ocr_too_many_pages",
+    "search_provider_unconfigured",
+    "search_provider_failed",
+    "search_no_evidence",
+    "search_budget_exhausted",
+    "model_unavailable",
+    "search_failed",
 }
 
 
@@ -68,6 +74,12 @@ class JobRecord:
     scope: str = "library"
     document_id: str = ""
     artifact_id: str = ""
+    session_id: str = ""
+    message_id: str = ""
+    run_id: str = ""
+    query: str = ""  # private input; never serialized into snapshots or logs
+    model: str = ""  # private input; snapshots expose no model routing before completion
+    second_round_enabled: bool = True
     state: str = "queued"
     message_code: str = ""
     created_at: int = 0
@@ -156,6 +168,41 @@ class JobService:
             self._condition.notify_all()
             snapshot = self._snapshot_locked(job)
         logger.info("jobs submitted kind=ocr count=1")
+        return snapshot
+
+    def submit_search(
+        self,
+        query: str,
+        *,
+        session_id: str,
+        model: str,
+        second_round_enabled: bool = True,
+    ) -> dict[str, Any]:
+        clean_query = " ".join(str(query or "").split()).strip()[:4000]
+        clean_session_id = str(session_id or "").strip()
+        clean_model = str(model or "").strip()
+        if not clean_query:
+            raise ValueError("query is required")
+        if not clean_session_id:
+            raise ValueError("session_id is required")
+        if not clean_model:
+            raise ValueError("model is required")
+        with self._condition:
+            self._require_capacity_locked(1)
+            job = JobRecord(
+                id=str(uuid.uuid4()),
+                kind="search",
+                scope="chat",
+                session_id=clean_session_id,
+                query=clean_query,
+                model=clean_model,
+                second_round_enabled=bool(second_round_enabled),
+                created_at=utc_ms(),
+            )
+            self._register_locked(job)
+            self._condition.notify_all()
+            snapshot = self._snapshot_locked(job)
+        logger.info("jobs submitted kind=search count=1")
         return snapshot
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -364,6 +411,9 @@ class JobService:
             "scope": job.scope,
             "document_id": job.document_id,
             "artifact_id": job.artifact_id,
+            "session_id": job.session_id,
+            "message_id": job.message_id,
+            "run_id": job.run_id,
             "created_at": job.created_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
@@ -393,6 +443,8 @@ class DocumentJobExecutor:
             self._run_import(job, on_running)
         elif job.kind == "ocr":
             self._run_ocr(job, on_running)
+        elif job.kind == "search":
+            self._run_search(job, on_running)
         else:
             raise JobFailure("job_failed")
 
@@ -478,6 +530,48 @@ class DocumentJobExecutor:
         except OCRGuardrailError as exc:
             raise JobFailure(exc.code) from exc
 
+    def _run_search(self, job: JobRecord, on_running: Callable[[], None]) -> None:
+        from odysseus_desktop_backend.cancellation import check_cancelled
+        from odysseus_desktop_backend.services.model_service import ModelServiceError
+        from odysseus_desktop_backend.services.search_provider import (
+            SearchProviderError,
+            configured_search_provider,
+        )
+        from odysseus_desktop_backend.services.search_service import (
+            SearchService,
+            SearchServiceError,
+        )
+
+        check_cancelled()
+        try:
+            provider = configured_search_provider()
+        except SearchProviderError as exc:
+            raise JobFailure(exc.code) from exc
+        on_running()
+        search = SearchService(
+            self.db,
+            self.services.sessions,
+            self.services.models,
+            self.services.documents,
+            self.services.rag,
+            provider,
+        )
+        try:
+            result = search.run(
+                question=job.query,
+                session_id=job.session_id,
+                model=job.model,
+                second_round_enabled=job.second_round_enabled,
+            )
+        except SearchProviderError as exc:
+            raise JobFailure(exc.code) from exc
+        except SearchServiceError as exc:
+            raise JobFailure(exc.code) from exc
+        except ModelServiceError as exc:
+            raise JobFailure("model_unavailable") from exc
+        job.message_id = str(result.get("assistant_message_id") or "")
+        job.run_id = str(result.get("run_id") or "")
+
     def _build_services(self) -> Any:
         from types import SimpleNamespace
 
@@ -490,6 +584,7 @@ class DocumentJobExecutor:
             OCRService,
         )
         from odysseus_desktop_backend.services.rag_service import RAGService
+        from odysseus_desktop_backend.services.session_service import SessionService
         from odysseus_desktop_backend.services.source_service import SourceService
         from odysseus_desktop_backend.services.vector_store import SQLiteNumPyVectorStore
 
@@ -500,7 +595,9 @@ class DocumentJobExecutor:
         ocr = OCRService(documents, rag)
         # Florence is deliberately not wired into the job worker (its thread
         # safety is unproven); the Ollama VLM text fallback is preserved.
-        ocr.set_vlm_text_extractor(LocalVLMTextExtractor(ModelService(self.db), None))
+        models = ModelService(self.db)
+        sessions = SessionService(self.db)
+        ocr.set_vlm_text_extractor(LocalVLMTextExtractor(models, None))
         artifacts = ArtifactService(self.db, documents, rag)
         sources = SourceService(documents, artifacts, rag, ocr=ocr)
         return SimpleNamespace(
@@ -510,4 +607,6 @@ class DocumentJobExecutor:
             ocr=ocr,
             artifacts=artifacts,
             sources=sources,
+            models=models,
+            sessions=sessions,
         )

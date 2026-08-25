@@ -453,7 +453,7 @@ def test_v020_schema_is_additive_and_stamped(tmp_path: Path):
             "multimodal_eval_runs",
             "multimodal_eval_case_results",
         }.issubset(tables)
-        assert db.conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()["value"] == "10"
+        assert db.conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()["value"] == "11"
         document_columns = {row["name"] for row in db.conn.execute("PRAGMA table_info(documents)").fetchall()}
         assert {"is_internal", "source_artifact_id", "generated_source_label", "scope", "promoted_at"}.issubset(document_columns)
         artifact_columns = {row["name"] for row in db.conn.execute("PRAGMA table_info(artifacts)").fetchall()}

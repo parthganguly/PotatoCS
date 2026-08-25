@@ -58,6 +58,7 @@ import {
   EvalSuite,
   ImageEvalRun,
   ImageEvalSuite,
+  JobRecord,
   LegacyImportReport,
   Message,
   ModelCapability,
@@ -123,6 +124,10 @@ import { AppSidebar } from "./features/shell/AppSidebar";
 import { backendBannerState, isBackendDegradedEvent } from "./features/shell/backendStatus";
 import { SourcesPage } from "./features/sources/SourcesPage";
 import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisionDiagnostics";
+import { SearchEvidenceCard } from "./features/search/SearchEvidenceCard";
+import { SearchJobStatus } from "./features/search/SearchJobStatus";
+import { useSearchJob } from "./features/search/useSearchJob";
+import { isActiveSearchState, searchFailureCopy, shouldShowChatProgress } from "./features/search/searchModel";
 
 type LoadState = "idle" | "loading" | "error";
 type ActiveView = "chat" | "sources" | "diagnostics";
@@ -191,6 +196,7 @@ function App() {
   const [documentEvidence, setDocumentEvidence] = useState<DocumentEvidenceDiagnostic[]>([]);
   const [grounding, setGrounding] = useState<RAGGroundingReport | null>(null);
   const [useRag, setUseRag] = useState(false);
+  const [useWebSearch, setUseWebSearch] = useState(false);
   const [verifyRag, setVerifyRag] = useState(false);
   const [answerStyle, setAnswerStyle] = useState<AnswerStyle>("precise");
   const [ragPreset, setRagPreset] = useState<RagPreset>("standard");
@@ -254,6 +260,19 @@ function App() {
       );
       if (importedSource) appendPendingSources([importedSource]);
     }
+  });
+  const searchJob = useSearchJob(async (job) => {
+    setPendingUserContent("");
+    setBusy(false);
+    if (job.session_id) {
+      setSelectedSessionId(job.session_id);
+      await loadMessages(job.session_id);
+      await loadConversationContext(job.session_id);
+    }
+    setSessions(await rpc<Session[]>("sessions.list"));
+    await refreshSources();
+    if (job.state === "failed") setError(searchFailureCopy(job.message_code));
+    if (job.state === "cancelled") setError("Web Search was cancelled.");
   });
 
   const selectedSession = useMemo(
@@ -1717,6 +1736,41 @@ function App() {
       return;
     }
     const activeConversationModel = modelChoices.length > 0 ? installedModelTag(requestedModel, modelChoices) : requestedModel;
+    if (useWebSearch) {
+      if (!message) {
+        setError("Enter a question for Web Search.");
+        return;
+      }
+      if (attachedSources.length > 0) {
+        setError("Send attachments in normal chat. Web Search already searches indexed local Sources alongside the public web.");
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setDraft("");
+      setPendingUserContent(message);
+      setLastChatAnalysis(null);
+      setRetrievedChunks([]);
+      setRetrievedSnippets([]);
+      setDocumentEvidence([]);
+      setGrounding(null);
+      try {
+        const submitted = await searchJob.submit({
+          query: message,
+          sessionId: selectedSessionId ?? undefined,
+          model: activeConversationModel,
+          secondRoundEnabled: true
+        });
+        setSelectedSessionId(submitted.session.id);
+        setSessions(await rpc<Session[]>("sessions.list"));
+      } catch {
+        setDraft(message);
+        setPendingUserContent("");
+        setBusy(false);
+        setError("Web Search could not be started. Check the backend and try again.");
+      }
+      return;
+    }
     if (
       normalizeVisionBackend(visionBackendDraft || settings.vision_backend) === "ollama" &&
       attachedArtifacts.length > 0 &&
@@ -1868,7 +1922,10 @@ function App() {
             answerStyle={answerStyle}
             ragPreset={ragPreset}
             useRag={useRag}
+            useWebSearch={useWebSearch}
             verifyRag={verifyRag}
+            searchJob={searchJob.job}
+            onCancelSearch={() => void searchJob.cancel()}
             onDeleteSession={deleteSession}
             onRetry={bootstrap}
             onSend={sendMessage}
@@ -1894,6 +1951,10 @@ function App() {
               }
             }}
             onSetUseRag={setUseRag}
+            onSetWebSearch={(value) => {
+              setUseWebSearch(value);
+              if (value) setUseRag(false);
+            }}
             onSetVerifyRag={setVerifyRag}
           />
         ) : activeView === "sources" ? (
@@ -2053,10 +2114,13 @@ function ChatWorkspace(props: {
   answerStyle: AnswerStyle;
   ragPreset: RagPreset;
   useRag: boolean;
+  useWebSearch: boolean;
   verifyRag: boolean;
+  searchJob: JobRecord | null;
   onAddExistingSource: (source: SourceSummary) => void;
   onAttachFiles: () => void;
   onCaptureScreen: () => void;
+  onCancelSearch: () => void;
   onDeleteSession: (sessionId: string) => void;
   onPasteImage: () => void;
   onPromoteSource: (source: SourceSummary, index: boolean) => void;
@@ -2071,6 +2135,7 @@ function ChatWorkspace(props: {
   onSetSelectedRagDocumentId: (value: string) => void;
   onSetSessionModel: (value: string) => void;
   onSetUseRag: (value: boolean) => void;
+  onSetWebSearch: (value: boolean) => void;
   onSetVerifyRag: (value: boolean) => void;
   onSetVisionModel: (value: string) => void;
 }) {
@@ -2097,6 +2162,7 @@ function ChatWorkspace(props: {
         settings={props.settings}
         showVision={showVision}
         useRag={props.useRag}
+        useWebSearch={props.useWebSearch}
         verifyRag={props.verifyRag}
         visionModel={props.visionModel}
         visionModels={props.visionModels}
@@ -2106,6 +2172,7 @@ function ChatWorkspace(props: {
         onSetSelectedRagDocumentId={props.onSetSelectedRagDocumentId}
         onSetSessionModel={props.onSetSessionModel}
         onSetUseRag={props.onSetUseRag}
+        onSetWebSearch={props.onSetWebSearch}
         onSetVerifyRag={props.onSetVerifyRag}
       />
 
@@ -2150,6 +2217,9 @@ function ChatWorkspace(props: {
                         trace={message.metadata.operation_trace}
                       />
                     )}
+                    {message.role === "assistant" && Array.isArray(message.metadata?.search_evidence) && (
+                      <SearchEvidenceCard evidence={message.metadata.search_evidence} />
+                    )}
                     {message.id === latestAssistantMessageId && props.retrievedChunks.length > 0 && (
                       <RetrievedSources
                         chunks={props.retrievedChunks}
@@ -2173,7 +2243,10 @@ function ChatWorkspace(props: {
                     </div>
                   </div>
                 )}
-                {props.busy && (
+                {props.searchJob && isActiveSearchState(props.searchJob.state) && (
+                  <SearchJobStatus job={props.searchJob} onCancel={props.onCancelSearch} />
+                )}
+                {shouldShowChatProgress(props.busy, props.searchJob?.state) && (
                   <ChatProgressBar
                     event={props.progressEvent}
                     fallbackLabel={props.progressFallbackLabel}
@@ -2218,6 +2291,8 @@ function ChatWorkspace(props: {
                     ? "Ask about what's in conversation"
                     : props.useRag
                       ? "Ask with Sources"
+                      : props.useWebSearch
+                        ? "Research the web and local Sources"
                       : "Message"
               }
               onKeyDown={(event) => {

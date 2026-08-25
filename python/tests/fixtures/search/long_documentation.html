@@ -1,0 +1,11 @@
+<!doctype html>
+<html><head><title>Frost API Reference</title></head><body><article>
+<h1>Frost API Reference</h1>
+<h2>Authentication</h2>
+<p>Clients send an access token in the Authorization header. Tokens expire after 30 minutes.</p>
+<h2>Retry behavior</h2>
+<p>A client may retry HTTP 429 responses after the number of seconds in Retry-After.</p>
+<pre><code>if response.status == 429:
+    wait(response.headers["Retry-After"])</code></pre>
+<p>Do not retry authentication failures. A 401 response requires a new access token.</p>
+</article></body></html>

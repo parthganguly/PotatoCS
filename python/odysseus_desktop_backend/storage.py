@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def utc_ms() -> int:
@@ -185,6 +185,46 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_rag_chunks_search
                 ON rag_chunks(is_deleted, embedding_model, document_id);
+
+            CREATE TABLE IF NOT EXISTS search_runs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT '',
+                user_message_id TEXT NOT NULL DEFAULT '',
+                assistant_message_id TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                executed_queries_json TEXT NOT NULL DEFAULT '[]',
+                round_count INTEGER NOT NULL DEFAULT 0,
+                budgets_json TEXT NOT NULL DEFAULT '{}',
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                error_code TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_search_runs_session_time
+                ON search_runs(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS search_evidence (
+                id TEXT PRIMARY KEY,
+                search_run_id TEXT NOT NULL,
+                source_document_id TEXT NOT NULL,
+                passage_id TEXT NOT NULL,
+                exact_quote TEXT NOT NULL,
+                quote_start INTEGER NOT NULL,
+                quote_end INTEGER NOT NULL,
+                provenance_kind TEXT NOT NULL,
+                verification_status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_document_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_search_evidence_run
+                ON search_evidence(search_run_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_search_evidence_source
+                ON search_evidence(source_document_id, passage_id);
 
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 content_hash TEXT NOT NULL,
@@ -520,6 +560,19 @@ class Database:
         # the mark_* helpers legitimately overwrite status fields mid-job
         # (V04_ESSENTIAL_SEMANTICS.md §B).
         self.ensure_column("documents", "is_staging", "INTEGER NOT NULL DEFAULT 0")
+        self.ensure_column("documents", "source_origin", "TEXT NOT NULL DEFAULT 'local'")
+        self.ensure_column("documents", "canonical_url", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "final_url", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "fetched_at", "INTEGER")
+        self.ensure_column("documents", "http_content_type", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "http_etag", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "http_last_modified", "TEXT NOT NULL DEFAULT ''")
+        self.ensure_column("documents", "acquisition_metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        self.ensure_column("documents", "web_revision_current", "INTEGER NOT NULL DEFAULT 1")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_web_revision "
+            "ON documents(canonical_url, web_revision_current, fetched_at DESC)"
+        )
         self.ensure_column("ocr_pages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self.ensure_column("artifacts", "scope", "TEXT NOT NULL DEFAULT 'library'")
         self.ensure_column("artifacts", "promoted_at", "INTEGER")
@@ -601,6 +654,17 @@ class Database:
         self.set_setting_default("embedding_backend", "auto")
         self.set_setting_default("embedding_model", "nomic-embed-text")
         self.set_setting_default("vision_backend", "automatic")
+        self.set_setting_default("search_max_queries", "4")
+        self.set_setting_default("search_results_per_query", "5")
+        self.set_setting_default("search_max_fetches", "8")
+        self.set_setting_default("search_max_response_bytes", str(2 * 1024 * 1024))
+        self.set_setting_default("search_max_concurrent_fetches", "3")
+        self.set_setting_default("search_max_passages", "12")
+        self.set_setting_default("search_max_dossier_chars", "24000")
+        self.set_setting_default("search_max_rounds", "2")
+        self.set_setting_default("search_max_model_calls", "5")
+        self.set_setting_default("search_second_round_enabled", "true")
+        self.set_setting_default("search_timeout_seconds", "90")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
         self.conn.commit()
 
