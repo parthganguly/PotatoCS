@@ -6,6 +6,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return -join ($algorithm.ComputeHash($stream) | ForEach-Object { $_.ToString("x2") })
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $SourceModelDir) {
     $SourceModelDir = Join-Path $repoRoot "models\florence2-base-ft"
@@ -67,7 +82,7 @@ foreach ($name in $required) {
     if ($item.Length -ne [int64]$entry.size_bytes) {
         throw "Florence-2 source size mismatch for $name. Expected $($entry.size_bytes), got $($item.Length)."
     }
-    $hash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-Sha256Hex -Path $sourcePath
     if ($hash -ne ([string]$entry.sha256).ToLowerInvariant()) {
         throw "Florence-2 source checksum mismatch for $name."
     }
