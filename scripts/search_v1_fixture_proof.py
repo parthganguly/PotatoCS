@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from odysseus_desktop_backend.services.rag_service import RAGService
 from odysseus_desktop_backend.services.search_service import SearchNoEvidenceError, SearchService
 from odysseus_desktop_backend.services.session_service import SessionService
 from odysseus_desktop_backend.services.vector_store import SQLiteNumPyVectorStore
+from odysseus_desktop_backend.services.web_extraction import ExtractedWebPage, WebExtractionError
 from odysseus_desktop_backend.services.web_fetcher import FetchResponse
 from odysseus_desktop_backend.storage import Database
 
@@ -82,6 +84,33 @@ class ProofFetcher:
             bytes_downloaded=len(body),
             redirects=0,
             elapsed_ms=1,
+        )
+
+
+class ProofExtractor:
+    """Deterministic fixture extractor; L8 can fail one navigation URL by design."""
+
+    def __init__(self, *, fail_urls: set[str] | None = None):
+        self.fail_urls = set(fail_urls or ())
+
+    def extract(self, body: bytes, *, content_type: str, final_url: str) -> ExtractedWebPage:
+        if final_url in self.fail_urls:
+            raise WebExtractionError("deliberate L8 navigation extraction failure")
+        decoded = body.decode("utf-8", errors="replace")
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", decoded, flags=re.IGNORECASE | re.DOTALL)
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else final_url
+        without_scripts = re.sub(
+            r"<(script|style)\b[^>]*>.*?</\1>", " ", decoded, flags=re.IGNORECASE | re.DOTALL
+        )
+        text = re.sub(r"<[^>]+>", " ", without_scripts)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            raise WebExtractionError("fixture extraction produced no text")
+        return ExtractedWebPage(
+            title=title,
+            text=text,
+            metadata={"canonical_url": final_url},
+            provenance_kind="exact_text",
         )
 
 
@@ -147,6 +176,11 @@ def result_row(
         "fetches": len(page_fetches),
         "network_requests_including_robots": len(fetcher.urls),
         "cache_hits": int(metrics.get("cache_hits") or 0),
+        "document_extraction_failures": int(metrics.get("extraction_failures") or 0),
+        "links_discovered": int(metrics.get("links_discovered") or 0),
+        "links_discovered_after_extraction_failure": int(
+            metrics.get("links_discovered_after_extraction_failure") or 0
+        ),
         "model_calls": model.calls,
         "verified_evidence": len((result or {}).get("citations") or []),
         "final_status": final_status,
@@ -163,7 +197,7 @@ def run_scenario(name: str) -> tuple[dict[str, Any], dict[str, Any]]:
                 db.conn.execute("PRAGMA page_count").fetchone()[0]
             )
             db.set_setting("search_mode", "local")
-            db.set_setting("search_local_max_new_urls", "1")
+            db.set_setting("search_local_max_new_urls", "2" if name == "L8" else "1")
             sessions = SessionService(db)
             documents = DocumentService(db)
             embeddings = EmbeddingService(db, provider=LocalHashEmbeddingProvider())
@@ -229,13 +263,41 @@ def run_scenario(name: str) -> tuple[dict[str, Any], dict[str, Any]]:
                     score=0.98, page_start=chunk["page_start"], page_end=chunk["page_end"], metadata=chunk["metadata"],
                 )])
                 discovery_path = "mechanism isolation: stipulated FTS miss -> dense semantic rescue -> fused evidence"
+            elif name == "L8":
+                question = "What is the default fixture checkpoint threshold?"
+                quote = "The default fixture checkpoint threshold is 1000 pages."
+                navigation_url = "https://fixture.example/docs.html"
+                target_url = "https://fixture.example/wal.html"
+                frontier.discover(
+                    navigation_url,
+                    discovery_kind="manual_seed",
+                    anchor_text="fixture checkpoint threshold documentation",
+                )
+                bodies[navigation_url] = (
+                    "<html><head><title>Fixture Documentation</title></head><body>"
+                    "<p>Checkpoint reference.</p>"
+                    f"<a href='{target_url}'>Write-Ahead Log (WAL) Mode</a>"
+                    "</body></html>"
+                ).encode()
+                bodies[target_url] = (
+                    f"<html><head><title>WAL</title></head><body><article><p>{quote}</p>"
+                    "</article></body></html>"
+                ).encode()
+                rag = real_rag
+                discovery_path = (
+                    "mechanism only: navigation fetch -> deliberate document-extraction failure -> "
+                    "bounded link discovery -> target fetch/extract -> verified evidence"
+                )
             else:
                 raise ValueError(name)
 
             provider = LocalDiscoveryProvider(db)
             fetcher = ProofFetcher(bodies)
             model = ProofModel(quote)
-            service = SearchService(db, sessions, model, documents, rag, provider, fetcher=fetcher)
+            extractor = ProofExtractor(fail_urls={navigation_url}) if name == "L8" else ProofExtractor()
+            service = SearchService(
+                db, sessions, model, documents, rag, provider, fetcher=fetcher, extractor=extractor
+            )
             session = sessions.create(model="fixture-model")
             started = time.perf_counter()
             result: dict[str, Any] | None = None
@@ -272,7 +334,28 @@ def run_scenario(name: str) -> tuple[dict[str, Any], dict[str, Any]]:
                 "fts_index_bytes": fts_bytes,
                 "ram_bytes": None,
             }
-            return result_row(name, question, discovery_path, result, model, fetcher, elapsed_ms, status), resources
+            row = result_row(name, question, discovery_path, result, model, fetcher, elapsed_ms, status)
+            if name == "L8":
+                row.update(
+                    {
+                        "navigation_documents": db.conn.execute(
+                            "SELECT COUNT(*) FROM documents WHERE canonical_url=?", (navigation_url,)
+                        ).fetchone()[0],
+                        "navigation_evidence": db.conn.execute(
+                            """
+                            SELECT COUNT(*) FROM search_evidence e
+                            JOIN documents d ON d.id=e.source_document_id
+                            WHERE d.canonical_url=?
+                            """,
+                            (navigation_url,),
+                        ).fetchone()[0],
+                        "target_documents": db.conn.execute(
+                            "SELECT COUNT(*) FROM documents WHERE canonical_url=?", (target_url,)
+                        ).fetchone()[0],
+                        "proof_scope": "mechanism only; not general web navigation quality",
+                    }
+                )
+            return row, resources
         finally:
             db.close()
 
@@ -307,7 +390,9 @@ def run_accumulation_scenario() -> tuple[dict[str, Any], dict[str, Any]]:
             fetcher = ProofFetcher(bodies)
 
             first_model = ProofModel("a quote that is deliberately absent")
-            first_service = SearchService(db, sessions, first_model, documents, rag, provider, fetcher=fetcher)
+            first_service = SearchService(
+                db, sessions, first_model, documents, rag, provider, fetcher=fetcher, extractor=ProofExtractor()
+            )
             first_session = sessions.create(model="fixture-model")
             started = time.perf_counter()
             first_status = "evidence_found"
@@ -330,7 +415,9 @@ def run_accumulation_scenario() -> tuple[dict[str, Any], dict[str, Any]]:
             ).fetchone()
 
             second_model = ProofModel("The linked recovery code is TRAIL-882.")
-            second_service = SearchService(db, sessions, second_model, documents, rag, provider, fetcher=fetcher)
+            second_service = SearchService(
+                db, sessions, second_model, documents, rag, provider, fetcher=fetcher, extractor=ProofExtractor()
+            )
             second_session = sessions.create(model="fixture-model")
             started = time.perf_counter()
             second_result = second_service.run(
@@ -371,6 +458,9 @@ def main() -> int:
     accumulation, accumulation_resources = run_accumulation_scenario()
     scenarios.append(accumulation)
     resources["L7"] = accumulation_resources
+    l8, l8_resources = run_scenario("L8")
+    scenarios.append(l8)
+    resources["L8"] = l8_resources
     print(json.dumps({"scenarios": scenarios, "resource_observations": resources}, indent=2, sort_keys=True))
     return 0
 

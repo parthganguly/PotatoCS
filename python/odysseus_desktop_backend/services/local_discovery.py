@@ -12,6 +12,7 @@ import urllib.robotparser
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -71,6 +72,77 @@ class DiscoveryTransientError(FetchError):
     def __init__(self, message: str, *, code: str):
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True)
+class NavigationLink:
+    href: str
+    anchor_text: str
+    surrounding_text: str
+
+
+class BoundedNavigationHTMLParser(HTMLParser):
+    """Collect bounded navigation metadata without creating evidence text."""
+
+    def __init__(self, *, max_links: int, deadline: float | None):
+        super().__init__(convert_charrefs=True)
+        self.max_links = max(0, int(max_links))
+        self.deadline = deadline
+        self.links: list[NavigationLink] = []
+        self.title_parts: list[str] = []
+        self._in_title = False
+        self._anchor_href = ""
+        self._anchor_parts: list[str] = []
+        self._anchor_context = ""
+        self._recent_text = ""
+
+    @property
+    def title(self) -> str:
+        return _clean_text(" ".join(self.title_parts), 300)
+
+    def _check(self) -> None:
+        check_cancelled()
+        _ensure_discovery_deadline(self.deadline)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._check()
+        lowered = str(tag or "").casefold()
+        if lowered == "title":
+            self._in_title = True
+        if lowered != "a" or self._anchor_href or len(self.links) >= self.max_links:
+            return
+        href = str(dict(attrs).get("href") or "").strip()
+        if not href:
+            return
+        self._anchor_href = href
+        self._anchor_parts = []
+        self._anchor_context = self._recent_text[-500:]
+
+    def handle_endtag(self, tag: str) -> None:
+        self._check()
+        lowered = str(tag or "").casefold()
+        if lowered == "title":
+            self._in_title = False
+        if lowered != "a" or not self._anchor_href:
+            return
+        anchor_text = _clean_text(" ".join(self._anchor_parts), 500)
+        if anchor_text:
+            surrounding = _clean_text(f"{self._anchor_context} {anchor_text}", 1000)
+            self.links.append(NavigationLink(self._anchor_href, anchor_text, surrounding))
+        self._anchor_href = ""
+        self._anchor_parts = []
+        self._anchor_context = ""
+
+    def handle_data(self, data: str) -> None:
+        self._check()
+        clean = _clean_text(data, 1000)
+        if not clean:
+            return
+        if self._in_title:
+            self.title_parts.append(clean)
+        if self._anchor_href:
+            self._anchor_parts.append(clean)
+        self._recent_text = _clean_text(f"{self._recent_text} {clean}", 1000)
 
 
 @dataclass
@@ -535,35 +607,29 @@ class FrontierStore:
         source_title: str,
         source_depth: int,
         max_links: int = 200,
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
-        try:
-            from lxml import html
-        except ImportError as exc:
-            raise RuntimeError("link discovery requires readability-lxml") from exc
         decoded = html_body.decode("utf-8", errors="replace") if isinstance(html_body, bytes) else str(html_body)
-        try:
-            root = html.fromstring(decoded, base_url=source_url)
-        except Exception:
-            return []
-        discovered: list[dict[str, Any]] = []
-        for anchor in root.xpath("//a[@href]"):
+        parser = BoundedNavigationHTMLParser(max_links=max_links, deadline=deadline)
+        for offset in range(0, len(decoded), 64 * 1024):
             check_cancelled()
-            if len(discovered) >= max(0, int(max_links)):
-                break
-            href = str(anchor.get("href") or "").strip()
-            text = _clean_text(anchor.text_content(), 500)
-            if not href or not text:
-                continue
-            absolute = urllib.parse.urljoin(source_url, href)
-            parent_text = _clean_text(anchor.getparent().text_content() if anchor.getparent() is not None else text, 1000)
+            _ensure_discovery_deadline(deadline)
+            parser.feed(decoded[offset : offset + 64 * 1024])
+        parser.close()
+        effective_title = parser.title or _clean_text(source_title, 500) or canonicalize_url(source_url)
+        discovered: list[dict[str, Any]] = []
+        for link in parser.links:
+            check_cancelled()
+            _ensure_discovery_deadline(deadline)
+            absolute = urllib.parse.urljoin(source_url, link.href)
             try:
                 row = self.discover(
                     absolute,
                     discovery_kind="hyperlink",
                     discovered_from_url=canonicalize_url(source_url),
-                    anchor_text=text,
-                    surrounding_text=parent_text,
-                    source_title=source_title,
+                    anchor_text=link.anchor_text,
+                    surrounding_text=link.surrounding_text,
+                    source_title=effective_title,
                     depth=max(0, int(source_depth)) + 1,
                     priority=1.0 / (max(0, int(source_depth)) + 2),
                 )
@@ -944,6 +1010,46 @@ class LocalDiscoveryProvider:
         with self._lock:
             self.query_metrics["frontier_candidates"] += len(rows)
             self.query_metrics["source_pack_hits"] += len(pack_hits)
+        results: list[ProviderSearchResult] = []
+        for position, row in enumerate(rows[: max(0, int(limit))], start=1):
+            snippet = " ".join(
+                value for value in (str(row["anchor_text"]), str(row["surrounding_text"])) if value
+            )[:1000]
+            results.append(
+                ProviderSearchResult(
+                    url=str(row["canonical_url"]),
+                    title=str(row["source_title"] or row["anchor_text"] or row["domain"]),
+                    snippet=snippet,
+                    position=position,
+                    provider=self.name,
+                    query=query,
+                    metadata={
+                        "frontier_id": str(row["id"]),
+                        "discovery_kind": str(row["discovery_kind"]),
+                        "depth": int(row["depth"]),
+                        "domain": str(row["domain"]),
+                        "raw_lexical_rank": float(row["raw_lexical_rank"]),
+                        "etag": str(row["etag"] or ""),
+                        "last_modified": str(row["last_modified"] or ""),
+                        **_json_object(row["metadata_json"]),
+                    },
+                )
+            )
+        return results
+
+    def search_discovered_links(self, query: str, *, limit: int) -> list[ProviderSearchResult]:
+        """Rank newly observed hyperlinks without reactivating Source Packs."""
+        check_cancelled()
+        rows = [
+            row
+            for row in self.frontier.search(
+                query,
+                limit=max(1, int(limit)) * 4,
+                max_depth=self.limits.max_depth,
+                allowed_source_packs=set(),
+            )
+            if str(row["discovery_kind"]) == "hyperlink"
+        ]
         results: list[ProviderSearchResult] = []
         for position, row in enumerate(rows[: max(0, int(limit))], start=1):
             snippet = " ".join(

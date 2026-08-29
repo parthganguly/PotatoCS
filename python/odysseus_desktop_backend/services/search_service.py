@@ -162,6 +162,8 @@ class SearchMetrics:
     cache_hits: int = 0
     extraction_successes: int = 0
     extraction_failures: int = 0
+    links_discovered: int = 0
+    links_discovered_after_extraction_failure: int = 0
     visual_candidates: int = 0
     passages_considered: int = 0
     dossier_chars: int = 0
@@ -745,7 +747,12 @@ class SearchService:
         if getattr(self.provider, "name", "") == "local":
             from odysseus_desktop_backend.services.local_discovery import LocalBudgetExhausted
 
-            for index, candidate in enumerate(candidates):
+            scheduled_urls = {str(candidate["canonical_url"]) for candidate in candidates}
+            index = 0
+            while index < len(candidates):
+                candidate = candidates[index]
+                if local_run_budget.remaining_pages <= 0:
+                    break
                 operations.append(TraceOperation("search.fetch_started"))
                 operations.append(TraceOperation("search.frontier_fetch"))
                 try:
@@ -755,6 +762,33 @@ class SearchService:
                     acquired.append((index, candidate, fetch, extracted))
                     metrics.urls_fetched += 1
                     metrics.bytes_downloaded += int(fetch.bytes_downloaded)
+                    discovered_links = int((candidate.get("metadata") or {}).get("links_discovered") or 0)
+                    if discovered_links:
+                        metrics.links_discovered += discovered_links
+                        operations.append(TraceOperation("search.links_discovered", count=discovered_links))
+                        followups: list[ProviderSearchResult] = []
+                        for query in queries:
+                            followups.extend(
+                                self.provider.search_discovered_links(
+                                    query,
+                                    limit=budget.results_per_query,
+                                )
+                            )
+                        followup_candidates = prioritize_candidates(followups, queries)
+                        followup_candidates = self.provider.bound_candidates(
+                            followup_candidates,
+                            fetch_limit,
+                            remaining_pages=local_run_budget.remaining_pages,
+                            excluded_urls=scheduled_urls | local_run_budget.observed_urls,
+                        )
+                        for followup in followup_candidates:
+                            canonical = str(followup["canonical_url"])
+                            if canonical in scheduled_urls:
+                                continue
+                            scheduled_urls.add(canonical)
+                            candidates.append(followup)
+                            metrics.fetch_attempts += 1
+                        metrics.frontier_candidates += len(followup_candidates)
                     if extracted is not None:
                         metrics.extraction_successes += 1
                     else:
@@ -790,9 +824,45 @@ class SearchService:
                     self.provider.frontier.mark_fetch_failure(str(candidate["canonical_url"]), getattr(exc, "code", "fetch_failed"))
                     if isinstance(exc, WebExtractionError):
                         metrics.extraction_failures += 1
+                        discovered_links = int((candidate.get("metadata") or {}).get("links_discovered") or 0)
+                        metrics.links_discovered += discovered_links
+                        metrics.links_discovered_after_extraction_failure += discovered_links
+                        operations.append(
+                            TraceOperation(
+                                "search.extraction_failed_links_discovered",
+                                status="degraded",
+                                count=discovered_links,
+                                code=exc.code,
+                            )
+                        )
+                        if discovered_links:
+                            followups = []
+                            for query in queries:
+                                followups.extend(
+                                    self.provider.search_discovered_links(
+                                        query,
+                                        limit=budget.results_per_query,
+                                    )
+                                )
+                            followup_candidates = prioritize_candidates(followups, queries)
+                            followup_candidates = self.provider.bound_candidates(
+                                followup_candidates,
+                                fetch_limit,
+                                remaining_pages=local_run_budget.remaining_pages,
+                                excluded_urls=scheduled_urls | local_run_budget.observed_urls,
+                            )
+                            for followup in followup_candidates:
+                                canonical = str(followup["canonical_url"])
+                                if canonical in scheduled_urls:
+                                    continue
+                                scheduled_urls.add(canonical)
+                                candidates.append(followup)
+                                metrics.fetch_attempts += 1
+                            metrics.frontier_candidates += len(followup_candidates)
                     operations.append(TraceOperation("search.fetch_failed", status="failed", code=getattr(exc, "code", "fetch_failed")))
                 finally:
                     self._sync_local_budget_metrics(local_run_budget, metrics)
+                    index += 1
         else:
             with ThreadPoolExecutor(max_workers=min(len(candidates), budget.max_concurrent_fetches)) as executor:
                 futures = {}
@@ -855,14 +925,6 @@ class SearchService:
             if local_run_budget is not None:
                 local_run_budget.observed_urls.add(str(candidate["canonical_url"]))
             passages.extend(passages_for_web_document(document, extracted, provider=str(candidate["provider"])))
-            if getattr(self.provider, "name", "") == "local" and fetch.content_type in {"text/html", "application/xhtml+xml"}:
-                depth = int((candidate.get("metadata") or {}).get("depth") or 0)
-                self.provider.frontier.discover_links(
-                    source_url=fetch.final_url,
-                    html_body=fetch.body,
-                    source_title=extracted.title,
-                    source_depth=depth,
-                )
         return passages
 
     def _fetch_and_extract(
@@ -942,6 +1004,16 @@ class SearchService:
         else:
             fetch = fetcher.fetch(str(candidate["canonical_url"]))
         check_cancelled()
+        if getattr(self.provider, "name", "") == "local" and fetch.content_type in {"text/html", "application/xhtml+xml"}:
+            depth = int(metadata.get("depth") or 0)
+            links = self.provider.frontier.discover_links(
+                source_url=fetch.final_url,
+                html_body=fetch.body,
+                source_title=str(candidate.get("title") or fetch.final_url),
+                source_depth=depth,
+                deadline=local_run_budget.deadline if local_run_budget is not None else deadline,
+            )
+            candidate.setdefault("metadata", {})["links_discovered"] = len(links)
         extracted = self.extractor.extract(
             fetch.body,
             content_type=fetch.headers.get("content-type", ""),

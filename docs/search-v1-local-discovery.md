@@ -235,6 +235,14 @@ web-origin material by default. Fetch/extraction/persistence failures are not
 promoted. Cancellation before that boundary rolls staged pages back and does
 not claim frontier success.
 
+For an already safely fetched HTML response, bounded navigation parsing is
+independent of document extraction. A document-extraction failure may retain
+only canonical destinations, anchor/context metadata, source relationship,
+and depth in the crawl frontier. It creates no `cached_web` document, RAG
+chunk, evidence passage, or citation. A discovered destination must still pass
+the normal fetch, extraction, persistence, retrieval, and exact-verification
+pipeline before its text can support an answer.
+
 Deleting the final live current `web`/`cached_web` observation resets its
 frontier row to `unfetched`, clears stale validators/hash/retry fields, and
 preserves discovery relationships and anchor history so the URL can be
@@ -254,8 +262,12 @@ Additive Operation Trace names are `search.local_fts`,
 `search.local_dense`, `search.local_fusion`, `search.frontier_candidates`,
 `search.fetch_started`, `search.sitemap_discovered`,
 `search.feed_discovered`, `search.source_pack_match`, and
-`search.local_no_evidence`. Metrics are counts/timings only and never contain
-private passage text.
+`search.local_no_evidence`. Navigation/extraction separation additionally
+reports `search.links_discovered` and
+`search.extraction_failed_links_discovered`, plus the count metrics
+`links_discovered`, `extraction_failures`, and
+`links_discovered_after_extraction_failure`. Metrics are counts/timings only
+and never contain private passage text.
 
 `LocalSearchIndex.metrics()` exposes current documents, current chunks, FTS
 rows, current cached web documents, known unfetched URLs, and represented
@@ -265,7 +277,7 @@ instrumentation rather than fabricating a value.
 
 ## Offline proof
 
-Run the deterministic L1-L7 proof and focused tests without network access:
+Run the deterministic L1-L8 proof and focused tests without network access:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run-search-v1-fixture-proof.ps1
@@ -281,7 +293,10 @@ Source Pack match before activation. L5 and L6 isolate fusion mechanics with
 stipulated dense/lexical fixtures; they do not measure a production embedder.
 L7 performs two Searches: page A is retained after `no_evidence`, then its
 persisted link allows Question B to acquire page B and verify an answer without
-refetching page A.
+refetching page A. L8 deliberately fails document extraction for a fetched
+navigation page, discovers one bounded link, and verifies evidence only from
+the successfully extracted destination. L8 proves this mechanism only; it does
+not establish general web-navigation quality.
 
 ## Known limitations and deferred variables
 

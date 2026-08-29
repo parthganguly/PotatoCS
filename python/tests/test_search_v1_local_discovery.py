@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import threading
@@ -32,6 +33,10 @@ from odysseus_desktop_backend.services.search_service import (
 )
 from odysseus_desktop_backend.services.session_service import SessionService
 from odysseus_desktop_backend.services.vector_store import SQLiteNumPyVectorStore
+from odysseus_desktop_backend.services.web_extraction import (
+    ExtractedWebPage,
+    WebExtractionError,
+)
 from odysseus_desktop_backend.services.web_fetcher import (
     FetchBlockedError,
     FetchError,
@@ -176,12 +181,40 @@ class LocalFixtureFetcher:
         )
 
 
+class FixtureHTMLExtractor:
+    def __init__(self, *, fail_urls: set[str] | None = None):
+        self.fail_urls = set(fail_urls or set())
+
+    def extract(self, body: bytes, *, content_type: str, final_url: str) -> ExtractedWebPage:
+        del content_type
+        if final_url in self.fail_urls:
+            raise WebExtractionError("fixture document extraction failed")
+        decoded = body.decode("utf-8", errors="replace")
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", decoded, flags=re.IGNORECASE | re.DOTALL)
+        title = " ".join((title_match.group(1) if title_match else final_url).split())
+        without_blocked = re.sub(
+            r"<(script|style|template|noscript)\b[^>]*>.*?</\1>",
+            " ",
+            decoded,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = " ".join(re.sub(r"<[^>]+>", " ", without_blocked).split())
+        if not text:
+            raise WebExtractionError("fixture document extraction produced no text")
+        return ExtractedWebPage(
+            title=title,
+            text=text,
+            metadata={"canonical_url": final_url},
+        )
+
+
 def local_search_stack(
     tmp_path: Path,
     model: object,
     fetcher: object,
     *,
     limits: LocalDiscoveryLimits | None = None,
+    extractor: object | None = None,
 ) -> tuple[Database, SessionService, DocumentService, RAGService, LocalDiscoveryProvider, SearchService]:
     db = Database(tmp_path / "profile")
     sessions = SessionService(db)
@@ -192,7 +225,16 @@ def local_search_stack(
         SQLiteNumPyVectorStore(db),
     )
     provider = LocalDiscoveryProvider(db, limits=limits)
-    service = SearchService(db, sessions, model, documents, rag, provider, fetcher=fetcher)
+    service = SearchService(
+        db,
+        sessions,
+        model,
+        documents,
+        rag,
+        provider,
+        fetcher=fetcher,
+        extractor=extractor or FixtureHTMLExtractor(),
+    )
     return db, sessions, documents, rag, provider, service
 
 
@@ -362,6 +404,56 @@ def test_frontier_limits_failure_restart_and_cancellation(tmp_path: Path) -> Non
         }
     finally:
         reopened.close()
+
+
+def test_navigation_link_parser_is_bounded_rejects_unsafe_and_honors_deadline(tmp_path: Path) -> None:
+    db = Database(tmp_path / "profile")
+    try:
+        frontier = FrontierStore(db)
+        body = """<html><head><title>Navigation Map</title></head><body>
+        <a href='/one'>one needle</a><a href='/two'>two needle</a><a href='/three'>three needle</a>
+        </body></html>"""
+        rows = frontier.discover_links(
+            source_url="https://example.com/start",
+            html_body=body,
+            source_title="Fallback",
+            source_depth=0,
+            max_links=2,
+        )
+        assert [row["canonical_url"] for row in rows] == [
+            "https://example.com/one",
+            "https://example.com/two",
+        ]
+        assert all(row["source_title"] == "Navigation Map" for row in rows)
+
+        unsafe = frontier.discover_links(
+            source_url="https://example.com/start",
+            html_body="""<a href='javascript:alert(1)'>bad scheme</a>
+            <a href='https://user:pass@example.com/private'>credentials</a>
+            <a href='http://127.0.0.1/private'>literal private host</a>""",
+            source_title="Unsafe",
+            source_depth=0,
+        )
+        assert unsafe == []
+        with pytest.raises(LocalBudgetExhausted):
+            frontier.discover_links(
+                source_url="https://example.com/start",
+                html_body="<a href='/late'>late</a>",
+                source_title="Late",
+                source_depth=0,
+                deadline=time.monotonic() - 1,
+            )
+        cancelled = threading.Event()
+        cancelled.set()
+        with cancellation_scope(cancelled), pytest.raises(JobCancelledError):
+            frontier.discover_links(
+                source_url="https://example.com/start",
+                html_body="<a href='/cancelled'>cancelled</a>",
+                source_title="Cancelled",
+                source_depth=0,
+            )
+    finally:
+        db.close()
 
 
 def test_sitemap_index_simple_malformed_oversize_and_unsafe(tmp_path: Path) -> None:
@@ -924,6 +1016,167 @@ def test_failed_extraction_persistence_and_cancellation_do_not_promote_or_mark_f
         db.close()
 
 
+def test_extraction_failed_navigation_discovers_and_fetches_verified_destination(tmp_path: Path) -> None:
+    navigation_url = "https://sqlite.example/docs.html"
+    target_url = "https://sqlite.example/wal.html"
+    quote = "The default automatic checkpoint threshold is 1000 pages."
+    navigation = _html(
+        "SQLite Documentation",
+        "SQLite default autocheckpoint documentation index.",
+        "<a href='/wal.html'>Write-Ahead Log (WAL) Mode</a>",
+    )
+    target = _html("WAL", quote)
+    fetcher = LocalFixtureFetcher(
+        {navigation_url: navigation, target_url: target},
+        default_robots=b"User-agent: *\nAllow: /\n",
+    )
+    db, sessions, _documents, _rag, provider, service = local_search_stack(
+        tmp_path,
+        QuoteEvidenceModel(quote),
+        fetcher,
+        limits=LocalDiscoveryLimits(max_new_urls=3, max_urls_per_domain=3),
+        extractor=FixtureHTMLExtractor(fail_urls={navigation_url}),
+    )
+    try:
+        provider.frontier.discover(
+            navigation_url,
+            discovery_kind="manual_seed",
+            anchor_text="SQLite default WAL autocheckpoint threshold",
+        )
+        session = sessions.create("navigation", "fixture")
+        result = service.run(
+            question="What is the default SQLite WAL autocheckpoint threshold?",
+            session_id=session["id"],
+            model="fixture",
+            second_round_enabled=False,
+        )
+        metrics = result["metrics"]
+        assert metrics["extraction_failures"] == 1
+        assert metrics["links_discovered_after_extraction_failure"] >= 1
+        assert metrics["page_fetches"] == 2
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE canonical_url=?", (navigation_url,)
+        ).fetchone()[0] == 0
+        target_document = db.conn.execute(
+            "SELECT id, source_origin, is_staging FROM documents WHERE canonical_url=?", (target_url,)
+        ).fetchone()
+        assert dict(target_document) == {
+            "id": target_document["id"],
+            "source_origin": "cached_web",
+            "is_staging": 0,
+        }
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM rag_chunks WHERE document_id=? AND is_deleted=0",
+            (target_document["id"],),
+        ).fetchone()[0] >= 1
+        evidence = db.conn.execute("SELECT exact_quote FROM search_evidence").fetchall()
+        assert [row["exact_quote"] for row in evidence] == [quote]
+        assert result["citations"][0]["canonical_url"] == target_url
+        assert fetcher.calls.count(navigation_url) == fetcher.calls.count(target_url) == 1
+    finally:
+        db.close()
+
+
+def test_successful_html_extraction_still_persists_and_discovers_link(tmp_path: Path) -> None:
+    navigation_url = "https://success.example/docs.html"
+    target_url = "https://success.example/target.html"
+    quote = "The verified destination value is SUCCESS-417."
+    fetcher = LocalFixtureFetcher(
+        {
+            navigation_url: _html(
+                "Successful Navigation",
+                "An ordinary successfully extractable navigation page.",
+                "<a href='/target.html'>verified destination value</a>",
+            ),
+            target_url: _html("Destination", quote),
+        },
+        default_robots=b"User-agent: *\nAllow: /\n",
+    )
+    db, sessions, _documents, _rag, provider, service = local_search_stack(
+        tmp_path,
+        QuoteEvidenceModel(quote),
+        fetcher,
+        limits=LocalDiscoveryLimits(max_new_urls=3, max_urls_per_domain=3),
+    )
+    try:
+        provider.frontier.discover(
+            navigation_url,
+            discovery_kind="manual_seed",
+            anchor_text="verified destination value documentation",
+        )
+        session = sessions.create("success", "fixture")
+        result = service.run(
+            question="What is the verified destination value?",
+            session_id=session["id"],
+            model="fixture",
+            second_round_enabled=False,
+        )
+        metrics = result["metrics"]
+        assert metrics["extraction_successes"] == 2
+        assert metrics["extraction_failures"] == 0
+        assert metrics["links_discovered"] >= 1
+        assert metrics["links_discovered_after_extraction_failure"] == 0
+        navigation_document = db.conn.execute(
+            "SELECT id, source_origin, is_staging FROM documents WHERE canonical_url=?",
+            (navigation_url,),
+        ).fetchone()
+        assert navigation_document is not None
+        assert navigation_document["source_origin"] == "cached_web"
+        assert navigation_document["is_staging"] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM rag_chunks WHERE document_id=? AND is_deleted=0",
+            (navigation_document["id"],),
+        ).fetchone()[0] >= 1
+        assert result["citations"][0]["canonical_url"] == target_url
+        assert fetcher.calls.count(navigation_url) == fetcher.calls.count(target_url) == 1
+    finally:
+        db.close()
+
+
+def test_hostile_navigation_anchor_never_becomes_evidence_when_target_fails(tmp_path: Path) -> None:
+    navigation_url = "https://hostile.example/docs.html"
+    target_url = "https://hostile.example/wal.html"
+    hostile_claim = "Default threshold is 1000 pages"
+    navigation = _html(
+        "Hostile Map",
+        "Untrusted navigation metadata.",
+        f"<a href='/wal.html'>{hostile_claim}</a>",
+    )
+    fetcher = LocalFixtureFetcher(
+        {navigation_url: navigation, target_url: FetchError("target unavailable")},
+        default_robots=b"User-agent: *\nAllow: /\n",
+    )
+    db, sessions, _documents, _rag, provider, service = local_search_stack(
+        tmp_path,
+        QuoteEvidenceModel(hostile_claim),
+        fetcher,
+        extractor=FixtureHTMLExtractor(fail_urls={navigation_url}),
+    )
+    try:
+        provider.frontier.discover(
+            navigation_url,
+            discovery_kind="manual_seed",
+            anchor_text="default threshold documentation",
+        )
+        session = sessions.create("hostile", "fixture")
+        with pytest.raises(SearchNoEvidenceError):
+            service.run(
+                question="What is the default threshold?",
+                session_id=session["id"],
+                model="fixture",
+                second_round_enabled=False,
+            )
+        metrics = _latest_metrics(db)
+        assert metrics["links_discovered_after_extraction_failure"] >= 1
+        assert db.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM search_evidence").fetchone()[0] == 0
+        assert [row["role"] for row in sessions.messages(session["id"])] == ["user"]
+        assert fetcher.calls.count(navigation_url) == fetcher.calls.count(target_url) == 1
+    finally:
+        db.close()
+
+
 def test_frontier_retry_backoff_blocked_fairness_and_literal_ip_rejection(tmp_path: Path) -> None:
     now = [1_000_000]
     db = Database(tmp_path / "profile")
@@ -1095,6 +1348,7 @@ def test_source_pack_activation_is_query_gated_preferred_and_malformed_safe(tmp_
             "SELECT priority FROM crawl_frontier WHERE canonical_url='https://www.sqlite.org/docs.html'"
         ).fetchone()
         assert sqlite_row is not None
+        assert not any("fixture.example" in row.url for row in relevant)
         assert provider.query_metrics["source_pack_errors"] == 1
 
         unrelated = provider.search("python snake habitat", limit=10, timeout=1)
@@ -1109,6 +1363,28 @@ def test_source_pack_activation_is_query_gated_preferred_and_malformed_safe(tmp_
         assert float(python_priority) == 2.5
     finally:
         db.close()
+
+
+def test_shipped_sqlite_pack_is_real_only_and_test_fixture_pack_keeps_feed_coverage(tmp_path: Path) -> None:
+    db = Database(tmp_path / "profile")
+    try:
+        store = SourcePackStore(db, FrontierStore(db))
+        sqlite_pack = store.parse(FIXTURES / "source_packs" / "sqlite.md")
+        fixture_pack = store.parse(FIXTURES / "source_packs" / "potatocs-fixture.md")
+        assert sqlite_pack.seeds == ("https://www.sqlite.org/docs.html",)
+        assert sqlite_pack.feeds == ()
+        assert "fixture.example" not in (FIXTURES / "source_packs" / "sqlite.md").read_text(encoding="utf-8")
+        assert fixture_pack.feeds == ("https://fixture.example/feed.atom",)
+    finally:
+        db.close()
+
+
+def test_runtime_verifiers_require_html_extraction_dependencies() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    for name in ("prepare-python-runtime.ps1", "verify-python-runtime.ps1"):
+        text = (repo / "scripts" / name).read_text(encoding="utf-8")
+        assert '"lxml"' in text
+        assert '"readability"' in text
 
 
 def test_malformed_pack_warning_is_safe_while_valid_pack_completes(tmp_path: Path) -> None:
