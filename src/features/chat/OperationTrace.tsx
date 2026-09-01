@@ -128,6 +128,9 @@ export function OperationTrace({
                     ["Extraction failures", metricNumber(trace.search.metrics.extraction_failures)],
                     ["Passages", metricNumber(trace.search.metrics.passages_considered)],
                     ["Dossier tokens (est.)", metricNumber(trace.search.metrics.dossier_token_estimate)],
+                    ["Evidence window", evidenceWindow(trace.search.metrics)],
+                    ["Evidence prompt (est. tokens)", metricNumber(trace.search.metrics.evidence_prompt_tokens_estimated)],
+                    ["Evidence prompt budget", evidenceBudget(trace.search.metrics)],
                     ["Verified quotes", metricNumber(trace.search.metrics.verified_evidence)],
                     ["Rejected quotes", metricNumber(trace.search.metrics.rejected_evidence)],
                     ["Evidence fallbacks", metricNumber(trace.search.metrics.evidence_selection_fallbacks)],
@@ -224,6 +227,42 @@ function yesNo(value: boolean | undefined): string {
 
 function listOrMissing(values: Array<string | number>): string {
   return values.length ? values.join(", ") : MISSING_VALUE;
+}
+
+type SearchMetrics = Record<string, number | boolean | null>;
+
+function metricCount(metrics: SearchMetrics, key: string): number | null {
+  const value = metrics[key];
+  return typeof value === "number" ? value : null;
+}
+
+/** "6 of 12 passages (budget-limited)" — makes a bounded window obvious at a glance. */
+function evidenceWindow(metrics: SearchMetrics): string {
+  const packed = metricCount(metrics, "evidence_passages_packed");
+  const available = metricCount(metrics, "evidence_passages_available");
+  if (packed === null || available === null || available === 0) return MISSING_VALUE;
+  const spansPacked = metricCount(metrics, "evidence_spans_packed");
+  const spansAvailable = metricCount(metrics, "evidence_spans_available");
+  const spans = spansPacked === null || spansAvailable === null ? "" : `, ${spansPacked}/${spansAvailable} spans`;
+  const notes = [
+    metrics.evidence_window_truncated === true ? "budget-limited" : "",
+    metrics.evidence_window_partial_passage === true ? "partial passage" : ""
+  ].filter(Boolean);
+  const suffix = notes.length ? ` (${notes.join(", ")})` : "";
+  return `${packed} of ${available} passages${spans}${suffix}`;
+}
+
+/** "3046 tokens of 4096 ctx, 256 reserved for output (loaded_runtime)" */
+function evidenceBudget(metrics: SearchMetrics): string {
+  const budget = metricCount(metrics, "evidence_input_budget_tokens");
+  const limit = metricCount(metrics, "evidence_context_limit_tokens");
+  if (budget === null || limit === null || limit === 0) return MISSING_VALUE;
+  const reserved = metricCount(metrics, "evidence_generation_reserve_tokens");
+  const source = typeof metrics.evidence_context_limit_source === "string" && metrics.evidence_context_limit_source
+    ? ` (${metrics.evidence_context_limit_source})`
+    : "";
+  const output = reserved === null ? "" : `, ${reserved} reserved for output`;
+  return `${budget} tokens of ${limit} ctx${output}${source}`;
 }
 
 function metricNumber(value: number | boolean | null | undefined): string {

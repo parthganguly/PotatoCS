@@ -95,7 +95,7 @@ class EmptyEvidenceModel:
                 self.cancel_on_selection.set()
             content = json.dumps(
                 {
-                    "evidence": [],
+                    "span_ids": [],
                     "needs_more_search": self.request_second_round and self.selection_calls == 1,
                     "next_query": "",
                 }
@@ -127,7 +127,7 @@ class QuoteEvidenceModel(EmptyEvidenceModel):
             section = next((part for part in prompt.split("SPAN_ID=")[1:] if self.quote in part), "")
             content = json.dumps(
                 {
-                    "evidence": [] if not section else [{"span_ids": [section.splitlines()[0]]}],
+                    "span_ids": [] if not section else [section.splitlines()[0]],
                     "needs_more_search": False,
                     "next_query": "",
                 }

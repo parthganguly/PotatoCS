@@ -135,7 +135,7 @@ def test_multiple_adjacent_spans_remain_separate_exact_evidence() -> None:
 
 
 def test_valid_empty_selection_is_abstention_not_fallback() -> None:
-    parsed = {"evidence": [], "needs_more_search": True}
+    parsed = {"span_ids": [], "needs_more_search": True}
     assert valid_evidence_selection(parsed) is True
     spans = build_evidence_spans([passage(SQLITE_SENTENCE)])
     assert deterministic_evidence_pointer_fallback(spans)
@@ -146,11 +146,18 @@ def test_valid_empty_selection_is_abstention_not_fallback() -> None:
 
 
 def test_malformed_schema_is_invalid_while_pointer_schema_is_valid() -> None:
-    assert valid_evidence_selection({"evidence": [{"span_ids": ["P1:S1"]}], "needs_more_search": False})
+    assert valid_evidence_selection({"span_ids": ["P1:S1"], "needs_more_search": False})
+    # The retired nested wrapper is no longer accepted.
     assert not valid_evidence_selection(
-        {"evidence": [{"passage_id": "p1", "quote": SQLITE_SENTENCE}], "needs_more_search": False}
+        {"evidence": [{"span_ids": ["P1:S1"]}], "needs_more_search": False}
     )
-    assert not valid_evidence_selection({"evidence": [{"span_ids": []}], "needs_more_search": False})
+    assert not valid_evidence_selection(
+        {"span_ids": [{"passage_id": "p1", "quote": SQLITE_SENTENCE}], "needs_more_search": False}
+    )
+    assert not valid_evidence_selection({"span_ids": ["P1:S1"], "needs_more_search": "false"})
+    assert not valid_evidence_selection({"span_ids": "P1:S1", "needs_more_search": False})
+    assert not valid_evidence_selection({"span_ids": ["   "], "needs_more_search": False})
+    assert not valid_evidence_selection({"span_ids": ["P1:S1"]})
 
 
 def test_hostile_source_cannot_create_resolvable_span_id_or_escape_boundary() -> None:
@@ -196,8 +203,9 @@ def test_private_rejection_diagnostic_contains_only_safe_identifiers(tmp_path) -
 def test_prompt_requests_ids_only_and_never_quote_url_or_offsets() -> None:
     spans = build_evidence_spans([passage(SQLITE_SENTENCE)])
     prompt = evidence_selection_prompt("What is the threshold?", spans, [])
-    contract = prompt.split("QUESTION:", 1)[0]
+    contract = prompt.split("OUTPUT\n", 1)[1]
     assert '"span_ids"' in contract
+    assert '"evidence"' not in contract
     assert '"quote"' not in contract
     assert '"passage_id"' not in contract
     assert "offsets" in contract

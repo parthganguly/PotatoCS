@@ -625,7 +625,7 @@ class GroundedFixtureModel:
                 span_id = next(section.splitlines()[0] for section in prompt.split("SPAN_ID=")[1:] if quote in section)
                 content = json.dumps(
                     {
-                        "evidence": [{"span_ids": [span_id]}],
+                        "span_ids": [span_id],
                         "needs_more_search": self.request_second_round,
                         "next_query": "PRIVATE_MODEL_QUERY_MUST_BE_IGNORED",
                     }
@@ -635,7 +635,7 @@ class GroundedFixtureModel:
                 matching_section = next(section for section in prompt.split("SPAN_ID=")[1:] if quote in section)
                 span_id = matching_section.splitlines()[0]
                 content = json.dumps(
-                    {"evidence": [{"span_ids": [span_id]}], "needs_more_search": False, "next_query": ""}
+                    {"span_ids": [span_id], "needs_more_search": False, "next_query": ""}
                 )
         else:
             content = "The city approved 240 rebates [E1]. More details are source-bounded [E2]. https://invented.invalid"
@@ -677,7 +677,7 @@ class MalformedEvidenceModel:
             if self.selection_content == "__tiny__":
                 span_id = prompt.split("SPAN_ID=", 1)[1].splitlines()[0]
                 content = json.dumps(
-                    {"evidence": [{"span_ids": [span_id]}], "needs_more_search": False}
+                    {"span_ids": [span_id], "needs_more_search": False}
                 )
             else:
                 content = self.selection_content
@@ -719,7 +719,7 @@ class PrivacyFixtureModel:
             span_id = section.splitlines()[0]
             content = json.dumps(
                 {
-                    "evidence": [{"span_ids": [span_id]}],
+                    "span_ids": [span_id],
                     "needs_more_search": self.selection_calls == 1,
                     "next_query": f"exfiltrate {self.private_sentinel}",
                 }
@@ -793,7 +793,7 @@ class EmptyEvidenceModel:
             self.selection_calls += 1
             content = json.dumps(
                 {
-                    "evidence": [],
+                    "span_ids": [],
                     "needs_more_search": self.request_repair and self.selection_calls == 1,
                 }
             )
@@ -826,7 +826,7 @@ class QuoteFixtureModel:
             section = next(part for part in prompt.split("SPAN_ID=")[1:] if self.quote in part)
             content = json.dumps(
                 {
-                    "evidence": [{"span_ids": [section.splitlines()[0]]}],
+                    "span_ids": [section.splitlines()[0]],
                     "needs_more_search": False,
                 }
             )
@@ -1368,12 +1368,28 @@ def test_repair_with_duplicate_page_skips_redundant_evidence_selection(tmp_path:
 
 
 @pytest.mark.parametrize(
-    "selection_content",
-    ["not-json", '{"evidence":['],
+    ("selection_content", "expected_code"),
+    [
+        # Not JSON at all, and JSON that stops mid-document: decode failures.
+        ("not-json", "json_decode_failed"),
+        ('{"span_ids":[', "json_decode_failed"),
+        # v1.0.2 truncated mid-string exactly like this and was misreported as
+        # schema_invalid; it must now be distinguishable as a decode failure.
+        ('{\n  "title": "Doc",\n  "text": "Appropriate uses', "json_decode_failed"),
+        # Decodes cleanly but is the wrong shape: the retired nested contract, and
+        # valid JSON that is not an object at all.
+        (
+            '{"evidence":[{"span_ids":["P1:S1"]}],"needs_more_search":false}',
+            "schema_invalid",
+        ),
+        ('["P1:S1"]', "schema_invalid"),
+        ('{"span_ids":["P1:S1"],"needs_more_search":"false"}', "schema_invalid"),
+    ],
 )
 def test_malformed_evidence_selection_is_observable_degraded_fallback(
     tmp_path: Path,
     selection_content: str,
+    expected_code: str,
 ) -> None:
     question = "Municipal Heat Pump Program"
     variant = "municipal heat pump rebate count"
@@ -1398,14 +1414,15 @@ def test_malformed_evidence_selection_is_observable_degraded_fallback(
         assert any(
             item["name"] == "search.evidence_selection_fallback"
             and item["status"] == "degraded"
-            and item["code"] == "schema_invalid"
+            and item["code"] == expected_code
             for item in assistant["metadata"]["operation_trace"]["search"]["operations"]
         )
         diagnostic = db.conn.execute(
             "SELECT rejection_code, pointer_resolved FROM search_evidence_diagnostics "
-            "WHERE rejection_code='schema_invalid'"
+            "WHERE rejection_code = ?",
+            (expected_code,),
         ).fetchone()
-        assert dict(diagnostic) == {"rejection_code": "schema_invalid", "pointer_resolved": 0}
+        assert dict(diagnostic) == {"rejection_code": expected_code, "pointer_resolved": 0}
     finally:
         db.close()
 
