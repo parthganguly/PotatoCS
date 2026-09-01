@@ -63,16 +63,16 @@ class ProofModel:
             content = json.dumps({"queries": [VARIANT]})
         elif "Propose one concise public-web repair query" in prompt:
             content = json.dumps({"query": REPAIR_QUERY})
-        elif "Select only exact copied quotes" in prompt:
+        elif "Select only identifiers for spans" in prompt:
             self.selection_calls += 1
             if self.selection_calls == 1:
-                passage_id = prompt.split("PASSAGE_ID=", 1)[1].splitlines()[0]
+                quote = "The city approved 240 heat-pump rebates for owner-occupied homes in 2026."
+                span_id = next(section.splitlines()[0] for section in prompt.split("SPAN_ID=")[1:] if quote in section)
                 content = json.dumps(
                     {
                         "evidence": [
                             {
-                                "passage_id": passage_id,
-                                "quote": "The city approved 240 heat-pump rebates for owner-occupied homes in 2026.",
+                                "span_ids": [span_id],
                             }
                         ],
                         "needs_more_search": self.use_second_round,
@@ -81,10 +81,10 @@ class ProofModel:
                 )
             else:
                 quote = "Applications close on October 1, 2026."
-                matching = next(section for section in prompt.split("PASSAGE_ID=")[1:] if quote in section)
+                matching = next(section for section in prompt.split("SPAN_ID=")[1:] if quote in section)
                 content = json.dumps(
                     {
-                        "evidence": [{"passage_id": matching.splitlines()[0], "quote": quote}],
+                        "evidence": [{"span_ids": [matching.splitlines()[0]]}],
                         "needs_more_search": False,
                         "next_query": "",
                     }

@@ -89,7 +89,7 @@ class EmptyEvidenceModel:
             content = json.dumps({"queries": []})
         elif "Propose one concise public-web repair query" in prompt:
             content = json.dumps({"query": self.repair_query})
-        elif "Select only exact copied quotes" in prompt:
+        elif "Select only identifiers for spans" in prompt:
             self.selection_calls += 1
             if self.cancel_on_selection is not None:
                 self.cancel_on_selection.set()
@@ -122,12 +122,12 @@ class QuoteEvidenceModel(EmptyEvidenceModel):
 
     def chat_detailed(self, model: str, messages: list[dict[str, str]], **kwargs: object) -> dict:
         prompt = messages[-1]["content"]
-        if "Select only exact copied quotes" in prompt:
+        if "Select only identifiers for spans" in prompt:
             self.calls += 1
-            section = next((part for part in prompt.split("PASSAGE_ID=")[1:] if self.quote in part), "")
+            section = next((part for part in prompt.split("SPAN_ID=")[1:] if self.quote in part), "")
             content = json.dumps(
                 {
-                    "evidence": [] if not section else [{"passage_id": section.splitlines()[0], "quote": self.quote}],
+                    "evidence": [] if not section else [{"span_ids": [section.splitlines()[0]]}],
                     "needs_more_search": False,
                     "next_query": "",
                 }
@@ -248,8 +248,8 @@ def test_fts5_available_and_v11_profile_migrates(tmp_path: Path) -> None:
     legacy.close()
     migrated = Database(profile)
     try:
-        assert SCHEMA_VERSION == 13
-        assert migrated.conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0] == "13"
+        assert SCHEMA_VERSION == 14
+        assert migrated.conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0] == "14"
         assert LocalSearchIndex(migrated).fts5_available()
     finally:
         migrated.close()

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def utc_ms() -> int:
@@ -197,6 +197,7 @@ class Database:
                 round_count INTEGER NOT NULL DEFAULT 0,
                 budgets_json TEXT NOT NULL DEFAULT '{}',
                 metrics_json TEXT NOT NULL DEFAULT '{}',
+                operations_json TEXT NOT NULL DEFAULT '[]',
                 error_code TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 completed_at INTEGER
@@ -225,6 +226,22 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_search_evidence_source
                 ON search_evidence(source_document_id, passage_id);
+
+            CREATE TABLE IF NOT EXISTS search_evidence_diagnostics (
+                id TEXT PRIMARY KEY,
+                search_run_id TEXT NOT NULL,
+                selection_index INTEGER NOT NULL,
+                selected_span_id TEXT NOT NULL DEFAULT '',
+                selected_passage_id TEXT NOT NULL DEFAULT '',
+                rejection_code TEXT NOT NULL DEFAULT '',
+                source_origin TEXT NOT NULL DEFAULT '',
+                pointer_resolved INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_search_evidence_diagnostics_run
+                ON search_evidence_diagnostics(search_run_id, selection_index);
 
             -- Search v1 keeps rag_chunks authoritative. This table only maps
             -- stable chunk ids to integer FTS rowids; the contentless FTS
@@ -669,6 +686,7 @@ class Database:
             """
         )
         self.ensure_column("messages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        self.ensure_column("search_runs", "operations_json", "TEXT NOT NULL DEFAULT '[]'")
         self.ensure_column("documents", "ocr_status", "TEXT NOT NULL DEFAULT 'not_needed'")
         self.ensure_column("documents", "ocr_engine", "TEXT NOT NULL DEFAULT ''")
         self.ensure_column("documents", "ocr_error", "TEXT NOT NULL DEFAULT ''")

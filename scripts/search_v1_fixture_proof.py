@@ -37,12 +37,12 @@ class ProofModel:
         prompt = messages[-1]["content"]
         if "Generate concise public-web search formulations" in prompt:
             content = json.dumps({"queries": []})
-        elif "Select only exact copied quotes" in prompt:
-            sections = prompt.split("PASSAGE_ID=")[1:]
+        elif "Select only identifiers for spans" in prompt:
+            sections = prompt.split("SPAN_ID=")[1:]
             match = next((section for section in sections if self.quote in section), None)
             content = json.dumps(
                 {
-                    "evidence": [] if match is None else [{"passage_id": match.splitlines()[0], "quote": self.quote}],
+                    "evidence": [] if match is None else [{"span_ids": [match.splitlines()[0]]}],
                     "needs_more_search": False,
                     "next_query": "",
                 }

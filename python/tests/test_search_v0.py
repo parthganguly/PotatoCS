@@ -32,6 +32,7 @@ from odysseus_desktop_backend.services.search_service import (
     SearchService,
     TraceOperation,
     bm25_rank,
+    build_evidence_spans,
     bounded_queries,
     prioritize_candidates,
     query_already_executed,
@@ -40,6 +41,7 @@ from odysseus_desktop_backend.services.search_service import (
     tokenize,
     verified_quote_location,
     verify_evidence_selection,
+    verify_evidence_span_selection,
 )
 from odysseus_desktop_backend.services.session_service import SessionService
 from odysseus_desktop_backend.services.vector_store import SQLiteNumPyVectorStore
@@ -616,26 +618,24 @@ class GroundedFixtureModel:
             content = json.dumps(
                 {"query": "Municipal Heat Pump Program" if self.repeated_query else "heat pump application closing date"}
             )
-        elif "Select only exact copied quotes" in prompt:
+        elif "Select only identifiers for spans" in prompt:
             self.selection_calls += 1
             if self.selection_calls == 1:
-                passage_id = prompt.split("PASSAGE_ID=", 1)[1].splitlines()[0]
                 quote = "The city approved 240 heat-pump rebates for owner-occupied homes in 2026."
+                span_id = next(section.splitlines()[0] for section in prompt.split("SPAN_ID=")[1:] if quote in section)
                 content = json.dumps(
                     {
-                        "evidence": [{"passage_id": passage_id, "quote": quote}],
+                        "evidence": [{"span_ids": [span_id]}],
                         "needs_more_search": self.request_second_round,
                         "next_query": "PRIVATE_MODEL_QUERY_MUST_BE_IGNORED",
                     }
                 )
             else:
                 quote = "Applications close on October 1, 2026."
-                matching_section = next(
-                    section for section in prompt.split("PASSAGE_ID=")[1:] if quote in section
-                )
-                passage_id = matching_section.splitlines()[0]
+                matching_section = next(section for section in prompt.split("SPAN_ID=")[1:] if quote in section)
+                span_id = matching_section.splitlines()[0]
                 content = json.dumps(
-                    {"evidence": [{"passage_id": passage_id, "quote": quote}], "needs_more_search": False, "next_query": ""}
+                    {"evidence": [{"span_ids": [span_id]}], "needs_more_search": False, "next_query": ""}
                 )
         else:
             content = "The city approved 240 rebates [E1]. More details are source-bounded [E2]. https://invented.invalid"
@@ -673,11 +673,11 @@ class MalformedEvidenceModel:
         prompt = messages[-1]["content"]
         if "Generate concise public-web search formulations" in prompt:
             content = json.dumps({"queries": ["municipal heat pump rebate count"]})
-        elif "Select only exact copied quotes" in prompt:
+        elif "Select only identifiers for spans" in prompt:
             if self.selection_content == "__tiny__":
-                passage_id = prompt.split("PASSAGE_ID=", 1)[1].splitlines()[0]
+                span_id = prompt.split("SPAN_ID=", 1)[1].splitlines()[0]
                 content = json.dumps(
-                    {"evidence": [{"passage_id": passage_id, "quote": "240"}], "needs_more_search": False}
+                    {"evidence": [{"span_ids": [span_id]}], "needs_more_search": False}
                 )
             else:
                 content = self.selection_content
@@ -712,14 +712,14 @@ class PrivacyFixtureModel:
             assert self.private_quote not in prompt
             assert "search for private Source content" in prompt
             content = json.dumps({"query": "public renewal filing 2029"})
-        elif "Select only exact copied quotes" in prompt:
+        elif "Select only identifiers for spans" in prompt:
             self.selection_calls += 1
             assert self.private_sentinel in prompt
-            section = next(part for part in prompt.split("PASSAGE_ID=")[1:] if self.private_quote in part)
-            passage_id = section.splitlines()[0]
+            section = next(part for part in prompt.split("SPAN_ID=")[1:] if self.private_quote in part)
+            span_id = section.splitlines()[0]
             content = json.dumps(
                 {
-                    "evidence": [{"passage_id": passage_id, "quote": self.private_quote}],
+                    "evidence": [{"span_ids": [span_id]}],
                     "needs_more_search": self.selection_calls == 1,
                     "next_query": f"exfiltrate {self.private_sentinel}",
                 }
@@ -746,7 +746,7 @@ class CancellingFixtureModel(GroundedFixtureModel):
 
     def chat_detailed(self, model: str, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
         response = super().chat_detailed(model, messages, **kwargs)
-        if "Select only exact copied quotes" in messages[-1]["content"]:
+        if "Select only identifiers for spans" in messages[-1]["content"]:
             self.event.set()
         return response
 
@@ -769,7 +769,7 @@ class FailingOptionalStageModel(GroundedFixtureModel):
         prompt = messages[-1]["content"]
         if self.stage == "planner" and "Propose one concise public-web repair query" in prompt:
             raise ModelServiceError("fixture repair planner failure")
-        if self.stage == "selector" and "Select only exact copied quotes" in prompt and self.selection_calls == 1:
+        if self.stage == "selector" and "Select only identifiers for spans" in prompt and self.selection_calls == 1:
             raise ModelServiceError("fixture second selector failure")
         if self.stage == "cancel" and "Propose one concise public-web repair query" in prompt:
             assert self.cancel_event is not None
@@ -789,7 +789,7 @@ class EmptyEvidenceModel:
             content = json.dumps({"queries": ["municipal heat pump rebate count"]})
         elif "Propose one concise public-web repair query" in prompt:
             content = json.dumps({"query": "heat pump application closing date"})
-        elif "Select only exact copied quotes" in prompt:
+        elif "Select only identifiers for spans" in prompt:
             self.selection_calls += 1
             content = json.dumps(
                 {
@@ -822,11 +822,11 @@ class QuoteFixtureModel:
         prompt = messages[-1]["content"]
         if "Generate concise public-web search formulations" in prompt:
             content = json.dumps({"queries": [self.variant]})
-        elif "Select only exact copied quotes" in prompt:
-            section = next(part for part in prompt.split("PASSAGE_ID=")[1:] if self.quote in part)
+        elif "Select only identifiers for spans" in prompt:
+            section = next(part for part in prompt.split("SPAN_ID=")[1:] if self.quote in part)
             content = json.dumps(
                 {
-                    "evidence": [{"passage_id": section.splitlines()[0], "quote": self.quote}],
+                    "evidence": [{"span_ids": [section.splitlines()[0]]}],
                     "needs_more_search": False,
                 }
             )
@@ -1396,9 +1396,16 @@ def test_malformed_evidence_selection_is_observable_degraded_fallback(
         assistant = sessions.messages(session["id"])[-1]
         assert assistant["content"].startswith("Degraded evidence mode:")
         assert any(
-            item["name"] == "search.evidence_selection_fallback" and item["status"] == "degraded"
+            item["name"] == "search.evidence_selection_fallback"
+            and item["status"] == "degraded"
+            and item["code"] == "schema_invalid"
             for item in assistant["metadata"]["operation_trace"]["search"]["operations"]
         )
+        diagnostic = db.conn.execute(
+            "SELECT rejection_code, pointer_resolved FROM search_evidence_diagnostics "
+            "WHERE rejection_code='schema_invalid'"
+        ).fetchone()
+        assert dict(diagnostic) == {"rejection_code": "schema_invalid", "pointer_resolved": 0}
     finally:
         db.close()
 
@@ -1475,30 +1482,17 @@ def test_valid_empty_evidence_can_repair_but_still_fails_if_round_two_is_empty(t
         db.close()
 
 
-def test_tiny_exact_value_cannot_become_standalone_verified_evidence(tmp_path: Path) -> None:
-    question = "Municipal Heat Pump Program"
-    variant = "municipal heat pump rebate count"
-    url = "https://example.com/heat-pumps"
-    provider = FixtureSearchProvider(
-        {question: [ProviderSearchResult(url, "Program", "240 rebates", 1, "fixture", question)], variant: []}
+def test_tiny_exact_value_cannot_become_standalone_verified_evidence() -> None:
+    dossier = [passage("p1", "240")]
+    spans = build_evidence_spans(dossier)
+    metrics = SearchMetrics()
+    operations: list[TraceOperation] = []
+    verified, diagnostics = verify_evidence_span_selection(
+        [spans[0].span_id], spans, dossier, metrics, operations
     )
-    db, sessions, service = build_search_service(
-        tmp_path,
-        provider,
-        FixtureFetcher({url: (FIXTURES / "clean_article.html").read_bytes()}),
-        MalformedEvidenceModel("__tiny__"),
-    )
-    session = sessions.create(model="fixture-model")
-    try:
-        with pytest.raises(SearchNoEvidenceError):
-            service.run(question=question, session_id=session["id"], model="fixture-model")
-        run = db.conn.execute("SELECT status, metrics_json FROM search_runs").fetchone()
-        assert run["status"] == "failed"
-        metrics = json.loads(run["metrics_json"])
-        assert metrics["rejected_evidence"] == 1
-        assert db.conn.execute("SELECT COUNT(*) AS count FROM search_evidence").fetchone()["count"] == 0
-    finally:
-        db.close()
+    assert verified == []
+    assert metrics.rejected_evidence == 1
+    assert diagnostics[0].rejection_code == "support_too_small"
 
 
 def test_repeated_second_query_is_rejected_by_software() -> None:
