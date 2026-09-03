@@ -1,21 +1,19 @@
-# PotatoCs
+# PotatoCS / Odysseus Desktop
 
-**Local AI for ordinary computers.**
+**Released local-first RAG desktop app for Windows — built to keep AI answers tied to inspectable evidence on ordinary hardware.**
 
-PotatoCs is a local-first AI desktop project for ordinary computers.
+PotatoCS is the project; **Odysseus Desktop v0.3.1** is the shipped Windows application. It combines local LLM inference with semantic retrieval, OCR, source-grounded answers, diagnostics, benchmark reports, and per-answer operation traces without a default cloud-upload path for documents or chats.
 
-The AI industry is being pulled toward centralized compute: data centers,
-hyperscalers, and frontier labs buying hardware in bulk. PotatoCs explores the
-opposite path — making the models people can actually run on modest machines
-more useful through software.
+## Engineering snapshot
 
-The current Windows build ships as **Odysseus Desktop v0.3.1**. It wraps local
-models with OCR, semantic retrieval, evidence-grounded answers, diagnostics,
-benchmark reports, and per-answer operation traces.
+- **Shipped product:** Windows installer with published checksums and release notes.
+- **Stack:** Tauri · Rust · Python · SQLite · Ollama · RAG · OCR.
+- **AI system:** local text/embedding/vision models with source-scoped retrieval and evidence-linked answers.
+- **Reliability:** explicit lexical fallback, sidecar recovery paths, operation traces, benchmark reports, and release-gate checks.
+- **Validation:** Python tests, frontend build, Cargo checks, smoke testing, and installed-app smoke testing.
+- **Design constraint:** useful local AI on modest consumer hardware, with privacy and hardware limits treated as product requirements.
 
-PotatoCs is for the computers people already own: older laptops, office PCs,
-modest gaming machines, and “potato” hardware that will never be a data center
-node.
+PotatoCS explores the opposite of cloud-only AI: making models that people can actually run on the computers they already own more useful through software.
 
 ## Download v0.3.1
 
