@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "error",
+  "model": "/nvme/glm52_i4",
+  "checks": [
+    { "id": "model.path", "status": "pass", "summary": "model directory is readable" },
+    { "id": "model.config", "status": "pass", "summary": "config.json is valid" },
+    { "id": "model.tokenizer", "status": "pass", "summary": "tokenizer.json found" },
+    { "id": "storage.persistence", "status": "pass", "summary": "model directory can store usage and KV state" },
+    { "id": "engine.binary", "status": "pass", "summary": "engine executable is ready" },
+    { "id": "accelerator.cuda", "status": "skip", "summary": "no NVIDIA GPU detected; CPU path is available" },
+    { "id": "model.shards", "status": "pass", "summary": "safetensors headers are valid" },
+    { "id": "storage.disk", "status": "pass", "summary": "model backing store is available" },
+    { "id": "memory.ram", "status": "fail", "summary": "planned RAM budget exceeds available memory", "details": { "available_bytes": 6000000000, "budget_bytes": 21120000000, "cache_slots_per_layer": 0 } },
+    { "id": "placement.plan", "status": "warn", "summary": "RAM budget cannot hold one expert slot per sparse layer" }
+  ],
+  "plan": null
+}

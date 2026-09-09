@@ -1,0 +1,60 @@
+{
+  "version": 2,
+  "policy": {
+    "name": "quality",
+    "preserve_quantization": true,
+    "preserve_router": true,
+    "quality_preserving": true
+  },
+  "model": {
+    "path": "/nvme/glm52_i4",
+    "shards": 70,
+    "model_bytes": 370000000000,
+    "dense_bytes": 9900000000,
+    "expert_bytes": 358000000000,
+    "expert_count": 19456,
+    "expert_layers": 76,
+    "typical_expert_bytes": 19000000,
+    "per_cap_bytes": 1444000000
+  },
+  "cpu": {
+    "physical_cores": 8,
+    "thread_policy": "physical-cores"
+  },
+  "tiers": {
+    "disk": {
+      "role": "cold-backing",
+      "model_bytes": 370000000000,
+      "available_bytes": 512000000000,
+      "cold_expert_bytes": 340000000000
+    },
+    "ram": {
+      "role": "resident+warm-experts",
+      "available_bytes": 24000000000,
+      "budget_bytes": 21120000000,
+      "dense_bytes": 9900000000,
+      "runtime_bytes": 5600000000,
+      "expert_cache_bytes": 5620000000,
+      "warm_expert_bytes": 5620000000,
+      "cache_slots_per_layer": 3,
+      "cache_slots_per_layer_note": "auto-capped from MemAvailable"
+    },
+    "vram": {
+      "role": "hot-experts",
+      "devices": [],
+      "budget_bytes": 0,
+      "hot_expert_bytes": 0,
+      "expert_capacity": 0,
+      "requires_host_backing": false
+    }
+  },
+  "expected_bottleneck": "disk expert misses",
+  "decisions": [
+    { "target": "VRAM", "reason": "profile-ranked hot experts" },
+    { "target": "RAM", "reason": "warm experts execute on CPU without quality loss" },
+    { "target": "Disk", "reason": "immutable recovery source for cold experts" }
+  ],
+  "warnings": [
+    "cold expert misses may reach disk; normal decode speed depends on hit rate"
+  ]
+}
