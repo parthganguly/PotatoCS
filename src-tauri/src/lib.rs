@@ -686,6 +686,8 @@ fn can_restart_and_retry(method: &str) -> bool {
             | "campaigns.report_data"
             | "jobs.get"
             | "jobs.list"
+            | "storage.status"
+            | "storage.cleanup_preview"
     )
 }
 
@@ -1488,6 +1490,11 @@ mod tests {
         assert!(can_restart_and_retry("jobs.list"));
         assert!(!can_restart_and_retry("jobs.submit_import"));
         assert!(!can_restart_and_retry("jobs.cancel"));
+        assert!(can_restart_and_retry("storage.status"));
+        assert!(can_restart_and_retry("storage.cleanup_preview"));
+        assert!(!can_restart_and_retry("storage.cleanup"));
+        assert!(!can_restart_and_retry("sources.delete"));
+        assert!(!can_restart_and_retry("documents.delete"));
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
             .expect("lifecycle log");
         assert!(log.contains(

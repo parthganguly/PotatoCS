@@ -1209,8 +1209,11 @@ def test_artifact_import_derivatives_redaction_and_delete(tmp_path: Path):
         deleted = artifacts.delete(artifact["id"])
         assert deleted["deleted"] is True
         assert not Path(artifact["thumbnail_path"]).exists()
-        tombstone = artifacts.get(artifact["id"])
-        assert tombstone["is_deleted"] is True
+        # Unreferenced artifacts are hard-deleted (Issue #17); a tombstone
+        # survives only when chat history or analysis runs reference the row.
+        assert deleted["tombstoned"] is False
+        with pytest.raises(KeyError):
+            artifacts.get(artifact["id"])
     finally:
         db.close()
 

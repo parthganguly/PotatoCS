@@ -4,7 +4,14 @@ import type { AppStatus, OllamaStatus, Session, Settings, VisionBackend } from "
 
 export { readableModelLabel } from "../../api/models";
 
-type ActiveView = "chat" | "sources" | "diagnostics";
+type ActiveView = "chat" | "sources" | "storage" | "diagnostics";
+
+const VIEW_LABELS: Record<ActiveView, string> = {
+  chat: "Chat",
+  sources: "Sources",
+  storage: "Storage",
+  diagnostics: "Diagnostics"
+};
 
 export function AppSidebar(props: {
   activeView: ActiveView;
@@ -50,8 +57,8 @@ export function AppSidebar(props: {
         </button>
       </div>
 
-      <nav className="grid grid-cols-3 gap-2 border-b border-ink/15 px-4 py-3">
-        {(["chat", "sources", "diagnostics"] as ActiveView[]).map((view) => (
+      <nav className="grid grid-cols-2 gap-2 border-b border-ink/15 px-4 py-3">
+        {(["chat", "sources", "storage", "diagnostics"] as ActiveView[]).map((view) => (
           <button
             className={`rounded-md px-2 py-2 text-sm font-medium ${
               props.activeView === view ? "bg-moss text-white" : "bg-white hover:bg-[#faf9f3]"
@@ -60,7 +67,7 @@ export function AppSidebar(props: {
             onClick={() => props.onSetActiveView(view)}
             type="button"
           >
-            {view === "chat" ? "Chat" : view === "sources" ? "Sources" : "Diagnostics"}
+            {VIEW_LABELS[view]}
           </button>
         ))}
       </nav>

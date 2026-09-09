@@ -306,26 +306,39 @@ itself:
 - profile root (single known path, shown so the user can find their data),
   total profile bytes;
 - category breakdown: database (app.db + WAL + SHM), documents (imported
-  copies), images/artifacts, logs, reports, support bundles, other;
+  copies), images/artifacts, logs, models, other. (Amended by Issue #17:
+  campaign reports live outside the profile — default `~/Downloads` — and
+  support bundles do not exist until Issue #18, so neither is a profile
+  category; the optional Florence model pack is counted but never cleanable.)
 - per-source stored bytes come from the existing `sources.list` summaries
   (`size_bytes`), not from a new file walk;
-- reclaimable estimate: unused embedding-cache rows + orphaned files in
-  app-owned directories (files not referenced by any live row);
 - free disk bytes for the volume containing the profile;
 - `low_disk: true` below a structural threshold (1 GiB free — structural,
   not tuned).
 
-### Cleanup actions (explicit, user-initiated, each fixed-scope)
+### Cleanup actions (explicit, user-initiated, fixed-scope)
 
-1. `storage.cleanup_cache`: delete embedding-cache rows whose
+Amended by Issue #17 (`V04_STORAGE_CLEANUP_DESIGN.md` §9/§12): cleanup is
+exposed as one read (`storage.cleanup_preview`) plus one mutation
+(`storage.cleanup`) sharing the same candidate enumeration, so the preview
+provably matches execution. The mutation covers exactly three allow-listed
+categories:
+
+1. **embedding cache**: delete embedding-cache rows whose
    `(content_hash, embedding_model)` no longer matches any live chunk, then
-   report bytes reclaimed (measured via page-count delta after `VACUUM` is
-   **not** run automatically — DB file shrink is reported honestly as
-   "space becomes reusable inside the database file").
-2. `storage.cleanup_orphans`: delete files under app-owned directories
-   (`files/documents`, `files/artifacts`) not referenced by any live DB row,
-   with the same path-safety rules. Reports count + bytes.
-3. Log rotation is out of scope for v0.4 (logs are small and fixed-label).
+   report rows + blob bytes (`VACUUM` is **not** run automatically — DB file
+   shrink is reported honestly as "space becomes reusable inside the
+   database file").
+2. **orphan files**: delete files directly under app-owned directories
+   (`files/documents`, `files/artifacts/*`) not referenced by any live DB
+   row, with the same path-safety rules and a structural minimum-age guard.
+   Reports count + bytes.
+3. **legacy deleted sources**: purge derived rows and owned files of
+   pre-v0.4 soft-deleted (`is_deleted=1`) documents/artifacts; the row
+   itself is hard-deleted only when chat history holds no reference.
+
+Cleanup is refused with a fixed message while any heavy job is active. Log
+rotation is out of scope for v0.4 (logs are bounded and fixed-label).
 
 ## E. Diagnostics redaction policy (allowlist)
 

@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
 from odysseus_desktop_backend.logging_config import get_logger
+from odysseus_desktop_backend.pathsafety import is_link
 from odysseus_desktop_backend.services.document_service import DocumentService, normalize_source_scope
 from odysseus_desktop_backend.services.image_preprocessing_service import (
     IMAGE_PREPROCESS_VERSION,
@@ -733,29 +735,162 @@ class ArtifactService:
         return {"artifact_id": artifact_id, "deleted": deleted}
 
     def delete(self, artifact_id: str) -> dict[str, Any]:
-        artifact = self.get(artifact_id)
-        self.unindex(artifact_id) if self.rag is not None else None
-        stored_row = self.db.conn.execute("SELECT stored_path FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
-        paths = [stored_row["stored_path"] if stored_row else ""]
-        paths.extend(derivation.get("stored_path") for derivation in artifact.get("derivations") or [])
-        removed: list[str] = []
-        for value in paths:
-            if not value:
-                continue
-            try:
-                path = self._confined(Path(str(value)))
-                if path.exists() and path.is_file():
-                    path.unlink()
-                    removed.append(path.name)
-            except ArtifactPathError:
-                logger.warning("skipped non-profile artifact delete path artifact_id=%s", artifact_id)
-        now = utc_ms()
-        self.db.conn.execute(
-            "UPDATE artifacts SET is_deleted = 1, status = 'deleted', updated_at = ? WHERE id = ?",
-            (now, artifact_id),
+        """User-facing artifact deletion (V04_STORAGE_CLEANUP_DESIGN.md §6).
+
+        Hard-deletes derivation rows and owned files; the artifacts row is
+        hard-deleted unless chat messages or analysis history reference it
+        (both foreign keys are ON DELETE RESTRICT), in which case it becomes
+        a tombstone with all derived data purged. Idempotent.
+        """
+        row = self.db.conn.execute(
+            "SELECT id, is_deleted FROM artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if row is None:
+            return {
+                "deleted": True,
+                "already_deleted": True,
+                "artifact_id": artifact_id,
+                "tombstoned": False,
+                "deleted_rows": 0,
+                "files_removed": 0,
+                "failed_files": 0,
+                "bytes_reclaimed": 0,
+            }
+        already_deleted = bool(row["is_deleted"])
+        purge = self._purge_artifact_data(artifact_id)
+        return {
+            "deleted": True,
+            "already_deleted": already_deleted,
+            "artifact_id": artifact_id,
+            "tombstoned": purge["tombstoned"],
+            "deleted_rows": purge["deleted_rows"],
+            "files_removed": purge["files_removed"],
+            "failed_files": purge["failed_files"],
+            "bytes_reclaimed": purge["bytes_reclaimed"],
+        }
+
+    def purge_deleted_artifact(self, artifact_id: str) -> dict[str, Any]:
+        """Purge derived rows and owned files of a soft-deleted artifact.
+
+        Used by storage cleanup for legacy (pre-v0.4) soft deletes.
+        """
+        row = self.db.conn.execute(
+            "SELECT id FROM artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if row is None:
+            return {
+                "deleted_rows": 0,
+                "row_deleted": False,
+                "files_removed": 0,
+                "failed_files": 0,
+                "bytes_reclaimed": 0,
+            }
+        purge = self._purge_artifact_data(artifact_id)
+        return {
+            "deleted_rows": purge["deleted_rows"] + (0 if purge["tombstoned"] else 1),
+            "row_deleted": not purge["tombstoned"],
+            "files_removed": purge["files_removed"],
+            "failed_files": purge["failed_files"],
+            "bytes_reclaimed": purge["bytes_reclaimed"],
+        }
+
+    def _purge_artifact_data(self, artifact_id: str) -> dict[str, Any]:
+        if self.rag is not None and self.documents is not None:
+            self.unindex(artifact_id)
+        stored_row = self.db.conn.execute(
+            "SELECT stored_path FROM artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        paths = [str(stored_row["stored_path"] or "") if stored_row else ""]
+        paths.extend(
+            str(derivation.get("stored_path") or "")
+            for derivation in self.derivations(artifact_id)
         )
-        self.db.conn.commit()
-        return {"deleted": True, "artifact_id": artifact_id, "removed_files": removed}
+        conn = self.db.conn
+        try:
+            deleted_rows = conn.execute(
+                "DELETE FROM artifact_derivations WHERE artifact_id = ?",
+                (artifact_id,),
+            ).rowcount
+            refs = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM message_artifacts WHERE artifact_id = ?) +
+                    (SELECT COUNT(*) FROM artifact_analysis_runs WHERE artifact_id = ?) AS n
+                """,
+                (artifact_id, artifact_id),
+            ).fetchone()
+            tombstoned = int(refs["n"] or 0) > 0
+            if tombstoned:
+                conn.execute(
+                    "UPDATE artifacts SET is_deleted = 1, status = 'deleted', error = '', updated_at = ? WHERE id = ?",
+                    (utc_ms(), artifact_id),
+                )
+            else:
+                conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            logger.warning("artifact delete failed reason=db_error")
+            raise RuntimeError("delete_failed") from None
+        files_removed = 0
+        failed_files = 0
+        bytes_reclaimed = 0
+        for value in paths:
+            removed, size, failed = self._remove_confined_file(value)
+            if removed:
+                files_removed += 1
+                bytes_reclaimed += size
+            elif failed:
+                failed_files += 1
+        logger.info(
+            "artifact deleted artifact_id=%s tombstoned=%s files_removed=%s failed_files=%s",
+            artifact_id,
+            tombstoned,
+            files_removed,
+            failed_files,
+        )
+        return {
+            "tombstoned": tombstoned,
+            "deleted_rows": max(0, deleted_rows),
+            "files_removed": files_removed,
+            "failed_files": failed_files,
+            "bytes_reclaimed": bytes_reclaimed,
+        }
+
+    def _remove_confined_file(self, value: str) -> tuple[bool, int, bool]:
+        """Delete one owned artifact file, fail closed.
+
+        Returns (removed, bytes, failed). A missing file is neither removed
+        nor failed. Symlinks/junctions and paths escaping the artifact root
+        are refused and counted as failed.
+        """
+        if not value:
+            return False, 0, False
+        candidate = Path(value)
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            return False, 0, False
+        except OSError:
+            logger.warning("artifact file removal refused reason=os_error")
+            return False, 0, True
+        link = is_link(candidate)
+        if link is None or link:
+            logger.warning("artifact file removal refused reason=symlink")
+            return False, 0, True
+        try:
+            path = self._confined(candidate)
+            if not path.is_file():
+                return False, 0, False
+            size = int(path.stat().st_size)
+            path.unlink()
+            return True, size, False
+        except ArtifactPathError:
+            logger.warning("artifact file removal refused reason=outside_profile")
+            return False, 0, True
+        except OSError:
+            logger.warning("artifact file removal failed reason=os_error")
+            return False, 0, True
 
     def promote(self, artifact_id: str) -> dict[str, Any]:
         artifact = self.get(artifact_id)

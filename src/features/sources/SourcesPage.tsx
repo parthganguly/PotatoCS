@@ -14,6 +14,7 @@ const FILTERS = [
 export function SourcesPage(props: {
   busy: boolean;
   error: string | null;
+  notice?: string | null;
   filter: string;
   sources: SourceSummary[];
   onAddSources: () => void;
@@ -56,6 +57,12 @@ export function SourcesPage(props: {
       {props.error && (
         <div className="border-b border-clay/30 bg-[#fff3ee] px-5 py-3 text-sm text-clay">
           {props.error}
+        </div>
+      )}
+
+      {!props.error && props.notice && (
+        <div className="border-b border-ink/15 bg-[#f4f4ec] px-5 py-3 text-sm text-ink/70">
+          {props.notice}
         </div>
       )}
 

@@ -122,10 +122,20 @@ import { firstRunReadinessNeeded, readinessRows } from "./features/readiness/rea
 import { AppSidebar } from "./features/shell/AppSidebar";
 import { backendBannerState, isBackendDegradedEvent } from "./features/shell/backendStatus";
 import { SourcesPage } from "./features/sources/SourcesPage";
+import { getCleanupPreview, getStorageStatus, runCleanup } from "./api/storage";
+import { StoragePanel } from "./features/storage/StoragePanel";
+import type { CleanupPreview, CleanupResult, StorageStatus } from "./features/storage/storageModel";
+import {
+  cleanupConfirmCopy,
+  deleteSourceConfirmCopy,
+  deleteSourceErrorCopy,
+  deleteSourceResultCopy,
+  storageErrorCopy
+} from "./features/storage/storageModel";
 import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisionDiagnostics";
 
 type LoadState = "idle" | "loading" | "error";
-type ActiveView = "chat" | "sources" | "diagnostics";
+type ActiveView = "chat" | "sources" | "storage" | "diagnostics";
 const SUPPORTED_DOCUMENT_EXTENSIONS = [".txt", ".md", ".pdf"];
 const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
 const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
@@ -174,6 +184,13 @@ function App() {
   const [showReadiness, setShowReadiness] = useState(false);
   const [readinessChecking, setReadinessChecking] = useState(false);
   const [activeView, setActiveView] = useState<ActiveView>("chat");
+  const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
+  const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null);
+  const [lastCleanup, setLastCleanup] = useState<CleanupResult | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [storageCleaning, setStorageCleaning] = useState(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [sourceNotice, setSourceNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [pendingSources, setPendingSources] = useState<SourceSummary[]>([]);
   const [conversationContext, setConversationContext] = useState<SourceSummary[]>([]);
@@ -356,6 +373,12 @@ function App() {
   useEffect(() => {
     if (activeView === "sources" && sources.length === 0) {
       void refreshSources();
+    }
+  }, [activeView]);
+
+  useEffect(() => {
+    if (activeView === "storage" && !storageStatus && !storageLoading) {
+      void refreshStorage();
     }
   }, [activeView]);
 
@@ -1262,18 +1285,52 @@ function App() {
   }
 
   async function deleteUnifiedSource(source: SourceSummary) {
-    const confirmed = window.confirm(`Delete ${source.display_name}?`);
+    const confirmed = window.confirm(deleteSourceConfirmCopy(source.display_name));
     if (!confirmed) return;
     setBusy(true);
     setError(null);
+    setSourceNotice(null);
     try {
-      await deleteSource(source.backend_kind, source.id);
+      const result = await deleteSource(source.backend_kind, source.id);
+      setSourceNotice(deleteSourceResultCopy(result));
       setPendingSources((current) => current.filter((item) => !sameSource(item, source)));
       await refreshSources();
     } catch (err) {
-      setError(readError(err));
+      // Fixed-copy mapping only; raw backend error strings are never rendered.
+      setError(deleteSourceErrorCopy(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function refreshStorage() {
+    setStorageLoading(true);
+    setStorageError(null);
+    try {
+      const [status, preview] = await Promise.all([getStorageStatus(), getCleanupPreview()]);
+      setStorageStatus(status);
+      setCleanupPreview(preview);
+    } catch (err) {
+      setStorageError(storageErrorCopy(err));
+    } finally {
+      setStorageLoading(false);
+    }
+  }
+
+  async function runStorageCleanup() {
+    if (!cleanupPreview) return;
+    const confirmed = window.confirm(cleanupConfirmCopy(cleanupPreview));
+    if (!confirmed) return;
+    setStorageCleaning(true);
+    setStorageError(null);
+    try {
+      const result = await runCleanup();
+      setLastCleanup(result);
+      await refreshStorage();
+    } catch (err) {
+      setStorageError(storageErrorCopy(err));
+    } finally {
+      setStorageCleaning(false);
     }
   }
 
@@ -1900,6 +1957,7 @@ function App() {
           <SourcesPage
             busy={busy}
             error={error}
+            notice={sourceNotice}
             filter={sourceFilter}
             sources={sources}
             onAddSources={chooseLibrarySources}
@@ -1910,6 +1968,17 @@ function App() {
             }}
             onPromote={promotePendingSource}
             onRefresh={() => refreshSources()}
+          />
+        ) : activeView === "storage" ? (
+          <StoragePanel
+            status={storageStatus}
+            preview={cleanupPreview}
+            lastCleanup={lastCleanup}
+            loading={storageLoading}
+            cleaning={storageCleaning}
+            error={storageError}
+            onRefresh={() => void refreshStorage()}
+            onCleanup={() => void runStorageCleanup()}
           />
         ) : (
           <DiagnosticsWorkspace

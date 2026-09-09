@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from odysseus_desktop_backend.logging_config import get_logger
+from odysseus_desktop_backend.pathsafety import is_link
 from odysseus_desktop_backend.storage import Database, utc_ms
 
 
@@ -574,7 +576,15 @@ class DocumentService:
             logger.warning("owned file removal refused reason=documents_dir_unresolvable")
             return False, 0, False
         try:
-            if candidate.is_symlink():
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                return False, 0, True
+            link = is_link(candidate)
+            if link is None:
+                logger.warning("owned file removal refused reason=os_error")
+                return False, 0, False
+            if link:
                 logger.warning("owned file removal refused reason=symlink")
                 return False, 0, False
             if not candidate.exists():
@@ -590,19 +600,130 @@ class DocumentService:
             logger.warning("owned file removal failed reason=os_error")
             return False, 0, False
 
-    def mark_deleted(self, document_id: str) -> dict[str, Any]:
-        now = utc_ms()
-        self.db.conn.execute(
-            """
-            UPDATE documents
-            SET is_deleted = 1, status = 'deleted', index_status = 'deleted', updated_at = ?
-            WHERE id = ?
-            """,
-            (now, document_id),
+    def delete_user_document(self, document_id: str) -> dict[str, Any]:
+        """User-facing Source deletion (V04_STORAGE_CLEANUP_DESIGN.md §6).
+
+        Hard-deletes derived rows and the app-owned file copy. The documents
+        row is hard-deleted unless chat history references it
+        (message_documents ON DELETE RESTRICT), in which case it becomes a
+        tombstone with all derived data purged. Idempotent: repeating the
+        call returns the same shape with zeroed reclaim numbers. The user's
+        original external file (source_path) is never touched.
+        """
+        row = self.db.conn.execute(
+            "SELECT id, stored_path, is_deleted FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "deleted": True,
+                "already_deleted": True,
+                "document_id": document_id,
+                "tombstoned": False,
+                "deleted_chunks": 0,
+                "deleted_pages": 0,
+                "deleted_ocr_pages": 0,
+                "file_removed": False,
+                "file_missing": True,
+                "bytes_reclaimed": 0,
+            }
+        already_deleted = bool(row["is_deleted"])
+        purge = self._purge_user_document_data(document_id, str(row["stored_path"] or ""))
+        return {
+            "deleted": True,
+            "already_deleted": already_deleted,
+            "document_id": document_id,
+            **purge,
+        }
+
+    def purge_deleted_document(self, document_id: str) -> dict[str, Any]:
+        """Purge derived rows and the owned file of a soft-deleted document.
+
+        Used by storage cleanup for legacy (pre-v0.4) soft deletes. The row
+        itself is removed only when chat history holds no reference.
+        """
+        row = self.db.conn.execute(
+            "SELECT id, stored_path FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "deleted_rows": 0,
+                "row_deleted": False,
+                "file_removed": False,
+                "file_missing": True,
+                "bytes_reclaimed": 0,
+            }
+        purge = self._purge_user_document_data(document_id, str(row["stored_path"] or ""))
+        return {
+            "deleted_rows": purge["deleted_chunks"]
+            + purge["deleted_pages"]
+            + purge["deleted_ocr_pages"]
+            + (0 if purge["tombstoned"] else 1),
+            "row_deleted": not purge["tombstoned"],
+            "file_removed": purge["file_removed"],
+            "file_missing": purge["file_missing"],
+            "bytes_reclaimed": purge["bytes_reclaimed"],
+        }
+
+    def _purge_user_document_data(self, document_id: str, stored_path: str) -> dict[str, Any]:
+        """Failure-atomic purge: one DB transaction, then validated file removal.
+
+        A DB failure rolls the transaction back and surfaces a fixed error
+        code — never a false "deleted" state. File removal runs only after
+        the commit; a locked or unsafe file is reported honestly and later
+        reclaimed by storage cleanup as an orphan.
+        """
+        conn = self.db.conn
+        try:
+            deleted_chunks = conn.execute(
+                "DELETE FROM rag_chunks WHERE document_id = ?", (document_id,)
+            ).rowcount
+            deleted_pages = conn.execute(
+                "DELETE FROM document_pages WHERE document_id = ?", (document_id,)
+            ).rowcount
+            deleted_ocr_pages = conn.execute(
+                "DELETE FROM ocr_pages WHERE document_id = ?", (document_id,)
+            ).rowcount
+            refs = conn.execute(
+                "SELECT COUNT(*) AS n FROM message_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            tombstoned = int(refs["n"] or 0) > 0
+            if tombstoned:
+                conn.execute(
+                    """
+                    UPDATE documents
+                    SET is_deleted = 1, status = 'deleted', index_status = 'deleted',
+                        error = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_ms(), document_id),
+                )
+            else:
+                conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            logger.warning("document delete failed reason=db_error")
+            raise RuntimeError("delete_failed") from None
+        file_removed, bytes_reclaimed, file_missing = self._remove_owned_file(stored_path)
+        logger.info(
+            "document deleted document_id=%s tombstoned=%s file_removed=%s file_missing=%s",
+            document_id,
+            tombstoned,
+            file_removed,
+            file_missing,
         )
-        self.db.conn.commit()
-        logger.info("document deleted document_id=%s", document_id)
-        return {"deleted": True, "document_id": document_id}
+        return {
+            "tombstoned": tombstoned,
+            "deleted_chunks": max(0, deleted_chunks),
+            "deleted_pages": max(0, deleted_pages),
+            "deleted_ocr_pages": max(0, deleted_ocr_pages),
+            "file_removed": file_removed,
+            "file_missing": file_missing,
+            "bytes_reclaimed": bytes_reclaimed,
+        }
 
     def promote(self, document_id: str) -> dict[str, Any]:
         document = self.get(document_id)

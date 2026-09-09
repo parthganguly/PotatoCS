@@ -162,10 +162,10 @@ class RAGService:
         return self.index_document(document_id)
 
     def delete_document(self, document_id: str) -> dict[str, Any]:
-        self.documents.get(document_id)
-        deleted_chunks = self.vector_store.delete_by_document(document_id)
-        document = self.documents.mark_deleted(document_id)
-        return {**document, "deleted_chunks": deleted_chunks}
+        # Failure-atomic hard deletion with honest reclaimed-byte reporting;
+        # the old mark_deleted soft delete reclaimed nothing
+        # (V04_STORAGE_CLEANUP_DESIGN.md §6).
+        return self.documents.delete_user_document(document_id)
 
     def search(
         self,
