@@ -21,7 +21,6 @@ from odysseus_desktop_backend.services.search_service import (
     EVIDENCE_TEMPLATE_RESERVE_TOKENS,
     MAX_EVIDENCE_SPAN_SELECTIONS,
     MAX_TRUSTED_CONTEXT_TOKENS,
-    MIN_MODEL_CONTEXT_TOKENS,
     EvidencePassage,
     SearchBudget,
     SearchMetrics,
@@ -279,13 +278,24 @@ def test_partial_packing_only_when_the_top_passage_alone_cannot_fit() -> None:
     ]
 
 
-def test_at_least_one_span_survives_an_absurdly_small_budget() -> None:
+def test_absurdly_small_budget_packs_nothing_rather_than_overflowing() -> None:
+    """Reconciled in the request-integrity package.
+
+    This previously asserted that one span always survives. Forcing a span into a
+    window that cannot hold it overflows the very context the packing exists to
+    respect, so an impossible allowance now packs nothing and the caller's
+    complete-request check refuses the call.
+    """
     dossier = [bulky_passage()]
     spans = build_evidence_spans(dossier)
     window = pack_evidence_window(QUESTION, spans, [], input_budget_tokens=1)
 
-    assert window.spans_packed == 1
-    assert window.spans[0].span_id == spans[0].span_id
+    assert window.spans == []
+    assert window.spans_packed == 0
+    assert window.passages_packed == 0
+    assert window.truncated is True
+    # Nothing was sliced to manufacture a non-empty window.
+    assert window.spans_available == len(spans)
 
 
 # --------------------------------------------------------------------------------
@@ -614,8 +624,10 @@ def test_unloaded_or_unreachable_model_falls_back_to_the_platform_default() -> N
 def test_reported_context_is_clamped_to_the_trusted_range() -> None:
     huge = StubModelService("{}", loaded_context=1_000_000)
     assert resolve_model_context_tokens(huge, "fixture-model")[0] == MAX_TRUSTED_CONTEXT_TOKENS
+    # Bounded downward only. A window smaller than Search needs is reported as it
+    # actually is; the complete-request check refuses the call it cannot support.
     tiny = StubModelService("{}", loaded_context=128)
-    assert resolve_model_context_tokens(tiny, "fixture-model")[0] == MIN_MODEL_CONTEXT_TOKENS
+    assert resolve_model_context_tokens(tiny, "fixture-model")[0] == 128
 
 
 def test_configured_context_pins_the_limit_without_probing() -> None:

@@ -129,6 +129,9 @@ def replay_trial(case, arm, service, deadline):
             "llama3.2:latest", [{"role": "system", "content": untrusted_content_system_prompt()},
                                  {"role": "user", "content": prompt}],
             budget, metrics, deadline, num_predict=1200, response_format=None,
+            context_tokens=resolve_model_context_tokens(
+                service.models, "llama3.2:latest", budget.model_context_tokens
+            )[0],
         )
         raw = response["content"]
         answer = resolve_answer_citations(raw, evidence)
@@ -153,8 +156,8 @@ def replay_trial(case, arm, service, deadline):
                    selected=selected, diagnostics=[asdict(d) for d in diagnostics + verification],
                    all_evidence_visible=visible, needs_more_search=more)
         if evidence:
-            answer, response = service._synthesize(case["question"], evidence, "llama3.2:latest",
-                                                   budget, metrics, operations, deadline)
+            answer, response, evidence = service._synthesize(case["question"], evidence, "llama3.2:latest",
+                                                             budget, metrics, operations, deadline)
             raw = response["content"]
         else:
             answer, raw = "", ""

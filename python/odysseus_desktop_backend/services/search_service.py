@@ -66,7 +66,6 @@ MAX_EVIDENCE_SPAN_SELECTIONS = 8
 # Ollama's own default when OLLAMA_CONTEXT_LENGTH is unset; used when the loaded
 # runtime window cannot be read. Never guess larger than the platform default.
 DEFAULT_MODEL_CONTEXT_TOKENS = 4096
-MIN_MODEL_CONTEXT_TOKENS = 2048
 # Ceiling on any externally reported window. Bounds the prompt even if a runtime
 # advertises an implausibly large context.
 MAX_TRUSTED_CONTEXT_TOKENS = 32768
@@ -74,6 +73,9 @@ MAX_TRUSTED_CONTEXT_TOKENS = 32768
 # MAX_EVIDENCE_SPAN_SELECTIONS span ids plus one boolean (~90 tokens), so this is
 # roughly 2.8x headroom and is reserved out of the context window in full.
 EVIDENCE_SELECTION_NUM_PREDICT = 256
+# num_predict for the synthesis call, reserved out of the context window in full
+# exactly like the selection allowance.
+SYNTHESIS_NUM_PREDICT = 1200
 # Chat template, role markers and the untrusted-content system message, none of
 # which appear in the user prompt string this module measures.
 EVIDENCE_TEMPLATE_RESERVE_TOKENS = 256
@@ -520,7 +522,7 @@ class SearchService:
                     operations.append(TraceOperation("search.local_no_evidence", status="completed", count=1))
                     self._sync_local_budget_metrics(local_run_budget, metrics)
                 raise SearchNoEvidenceError("Search found no deterministically verified evidence")
-            answer, synthesis_response = self._synthesize(
+            answer, synthesis_response, verified = self._synthesize(
                 clean_question,
                 verified,
                 clean_model,
@@ -652,6 +654,9 @@ class SearchService:
                 deadline,
                 num_predict=256,
                 response_format="json",
+                context_tokens=resolve_model_context_tokens(
+                    self.models, model, budget.model_context_tokens
+                )[0],
             )
             parsed = parse_json_object(str(response.get("content") or ""))
             raw_queries = parsed.get("queries") if isinstance(parsed, dict) else None
@@ -1165,6 +1170,7 @@ class SearchService:
             deadline,
             num_predict=EVIDENCE_SELECTION_NUM_PREDICT,
             response_format="json",
+            context_tokens=context_limit,
         )
         parsed, decode_code = parse_json_object_detailed(str(response.get("content") or ""))
         valid_structure = valid_evidence_selection(parsed)
@@ -1277,6 +1283,9 @@ class SearchService:
             deadline,
             num_predict=160,
             response_format="json",
+            context_tokens=resolve_model_context_tokens(
+                self.models, model, budget.model_context_tokens
+            )[0],
         )
         parsed = parse_json_object(str(response.get("content") or ""))
         query = clean_query(parsed.get("query")) if isinstance(parsed, dict) else ""
@@ -1298,22 +1307,45 @@ class SearchService:
         metrics: SearchMetrics,
         operations: list[TraceOperation],
         deadline: float,
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any], list[VerifiedEvidence]]:
         operations.append(TraceOperation("search.synthesis_started"))
-        prompt = synthesis_prompt(question, evidence)
+        context_tokens, _ = resolve_model_context_tokens(
+            self.models, model, budget.model_context_tokens
+        )
+        # Whole evidence items only, dropped from the tail so every surviving item
+        # keeps its E-number and its citation index. One item is the minimum useful
+        # synthesis request; if even that cannot fit, _model_call refuses the call
+        # rather than sending a request the window would truncate.
+        fitted = list(evidence)
+        while len(fitted) > 1 and complete_request_tokens(
+            synthesis_messages(question, fitted), SYNTHESIS_NUM_PREDICT
+        ) > context_tokens:
+            fitted.pop()
+        if len(fitted) < len(evidence):
+            metrics.degraded = True
+            operations.append(
+                TraceOperation(
+                    "search.synthesis_evidence_trimmed",
+                    status="degraded",
+                    code="context_budget",
+                    count=len(fitted),
+                )
+            )
         response = self._model_call(
             model,
-            [{"role": "system", "content": untrusted_content_system_prompt()}, {"role": "user", "content": prompt}],
+            synthesis_messages(question, fitted),
             budget,
             metrics,
             deadline,
-            num_predict=1200,
+            num_predict=SYNTHESIS_NUM_PREDICT,
             response_format=None,
+            context_tokens=context_tokens,
         )
         content = str(response.get("content") or "").strip()
         if not content:
             raise SearchServiceError("final synthesis returned no answer")
-        return resolve_answer_citations(content, evidence), response
+        # Citations map to exactly the evidence synthesis actually saw.
+        return resolve_answer_citations(content, fitted), response, fitted
 
     def _model_call(
         self,
@@ -1325,16 +1357,31 @@ class SearchService:
         *,
         num_predict: int,
         response_format: str | None,
+        context_tokens: int,
     ) -> dict[str, Any]:
         check_cancelled()
         self._ensure_time(deadline)
         if metrics.model_calls >= budget.max_model_calls:
             raise SearchBudgetError("Search model-call budget exhausted")
+        # The complete request must fit the capacity this same call requests.
+        # Overflowing the window silently deletes the head of the prompt, where the
+        # output contract lives, so an impossible request is refused, never sent.
+        required = complete_request_tokens(messages, num_predict)
+        if required > context_tokens:
+            raise SearchBudgetError(
+                f"Search request needs about {required} tokens but the model context "
+                f"for this call is {context_tokens}"
+            )
         metrics.model_calls += 1
         response = self.models.chat_detailed(
             model,
             messages,
-            options={"temperature": 0, "num_predict": num_predict},
+            options={
+                "temperature": 0,
+                "num_predict": num_predict,
+                # Accounted capacity and requested capacity are the same number.
+                "num_ctx": context_tokens,
+            },
             thinking="off",
             timeout=max(1.0, min(120.0, deadline - time.monotonic())),
             response_format=response_format,
@@ -1767,6 +1814,21 @@ def estimate_prompt_tokens(text: str) -> int:
     return math.ceil(utf8_length(text) / EVIDENCE_ESTIMATOR_BYTES_PER_TOKEN)
 
 
+def complete_request_tokens(messages: list[dict[str, str]], num_predict: int) -> int:
+    """Estimated context cost of the request we actually send.
+
+    Every message the request carries, plus the generation allowance reserved in
+    full, plus the chat-template/role-marker reserve. This is the single accounting
+    used for every Search model call. The byte-based estimator remains an estimator,
+    not a tokenizer guarantee, so the template reserve is the deliberate margin.
+    """
+    return (
+        sum(estimate_prompt_tokens(str(item.get("content") or "")) for item in messages)
+        + int(num_predict)
+        + EVIDENCE_TEMPLATE_RESERVE_TOKENS
+    )
+
+
 def evidence_input_budget_tokens(context_limit_tokens: int) -> int:
     """Prompt-token budget for the evidence-selection call.
 
@@ -1782,7 +1844,13 @@ def evidence_input_budget_tokens(context_limit_tokens: int) -> int:
 
 
 def clamp_context_tokens(value: int) -> int:
-    return max(MIN_MODEL_CONTEXT_TOKENS, min(int(value), MAX_TRUSTED_CONTEXT_TOKENS))
+    """Bound a reported/configured window downward only.
+
+    A capacity smaller than Search needs is never rounded up: inventing context we
+    were not given is what makes accounting disagree with the runtime. Undersized
+    windows survive here and are refused later by the complete-request check.
+    """
+    return min(max(1, int(value)), MAX_TRUSTED_CONTEXT_TOKENS)
 
 
 def resolve_model_context_tokens(models: Any, model: str, configured: int = 0) -> tuple[int, str]:
@@ -1895,16 +1963,17 @@ def pack_evidence_window(
             # A whole passage is never cut merely to squeeze in another fragment.
             break
         # Last resort only: the highest-ranked passage alone exceeds the budget, so
-        # pack its leading spans. The first span is always kept so the selection task
-        # still reaches the model with something to choose from.
+        # pack its leading spans. Spans stay atomic and the budget is never violated
+        # to guarantee a non-empty window; zero packed spans is a legitimate outcome
+        # that the caller's complete-request check then refuses.
         used = utf8_length(evidence_passage_header(key, group)) + 1
         for span in group:
             span_bytes = utf8_length(evidence_span_block(span))
-            if packed and used + span_bytes > remaining:
+            if used + span_bytes > remaining:
                 break
             packed.append(span)
             used += span_bytes
-        packed_passages = 1
+        packed_passages = 1 if packed else 0
         partial_passage = len(packed) < len(group)
         break
     return EvidenceWindow(
@@ -2321,6 +2390,13 @@ def synthesis_prompt(question: str, evidence: list[VerifiedEvidence]) -> str:
         "Cite supporting sentences with the supplied evidence IDs like [E1]. Never write or invent a URL.\n"
         f"QUESTION:\n{question}\nVERIFIED EVIDENCE:\n" + "\n\n".join(rows)
     )
+
+
+def synthesis_messages(question: str, evidence: list[VerifiedEvidence]) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": untrusted_content_system_prompt()},
+        {"role": "user", "content": synthesis_prompt(question, evidence)},
+    ]
 
 
 def resolve_answer_citations(answer: str, evidence: list[VerifiedEvidence]) -> str:
