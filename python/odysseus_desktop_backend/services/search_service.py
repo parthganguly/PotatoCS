@@ -44,6 +44,7 @@ SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 URL_RE = re.compile(r"https?://[^\s)\]>]+", re.IGNORECASE)
 EVIDENCE_CITATION_RE = re.compile(r"\[(E[0-9]+)\]", re.IGNORECASE)
 QUERY_KEY_RE = re.compile(r"[^\w]+", re.UNICODE)
+SPAN_ID_RE = re.compile(r"P\d{1,4}:S\d{1,4}")
 MIN_VERIFIED_QUOTE_CHARS = 8
 MIN_VERIFIED_QUOTE_TOKENS = 2
 MIN_FALLBACK_QUOTE_CHARS = 24
@@ -2070,11 +2071,15 @@ def verify_evidence_span_selection(
         span = by_span_id.get(span_id)
         if span is None:
             code = "unknown_span"
+            # Diagnostics may echo only our own pointer grammar. Anything else is
+            # arbitrary model text that can carry private source content, so it is
+            # dropped rather than stored, truncated, or hashed.
+            reported_span_id = span_id if SPAN_ID_RE.fullmatch(span_id) else ""
             metrics.rejected_evidence += 1
             diagnostics.append(
                 EvidenceDiagnostic(
                     selection_index=selection_index,
-                    selected_span_id=span_id,
+                    selected_span_id=reported_span_id,
                     rejection_code=code,
                 )
             )
@@ -2083,7 +2088,7 @@ def verify_evidence_span_selection(
                     "search.evidence_rejected",
                     status="rejected",
                     code=code,
-                    selected_span_id=span_id,
+                    selected_span_id=reported_span_id,
                     pointer_resolved=False,
                 )
             )

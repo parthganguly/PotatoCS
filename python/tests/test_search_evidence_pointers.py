@@ -223,3 +223,17 @@ def test_corrupt_pointer_metadata_fails_existing_exact_location_check() -> None:
     )
     assert verified == []
     assert diagnostics[0].rejection_code == "verification_mismatch"
+
+
+def test_non_canonical_pointer_is_rejected_without_recording_model_text() -> None:
+    dossier = [passage(SQLITE_SENTENCE)]
+    secret = "SYNTHETIC_PRIVATE_SENTINEL_9381"
+    noise = ["P1:S1 " + secret, secret, "P" * 9, "P99999:S1", ""]
+    _, verified, diagnostics, metrics, operations = resolve(["P99:S99", *noise], dossier)
+
+    assert verified == []
+    assert metrics.rejected_evidence == len(noise) + 1
+    assert {item.rejection_code for item in diagnostics} == {"unknown_span"}
+    # Canonical unknown pointers stay diagnosable; everything else is dropped, not stored.
+    assert [item.selected_span_id for item in diagnostics] == ["P99:S99", *[""] * len(noise)]
+    assert [item.selected_span_id for item in operations] == ["P99:S99", *[""] * len(noise)]
