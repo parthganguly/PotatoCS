@@ -24,6 +24,8 @@ from odysseus_desktop_backend.services.search_provider import (
     SearchProviderError,
 )
 from odysseus_desktop_backend.services.search_service import (
+    RESULTS_ONLY_ANSWER,
+    RESULTS_ONLY_MAX_URL_CHARS,
     EvidencePassage,
     SearchBudget,
     SearchBudgetError,
@@ -1386,11 +1388,18 @@ def test_repair_with_duplicate_page_skips_redundant_evidence_selection(tmp_path:
         ('{"span_ids":["P1:S1"],"needs_more_search":"false"}', "schema_invalid"),
     ],
 )
-def test_malformed_evidence_selection_is_observable_degraded_fallback(
+def test_malformed_evidence_selection_is_a_results_only_outcome(
     tmp_path: Path,
     selection_content: str,
     expected_code: str,
 ) -> None:
+    """Reconciled from the retired positional-fallback contract.
+
+    The old contract answered from whichever spans happened to come first in the
+    window and cited them. Position is not relevance, so a malformed selection now
+    yields zero support and the successful retrieval is delivered as a results-only
+    outcome that stays inspectable but is never presented as answer evidence.
+    """
     question = "Municipal Heat Pump Program"
     variant = "municipal heat pump rebate count"
     url = "https://example.com/heat-pumps"
@@ -1406,23 +1415,132 @@ def test_malformed_evidence_selection_is_observable_degraded_fallback(
     session = sessions.create(model="fixture-model")
     try:
         result = service.run(question=question, session_id=session["id"], model="fixture-model")
+        assert result["outcome"] == "results_only"
+        assert result["citations"] == []
         assert result["metrics"]["evidence_selection_fallbacks"] == 1
         assert result["metrics"]["degraded"] is True
-        assert len(result["citations"][0]["exact_quote"]) >= 24
-        assistant = sessions.messages(session["id"])[-1]
-        assert assistant["content"].startswith("Degraded evidence mode:")
+        assert result["metrics"]["verified_evidence"] == 0
+
+        # Reload through a fresh reader: the outcome is durable, not in-memory state.
+        assistant = SessionService(db).messages(session["id"])[-1]
+        assert assistant["content"] == RESULTS_ONLY_ANSWER
+        assert "search_evidence" not in assistant["metadata"]
+        assert "Sources:" not in assistant["content"]
+        assert "[E1]" not in assistant["content"]
+        results = assistant["metadata"]["search_results"]
+        assert results["outcome"] == "results_only"
+        assert results["reason"] == "selection_malformed"
+        assert results["passages"], "successful retrieval must stay inspectable"
+        assert any("240 heat-pump rebates" in item["text"] for item in results["passages"])
+        assert all(item["canonical_url"] == url for item in results["passages"])
+        # Retrieval items carry no evidence identity, citation number or verified status.
+        assert not {"evidence_id", "citation_number", "verification_status", "exact_quote"} & set(
+            results["passages"][0]
+        )
+
+        trace = assistant["metadata"]["operation_trace"]
+        assert trace["search"]["outcome"] == "results_only"
+        assert trace["models"]["final_answer_model"] == ""
+        assert trace["pipeline"]["verifier_status"] == "results_only"
+        operations = trace["search"]["operations"]
         assert any(
             item["name"] == "search.evidence_selection_fallback"
             and item["status"] == "degraded"
             and item["code"] == expected_code
-            for item in assistant["metadata"]["operation_trace"]["search"]["operations"]
+            and item["count"] == 0
+            for item in operations
         )
+        assert any(item["name"] == "search.results_only" for item in operations)
+
         diagnostic = db.conn.execute(
             "SELECT rejection_code, pointer_resolved FROM search_evidence_diagnostics "
             "WHERE rejection_code = ?",
             (expected_code,),
         ).fetchone()
         assert dict(diagnostic) == {"rejection_code": expected_code, "pointer_resolved": 0}
+        assert db.conn.execute("SELECT COUNT(*) AS count FROM search_evidence").fetchone()["count"] == 0
+        run = db.conn.execute("SELECT status, error_code FROM search_runs").fetchone()
+        assert dict(run) == {"status": "completed", "error_code": ""}
+
+        # Malformed selection must not roll the successful acquisition back.
+        document = db.conn.execute("SELECT * FROM documents WHERE canonical_url = ?", (url,)).fetchone()
+        assert document is not None
+        assert document["is_staging"] == 0
+        assert document["web_revision_current"] == 1
+    finally:
+        db.close()
+
+
+def test_results_only_omits_an_oversized_url_without_truncating_it(tmp_path: Path) -> None:
+    """Dossier text is bounded by max_dossier_chars; a canonical URL was not.
+
+    A ~100 KB query string made the persisted results-only metadata two orders of
+    magnitude larger than the retrieval it described. An over-length URL is now omitted
+    rather than truncated, because a shortened URL is a different destination.
+    """
+    question = "Municipal Heat Pump Program"
+    variant = "municipal heat pump rebate count"
+    normal_url = "https://example.com/heat-pumps"
+    long_url = "https://example.com/heat-pumps-archive?q=" + ("x" * 100000)
+    long_body = (
+        "<!doctype html><html lang=en><head><title>Rebate Archive</title></head><body><main>"
+        "<h1>Rebate Archive</h1>"
+        "<p>The archive lists rebate totals for the municipal heat pump program by year.</p>"
+        "<p>Archived pages are retained for reference and are not application forms.</p>"
+        "</main></body></html>"
+    ).encode("utf-8")
+    provider = FixtureSearchProvider(
+        {
+            question: [
+                ProviderSearchResult(normal_url, "Program", "240 rebates", 1, "fixture", question),
+                ProviderSearchResult(long_url, "Rebate Archive", "Archive of rebate totals", 2, "fixture", question),
+            ],
+            variant: [],
+        }
+    )
+    db, sessions, service = build_search_service(
+        tmp_path,
+        provider,
+        FixtureFetcher(
+            {normal_url: (FIXTURES / "clean_article.html").read_bytes(), long_url: long_body}
+        ),
+        MalformedEvidenceModel("not json at all"),
+    )
+    session = sessions.create(model="fixture-model")
+    try:
+        result = service.run(question=question, session_id=session["id"], model="fixture-model")
+        assert result["outcome"] == "results_only"
+        assistant = SessionService(db).messages(session["id"])[-1]
+        passages = assistant["metadata"]["search_results"]["passages"]
+        by_url = {item["canonical_url"] for item in passages}
+
+        # A normal validated URL survives untouched.
+        assert normal_url in by_url
+        # The oversized URL is omitted, not truncated into a different destination.
+        assert long_url not in by_url
+        assert all(len(item["canonical_url"]) <= RESULTS_ONLY_MAX_URL_CHARS for item in passages)
+        assert not any(item["canonical_url"].startswith("https://example.com/heat-pumps-archive")
+                       for item in passages)
+
+        # The rest of that passage is preserved: the retrieval result stays useful.
+        archived = [item for item in passages if item["title"] == "Rebate Archive"]
+        assert len(archived) == 1
+        assert archived[0]["canonical_url"] == ""
+        assert "rebate totals" in archived[0]["text"]
+        assert archived[0]["passage_id"]
+        assert archived[0]["source_id"]
+        assert archived[0]["source_origin"] == "web"
+
+        # The persisted metadata no longer balloons because of the URL field.
+        serialized = json.dumps(assistant["metadata"]["search_results"], separators=(",", ":"))
+        dossier_chars = sum(len(item["text"]) for item in passages)
+        assert "x" * 3000 not in serialized
+        assert len(serialized) < dossier_chars + 4000
+        # Still no evidence identity anywhere in the results-only payload.
+        assert "evidence_id" not in serialized
+        assert "citation_number" not in serialized
+        assert "verification_status" not in serialized
+        assert db.conn.execute("SELECT COUNT(*) AS count FROM search_evidence").fetchone()["count"] == 0
     finally:
         db.close()
 

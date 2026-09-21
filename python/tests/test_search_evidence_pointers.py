@@ -11,7 +11,6 @@ from odysseus_desktop_backend.services.search_service import (
     TraceOperation,
     build_evidence_spans,
     citation_dict,
-    deterministic_evidence_pointer_fallback,
     evidence_selection_prompt,
     valid_evidence_selection,
     verify_evidence_span_selection,
@@ -137,8 +136,6 @@ def test_multiple_adjacent_spans_remain_separate_exact_evidence() -> None:
 def test_valid_empty_selection_is_abstention_not_fallback() -> None:
     parsed = {"span_ids": [], "needs_more_search": True}
     assert valid_evidence_selection(parsed) is True
-    spans = build_evidence_spans([passage(SQLITE_SENTENCE)])
-    assert deterministic_evidence_pointer_fallback(spans)
     _, verified, diagnostics, metrics, _ = resolve([], [passage(SQLITE_SENTENCE)])
     assert verified == []
     assert diagnostics == []

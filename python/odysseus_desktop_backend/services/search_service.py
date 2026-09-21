@@ -50,9 +50,29 @@ MIN_VERIFIED_QUOTE_TOKENS = 2
 MIN_FALLBACK_QUOTE_CHARS = 24
 MIN_FALLBACK_QUOTE_TOKENS = 4
 DEGRADED_EVIDENCE_NOTE = (
-    "Degraded evidence mode: structured evidence selection failed, so exact contextual source excerpts "
-    "were selected deterministically."
+    "Degraded evidence mode: a later evidence selection failed, so this answer uses only the evidence "
+    "that was verified before that failure."
 )
+# Content-free: names the outcome, never the round's text.
+DEGRADED_SELECTION_WARNING = (
+    "Structured evidence selection failed; that round contributed no evidence."
+)
+# Software-authored on purpose. The model whose malformed reply caused this outcome
+# must not also narrate it.
+RESULTS_ONLY_ANSWER = (
+    "Search found source material, but could not select evidence for an answer. "
+    "You can inspect the retrieved passages below."
+)
+RESULTS_ONLY_OUTCOME = "results_only"
+RESULTS_ONLY_SELECTION_MALFORMED = "selection_malformed"
+# Results-only passages are persisted into the assistant message row, so every field
+# they carry needs a finite bound. The dossier text is already capped by
+# max_dossier_chars, but a canonical URL is not: a multi-kilobyte query string would
+# otherwise dominate the stored message. 2048 is the long-standing interoperable URL
+# ceiling, so a real destination is never near it. An over-length URL is omitted, never
+# truncated - a shortened URL is a different destination, and presenting one as the
+# source of a passage would be a lie.
+RESULTS_ONLY_MAX_URL_CHARS = 2048
 DEGRADED_REPAIR_WARNING = (
     "The optional repair step failed; the answer uses verified round-one evidence only."
 )
@@ -514,6 +534,25 @@ class SearchService:
                             )
                         )
 
+            if not verified and metrics.evidence_selection_fallbacks:
+                # Retrieval succeeded; only the model's structured selection was malformed.
+                # That is a results-only product, not a failed Search: discarding the
+                # retrieval here would let one bad model reply erase work that worked.
+                return self._complete_results_only(
+                    run_id=run_id,
+                    session_id=session_id,
+                    user_message_id=str(user_message["id"]),
+                    model=clean_model,
+                    question=clean_question,
+                    dossier=dossier,
+                    executed_queries=executed_queries,
+                    observed_revisions=observed_web_revisions,
+                    local_run_budget=local_run_budget,
+                    metrics=metrics,
+                    operations=operations,
+                    warnings=warnings,
+                    started=started,
+                )
             if not verified:
                 if getattr(self.provider, "name", "") == "local":
                     check_cancelled()
@@ -609,6 +648,95 @@ class SearchService:
                 error_code=code,
             )
             raise
+
+    def _complete_results_only(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        user_message_id: str,
+        model: str,
+        question: str,
+        dossier: list[EvidencePassage],
+        executed_queries: list[str],
+        observed_revisions: list[tuple[str, str]],
+        local_run_budget: Any,
+        metrics: SearchMetrics,
+        operations: list[TraceOperation],
+        warnings: list[str],
+        started: float,
+    ) -> dict[str, Any]:
+        """Deliver successful retrieval that produced no verifiable answer support.
+
+        Nothing here is answer evidence. Synthesis never runs, no ``search_evidence``
+        row is written, no E identifier or citation number is minted, and the model is
+        not credited with a final answer. The bounded dossier is handed to the owner as
+        retrieval output only, so a retrieval result can never read as verified support.
+        """
+        check_cancelled()
+        # Same finalization the answered path uses: acquisition already succeeded.
+        if getattr(self.provider, "name", "") == "local":
+            self._finalize_local_observations(observed_revisions)
+            self._sync_local_budget_metrics(local_run_budget, metrics)
+        else:
+            self.web_sources.finalize_success(observed_revisions)
+        metrics.wall_time_ms = int((time.monotonic() - started) * 1000)
+        operations.append(
+            TraceOperation(
+                "search.results_only",
+                status="degraded",
+                count=len(dossier),
+                code=RESULTS_ONLY_SELECTION_MALFORMED,
+            )
+        )
+        trace = build_search_trace(
+            model=model,
+            synthesis_response={},
+            verified=[],
+            metrics=metrics,
+            operations=operations,
+            warnings=warnings,
+            provider=self.provider.name,
+            outcome=RESULTS_ONLY_OUTCOME,
+        )
+        assistant = self.sessions.add_message(
+            session_id,
+            "assistant",
+            RESULTS_ONLY_ANSWER,
+            {
+                "operation_trace": trace,
+                "search": {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "round_count": metrics.round_count,
+                },
+                "search_results": {
+                    "outcome": RESULTS_ONLY_OUTCOME,
+                    "reason": RESULTS_ONLY_SELECTION_MALFORMED,
+                    "passages": [retrieved_passage_dict(item) for item in dossier],
+                },
+            },
+        )
+        self._maybe_title_session(session_id, question)
+        self._complete_run(
+            run_id,
+            assistant_message_id=str(assistant["id"]),
+            executed_queries=executed_queries,
+            metrics=metrics,
+            operations=operations,
+            status="completed",
+        )
+        self._update_user_message_search_status(user_message_id, run_id, "completed")
+        return {
+            "run_id": run_id,
+            "session_id": session_id,
+            "user_message_id": user_message_id,
+            "assistant_message_id": str(assistant["id"]),
+            "queries": executed_queries,
+            "citations": [],
+            "metrics": asdict(metrics),
+            "outcome": RESULTS_ONLY_OUTCOME,
+        }
 
     def _finalize_local_observations(
         self,
@@ -1185,13 +1313,15 @@ class SearchService:
         diagnostics: list[EvidenceDiagnostic] = []
         if not valid_structure:
             rejection_code = decode_code or EVIDENCE_SCHEMA_INVALID_CODE
-            selected = deterministic_evidence_pointer_fallback(window.spans)
+            # A passage's position in the window is not evidence of its relevance to the
+            # question, so a malformed reply selects nothing at all for this round.
+            selected = []
             diagnostics.append(
                 EvidenceDiagnostic(selection_index=0, rejection_code=rejection_code)
             )
             metrics.evidence_selection_fallbacks += 1
             metrics.degraded = True
-            warnings.append(DEGRADED_EVIDENCE_NOTE)
+            warnings.append(DEGRADED_SELECTION_WARNING)
             operations.append(
                 TraceOperation(
                     "search.evidence_selection_fallback",
@@ -2107,24 +2237,6 @@ def skip_repeated_title_prefix(text: str, start: int, end: int, title: str) -> i
     return cursor if cursor < end else start
 
 
-def deterministic_evidence_pointer_fallback(spans: list[EvidenceSpan]) -> list[str]:
-    selected: list[str] = []
-    seen_passages: set[str] = set()
-    for span in spans:
-        if span.passage_id in seen_passages:
-            continue
-        if support_span_is_reasonable(
-            span.text,
-            min_chars=MIN_FALLBACK_QUOTE_CHARS,
-            min_tokens=MIN_FALLBACK_QUOTE_TOKENS,
-        ):
-            selected.append(span.span_id)
-            seen_passages.add(span.passage_id)
-        if len(selected) >= 3:
-            break
-    return selected
-
-
 def verify_evidence_span_selection(
     selected_span_ids: list[str],
     spans: list[EvidenceSpan],
@@ -2440,6 +2552,34 @@ def citation_dict(item: VerifiedEvidence, index: int) -> dict[str, Any]:
     }
 
 
+def retrieved_passage_dict(item: EvidencePassage) -> dict[str, Any]:
+    """User-owned retrieval metadata for a results-only outcome.
+
+    Deliberately omits everything that marks verified support: no evidence id, no
+    citation number, no ``verification_status`` and no source offsets. The dossier is
+    already bounded by ``max_passages``/``max_dossier_chars``, so its text is reused
+    rather than copied into a second, larger representation.
+    """
+    canonical_url = str(item.canonical_url or "")
+    # Only a validated web URL is exposed; a local source's stored path never is, and an
+    # over-length URL is dropped rather than truncated (see RESULTS_ONLY_MAX_URL_CHARS).
+    usable_url = (
+        canonical_url.lower().startswith(("http://", "https://"))
+        and len(canonical_url) <= RESULTS_ONLY_MAX_URL_CHARS
+    )
+    return {
+        "passage_id": item.passage_id,
+        "source_id": item.source_document_id,
+        "title": item.title,
+        "source_origin": item.source_origin,
+        "canonical_url": canonical_url if usable_url else "",
+        "fetched_at": item.fetched_at,
+        "provenance_kind": item.provenance_kind,
+        "page_number": item.page_number,
+        "text": item.text,
+    }
+
+
 def build_search_trace(
     *,
     model: str,
@@ -2449,15 +2589,19 @@ def build_search_trace(
     operations: list[TraceOperation],
     warnings: list[str],
     provider: str,
+    outcome: str = "answer",
 ) -> dict[str, Any]:
+    # A results-only run synthesized nothing, so it must not attribute a final answer
+    # to the model or report evidence as verified.
+    answered = outcome == "answer"
     return {
         "schema_version": 1,
         "timing": {"answer_latency_ms": metrics.wall_time_ms},
-        "models": {"final_answer_model": str(synthesis_response.get("model") or model)},
+        "models": {"final_answer_model": str(synthesis_response.get("model") or model) if answered else ""},
         "pipeline": {
             "rag_enabled": True,
             "verifier_enabled": True,
-            "verifier_status": "verified_exact",
+            "verifier_status": "verified_exact" if answered else outcome,
             "search_enabled": True,
             "search_rounds": metrics.round_count,
             "second_round_used": metrics.second_round_used,
@@ -2483,6 +2627,7 @@ def build_search_trace(
         },
         "search": {
             "provider": provider,
+            "outcome": outcome,
             "metrics": asdict(metrics),
             "operations": [trace_operation_dict(item) for item in operations],
         },

@@ -181,3 +181,64 @@ export class SearchJobController {
     this.timerId = null;
   }
 }
+
+
+// Persisted message metadata is durable: it can be legacy, partially written or
+// hand-edited, so the static SearchResultsOnly type is not runtime validation. These
+// helpers normalize an untrusted payload into rows that are safe to render, dropping
+// anything unusable instead of throwing.
+export type ResultsOnlyPassage = {
+  passage_id: string;
+  source_id: string;
+  title: string;
+  source_origin: string;
+  canonical_url: string;
+  fetched_at: number;
+  provenance_kind: string;
+  page_number: number | null;
+  text: string;
+};
+
+function safeText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function safeNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function resultsOnlyPassage(value: unknown): ResultsOnlyPassage | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const passageId = safeText(row.passage_id);
+  const text = safeText(row.text);
+  // Without a stable identity or any text there is nothing to inspect.
+  if (!passageId || !text) return null;
+  const url = safeText(row.canonical_url);
+  const page = row.page_number;
+  return {
+    passage_id: passageId,
+    source_id: safeText(row.source_id),
+    title: safeText(row.title) || "Untitled source",
+    source_origin: safeText(row.source_origin),
+    // Re-checked here too: a corrupted row must never become a non-http href.
+    canonical_url: url.startsWith("https://") || url.startsWith("http://") ? url : "",
+    fetched_at: safeNumber(row.fetched_at),
+    provenance_kind: safeText(row.provenance_kind),
+    page_number: typeof page === "number" && Number.isFinite(page) ? page : null,
+    text
+  };
+}
+
+export function resultsOnlyPassages(metadata: unknown): ResultsOnlyPassage[] {
+  if (typeof metadata !== "object" || metadata === null) return [];
+  const value = metadata as Record<string, unknown>;
+  if (value.outcome !== "results_only") return [];
+  if (!Array.isArray(value.passages)) return [];
+  const rows: ResultsOnlyPassage[] = [];
+  for (const entry of value.passages) {
+    const row = resultsOnlyPassage(entry);
+    if (row !== null) rows.push(row);
+  }
+  return rows;
+}

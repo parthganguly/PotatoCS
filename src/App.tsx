@@ -125,6 +125,7 @@ import { backendBannerState, isBackendDegradedEvent } from "./features/shell/bac
 import { SourcesPage } from "./features/sources/SourcesPage";
 import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisionDiagnostics";
 import { SearchEvidenceCard } from "./features/search/SearchEvidenceCard";
+import { SearchResultsOnlyCard } from "./features/search/SearchResultsOnlyCard";
 import { SearchJobStatus } from "./features/search/SearchJobStatus";
 import { useSearchJob } from "./features/search/useSearchJob";
 import { isActiveSearchState, searchFailureCopy, shouldShowChatProgress } from "./features/search/searchModel";
@@ -2219,6 +2220,9 @@ function ChatWorkspace(props: {
                     )}
                     {message.role === "assistant" && Array.isArray(message.metadata?.search_evidence) && (
                       <SearchEvidenceCard evidence={message.metadata.search_evidence} />
+                    )}
+                    {message.role === "assistant" && message.metadata?.search_results && (
+                      <SearchResultsOnlyCard results={message.metadata.search_results} />
                     )}
                     {message.id === latestAssistantMessageId && props.retrievedChunks.length > 0 && (
                       <RetrievedSources

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { build } from "esbuild";
 
 const result = await build({
@@ -159,6 +160,121 @@ const submitResult = (job) => ({ job, session: { id: "session-1", title: "New ch
   assert.equal(model.searchFailureCopy(latest.message_code).includes("persistent private"), false);
   assert.equal(busy, false);
   assert.equal(clock.tasks.size, 0);
+}
+
+// Results-only retrieval must render as retrieval, never as verified answer support.
+// Persisted message metadata is durable and can be malformed, legacy or hand-edited, so
+// the component is rendered for real here rather than asserted against its source text.
+{
+  const rendered = await build({
+    stdin: {
+      contents: [
+        'import { createElement } from "react";',
+        'import { renderToStaticMarkup } from "react-dom/server";',
+        'import { SearchResultsOnlyCard } from "./src/features/search/SearchResultsOnlyCard";',
+        'export function render(results) {',
+        '  return renderToStaticMarkup(createElement(SearchResultsOnlyCard, { results }));',
+        '}'
+      ].join(String.fromCharCode(10)),
+      resolveDir: process.cwd(),
+      loader: "ts"
+    },
+    bundle: true,
+    format: "cjs",
+    platform: "node",
+    write: false,
+    // react and react-dom/server stay external so the real installed copies load; only
+    // the component and its helper are bundled.
+    external: ["react", "react-dom/server"],
+    define: { "process.env.NODE_ENV": '"production"' }
+  });
+  const cardModule = { exports: {} };
+  new Function("require", "module", "exports", rendered.outputFiles[0].text)(
+    createRequire(import.meta.url), cardModule, cardModule.exports
+  );
+  const render = (results) => cardModule.exports.render(results);
+  const HEADING = "Retrieved passages — not verified answer support";
+  const valid = {
+    passage_id: "p1",
+    source_id: "doc-1",
+    title: "Municipal Heat Pump Program",
+    source_origin: "web",
+    canonical_url: "https://example.com/heat-pumps",
+    fetched_at: 1,
+    provenance_kind: "exact_text",
+    page_number: null,
+    text: "The city approved 240 heat-pump rebates."
+  };
+
+  // 1-2. Malformed top-level payloads render nothing and never throw.
+  for (const payload of [
+    undefined,
+    null,
+    "results_only",
+    42,
+    {},
+    { outcome: "results_only" },
+    { outcome: "results_only", passages: null },
+    { outcome: "results_only", passages: "nope" },
+    { outcome: "results_only", passages: {} },
+    { outcome: "results_only", passages: [] },
+    { outcome: "results_only", passages: [null] },
+    { outcome: "results_only", passages: [null, undefined, 7, "row", [], {}] },
+    { outcome: "answer", passages: [valid] }
+  ]) {
+    assert.equal(render(payload), "", `expected no output for ${JSON.stringify(payload) ?? "undefined"}`);
+  }
+
+  // 3-4. Invalid rows are ignored while the valid row still renders.
+  const mixed = render({
+    outcome: "results_only",
+    passages: [
+      null,
+      "row",
+      { passage_id: "no-text" },
+      { text: "no identity" },
+      { passage_id: 5, text: "wrong id type" },
+      valid
+    ]
+  });
+  assert.equal(mixed.includes(valid.text), true);
+  assert.equal(mixed.includes("no identity"), false);
+  assert.equal(mixed.includes("wrong id type"), false);
+  assert.equal((mixed.match(/<article/g) || []).length, 1);
+
+  // 5. The distinction between retrieval and verified support survives rendering.
+  assert.equal(mixed.includes(HEADING), true);
+  assert.equal(mixed.includes("not verified"), true);
+  assert.equal(mixed.includes("citation"), true, "copy explains that there are no citation numbers");
+  assert.equal(/\[\d+\]/.test(mixed), false, "no clickable citation numbers");
+  assert.equal(mixed.includes("verified_exact"), false);
+
+  // 6. Valid source links render normally; unusable ones simply do not.
+  assert.equal(mixed.includes('href="https://example.com/heat-pumps"'), true);
+  const badUrl = render({
+    outcome: "results_only",
+    passages: [{ ...valid, canonical_url: "javascript:alert(1)" }, { ...valid, passage_id: "p2", canonical_url: 12 }]
+  });
+  assert.equal(badUrl.includes(valid.text), true);
+  assert.equal(badUrl.includes("javascript:"), false);
+  assert.equal(badUrl.includes("<a "), false);
+
+  // Wrong primitive types in optional fields degrade instead of throwing.
+  const loose = render({
+    outcome: "results_only",
+    passages: [{ ...valid, title: 9, fetched_at: "soon", page_number: "three", source_origin: null }]
+  });
+  assert.equal(loose.includes("Untitled source"), true);
+  assert.equal(loose.includes("local Source"), true);
+  assert.equal(loose.includes("Fetched"), false);
+  assert.equal(loose.includes("Page"), false);
+
+  const appSourceForCard = readFileSync("src/App.tsx", "utf8");
+  assert.equal(appSourceForCard.includes("<SearchResultsOnlyCard results={message.metadata.search_results} />"), true);
+  // The component must use the same helper this test exercises.
+  const cardSource = readFileSync("src/features/search/SearchResultsOnlyCard.tsx", "utf8");
+  assert.equal(cardSource.includes("resultsOnlyPassages(results)"), true);
+  assert.equal(model.resultsOnlyPassages({ outcome: "results_only", passages: [null, valid] }).length, 1);
 }
 
 console.log("search-ui-tests-ok");

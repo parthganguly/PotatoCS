@@ -134,6 +134,26 @@ export type SearchEvidence = {
   verification_status: "verified_exact";
 };
 
+// Retrieval output for a results-only Search outcome. Intentionally has no
+// evidence_id, citation_number or verification_status: it is not answer support.
+export type SearchRetrievedPassage = {
+  passage_id: string;
+  source_id: string;
+  title: string;
+  source_origin: "local" | "web" | "cached_web" | string;
+  canonical_url: string;
+  fetched_at: number;
+  provenance_kind: string;
+  page_number: number | null;
+  text: string;
+};
+
+export type SearchResultsOnly = {
+  outcome: "results_only" | string;
+  reason: "selection_malformed" | string;
+  passages: SearchRetrievedPassage[];
+};
+
 export type Message = {
   id: string;
   session_id: string;
@@ -143,6 +163,7 @@ export type Message = {
   metadata?: {
     operation_trace?: OperationTrace;
     search_evidence?: SearchEvidence[];
+    search_results?: SearchResultsOnly;
     [key: string]: unknown;
   };
   documents?: DocumentRecord[];

@@ -118,13 +118,22 @@ def test_private_content_stays_out_of_durable_diagnostics(tmp_path, caplog, repl
         rows = {table: [dict(r) for r in db.conn.execute(f"SELECT * FROM {table}")]
                 for table in ("search_runs", "search_evidence_diagnostics")}
         assert "selection" in seen
-        if reply_kind in {"valid", "malformed"}:
+        messages = sessions.messages(session["id"])
+        if reply_kind == "valid":
             assert "synthesis" in seen
-            assert private_text in sessions.messages(session["id"])[-1]["content"]
-        traces = [m["metadata"].get("operation_trace", {}) for m in sessions.messages(session["id"])]
+            assert private_text in messages[-1]["content"]
+        if reply_kind == "malformed":
+            # Malformed selection no longer synthesizes; the private passage reaches the
+            # owner as retrieval output instead, which is user content, not a diagnostic.
+            assert "synthesis" not in seen
+            results = messages[-1]["metadata"]["search_results"]
+            assert results["outcome"] == "results_only"
+            assert any(private_text in item["text"] for item in results["passages"])
+        traces = [m["metadata"].get("operation_trace", {}) for m in messages]
         assert secret not in json.dumps({"rows": rows, "traces": traces})
         assert secret not in caplog.text
-        # Stored source/evidence and conversation are user content, not diagnostics.
+        # Stored source/evidence, retrieval results and conversation are user content,
+        # not diagnostics.
     finally:
         db.close()
 

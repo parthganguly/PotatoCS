@@ -27,6 +27,7 @@ from odysseus_desktop_backend.services.local_discovery import (
 )
 from odysseus_desktop_backend.services.rag_service import RAGService
 from odysseus_desktop_backend.services.search_service import (
+    RESULTS_ONLY_ANSWER,
     SearchBudgetError,
     SearchNoEvidenceError,
     SearchService,
@@ -145,6 +146,24 @@ class QuoteEvidenceModel(EmptyEvidenceModel):
             "prompt_eval_count": 10, "eval_count": 4, "total_duration_ns": 1_000_000,
             "load_duration_ns": 0, "generation_tokens_per_second": 10.0,
         }
+
+
+ROBOTS_ALLOW_ALL = ("User-agent: *" + chr(10) + "Allow: /" + chr(10)).encode()
+
+
+class MalformedSelectionModel(EmptyEvidenceModel):
+    """Replies to evidence selection with output that cannot be decoded."""
+
+    def chat_detailed(self, model: str, messages: list[dict[str, str]], **kwargs: object) -> dict:
+        if "Select only identifiers for spans" in messages[-1]["content"]:
+            self.calls += 1
+            self.selection_calls += 1
+            return {
+                "model": model, "content": "not json at all {", "thinking": "", "done_reason": "stop",
+                "prompt_eval_count": 10, "eval_count": 4, "total_duration_ns": 1_000_000,
+                "load_duration_ns": 0, "generation_tokens_per_second": 10.0,
+            }
+        return super().chat_detailed(model, messages, **kwargs)
 
 
 class LocalFixtureFetcher:
@@ -1482,3 +1501,82 @@ def test_job_search_mode_routes_local_without_external_factory_and_preserves_ext
     assert invalid_failure.value.code == "search_provider_unconfigured"
     assert seen[-1] == (external_provider, "external query")
     db.close()
+
+
+def test_local_malformed_selection_is_results_only_and_keeps_acquisition(tmp_path: Path) -> None:
+    """Local mode: retrieval succeeded, so a malformed selection is not a failed Search."""
+    url = "https://local.example/threshold"
+    fetcher = LocalFixtureFetcher(
+        {url: _html("Threshold Notes", "The maintenance threshold is 1000 pages for the local fixture.")},
+        default_robots=ROBOTS_ALLOW_ALL,
+    )
+    model = MalformedSelectionModel()
+    db, sessions, _documents, _rag, provider, service = local_search_stack(tmp_path, model, fetcher)
+    try:
+        provider.frontier.discover(url, discovery_kind="manual_seed", anchor_text="threshold notes")
+        session = sessions.create("threshold", "fixture")
+        result = service.run(
+            question="threshold notes", session_id=session["id"], model="fixture", second_round_enabled=False
+        )
+        assert result["outcome"] == "results_only"
+        assert result["citations"] == []
+        assert model.selection_calls == 1, "malformed output alone must not buy another selection"
+
+        assistant = sessions.messages(session["id"])[-1]
+        assert assistant["content"] == RESULTS_ONLY_ANSWER
+        assert "search_evidence" not in assistant["metadata"]
+        results = assistant["metadata"]["search_results"]
+        assert results["outcome"] == "results_only"
+        assert results["reason"] == "selection_malformed"
+        assert any("maintenance threshold is 1000 pages" in item["text"] for item in results["passages"])
+        assert db.conn.execute("SELECT COUNT(*) FROM search_evidence").fetchone()[0] == 0
+        assert dict(db.conn.execute("SELECT status, error_code FROM search_runs").fetchone()) == {
+            "status": "completed", "error_code": ""
+        }
+        # The local observation is finalized, not rolled back.
+        assert db.conn.execute(
+            "SELECT status FROM crawl_frontier WHERE canonical_url=?", (url,)
+        ).fetchone()[0] == "fetched"
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE canonical_url=? AND is_deleted=0 AND web_revision_current=1",
+            (url,),
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_cancelled_run_with_malformed_selection_stays_cancelled(tmp_path: Path) -> None:
+    """Results-only is for successful retrieval only; cancellation stays cancellation.
+
+    The cancel is observed at the existing selection-call boundary, so the run never
+    reaches the results-only path at all. ``_complete_results_only`` re-checks
+    cancellation on entry for a request that arrives after selection returns.
+    """
+    url = "https://local.example/cancelled"
+    fetcher = LocalFixtureFetcher(
+        {url: _html("Cancelled Notes", "A retained observation about the cancelled fixture run.")},
+        default_robots=ROBOTS_ALLOW_ALL,
+    )
+    event = threading.Event()
+
+    class CancellingMalformedModel(MalformedSelectionModel):
+        def chat_detailed(self, model: str, messages: list[dict[str, str]], **kwargs: object) -> dict:
+            if "Select only identifiers for spans" in messages[-1]["content"]:
+                event.set()
+            return super().chat_detailed(model, messages, **kwargs)
+
+    db, sessions, _documents, _rag, provider, service = local_search_stack(
+        tmp_path, CancellingMalformedModel(), fetcher
+    )
+    try:
+        provider.frontier.discover(url, discovery_kind="manual_seed", anchor_text="cancelled notes")
+        session = sessions.create("cancelled", "fixture")
+        with cancellation_scope(event), pytest.raises(JobCancelledError):
+            service.run(
+                question="cancelled notes", session_id=session["id"], model="fixture", second_round_enabled=False
+            )
+        assert db.conn.execute("SELECT status FROM search_runs").fetchone()[0] == "cancelled"
+        assert [message["role"] for message in sessions.messages(session["id"])] == ["user"]
+        assert db.conn.execute("SELECT COUNT(*) FROM search_evidence").fetchone()[0] == 0
+    finally:
+        db.close()

@@ -15,6 +15,7 @@ import pytest
 
 from odysseus_desktop_backend.services.search_service import (
     DEFAULT_MODEL_CONTEXT_TOKENS,
+    DEGRADED_SELECTION_WARNING,
     EVIDENCE_ESTIMATOR_BYTES_PER_TOKEN,
     EVIDENCE_OUTPUT_CONTRACT,
     EVIDENCE_SELECTION_NUM_PREDICT,
@@ -31,8 +32,10 @@ from odysseus_desktop_backend.services.search_service import (
     evidence_input_budget_tokens,
     evidence_selection_prompt,
     group_spans_by_passage,
+    dedupe_verified,
     pack_evidence_window,
     parse_json_object_detailed,
+    retrieved_passage_dict,
     resolve_model_context_tokens,
     valid_evidence_selection,
     verify_evidence_span_selection,
@@ -499,6 +502,66 @@ def test_valid_json_with_wrong_shape_is_reported_as_schema_invalid(content: str)
         item for item in outcome["operations"] if item.name == "search.evidence_selection_fallback"
     )
     assert fallback.code == "schema_invalid"
+
+
+def test_malformed_selection_never_promotes_the_late_decisive_span() -> None:
+    """The v1.0.2 historical shape: decisive support at P1:S7, malformed reply.
+
+    v1.0.2 answered from the positionally-first qualifying spans and cited them, so a
+    retrieval result was displayed as verified support. The decisive sentence must stay
+    readable as retrieval output while gaining no evidence status from the failure.
+    """
+    dossier = oversized_dossier()
+    outcome = select(dossier, "not json at all")
+    spans = build_evidence_spans(dossier)
+    decisive = next(span for span in spans if span.text == DECISIVE_SENTENCE)
+    assert decisive.span_id == "P1:S7"
+    assert "SPAN_ID=P1:S7" in outcome["prompt"]
+    assert DECISIVE_SENTENCE in outcome["prompt"]
+    # It was visible to the model and it is still in the dossier, but nothing was picked.
+    assert outcome["selected"] == []
+    verified, _ = verify_evidence_span_selection(
+        outcome["selected"], outcome["spans"], dossier, SearchMetrics(), []
+    )
+    assert verified == []
+    # The retrieval product retains it verbatim; no evidence identity is attached.
+    passages = [retrieved_passage_dict(item) for item in dossier]
+    # Both the decisive sentence and the span v1.0.2 would have cited instead remain
+    # readable retrieval output, and neither carries evidence identity.
+    assert any(DECISIVE_SENTENCE in item["text"] for item in passages)
+    assert any(FIRST_QUALIFYING_SENTENCE in item["text"] for item in passages)
+    assert all("evidence_id" not in item and "verification_status" not in item for item in passages)
+
+
+def test_malformed_repair_keeps_round_one_evidence_and_adds_nothing() -> None:
+    """Case 1: valid round one, malformed repair selection."""
+    dossier = oversized_dossier()
+    first = select(dossier, json.dumps({"span_ids": ["P1:S7"], "needs_more_search": True}))
+    verified, _ = verify_evidence_span_selection(
+        first["selected"], first["spans"], dossier, SearchMetrics(), []
+    )
+    assert [item.exact_quote for item in verified] == [DECISIVE_SENTENCE]
+
+    metrics = SearchMetrics()
+    operations: list[TraceOperation] = []
+    warnings: list[str] = []
+    service = SearchService.__new__(SearchService)
+    service.models = StubModelService("broken JSON", loaded_context=4096)
+    selected, spans, needs_more, diagnostics = service._select_evidence(
+        QUESTION, dossier, "fixture-model", SearchBudget(), metrics, operations, time_far_future(),
+        prior_verified=verified, warnings=warnings,
+    )
+    assert selected == []
+    assert needs_more is False, "a malformed reply must not request another repair round"
+    assert diagnostics[0].rejection_code == "json_decode_failed"
+    assert metrics.degraded is True
+    repaired, _ = verify_evidence_span_selection(selected, spans, dossier, metrics, operations)
+    assert repaired == []
+    # dedupe_verified is what run() applies; round one survives untouched and alone.
+    surviving = dedupe_verified([*verified, *repaired])
+    assert [item.exact_quote for item in surviving] == [DECISIVE_SENTENCE]
+    assert [item.evidence_id for item in surviving] == ["E1"]
+    assert warnings == [DEGRADED_SELECTION_WARNING]
 
 
 def test_decode_and_schema_failures_are_distinguishable_in_the_trace() -> None:

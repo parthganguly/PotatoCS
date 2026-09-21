@@ -160,12 +160,18 @@ def replay_trial(case, arm, service, deadline):
                                                              budget, metrics, operations, deadline)
             raw = response["content"]
         else:
+            # No verified support: synthesis is never invoked, malformed or not.
             answer, raw = "", ""
         if metrics.evidence_selection_fallbacks and answer:
             from odysseus_desktop_backend.services.search_service import DEGRADED_EVIDENCE_NOTE
             answer = DEGRADED_EVIDENCE_NOTE + "\n\n" + answer
+    # Malformed selection is recorded as a results-only trial: no synthesis ran and the
+    # retrieved passages are not evidence, so they are never scored as support.
+    outcome = ("results_only" if metrics.evidence_selection_fallbacks and not evidence
+               else "answer" if answer else "no_evidence")
     row.update(answer=answer, raw_answer=raw, evidence=[asdict(e) for e in evidence],
-               metrics=asdict(metrics), warnings=warnings, **answer_structure(raw, evidence))
+               metrics=asdict(metrics), warnings=warnings, outcome=outcome,
+               **answer_structure(raw, evidence))
     return row
 
 
