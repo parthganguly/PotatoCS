@@ -107,6 +107,39 @@ def test_upgrade_from_v021_reaches_fresh_schema_and_preserves_rows(
         assert upgraded.conn.execute(
             "SELECT content FROM rag_chunks WHERE id = 'chunk-1'"
         ).fetchone()["content"] == "Historical chunk"
+        document_columns = {
+            row["name"] for row in upgraded.conn.execute("PRAGMA table_info(documents)")
+        }
+        assert {
+            "source_origin",
+            "canonical_url",
+            "final_url",
+            "fetched_at",
+            "http_content_type",
+            "http_etag",
+            "http_last_modified",
+            "acquisition_metadata_json",
+            "web_revision_current",
+        } <= document_columns
+        historical_provenance = upgraded.conn.execute(
+            "SELECT source_origin, web_revision_current FROM documents WHERE id = 'document-1'"
+        ).fetchone()
+        assert dict(historical_provenance) == {"source_origin": "local", "web_revision_current": 1}
+        assert upgraded.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'search_runs'"
+        ).fetchone() is not None
+        assert upgraded.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'search_evidence'"
+        ).fetchone() is not None
+        search_indexes = {
+            row["name"]
+            for row in upgraded.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_search_%'"
+            )
+        }
+        assert {"idx_search_runs_session_time", "idx_search_evidence_run", "idx_search_evidence_source"} <= search_indexes
+        evidence_foreign_keys = upgraded.conn.execute("PRAGMA foreign_key_list(search_evidence)").fetchall()
+        assert {row["table"] for row in evidence_foreign_keys} == {"documents", "search_runs"}
         assert upgraded.conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert upgraded.conn.execute(
             "SELECT value FROM app_meta WHERE key = 'schema_version'"

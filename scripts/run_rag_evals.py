@@ -37,7 +37,15 @@ def main() -> int:
     )
     parser.add_argument("--thinking", choices=["off", "on", "auto"], default="off")
     parser.add_argument("--repeats", type=int, choices=[1, 3], default=1)
+    parser.add_argument("--search-replay", action="store_true", help="Run the frozen synthetic Search pointer comparison (36 trials maximum).")
+    parser.add_argument("--output", type=Path, help="New output directory for Search replay; existing results are never overwritten.")
     args = parser.parse_args()
+    if args.search_replay:
+        from search_replay import run_replay
+
+        if args.output is None:
+            parser.error("--search-replay requires --output")
+        return run_replay(args.output)
 
     with tempfile.TemporaryDirectory(prefix="odysseus-rag-eval-cli-") as temp:
         db = Database(Path(temp))

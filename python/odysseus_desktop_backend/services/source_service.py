@@ -232,11 +232,13 @@ class SourceService:
 
     def document_summary(self, document: dict[str, Any]) -> dict[str, Any]:
         file_type = str(document.get("file_type") or "").lower()
+        source_origin = str(document.get("source_origin") or "local")
         diagnostics = self.documents.text_diagnostics(str(document["id"]))
         return {
             "id": str(document["id"]),
             "backend_kind": "document",
-            "source_type": document_source_type(file_type),
+            "source_type": "web" if source_origin in {"web", "cached_web"} else document_source_type(file_type),
+            "source_origin": source_origin,
             "scope": str(document.get("scope") or "library"),
             "display_name": str(document.get("title") or document.get("file_name") or "Document"),
             "mime_type": document_mime_type(file_type),
@@ -252,6 +254,10 @@ class SourceService:
             "chunk_count": int(diagnostics.get("chunk_count") or 0),
             "warning": document_warning(document),
             "error": str(document.get("error") or ""),
+            "canonical_url": str(document.get("canonical_url") or ""),
+            "final_url": str(document.get("final_url") or ""),
+            "fetched_at": int(document.get("fetched_at") or 0),
+            "web_revision_current": bool(document.get("web_revision_current", True)),
             "diagnostics": diagnostics,
             "document": document,
         }

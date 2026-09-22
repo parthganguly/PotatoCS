@@ -493,7 +493,11 @@ class DocumentService:
         The user's original external file (source_path) is never touched.
         """
         row = self.db.conn.execute(
-            "SELECT stored_path FROM documents WHERE id = ?", (document_id,)
+            """
+            SELECT stored_path, source_origin, canonical_url, web_revision_current
+            FROM documents WHERE id = ?
+            """,
+            (document_id,),
         ).fetchone()
         if row is None:
             return {
@@ -506,8 +510,9 @@ class DocumentService:
         file_removed, bytes_reclaimed, file_missing = self._remove_owned_file(
             str(row["stored_path"] or "")
         )
-        self.db.conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-        self.db.conn.commit()
+        with self.db.conn:
+            self.db.conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            self._release_deleted_web_frontier(row)
         logger.info(
             "document purged document_id=%s file_removed=%s file_missing=%s",
             document_id,
@@ -592,17 +597,58 @@ class DocumentService:
 
     def mark_deleted(self, document_id: str) -> dict[str, Any]:
         now = utc_ms()
-        self.db.conn.execute(
+        row = self.db.conn.execute(
             """
-            UPDATE documents
-            SET is_deleted = 1, status = 'deleted', index_status = 'deleted', updated_at = ?
-            WHERE id = ?
+            SELECT source_origin, canonical_url, web_revision_current
+            FROM documents WHERE id = ?
             """,
-            (now, document_id),
-        )
-        self.db.conn.commit()
+            (document_id,),
+        ).fetchone()
+        with self.db.conn:
+            self.db.conn.execute(
+                """
+                UPDATE documents
+                SET is_deleted = 1, status = 'deleted', index_status = 'deleted', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, document_id),
+            )
+            if row is not None:
+                self._release_deleted_web_frontier(row)
         logger.info("document deleted document_id=%s", document_id)
         return {"deleted": True, "document_id": document_id}
+
+    def _release_deleted_web_frontier(self, document: Any) -> None:
+        """Make a URL reacquirable when its final current web copy disappears."""
+        if str(document["source_origin"] or "") not in {"web", "cached_web"}:
+            return
+        if not bool(document["web_revision_current"]):
+            return
+        canonical_url = str(document["canonical_url"] or "")
+        if not canonical_url:
+            return
+        current = self.db.conn.execute(
+            """
+            SELECT 1 FROM documents
+            WHERE is_deleted = 0 AND COALESCE(is_staging, 0) = 0
+              AND source_origin IN ('web', 'cached_web')
+              AND canonical_url = ? AND web_revision_current = 1
+            LIMIT 1
+            """,
+            (canonical_url,),
+        ).fetchone()
+        if current is not None:
+            return
+        self.db.conn.execute(
+            """
+            UPDATE crawl_frontier
+            SET status = 'unfetched', failure_code = '', last_fetch_at = NULL,
+                etag = '', last_modified = '', content_hash = '',
+                attempt_count = 0, last_attempt_at = NULL, next_retry_at = NULL
+            WHERE canonical_url = ?
+            """,
+            (canonical_url,),
+        )
 
     def promote(self, document_id: str) -> dict[str, Any]:
         document = self.get(document_id)
@@ -816,6 +862,12 @@ class DocumentService:
         item["is_internal"] = bool(item.get("is_internal", 0))
         item["is_staging"] = bool(item.get("is_staging", 0))
         item["scope"] = str(item.get("scope") or "library")
+        item["source_origin"] = str(item.get("source_origin") or "local")
+        item["web_revision_current"] = bool(item.get("web_revision_current", 1))
+        try:
+            item["acquisition_metadata"] = json.loads(item.get("acquisition_metadata_json") or "{}")
+        except (TypeError, ValueError):
+            item["acquisition_metadata"] = {}
         return item
 
 

@@ -1,4 +1,5 @@
 numpy
 pypdf
+readability-lxml
 reportlab
 pillow

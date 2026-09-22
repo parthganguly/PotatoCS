@@ -82,6 +82,9 @@ export function OperationTrace({
                 ["Deterministic answer", yesNo(trace.pipeline.deterministic_visual_answer)],
                 ["Answer style", valueOrMissing(trace.pipeline.answer_style)],
                 ["Thinking mode", valueOrMissing(trace.pipeline.thinking_mode)],
+                ["Web Search", yesNo(trace.pipeline.search_enabled)],
+                ["Search rounds", numberOrMissing(trace.pipeline.search_rounds)],
+                ["Second round", yesNo(trace.pipeline.second_round_used)],
                 ["Done reason", valueOrMissing(trace.pipeline.done_reason)]
               ]}
               title="Pipeline"
@@ -108,6 +111,52 @@ export function OperationTrace({
               rows={[["Warnings", trace.warnings.length ? trace.warnings.join(" · ") : MISSING_VALUE]]}
               title="Warnings"
             />
+            {trace.search && (
+              <>
+                <TraceSection
+                  rows={[
+                    ["Provider", valueOrMissing(trace.search.provider)],
+                    ["Queries", metricNumber(trace.search.metrics.queries_issued)],
+                    ["Results", metricNumber(trace.search.metrics.results_returned)],
+                    ["Results deduped", metricNumber(trace.search.metrics.results_deduped)],
+                    ["Fetch attempts", metricNumber(trace.search.metrics.fetch_attempts)],
+                    ["Fetched", metricNumber(trace.search.metrics.urls_fetched)],
+                    ["Fetch failures", metricNumber(trace.search.metrics.fetch_failures)],
+                    ["Fetches blocked", metricNumber(trace.search.metrics.fetch_blocked)],
+                    ["Bytes", metricBytes(trace.search.metrics.bytes_downloaded)],
+                    ["Cache hits", metricNumber(trace.search.metrics.cache_hits)],
+                    ["Extraction failures", metricNumber(trace.search.metrics.extraction_failures)],
+                    ["Passages", metricNumber(trace.search.metrics.passages_considered)],
+                    ["Dossier tokens (est.)", metricNumber(trace.search.metrics.dossier_token_estimate)],
+                    ["Evidence window", evidenceWindow(trace.search.metrics)],
+                    ["Evidence prompt (est. tokens)", metricNumber(trace.search.metrics.evidence_prompt_tokens_estimated)],
+                    ["Evidence prompt budget", evidenceBudget(trace.search.metrics)],
+                    ["Verified quotes", metricNumber(trace.search.metrics.verified_evidence)],
+                    ["Rejected quotes", metricNumber(trace.search.metrics.rejected_evidence)],
+                    ["Evidence fallbacks", metricNumber(trace.search.metrics.evidence_selection_fallbacks)],
+                    ["Degraded", metricBoolean(trace.search.metrics.degraded)],
+                    ["Visual candidates", metricNumber(trace.search.metrics.visual_candidates)],
+                    ["Model calls", metricNumber(trace.search.metrics.model_calls)],
+                    ["First usable evidence", metricTiming(trace.search.metrics.time_to_first_usable_evidence_ms)],
+                    ["Search wall time", metricTiming(trace.search.metrics.wall_time_ms)]
+                  ]}
+                  title="Search"
+                />
+                <TraceSection
+                  rows={[["Operations", trace.search.operations.map((item) => {
+                    const detail = [
+                      item.count === null || item.count === undefined ? "" : `count=${item.count}`,
+                      item.elapsed_ms === null || item.elapsed_ms === undefined ? "" : formatTiming(item.elapsed_ms),
+                      item.code || ""
+                    ].filter(Boolean).join(", ");
+                    const status = item.status === "completed" ? "" : item.status;
+                    const suffix = [status, detail].filter(Boolean).join("; ");
+                    return `${item.name}${suffix ? ` (${suffix})` : ""}`;
+                  }).join(" · ") || MISSING_VALUE]]}
+                  title="Search trace"
+                />
+              </>
+            )}
             {trace.model_trace.thinking_returned && (
               <section className="sm:col-span-2">
                 <h4 className="mb-1 font-semibold text-ink">Model trace</h4>
@@ -178,4 +227,59 @@ function yesNo(value: boolean | undefined): string {
 
 function listOrMissing(values: Array<string | number>): string {
   return values.length ? values.join(", ") : MISSING_VALUE;
+}
+
+type SearchMetrics = Record<string, number | boolean | null>;
+
+function metricCount(metrics: SearchMetrics, key: string): number | null {
+  const value = metrics[key];
+  return typeof value === "number" ? value : null;
+}
+
+/** "6 of 12 passages (budget-limited)" — makes a bounded window obvious at a glance. */
+function evidenceWindow(metrics: SearchMetrics): string {
+  const packed = metricCount(metrics, "evidence_passages_packed");
+  const available = metricCount(metrics, "evidence_passages_available");
+  if (packed === null || available === null || available === 0) return MISSING_VALUE;
+  const spansPacked = metricCount(metrics, "evidence_spans_packed");
+  const spansAvailable = metricCount(metrics, "evidence_spans_available");
+  const spans = spansPacked === null || spansAvailable === null ? "" : `, ${spansPacked}/${spansAvailable} spans`;
+  const notes = [
+    metrics.evidence_window_truncated === true ? "budget-limited" : "",
+    metrics.evidence_window_partial_passage === true ? "partial passage" : ""
+  ].filter(Boolean);
+  const suffix = notes.length ? ` (${notes.join(", ")})` : "";
+  return `${packed} of ${available} passages${spans}${suffix}`;
+}
+
+/** "3046 tokens of 4096 ctx, 256 reserved for output (loaded_runtime)" */
+function evidenceBudget(metrics: SearchMetrics): string {
+  const budget = metricCount(metrics, "evidence_input_budget_tokens");
+  const limit = metricCount(metrics, "evidence_context_limit_tokens");
+  if (budget === null || limit === null || limit === 0) return MISSING_VALUE;
+  const reserved = metricCount(metrics, "evidence_generation_reserve_tokens");
+  const source = typeof metrics.evidence_context_limit_source === "string" && metrics.evidence_context_limit_source
+    ? ` (${metrics.evidence_context_limit_source})`
+    : "";
+  const output = reserved === null ? "" : `, ${reserved} reserved for output`;
+  return `${budget} tokens of ${limit} ctx${output}${source}`;
+}
+
+function metricNumber(value: number | boolean | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : MISSING_VALUE;
+}
+
+function metricBytes(value: number | boolean | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return MISSING_VALUE;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function metricTiming(value: number | boolean | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? formatTiming(value) : MISSING_VALUE;
+}
+
+function metricBoolean(value: number | boolean | null | undefined): string {
+  return typeof value === "boolean" ? (value ? "Yes" : "No") : MISSING_VALUE;
 }

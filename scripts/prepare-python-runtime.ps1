@@ -95,7 +95,7 @@ import importlib
 import os
 import sys
 sys.path.insert(0, os.environ["ODYSSEUS_BACKEND_PATH"])
-for module in ("json", "sqlite3", "numpy", "pypdf", "reportlab", "PIL", "rpc_server", "odysseus_desktop_backend"):
+for module in ("json", "sqlite3", "numpy", "pypdf", "reportlab", "PIL", "lxml", "readability", "rpc_server", "odysseus_desktop_backend"):
     importlib.import_module(module)
 print("embedded Python runtime verified")
 "@

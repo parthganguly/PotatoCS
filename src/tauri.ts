@@ -23,9 +23,12 @@ export type JobRecord = {
   kind: string;
   state: string;
   message_code: string;
-  scope: JobScope;
+  scope: JobScope | "chat";
   document_id: string;
   artifact_id: string;
+  session_id: string;
+  message_id: string;
+  run_id: string;
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
@@ -34,6 +37,7 @@ export type JobRecord = {
 };
 
 export type SubmitImportJobsResult = { jobs: JobRecord[] };
+export type SubmitSearchJobResult = { job: JobRecord; session: Session };
 
 export type Session = {
   id: string;
@@ -77,6 +81,9 @@ export type OperationTrace = {
     answer_style?: string;
     thinking_mode?: string;
     done_reason?: string;
+    search_enabled?: boolean;
+    search_rounds?: number;
+    second_round_used?: boolean;
   };
   tokens: {
     prompt_tokens?: number;
@@ -96,6 +103,55 @@ export type OperationTrace = {
     thinking_char_count: number;
     thinking_truncated: boolean;
   };
+  search?: {
+    provider: string;
+    metrics: Record<string, number | boolean | null>;
+    operations: Array<{
+      name: string;
+      status: string;
+      elapsed_ms?: number | null;
+      count?: number | null;
+      code?: string;
+    }>;
+  };
+};
+
+export type SearchEvidence = {
+  citation_number: number;
+  evidence_id: string;
+  source_id: string;
+  passage_id: string;
+  title: string;
+  source_origin: "local" | "web" | "cached_web" | string;
+  canonical_url: string;
+  final_url: string;
+  fetched_at: number;
+  provenance_kind: string;
+  exact_quote: string;
+  quote_start: number;
+  quote_end: number;
+  page_number: number | null;
+  verification_status: "verified_exact";
+};
+
+// Retrieval output for a results-only Search outcome. Intentionally has no
+// evidence_id, citation_number or verification_status: it is not answer support.
+export type SearchRetrievedPassage = {
+  passage_id: string;
+  source_id: string;
+  title: string;
+  source_origin: "local" | "web" | "cached_web" | string;
+  canonical_url: string;
+  fetched_at: number;
+  provenance_kind: string;
+  page_number: number | null;
+  text: string;
+};
+
+export type SearchResultsOnly = {
+  outcome: "results_only" | string;
+  reason: "selection_malformed" | string;
+  passages: SearchRetrievedPassage[];
 };
 
 export type Message = {
@@ -106,6 +162,8 @@ export type Message = {
   created_at: number;
   metadata?: {
     operation_trace?: OperationTrace;
+    search_evidence?: SearchEvidence[];
+    search_results?: SearchResultsOnly;
     [key: string]: unknown;
   };
   documents?: DocumentRecord[];
@@ -252,6 +310,13 @@ export type DocumentRecord = {
   promoted_at?: number | null;
   display_order?: number;
   status_label?: string;
+  source_origin?: string;
+  canonical_url?: string;
+  final_url?: string;
+  fetched_at?: number | null;
+  web_revision_current?: boolean;
+  http_content_type?: string;
+  acquisition_metadata?: Record<string, unknown>;
 };
 
 export type RAGChunk = {
@@ -428,7 +493,7 @@ export type VisionBackend = "automatic" | "florence2" | "ollama" | "ocr_only";
 
 export type SourceScope = "library" | "session";
 export type SourceBackendKind = "document" | "artifact";
-export type SourceType = "pdf" | "text" | "markdown" | "image" | "screenshot";
+export type SourceType = "pdf" | "text" | "markdown" | "image" | "screenshot" | "web";
 
 export type SourceSummary = {
   id: string;
@@ -453,6 +518,11 @@ export type SourceSummary = {
   height?: number;
   warning?: string;
   error?: string;
+  source_origin?: string;
+  canonical_url?: string;
+  final_url?: string;
+  fetched_at?: number;
+  web_revision_current?: boolean;
   conversation_status?: "in_conversation";
   conversation_added_message_id?: string;
   conversation_created_at?: number;
@@ -1176,6 +1246,20 @@ export async function retryBackend(): Promise<void> {
 export async function submitImportJobs(paths: string[], scope: JobScope): Promise<JobRecord[]> {
   const result = await rpc<SubmitImportJobsResult>("jobs.submit_import", { paths, scope });
   return result.jobs;
+}
+
+export async function submitSearchJob(params: {
+  query: string;
+  sessionId?: string;
+  model: string;
+  secondRoundEnabled?: boolean;
+}): Promise<SubmitSearchJobResult> {
+  return rpc<SubmitSearchJobResult>("jobs.submit_search", {
+    query: params.query,
+    session_id: params.sessionId || undefined,
+    model: params.model,
+    second_round_enabled: params.secondRoundEnabled ?? true
+  });
 }
 
 export async function getJob(jobId: string): Promise<JobRecord> {

@@ -153,6 +153,17 @@ function SourceRow(props: {
               <MiniMetric label="Chunks" value={source.diagnostics.chunk_count ?? 0} />
             </div>
           )}
+          {source.source_type === "web" && (
+            <div className="mt-3 text-[11px] leading-5 text-ink/55">
+              {source.canonical_url && (
+                <a className="block truncate text-tide underline decoration-tide/30 underline-offset-2" href={source.canonical_url} rel="noreferrer" target="_blank">
+                  {source.canonical_url}
+                </a>
+              )}
+              {Boolean(source.fetched_at) && <p>Fetched {new Date(source.fetched_at!).toLocaleString()}</p>}
+              {source.web_revision_current === false && <p>Historical web revision · excluded from current retrieval</p>}
+            </div>
+          )}
         </div>
       </div>
       <div className="mt-3 flex flex-wrap justify-end gap-2">
@@ -216,6 +227,7 @@ function MiniMetric({ label, value }: { label: string; value: number | string })
 }
 
 function formatSourceType(source: SourceSummary): string {
+  if (source.source_type === "web") return source.source_origin === "cached_web" ? "Cached web source" : "Web source";
   if (source.source_type === "pdf") return `${source.page_count ?? 0} page PDF`;
   if (source.source_type === "markdown") return "Markdown";
   if (source.source_type === "text") return "Text";

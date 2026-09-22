@@ -27,6 +27,7 @@ from odysseus_desktop_backend.services.model_service import ModelService
 from odysseus_desktop_backend.services.ocr_service import LocalVLMTextExtractor, OCRService
 from odysseus_desktop_backend.services.rag_service import RAGService
 from odysseus_desktop_backend.services.session_service import SessionService
+from odysseus_desktop_backend.services.search_service import recover_interrupted_search_runs
 from odysseus_desktop_backend.services.source_service import SourceService
 from odysseus_desktop_backend.services.settings_service import SettingsService
 from odysseus_desktop_backend.services.vector_store import SQLiteNumPyVectorStore
@@ -121,6 +122,9 @@ class SidecarApp:
         recovered_campaigns = self.campaigns.recover_interrupted_campaigns()
         if recovered_campaigns:
             logger.warning("recovered interrupted benchmark campaigns count=%s", recovered_campaigns)
+        recovered_searches = recover_interrupted_search_runs(self.db)
+        if recovered_searches:
+            logger.warning("recovered interrupted Search runs count=%s", recovered_searches)
         repaired = self.documents.repair_startup_state()
         if repaired["purged_staging"] or repaired["ocr_reset"]:
             logger.warning(
@@ -175,6 +179,7 @@ class SidecarApp:
             "documents.ocr_pages": self.documents_ocr_pages,
             "ocr.status": self.ocr_status,
             "jobs.submit_import": self.jobs_submit_import,
+            "jobs.submit_search": self.jobs_submit_search,
             "jobs.get": self.jobs_get,
             "jobs.list": self.jobs_list,
             "jobs.cancel": self.jobs_cancel,
@@ -493,6 +498,17 @@ class SidecarApp:
             raise RpcError(-32602, "paths must be a list of strings")
         scope = optional_str(params, "scope") or "library"
         return {"jobs": self.jobs.submit_import(paths, scope=scope)}
+
+    def jobs_submit_search(self, params: JsonDict) -> JsonDict:
+        model = require_str(params, "model")
+        session = self.sessions.ensure(optional_str(params, "session_id"), model=model)
+        job = self.jobs.submit_search(
+            require_str(params, "query"),
+            session_id=str(session["id"]),
+            model=model,
+            second_round_enabled=optional_bool(params, "second_round_enabled", True),
+        )
+        return {"job": job, "session": session}
 
     def jobs_get(self, params: JsonDict) -> JsonDict:
         return self.jobs.get(require_str(params, "job_id"))

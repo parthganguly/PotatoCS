@@ -53,6 +53,7 @@ class VectorStore(ABC):
         limit: int = 5,
         embedding_model: str | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_search_cache: bool = False,
     ) -> list[SearchResult]:
         raise NotImplementedError
 
@@ -133,8 +134,15 @@ class SQLiteNumPyVectorStore(VectorStore):
         limit: int = 5,
         embedding_model: str | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_search_cache: bool = False,
     ) -> list[SearchResult]:
         model_filter = "AND c.embedding_model = ?" if embedding_model else ""
+        cache_filter = (
+            "AND (COALESCE(d.source_origin, 'local') NOT IN ('web', 'cached_web') "
+            "OR COALESCE(d.web_revision_current, 1) = 1)"
+            if include_search_cache
+            else "AND COALESCE(d.source_origin, 'local') NOT IN ('web', 'cached_web')"
+        )
         rows = self.db.conn.execute(
             f"""
             SELECT
@@ -147,6 +155,7 @@ class SQLiteNumPyVectorStore(VectorStore):
                 AND e.embedding_model = c.embedding_model
             WHERE c.is_deleted = 0 AND d.is_deleted = 0 AND d.index_status = 'indexed'
               AND COALESCE(d.is_staging, 0) = 0
+              {cache_filter}
             {model_filter}
             """,
             ([embedding_model] if embedding_model else []),

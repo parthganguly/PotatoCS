@@ -10,6 +10,7 @@ import type {
   VisionBackend
 } from "../../tauri";
 import { installedModelTag, isInstalledModelTag, readableModelLabel } from "../../api/models";
+import { SEARCH_PRIVACY_DISCLOSURE } from "../search/searchModel";
 
 const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
   { value: "precise", label: "Precise" },
@@ -31,6 +32,7 @@ export function ChatHeader(props: {
   settings: Settings;
   showVision: boolean;
   useRag: boolean;
+  useWebSearch: boolean;
   verifyRag: boolean;
   visionModel: string;
   visionModels: ModelCapability[];
@@ -41,6 +43,7 @@ export function ChatHeader(props: {
   onSetSelectedRagDocumentId: (value: string) => void;
   onSetSessionModel: (model: string) => void;
   onSetUseRag: (value: boolean) => void;
+  onSetWebSearch: (value: boolean) => void;
   onSetVerifyRag: (value: boolean) => void;
 }) {
   const indexedDocuments = props.documents.filter(isRagReadyDocument);
@@ -81,7 +84,7 @@ export function ChatHeader(props: {
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-3">
-        {props.useRag && (
+        {props.useRag && !props.useWebSearch && (
           <select
             className="h-10 max-w-[240px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
             disabled={props.busy || indexedDocuments.length === 0}
@@ -97,7 +100,7 @@ export function ChatHeader(props: {
             ))}
           </select>
         )}
-        {props.useRag && (
+        {props.useRag && !props.useWebSearch && (
           <select
             className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
             disabled={props.busy}
@@ -109,7 +112,7 @@ export function ChatHeader(props: {
             <option value="potato">Potato Mode</option>
           </select>
         )}
-        {props.useRag && (
+        {props.useRag && !props.useWebSearch && (
           <select
             className="h-10 max-w-[150px] rounded-md border border-ink/15 bg-white px-3 text-sm outline-none focus:border-tide"
             disabled={props.busy || props.ragPreset === "potato"}
@@ -124,16 +127,33 @@ export function ChatHeader(props: {
             ))}
           </select>
         )}
+        <div className="max-w-[360px]">
+          <label className="flex items-center gap-2 rounded-md border border-tide/25 bg-white px-3 py-2 text-sm" title={SEARCH_PRIVACY_DISCLOSURE}>
+            <input
+              aria-describedby="web-search-privacy-disclosure"
+              checked={props.useWebSearch}
+              className="h-4 w-4 accent-tide"
+              disabled={props.busy}
+              onChange={(event) => props.onSetWebSearch(event.target.checked)}
+              type="checkbox"
+            />
+            Web Search
+          </label>
+          <p className="mt-1 text-[11px] leading-4 text-ink/55" id="web-search-privacy-disclosure">
+            {SEARCH_PRIVACY_DISCLOSURE}
+          </p>
+        </div>
         <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
           <input
             checked={props.useRag}
             className="h-4 w-4 accent-moss"
+            disabled={props.busy || props.useWebSearch}
             onChange={(event) => props.onSetUseRag(event.target.checked)}
             type="checkbox"
           />
           RAG
         </label>
-        {props.useRag && (
+        {props.useRag && !props.useWebSearch && (
           <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm">
             <input
               checked={props.ragPreset !== "potato" && props.verifyRag}

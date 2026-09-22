@@ -92,6 +92,9 @@ Ollama-backed local model runtime.
 - Runs benchmark campaigns and exports local PDF, HTML, and JSON reports.
 - Stores sessions, Sources, settings, benchmark history, and operation traces
   in local SQLite profiles.
+- Runs optional bounded Web Search through a configured Brave Search API key,
+  then verifies exact retained evidence before rendering citations. See
+  [Search v0](docs/search-v0.md).
 
 ## Current release: v0.3.1
 
