@@ -1,0 +1,12 @@
+# CI-only pins for python/requirements.txt (unpinned there) plus pytest:
+# the versions the suite was last run against on Windows with Python 3.13.
+numpy==2.4.6
+pypdf==6.13.1
+readability-lxml==0.8.4.1
+lxml==6.1.2
+lxml_html_clean==0.4.5
+cssselect==1.5.0
+chardet==7.6.0
+reportlab==4.5.1
+pillow==12.2.0
+pytest==9.0.3
