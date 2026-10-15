@@ -10,3 +10,6 @@ chardet==7.6.0
 reportlab==4.5.1
 pillow==12.2.0
 pytest==9.0.3
+# scripts/search_replay.py (imported by test_search_baseline_acceptance) needs psutil,
+# which python/requirements.txt does not list.
+psutil==7.2.2
