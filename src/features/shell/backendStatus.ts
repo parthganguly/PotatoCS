@@ -1,6 +1,11 @@
 export const BACKEND_DEGRADED_MESSAGE =
   "Backend unavailable. Local AI features may not work until the backend reconnects.";
 
+export const PROFILE_IN_USE_BANNER =
+  "Profile already open. PotatoCS is already running with this profile in another window. Close that window, then choose Retry backend.";
+export const BACKEND_STOP_UNCONFIRMED_BANNER =
+  "The previous backend could not be confirmed stopped, so a new one was not started. Close and reopen PotatoCS.";
+
 export const BACKEND_RETRY_LABEL = "Retry backend";
 export const BACKEND_RETRYING_LABEL = "Retrying...";
 
@@ -27,10 +32,21 @@ export type BackendBannerState = {
  * privacy-safe copy: error details, payloads and paths from the shell
  * never reach this banner by construction.
  */
-export function backendBannerState(degraded: boolean, retrying: boolean): BackendBannerState {
+export function backendBannerState(
+  degraded: boolean,
+  retrying: boolean,
+  reason: string | null | undefined = null
+): BackendBannerState {
+  // A profile owned by another window is not a crash; say what it is.
+  const message =
+    reason === "profile_in_use"
+      ? PROFILE_IN_USE_BANNER
+      : reason === "backend_stop_unconfirmed"
+        ? BACKEND_STOP_UNCONFIRMED_BANNER
+        : BACKEND_DEGRADED_MESSAGE;
   return {
     visible: degraded,
-    message: BACKEND_DEGRADED_MESSAGE,
+    message,
     retryLabel: retrying ? BACKEND_RETRYING_LABEL : BACKEND_RETRY_LABEL,
     retryDisabled: retrying
   };

@@ -11,19 +11,27 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from odysseus_desktop_backend import __version__
+from odysseus_desktop_backend.cancellation import TurnDeadline
 from odysseus_desktop_backend.logging_config import get_logger, setup_logging
+from odysseus_desktop_backend.profile_ownership import (
+    PROFILE_IN_USE_EXIT_CODE,
+    PROFILE_IN_USE_MESSAGE,
+    ProfileInUseError,
+    ProfileOwnership,
+)
 from odysseus_desktop_backend.progress import progress_operation
 from odysseus_desktop_backend.services.artifact_service import ArtifactService
 from odysseus_desktop_backend.services.campaign_service import CampaignService
 from odysseus_desktop_backend.services.chat_service import ChatService
+from odysseus_desktop_backend.services.chat_turns import ACTIVE_STATES, ChatTurnStore
 from odysseus_desktop_backend.services.document_service import DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.eval_service import EvalService
 from odysseus_desktop_backend.services.florence2_service import Florence2Backend
 from odysseus_desktop_backend.services.image_eval_service import ImageEvalService
-from odysseus_desktop_backend.services.job_service import JobService
+from odysseus_desktop_backend.services.job_service import TERMINAL_JOB_STATES, JobService
 from odysseus_desktop_backend.services.legacy_import_service import LegacyImportService
-from odysseus_desktop_backend.services.model_service import ModelService
+from odysseus_desktop_backend.services.model_service import INTERACTIVE_TURN_SECONDS, ModelService
 from odysseus_desktop_backend.services.ocr_service import LocalVLMTextExtractor, OCRService
 from odysseus_desktop_backend.services.rag_service import RAGService
 from odysseus_desktop_backend.services.session_service import SessionService
@@ -63,8 +71,13 @@ class RpcError(Exception):
 
 
 class SidecarApp:
-    def __init__(self, profile_dir: str | Path):
+    def __init__(self, profile_dir: str | Path, ownership: ProfileOwnership | None = None):
         self.profile_dir = Path(profile_dir)
+        # At most one live backend owns a profile. Nothing below (migration,
+        # attempt reconciliation, jobs) runs without holding it; a second backend
+        # raises ProfileInUseError here, before touching the profile.
+        self.ownership = ownership or ProfileOwnership(self.profile_dir)
+        self._closed = False
         self.launch_info = sidecar_launch_info(self.profile_dir)
         logger.info(
             "backend startup profile_dir=%s python_executable=%s cwd=%s resource_dir=%s dev_repo_root=%s app_data_dir=%s florence_model_dir_env=%s copied_backend_dir=%s",
@@ -97,6 +110,7 @@ class SidecarApp:
         self.ocr.set_vlm_text_extractor(LocalVLMTextExtractor(self.models, self.florence))
         self.vision = VisionService(self.artifacts, self.ocr, self.models, florence=self.florence)
         self.legacy_import = LegacyImportService(self.documents, self.rag, self.sessions, self.settings)
+        self.turns = ChatTurnStore(self.db)
         self.chat = ChatService(
             self.sessions,
             self.settings,
@@ -107,6 +121,7 @@ class SidecarApp:
             sources=self.sources,
             vision=self.vision,
             ocr=self.ocr,
+            turns=self.turns,
         )
         self.evals = EvalService(self.db)
         self.image_evals = ImageEvalService(self.db, self.artifacts, self.vision)
@@ -132,6 +147,11 @@ class SidecarApp:
                 repaired["purged_staging"],
                 repaired["ocr_reset"],
             )
+        # No worker of an earlier process can still own a chat attempt; settle them
+        # as interrupted so they can never commit later. Nothing is replayed.
+        interrupted_turns = self.turns.reconcile_interrupted()
+        if interrupted_turns:
+            logger.warning("reconciled interrupted chat attempts count=%s", interrupted_turns)
         self.jobs = JobService(self.profile_dir)
         self.shutdown_requested = False
         self.methods: dict[str, Callable[[JsonDict], Any]] = {
@@ -180,6 +200,10 @@ class SidecarApp:
             "ocr.status": self.ocr_status,
             "jobs.submit_import": self.jobs_submit_import,
             "jobs.submit_search": self.jobs_submit_search,
+            "jobs.submit_chat": self.jobs_submit_chat,
+            "jobs.retry_chat": self.jobs_retry_chat,
+            "jobs.chat_status": self.jobs_chat_status,
+            "jobs.chat_result": self.jobs_chat_result,
             "jobs.get": self.jobs_get,
             "jobs.list": self.jobs_list,
             "jobs.cancel": self.jobs_cancel,
@@ -212,9 +236,15 @@ class SidecarApp:
         }
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         logger.info("backend shutdown profile_dir=%s", self.profile_dir)
-        self.jobs.shutdown()
-        self.db.close()
+        try:
+            self.jobs.shutdown()
+            self.db.close()
+        finally:
+            self.ownership.release()
 
     def dispatch(self, method: str, params: JsonDict | None) -> Any:
         handler = self.methods.get(method)
@@ -299,7 +329,7 @@ class SidecarApp:
     def sessions_messages(self, params: JsonDict) -> list[JsonDict]:
         session_id = require_str(params, "session_id")
         messages = self.documents.hydrate_messages(self.sessions.messages(session_id))
-        return self.artifacts.hydrate_messages(messages)
+        return self.turns.annotate(session_id, self.artifacts.hydrate_messages(messages))
 
     def chat_send(self, params: JsonDict) -> JsonDict:
         artifact_ids = optional_str_list(params, "artifact_ids")
@@ -310,23 +340,14 @@ class SidecarApp:
             artifact_id=artifact_ids[0] if artifact_ids else None,
         ):
             return self.chat.send(
-                message=str(params.get("message") or ""),
                 session_id=optional_str(params, "session_id"),
-                model=optional_str(params, "model"),
-                use_rag=optional_bool(params, "use_rag", False),
-                document_ids=optional_str_list(params, "document_ids"),
-                verify_rag=optional_bool(params, "verify_rag", False),
-                answer_style=optional_str(params, "answer_style"),
-                temperature=optional_float(params, "temperature", 0.0),
-                rag_preset=optional_str(params, "rag_preset"),
-                thinking_mode=optional_str(params, "thinking_mode") or "auto",
-                attachment_document_ids=optional_str_list(params, "attachment_document_ids"),
                 artifact_ids=artifact_ids,
                 multimodal_mode=optional_str(params, "multimodal_mode") or "automatic",
                 vision_model=optional_str(params, "vision_model") or "",
                 vision_backend=optional_str(params, "vision_backend") or "",
                 analysis_request_id=optional_str(params, "analysis_request_id") or "",
                 crop_derivation_id=optional_str(params, "crop_derivation_id") or "",
+                **chat_text_params(params),
             )
 
     def models_detect_ollama(self, _params: JsonDict) -> JsonDict:
@@ -510,6 +531,96 @@ class SidecarApp:
         )
         return {"job": job, "session": session}
 
+    def jobs_submit_chat(self, params: JsonDict) -> JsonDict:
+        """Text/document chat as a cancellable job; image turns stay on chat.send.
+
+        Accepting persists the logical user message, its sources and attempt 1 once.
+        The same operation_key returns the existing operation and starts nothing.
+        """
+        deadline = TurnDeadline(INTERACTIVE_TURN_SECONDS)  # measured from accepted Send
+        if optional_str_list(params, "artifact_ids"):
+            raise RpcError(-32602, "image attachments must be sent with chat.send")
+        request = chat_text_params(params)
+        content = request.pop("message").strip()
+        attachments = request.pop("attachment_document_ids") or []
+        if not content and not attachments:
+            raise RpcError(-32602, "message is required")
+        model = require_str(params, "model")
+        operation_key = optional_str(params, "operation_key") or str(uuid.uuid4())
+        existing = self.turns.status(operation_key=operation_key)
+        if existing is not None:
+            return self._chat_operation(existing)
+        session = self.sessions.ensure(optional_str(params, "session_id"), model=model)
+        self._require_text_conversation(str(session["id"]))
+        self.jobs.ensure_capacity()
+        turn, created = self.turns.accept(
+            session_id=str(session["id"]),
+            content=content,
+            attachment_document_ids=attachments,
+            request=request,
+            operation_key=operation_key,
+        )
+        return self._chat_operation(turn, deadline if created else None)
+
+    def jobs_retry_chat(self, params: JsonDict) -> JsonDict:
+        """Explicit retry of an unanswered latest turn: a new attempt, no new user message."""
+        deadline = TurnDeadline(INTERACTIVE_TURN_SECONDS)
+        message_id = require_str(params, "message_id")
+        operation_key = require_str(params, "operation_key")
+        existing = self.turns.status(operation_key=operation_key)
+        if existing is not None:
+            return self._chat_operation(existing)
+        current = self.turns.status(message_id=message_id)
+        if current is None:
+            raise RpcError(-32602, "only a tracked chat question can be retried")
+        self._require_text_conversation(str(current["session_id"]))
+        self.jobs.ensure_capacity()
+        turn, created = self.turns.retry(message_id, operation_key)
+        return self._chat_operation(turn, deadline if created else None)
+
+    def jobs_chat_status(self, params: JsonDict) -> JsonDict:
+        """Authoritative outcome of a turn, by message id or operation key. Never starts work."""
+        message_id = optional_str(params, "message_id") or ""
+        operation_key = optional_str(params, "operation_key") or ""
+        if not message_id and not operation_key:
+            raise RpcError(-32602, "message_id or operation_key is required")
+        turn = self.turns.status(message_id=message_id, operation_key=operation_key)
+        if turn is None:
+            return {"found": False, "turn": None, "job": None}
+        job = self.jobs.find_chat_attempt(turn["current_attempt_id"])
+        if turn["latest_state"] in ACTIVE_STATES and (job is None or job["state"] in TERMINAL_JOB_STATES):
+            # Only terminal jobs are ever pruned, and startup retired every earlier
+            # process's attempts, so no worker can still send or save for this one.
+            # Retiring it is the same atomic update a late commit would race.
+            self.turns.finish(turn["current_attempt_id"], "interrupted", "outcome_reconciled")
+            turn = self.turns.status(message_id=turn["message_id"])
+        return {"found": True, "turn": turn, "job": job}
+
+    def _require_text_conversation(self, session_id: str) -> None:
+        if any(source.get("backend_kind") == "artifact" for source in self.sources.conversation_context(session_id)):
+            raise RpcError(-32602, "image conversations must be sent with chat.send")
+
+    def _chat_operation(self, turn: JsonDict, deadline: TurnDeadline | None = None) -> JsonDict:
+        """Queue the turn's new attempt (when `deadline` is given) and describe the operation."""
+        attempt_id = str(turn["current_attempt_id"])
+        if deadline is not None:
+            try:
+                job = self.jobs.submit_chat(
+                    session_id=str(turn["session_id"]),
+                    message_id=str(turn["message_id"]),
+                    attempt_id=attempt_id,
+                    deadline=deadline,
+                )
+            except Exception:
+                self.turns.finish(attempt_id, "failed", "job_failed")
+                raise
+        else:
+            job = self.jobs.find_chat_attempt(attempt_id)
+        return {"job": job, "session": self.sessions.get(str(turn["session_id"])), "turn": turn}
+
+    def jobs_chat_result(self, params: JsonDict) -> JsonDict:
+        return self.jobs.chat_result(require_str(params, "job_id"))
+
     def jobs_get(self, params: JsonDict) -> JsonDict:
         return self.jobs.get(require_str(params, "job_id"))
 
@@ -517,7 +628,14 @@ class SidecarApp:
         return self.jobs.list()
 
     def jobs_cancel(self, params: JsonDict) -> JsonDict:
-        return self.jobs.cancel(require_str(params, "job_id"))
+        job_id = require_str(params, "job_id")
+        snapshot = self.jobs.cancel(job_id)
+        if snapshot.get("attempt_id"):
+            # After the job is cancel_requested: a queued attempt is cancelled now; a
+            # running one can no longer commit, and its worker settles it once nothing
+            # can be sent. A commit that already won leaves this a no-op.
+            self.turns.request_cancel(str(snapshot["attempt_id"]))
+        return snapshot
 
     def legacy_import_folder(self, params: JsonDict) -> JsonDict:
         return self.legacy_import.import_folder(require_str(params, "folder"))
@@ -709,6 +827,22 @@ def optional_str_list(params: JsonDict, key: str) -> list[str] | None:
     return clean
 
 
+def chat_text_params(params: JsonDict) -> JsonDict:
+    """ChatService.send arguments shared by chat.send and jobs.submit_chat."""
+    return {
+        "message": str(params.get("message") or ""),
+        "model": optional_str(params, "model"),
+        "use_rag": optional_bool(params, "use_rag", False),
+        "document_ids": optional_str_list(params, "document_ids"),
+        "verify_rag": optional_bool(params, "verify_rag", False),
+        "answer_style": optional_str(params, "answer_style"),
+        "temperature": optional_float(params, "temperature", 0.0),
+        "rag_preset": optional_str(params, "rag_preset"),
+        "thinking_mode": optional_str(params, "thinking_mode") or "auto",
+        "attachment_document_ids": optional_str_list(params, "attachment_document_ids"),
+    }
+
+
 def make_response(request_id: Any, result: Any = None, error: RpcError | None = None) -> JsonDict:
     response: JsonDict = {"jsonrpc": "2.0", "id": request_id}
     if error is not None:
@@ -732,9 +866,14 @@ def main() -> int:
         print("ODYSSEUS_PROFILE_DIR is required", file=sys.stderr)
         return 2
 
+    try:
+        ownership = ProfileOwnership(profile_dir)  # before logging or any profile write
+    except ProfileInUseError:
+        print(PROFILE_IN_USE_MESSAGE, file=sys.stderr)
+        return PROFILE_IN_USE_EXIT_CODE
     setup_logging(profile_dir)
     logger.info("JSON-RPC sidecar starting version=%s", __version__)
-    app = SidecarApp(profile_dir)
+    app = SidecarApp(profile_dir, ownership=ownership)
     try:
         for line in sys.stdin:
             line = line.strip()

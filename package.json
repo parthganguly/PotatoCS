@@ -12,6 +12,7 @@
     "test:readiness": "node scripts/test-readiness.mjs",
     "test:jobs-ui": "node scripts/test-jobs-ui.mjs",
     "test:search-ui": "node scripts/test-search-ui.mjs",
+    "test:chat-job": "node scripts/test-chat-job.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "prepare:python": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-python-runtime.ps1",
     "verify:python": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-python-runtime.ps1",

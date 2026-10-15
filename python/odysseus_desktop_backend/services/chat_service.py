@@ -8,11 +8,20 @@ import uuid
 from typing import TYPE_CHECKING
 from typing import Any
 
+from odysseus_desktop_backend.cancellation import (
+    JobCancelledError,
+    TurnDeadline,
+    TurnDeadlineExceeded,
+    active_deadline,
+    check_cancelled,
+)
 from odysseus_desktop_backend.progress import bind_progress_context, emit_progress
 from odysseus_desktop_backend.services.model_service import (
     CORRECTION_NUM_PREDICT,
     CORRECTION_TIMEOUT_SECONDS,
     INTERACTIVE_CHAT_TIMEOUT_SECONDS,
+    INTERACTIVE_VERIFICATION_SECONDS,
+    MODEL_PREPARE_TIMEOUT_SECONDS,
     VERIFIER_NUM_PREDICT,
     VERIFIER_TIMEOUT_SECONDS,
     VISION_CHAT_TIMEOUT_SECONDS,
@@ -48,6 +57,7 @@ from odysseus_desktop_backend.storage import utc_ms
 
 if TYPE_CHECKING:
     from odysseus_desktop_backend.services.artifact_service import ArtifactService
+    from odysseus_desktop_backend.services.chat_turns import ChatTurnStore
     from odysseus_desktop_backend.services.document_service import DocumentService
     from odysseus_desktop_backend.services.ocr_service import OCRService
     from odysseus_desktop_backend.services.rag_service import RAGService
@@ -97,6 +107,7 @@ class ChatService:
         sources: SourceService | None = None,
         vision: VisionService | None = None,
         ocr: OCRService | None = None,
+        turns: ChatTurnStore | None = None,
     ):
         self.sessions = sessions
         self.settings = settings
@@ -107,6 +118,7 @@ class ChatService:
         self.sources = sources
         self.vision = vision
         self.ocr = ocr
+        self.turns = turns
 
     def send(
         self,
@@ -128,7 +140,17 @@ class ChatService:
         vision_backend: str = VISION_BACKEND_AUTOMATIC,
         analysis_request_id: str = "",
         crop_derivation_id: str = "",
+        attempt_id: str = "",
+        user_message_id: str = "",
     ) -> dict[str, Any]:
+        """Answer one turn.
+
+        With `attempt_id` (job chat) the logical user message and its sources were
+        persisted at acceptance: they are reused, never re-created, and the answer is
+        saved only through the attempt's atomic commit.
+        """
+        if attempt_id and (self.turns is None or not user_message_id):
+            raise ValueError("a tracked attempt needs its turn store and user message")
         content = (message or "").strip()
         question_for_models = content or "Summarize the attached source."
         clean_attachment_document_ids = [
@@ -172,14 +194,20 @@ class ChatService:
         if not session.get("model"):
             session = self.sessions.update(session["id"], {"model": selected_model})
 
-        user_message = self.sessions.add_message(session["id"], "user", content)
+        if attempt_id:
+            user_message = next(
+                item for item in self.sessions.messages(session["id"]) if item["id"] == user_message_id
+            )
+        else:
+            user_message = self.sessions.add_message(session["id"], "user", content)
         bind_progress_context(
             session_id=session["id"],
             message_id=user_message["id"],
             artifact_id=clean_artifact_ids[0] if clean_artifact_ids else None,
         )
         conversation_sources: list[tuple[str, str]] = []
-        if clean_attachment_document_ids and self.documents is not None:
+        # A tracked turn's sources were linked once, at acceptance.
+        if clean_attachment_document_ids and self.documents is not None and not attempt_id:
             self.documents.link_message(user_message["id"], clean_attachment_document_ids)
             conversation_sources.extend(("document", document_id) for document_id in clean_attachment_document_ids)
         if clean_artifact_ids:
@@ -205,7 +233,11 @@ class ChatService:
             for source in active_context
             if source.get("backend_kind") == "artifact"
         ] if self.sources is not None else clean_artifact_ids
-        effective_document_ids = combine_unique(active_document_ids, document_ids or [])
+        # A retry uses the original attachments even if they left the conversation since.
+        effective_document_ids = combine_unique(
+            active_document_ids,
+            list(document_ids or []) + (clean_attachment_document_ids if attempt_id else []),
+        )
         document_context_enabled = use_rag or bool(effective_document_ids)
         selected_rag_preset = normalize_rag_preset(rag_preset) if document_context_enabled else DEFAULT_RAG_PRESET
         potato_mode = document_context_enabled and selected_rag_preset == "potato"
@@ -225,6 +257,7 @@ class ChatService:
                 session_document_ids=active_document_ids,
                 indexed_source_document_ids=document_ids or [],
             )
+        _turn_check()
 
         analysis = None
         multimodal_route: dict[str, Any] = {}
@@ -291,6 +324,13 @@ class ChatService:
                     "attached_documents": self.documents.attachments_for_messages([user_message["id"]]).get(user_message["id"], []) if self.documents else [],
                 }
         history = self.sessions.messages(session["id"])
+        # Model history: completed exchanges plus the current question, exactly once
+        # and last. Tracked questions that never got an answer are left out; untracked
+        # legacy messages keep their existing behavior.
+        unanswered = self.turns.unanswered_message_ids(session["id"]) if self.turns is not None else set()
+        history = [
+            item for item in history if item["id"] != user_message["id"] and item["id"] not in unanswered
+        ] + [item for item in history if item["id"] == user_message["id"]]
         rag_context = ""
         retrieved_chunks: list[dict[str, Any]] = []
         retrieved_snippets: list[dict[str, Any]] = []
@@ -312,6 +352,7 @@ class ChatService:
                 retrieved_snippets,
                 model_received=bool(rag_context),
             )
+        _turn_check()
 
         ollama_messages = [
             {"id": str(item["id"]), "role": item["role"], "content": item["content"]}
@@ -428,13 +469,14 @@ class ChatService:
                 reply = poor_ocr_limitation
                 reply_response = self._local_reply_response(selected_model, reply)
             else:
+                self._prepare_model(selected_model, generation_options)
                 emit_progress("answer_generation")
                 reply_response = self._chat_model_detailed(
                     selected_model,
                     ollama_messages,
                     generation_options,
                     thinking=selected_thinking_mode,
-                    timeout=timeout,
+                    timeout=_turn_allow(timeout),
                 )
                 reply = str(reply_response.get("content") or "")
         grounding = self._grounding_report(
@@ -442,16 +484,27 @@ class ChatService:
             enabled=verify_rag,
             status="not_run" if rag_context else "no_evidence",
         )
+        verification_notice: dict[str, str] | None = None
         if rag_context and verify_rag and retrieved_snippets:
-            emit_progress("answer_verification")
-            reply, grounding = self._verify_and_correct(
-                model=selected_model,
-                messages=ollama_messages,
-                draft_answer=reply,
-                snippets=retrieved_snippets,
-                answer_style=selected_answer_style,
-                options=generation_options,
-            )
+            turn = active_deadline()
+            if turn is not None and turn.expired():
+                # A complete draft exists: keep it and start no further verification.
+                grounding = self._grounding_report(
+                    retrieved_snippets, enabled=True, status="timeout", error="turn deadline reached before verification"
+                )
+            else:
+                emit_progress("answer_verification")
+                reply, grounding = self._verify_and_correct(
+                    model=selected_model,
+                    messages=ollama_messages,
+                    draft_answer=reply,
+                    snippets=retrieved_snippets,
+                    answer_style=selected_answer_style,
+                    options=generation_options,
+                    budget=turn.budget(INTERACTIVE_VERIFICATION_SECONDS) if turn is not None else None,
+                )
+            if turn is not None:
+                verification_notice = verification_notice_for(grounding)
         if rag_context and retrieved_snippets:
             reply = self._guard_ocr_answer(
                 reply,
@@ -479,15 +532,27 @@ class ChatService:
             embedding_model=str(current_settings.get("embedding_model") or ""),
             embedding_backend=str(current_settings.get("embedding_backend") or ""),
         )
-        assistant_message = self.sessions.add_message(
-            session["id"],
-            "assistant",
-            reply,
-            metadata={"operation_trace": operation_trace},
-        )
-
-        if session["title"] == "New chat":
-            self.sessions.update(session["id"], {"title": self._derive_title(question_for_models)})
+        answer_metadata: dict[str, Any] = {"operation_trace": operation_trace}
+        if verification_notice:
+            answer_metadata["verification_notice"] = verification_notice
+        if attempt_id:
+            assert self.turns is not None
+            # Saved only if this attempt is still the authorized, uncancelled one.
+            assistant_message = self.turns.commit_answer(
+                attempt_id,
+                content=reply,
+                metadata=answer_metadata,
+                title=self._derive_title(question_for_models),
+            )
+        else:
+            assistant_message = self.sessions.add_message(
+                session["id"],
+                "assistant",
+                reply,
+                metadata=answer_metadata,
+            )
+            if session["title"] == "New chat":
+                self.sessions.update(session["id"], {"title": self._derive_title(question_for_models)})
 
         return {
             "session": self.sessions.get(session["id"]),
@@ -758,6 +823,8 @@ class ChatService:
                 {"backend_kind": "artifact", **artifact}
                 for artifact in item.get("artifacts", [])
             ]
+        if self.turns is not None and hydrated:
+            self.turns.annotate(str(hydrated[0]["session_id"]), hydrated)
         return hydrated
 
     def _prepare_document_evidence(
@@ -2118,6 +2185,22 @@ class ChatService:
             completed_at=utc_ms(),
         )
 
+    def _prepare_model(self, model: str, options: dict[str, Any]) -> None:
+        """Bound waiting for/loading the model separately from generating the answer."""
+        impl = type(self.models)
+        prepare = getattr(impl, "prepare", None)
+        answers_chat_itself = any(
+            getattr(impl, name, None) is not getattr(ModelService, name) for name in ("chat", "chat_detailed")
+        )
+        # Same rule as _chat_model_detailed: a double that answers chat itself has
+        # no runtime behind it, so an inherited prepare must never reach Ollama.
+        if prepare is None or (prepare is ModelService.prepare and answers_chat_itself):
+            return
+        emit_progress("model_prepare")
+        self.models.prepare(model, options=options, timeout=_turn_allow(MODEL_PREPARE_TIMEOUT_SECONDS))
+        # A cancel that lands while a load finishes must not start generation.
+        check_cancelled()
+
     def _chat_model(
         self,
         model: str,
@@ -2376,8 +2459,14 @@ class ChatService:
         snippets: list[dict[str, Any]],
         answer_style: str,
         options: dict[str, Any],
+        budget: TurnDeadline | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        first_report = self._verify_answer(model, draft_answer, snippets)
+        """Verify, correct at most once, verify again.
+
+        With a `budget` (interactive turn) every call shares it, and a correction
+        replaces the draft only if it passes verification.
+        """
+        first_report = self._verify_answer(model, draft_answer, snippets, budget=budget)
         contradicted = first_report.get("contradicted_claims") or []
         if not contradicted:
             return draft_answer, first_report
@@ -2403,19 +2492,27 @@ class ChatService:
                 correction_messages,
                 correction_options,
                 thinking="off",
-                timeout=CORRECTION_TIMEOUT_SECONDS,
+                timeout=budget.allow(CORRECTION_TIMEOUT_SECONDS) if budget else CORRECTION_TIMEOUT_SECONDS,
             )
-        except ModelTimeoutError as exc:
+        except (ModelTimeoutError, TurnDeadlineExceeded) as exc:
             first_report["correction_status"] = "timeout"
             first_report["correction_error"] = str(exc)
             return draft_answer, first_report
+        except JobCancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 - correction is optional
             first_report["correction_status"] = "error"
             first_report["correction_error"] = str(exc)
             return draft_answer, first_report
 
         corrected = str(correction_response.get("content") or "")
-        final_report = self._verify_answer(model, corrected, snippets, stage="final_verification")
+        final_report = self._verify_answer(model, corrected, snippets, stage="final_verification", budget=budget)
+        if budget is not None and final_report["verifier"]["status"] != "passed":
+            # The complete draft stands until a replacement passes verification.
+            first_report["correction_status"] = "not_verified"
+            first_report["correction_latency_ms"] = int(correction_response.get("elapsed_ms") or 0)
+            first_report["final_verifier_status"] = final_report["verifier"]["status"]
+            return draft_answer, first_report
         final_report["regenerated"] = True
         final_report["draft_verifier"] = first_report
         final_report["correction_status"] = "completed"
@@ -2429,6 +2526,7 @@ class ChatService:
         snippets: list[dict[str, Any]],
         *,
         stage: str = "verifier",
+        budget: TurnDeadline | None = None,
     ) -> dict[str, Any]:
         prompt = (
             "Use this as a lightweight warning pass, not as a perfect judge. "
@@ -2453,7 +2551,7 @@ class ChatService:
                 ],
                 {"temperature": DEFAULT_TEMPERATURE, "num_predict": VERIFIER_NUM_PREDICT},
                 thinking="off",
-                timeout=VERIFIER_TIMEOUT_SECONDS,
+                timeout=budget.allow(VERIFIER_TIMEOUT_SECONDS) if budget else VERIFIER_TIMEOUT_SECONDS,
                 response_format="json",
             )
             raw = str(response.get("content") or "")
@@ -2462,13 +2560,15 @@ class ChatService:
             report[f"{stage}_latency_ms"] = int(response.get("elapsed_ms") or 0)
             report["verifier_latency_ms"] = int(response.get("elapsed_ms") or 0)
             return report
-        except ModelTimeoutError as exc:
+        except (ModelTimeoutError, TurnDeadlineExceeded) as exc:
             return self._grounding_report(
                 snippets,
                 enabled=True,
                 status="timeout",
                 error=str(exc),
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 - verifier is optional and must not break chat
             return self._grounding_report(
                 snippets,
@@ -2566,6 +2666,35 @@ class ChatService:
             "contradicted_claims": contradicted_claims or [],
             "regenerated": False,
         }
+
+
+def _turn_allow(stage_seconds: float) -> float:
+    """Inside an interactive turn: the lesser of the stage allowance and what remains."""
+    turn = active_deadline()
+    return stage_seconds if turn is None else turn.allow(stage_seconds)
+
+
+def _turn_check() -> None:
+    turn = active_deadline()
+    if turn is not None:
+        turn.check()
+
+
+def verification_notice_for(grounding: dict[str, Any]) -> dict[str, str] | None:
+    """Fixed, visible qualification for an answer whose optional verification did not pass."""
+    status = str((grounding.get("verifier") or {}).get("status") or "")
+    correction = str(grounding.get("correction_status") or "")
+    if status == "passed":
+        return None
+    if "timeout" in (status, correction, str(grounding.get("final_verifier_status") or "")):
+        reason = "Verification ran out of time."
+    elif status == "error" or correction == "error":
+        reason = "The verifier could not complete."
+    elif correction == "not_verified":
+        reason = "A corrected answer did not pass verification, so the original answer is shown."
+    else:
+        reason = "Some claims could not be confirmed from the retrieved sources."
+    return {"label": "Verification incomplete", "reason": reason}
 
 
 def _compact_trace_fields(values: dict[str, Any]) -> dict[str, Any]:

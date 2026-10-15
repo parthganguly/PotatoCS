@@ -51,8 +51,8 @@ type SearchSubmitParams = {
   secondRoundEnabled?: boolean;
 };
 
-type SearchJobApi = {
-  submit: (params: SearchSubmitParams) => Promise<SubmitSearchJobResult>;
+export type JobPollApi<P, R extends { job: JobRecord | null }> = {
+  submit: (params: P) => Promise<R>;
   get: (jobId: string) => Promise<JobRecord>;
   cancel: (jobId: string) => Promise<JobRecord>;
 };
@@ -67,18 +67,24 @@ const browserScheduler: Scheduler = {
   clear: (timerId) => globalThis.clearTimeout(timerId)
 };
 
-export class SearchJobController {
+// Polls one submitted job (Search or chat) to a terminal state; polling is authoritative.
+// Every submit/clear starts a new generation: a late submit, poll or cancel response
+// from an earlier generation is dropped instead of replacing the current job.
+export class JobPollController<P = SearchSubmitParams, R extends { job: JobRecord | null } = SubmitSearchJobResult> {
   private job: JobRecord | null = null;
   private listener: (job: JobRecord | null) => void = () => undefined;
   private timerId: number | null = null;
   private active = false;
   private pollFailures = 0;
   private handledTerminalId = "";
+  private generation = 0;
+  private submitting = false;
 
   constructor(
-    private readonly api: SearchJobApi,
+    private readonly api: JobPollApi<P, R>,
     private readonly onSettled: (job: JobRecord) => void | Promise<void>,
-    private readonly scheduler: Scheduler = browserScheduler
+    private readonly scheduler: Scheduler = browserScheduler,
+    private readonly pollFailureCode = "search_poll_unavailable"
   ) {}
 
   subscribe(listener: (job: JobRecord | null) => void): () => void {
@@ -93,29 +99,63 @@ export class SearchJobController {
     };
   }
 
-  async submit(params: SearchSubmitParams): Promise<SubmitSearchJobResult> {
+  async submit(params: P): Promise<R> {
+    // Synchronous: a second submit in the same render, before React commits busy, is refused.
+    if (this.submitting) throw new Error("A job is already being submitted.");
+    this.submitting = true;
+    const generation = ++this.generation;
     this.clearTimer();
-    const result = await this.api.submit(params);
-    this.job = result.job;
-    this.pollFailures = 0;
-    this.handledTerminalId = "";
+    this.job = null; // a new submission never shows the previous job
     this.emit();
-    this.schedule();
-    return result;
+    try {
+      const result = await this.api.submit(params);
+      if (generation === this.generation) {
+        this.job = result.job;
+        this.pollFailures = 0;
+        this.handledTerminalId = "";
+        this.emit();
+        this.schedule();
+      }
+      return result;
+    } finally {
+      this.submitting = false;
+    }
   }
 
   async cancel(): Promise<void> {
-    if (!this.job || TERMINAL_STATES.has(this.job.state) || this.job.state === "cancel_requested") return;
+    const target = this.job;
+    const generation = this.generation;
+    if (!target || TERMINAL_STATES.has(target.state) || target.state === "cancel_requested") return;
     try {
-      this.job = await this.api.cancel(this.job.job_id);
+      const next = await this.api.cancel(target.job_id);
+      if (generation !== this.generation || this.job?.job_id !== target.job_id) return;
+      if (TERMINAL_STATES.has(this.job.state)) return; // polling already settled it
+      this.job = next;
       this.emit();
-      this.schedule();
+      if (TERMINAL_STATES.has(next.state)) {
+        await this.settle(next);
+      } else {
+        this.schedule();
+      }
     } catch {
       // Polling remains authoritative when cancellation races a transition.
     }
   }
 
+  // Follow an already-submitted job again (e.g. after reconciliation found it still
+  // running). Starts a new generation; never submits anything.
+  attach(job: JobRecord): void {
+    this.generation += 1;
+    this.clearTimer();
+    this.job = job;
+    this.pollFailures = 0;
+    this.handledTerminalId = "";
+    this.emit();
+    this.schedule();
+  }
+
   clear(): void {
+    this.generation += 1;
     this.clearTimer();
     this.job = null;
     this.pollFailures = 0;
@@ -133,10 +173,12 @@ export class SearchJobController {
 
   private async poll(): Promise<void> {
     const current = this.job;
+    const generation = this.generation;
     if (!this.active || !current || TERMINAL_STATES.has(current.state)) return;
     try {
       const next = await this.api.get(current.job_id);
-      if (!this.active || this.job?.job_id !== current.job_id) return;
+      if (!this.active || generation !== this.generation || this.job?.job_id !== current.job_id) return;
+      if (TERMINAL_STATES.has(this.job.state)) return; // a cancel response already settled it
       this.pollFailures = 0;
       this.job = next;
       this.emit();
@@ -146,13 +188,14 @@ export class SearchJobController {
         this.schedule();
       }
     } catch {
-      if (!this.active || this.job?.job_id !== current.job_id) return;
+      if (!this.active || generation !== this.generation || this.job?.job_id !== current.job_id) return;
+      if (TERMINAL_STATES.has(this.job.state)) return;
       this.pollFailures += 1;
       if (this.pollFailures >= SEARCH_POLL_MAX_FAILURES) {
         this.job = {
           ...current,
           state: "failed",
-          message_code: "search_poll_unavailable",
+          message_code: this.pollFailureCode,
           finished_at: Date.now(),
           queue_position: null
         };

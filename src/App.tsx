@@ -46,6 +46,12 @@ import {
   CampaignReportData,
   CampaignReportResult,
   ChatResult,
+  cancelJob,
+  getChatJobResult,
+  getChatStatus,
+  getJob,
+  submitChatJob,
+  type ChatStatusResult,
   ArtifactAnalysisRun,
   ArtifactDerivation,
   ArtifactRecord,
@@ -108,6 +114,16 @@ import {
 import { conversationSources, deleteSource, importSources, listSources, promoteSource, removeConversationSource } from "./api/sources";
 import { ComposerAttachments, MessageAttachments, documentAttachmentStatusLabel } from "./features/attachments/ComposerAttachments";
 import { ChatProgressBar } from "./features/chat/ChatProgressBar";
+import {
+  CHAT_POLL_FAILURE_CODE,
+  CHAT_RESULT_UNAVAILABLE_COPY,
+  CHECKING_OUTCOME_LABEL,
+  canSendAsChatJob,
+  chatAttemptLabel,
+  chatJobFailureCopy,
+  chatTurnStatusLabel,
+  isConfirmedChatOutcome
+} from "./features/chat/chatJob";
 import { ChatHeader } from "./features/chat/ChatHeader";
 import { OperationTrace } from "./features/chat/OperationTrace";
 import { OperationProgressDiagnostics } from "./features/chat/OperationProgressDiagnostics";
@@ -127,7 +143,7 @@ import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisio
 import { SearchEvidenceCard } from "./features/search/SearchEvidenceCard";
 import { SearchResultsOnlyCard } from "./features/search/SearchResultsOnlyCard";
 import { SearchJobStatus } from "./features/search/SearchJobStatus";
-import { useSearchJob } from "./features/search/useSearchJob";
+import { useJobPoll, useSearchJob } from "./features/search/useSearchJob";
 import { isActiveSearchState, searchFailureCopy, shouldShowChatProgress } from "./features/search/searchModel";
 
 type LoadState = "idle" | "loading" | "error";
@@ -250,6 +266,10 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingUserContent, setPendingUserContent] = useState("");
+  // Set synchronously per send: a second submit in the same render sees it before busy commits.
+  const sendingRef = useRef(false);
+  // A Search or chat job is being submitted; until its id is known no progress event is its own.
+  const [awaitingJob, setAwaitingJob] = useState(false);
   const chatProgress = useChatProgress(busy);
   const importJobs = useImportJobs(async ({ job, refreshSources: shouldRefresh }) => {
     if (!shouldRefresh) return;
@@ -263,6 +283,7 @@ function App() {
     }
   });
   const searchJob = useSearchJob(async (job) => {
+    sendingRef.current = false;
     setPendingUserContent("");
     setBusy(false);
     if (job.session_id) {
@@ -275,6 +296,58 @@ function App() {
     if (job.state === "failed") setError(searchFailureCopy(job.message_code));
     if (job.state === "cancelled") setError("Web Search was cancelled.");
   });
+  // The chat turn in flight as a job. Its operation key lets the backend say what
+  // happened to it; the composer is refilled only when the backend never accepted it.
+  const chatTurnRef = useRef<ChatTurnRequest | null>(null);
+  // A turn whose outcome the UI could not establish. Nothing is resent automatically.
+  const [outcomeCheck, setOutcomeCheck] = useState<{ checking: boolean; turn: ChatTurnRequest } | null>(null);
+  const chatJob = useJobPoll(
+    { submit: submitChatJob, get: getJob, cancel: cancelJob },
+    async (job) => {
+      const turn = chatTurnRef.current;
+      chatTurnRef.current = null;
+      let following = false;
+      try {
+        if (job.state === "completed") {
+          let result: ChatResult;
+          try {
+            result = await getChatJobResult(job.job_id);
+          } catch {
+            // The answer exists; only loading it failed. Do not invite a duplicate send.
+            if (job.session_id) {
+              setSelectedSessionId(job.session_id);
+              await loadMessages(job.session_id);
+            }
+            setError(CHAT_RESULT_UNAVAILABLE_COPY);
+            return;
+          }
+          await applyChatResult(result, turn?.attachedSources ?? []);
+          return;
+        }
+        if (turn && !isConfirmedChatOutcome(job.message_code)) {
+          // Lost polling or an unexpected failure: ask the backend what was saved.
+          following = await reconcileChatTurn(turn);
+          return;
+        }
+        if (job.session_id) {
+          setSelectedSessionId(job.session_id);
+          await loadMessages(job.session_id);
+        }
+        // The question stays in the conversation with its own Retry; the composer is not refilled.
+        setError(chatJobFailureCopy(job.message_code, turn?.modelLabel ?? "The selected model"));
+      } catch (err) {
+        if (job.session_id) await loadMessages(job.session_id);
+        setError(readError(err));
+      } finally {
+        if (!following) {
+          sendingRef.current = false;
+          setPendingUserContent("");
+          setBusy(false);
+        }
+      }
+    },
+    CHAT_POLL_FAILURE_CODE
+  );
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
@@ -301,6 +374,8 @@ function App() {
     void listen<unknown>("backend_degraded", (event) => {
       if (!disposed && isBackendDegradedEvent(event.payload)) {
         setBackendDegraded(event.payload.degraded);
+        // The host's status carries the fixed reason (e.g. profile already open).
+        void getAppStatus().then(setAppStatus).catch(() => undefined);
       }
     })
       .then((nextUnlisten) => {
@@ -489,6 +564,14 @@ function App() {
     } catch (err) {
       setLoadState("error");
       setError(readError(err));
+      try {
+        // Startup can fail because the profile is open elsewhere; the banner says so.
+        const status = await getAppStatus();
+        setAppStatus(status);
+        setBackendDegraded(Boolean(status.backend_degraded));
+      } catch {
+        // The startup error above stays.
+      }
     }
   }
 
@@ -501,6 +584,7 @@ function App() {
     } catch {
       // Keep the fixed banner copy; raw retry errors never reach the UI.
       setBackendDegraded(true);
+      setAppStatus(await getAppStatus().catch(() => appStatus));
     } finally {
       setBackendRetrying(false);
     }
@@ -1125,6 +1209,72 @@ function App() {
     }
   }
 
+  // Asks the backend what happened to a turn whose outcome the UI could not establish.
+  // Returns true when the turn is still running and is being followed again.
+  async function reconcileChatTurn(turn: ChatTurnRequest, rejection?: string): Promise<boolean> {
+    setOutcomeCheck({ checking: true, turn });
+    let status: ChatStatusResult;
+    try {
+      status = await getChatStatus({ operation_key: turn.operationKey });
+    } catch {
+      setOutcomeCheck({ checking: false, turn });
+      return false;
+    }
+    setOutcomeCheck(null);
+    if (!status.found || !status.turn) {
+      // The backend never accepted it, so nothing was saved and a resend cannot duplicate it.
+      if (!turn.retry) setDraft(turn.message);
+      setError(rejection ?? "The question was not received, so nothing was saved.");
+      return false;
+    }
+    setSelectedSessionId(status.turn.session_id);
+    if (status.job && isActiveSearchState(status.job.state)) {
+      chatTurnRef.current = turn;
+      sendingRef.current = true;
+      setBusy(true);
+      chatJob.attach(status.job);
+      return true;
+    }
+    await loadMessages(status.turn.session_id);
+    if (!status.turn.answered) setError(chatTurnStatusLabel(status.turn));
+    return false;
+  }
+
+  // Explicit retry of the latest unanswered question: a new attempt, never a new message.
+  async function retryChatTurn(message: Message) {
+    if (busy || sendingRef.current || !message.turn?.can_retry) return;
+    const turn: ChatTurnRequest = {
+      message: message.content,
+      attachedSources: [],
+      modelLabel: readableModelLabel(String(selectedSession?.model || settings.default_model || "llama3.2")),
+      operationKey: makeRequestId("chat-retry"),
+      retry: true
+    };
+    sendingRef.current = true;
+    setBusy(true);
+    setError(null);
+    chatTurnRef.current = turn;
+    setAwaitingJob(true);
+    try {
+      const submitted = await chatJob.submit({ retry_message_id: message.id, operation_key: turn.operationKey });
+      if (!submitted.job) {
+        chatTurnRef.current = null;
+        await reconcileChatTurn(turn);
+      } else {
+        await loadMessages(message.session_id);
+      }
+    } catch (err) {
+      chatTurnRef.current = null;
+      await reconcileChatTurn(turn, readError(err));
+    } finally {
+      setAwaitingJob(false);
+      if (!chatTurnRef.current) {
+        sendingRef.current = false;
+        setBusy(false);
+      }
+    }
+  }
+
   async function loadConversationContext(sessionId: string) {
     try {
       setConversationContext(await conversationSources(sessionId));
@@ -1720,8 +1870,26 @@ function App() {
     }
   }
 
+  async function applyChatResult(result: ChatResult, attachedSources: SourceSummary[]) {
+    setSelectedSessionId(result.session.id);
+    setMessages(result.messages);
+    setRetrievedChunks(result.retrieved_chunks ?? []);
+    setRetrievedSnippets(result.retrieved_snippets ?? []);
+    setDocumentEvidence(result.document_evidence ?? []);
+    setGrounding(result.grounding ?? null);
+    setLastChatAnalysis(result.artifact_analysis ?? null);
+    await loadConversationContext(result.session.id);
+    if (attachedSources.length > 0) {
+      setPendingSources([]);
+      await refreshSources();
+    }
+    setSessions(await rpc<Session[]>("sessions.list"));
+  }
+
   async function sendMessage(event: FormEvent) {
     event.preventDefault();
+    // Enter calls form.requestSubmit(), which ignores the disabled Send button.
+    if (busy || sendingRef.current) return;
     const message = draft.trim();
     const attachedSources = pendingSources;
     const attachedArtifacts = attachedSources.filter((source) => source.backend_kind === "artifact");
@@ -1746,7 +1914,9 @@ function App() {
         setError("Send attachments in normal chat. Web Search already searches indexed local Sources alongside the public web.");
         return;
       }
+      sendingRef.current = true;
       setBusy(true);
+      setAwaitingJob(true);
       setError(null);
       setDraft("");
       setPendingUserContent(message);
@@ -1765,10 +1935,13 @@ function App() {
         setSelectedSessionId(submitted.session.id);
         setSessions(await rpc<Session[]>("sessions.list"));
       } catch {
+        sendingRef.current = false;
         setDraft(message);
         setPendingUserContent("");
         setBusy(false);
         setError("Web Search could not be started. Check the backend and try again.");
+      } finally {
+        setAwaitingJob(false);
       }
       return;
     }
@@ -1781,6 +1954,7 @@ function App() {
       setError("Choose a confirmed local vision model, or switch image mode to OCR only.");
       return;
     }
+    sendingRef.current = true;
     setBusy(true);
     setError(null);
     setDraft("");
@@ -1814,20 +1988,34 @@ function App() {
         params.vision_model = chatMultimodalMode === "ocr_only" || activeVisionBackend === "florence2" || activeVisionBackend === "ocr_only" ? "" : chatVisionModel.trim();
         params.analysis_request_id = makeRequestId("chat-image");
       }
-      const result = await rpc<ChatResult>("chat.send", params);
-      setSelectedSessionId(result.session.id);
-      setMessages(result.messages);
-      setRetrievedChunks(result.retrieved_chunks ?? []);
-      setRetrievedSnippets(result.retrieved_snippets ?? []);
-      setDocumentEvidence(result.document_evidence ?? []);
-      setGrounding(result.grounding ?? null);
-      setLastChatAnalysis(result.artifact_analysis ?? null);
-      await loadConversationContext(result.session.id);
-      if (attachedSources.length > 0) {
-        setPendingSources([]);
-        await refreshSources();
+      if (canSendAsChatJob(attachedSources, conversationContext)) {
+        // Text/document turns run as a cancellable job; busy stays set until it settles.
+        const turn: ChatTurnRequest = {
+          message,
+          attachedSources,
+          modelLabel: readableModelLabel(activeConversationModel),
+          operationKey: makeRequestId("chat-turn"),
+          retry: false
+        };
+        params.operation_key = turn.operationKey;
+        chatTurnRef.current = turn;
+        setAwaitingJob(true);
+        try {
+          const submitted = await chatJob.submit(params);
+          if (!submitted.job) {
+            chatTurnRef.current = null;
+            await reconcileChatTurn(turn);
+          }
+        } catch (err) {
+          chatTurnRef.current = null;
+          // It may or may not have been accepted: ask the backend, never guess or resend.
+          await reconcileChatTurn(turn, readError(err));
+        } finally {
+          setAwaitingJob(false);
+        }
+        return;
       }
-      setSessions(await rpc<Session[]>("sessions.list"));
+      await applyChatResult(await rpc<ChatResult>("chat.send", params), attachedSources);
     } catch (err) {
       setDraft(message);
       setError(readError(err));
@@ -1835,8 +2023,11 @@ function App() {
         await loadMessages(selectedSessionId);
       }
     } finally {
-      setPendingUserContent("");
-      setBusy(false);
+      if (!chatTurnRef.current) {
+        sendingRef.current = false;
+        setPendingUserContent("");
+        setBusy(false);
+      }
     }
   }
 
@@ -1872,6 +2063,7 @@ function App() {
       <section className="flex min-w-0 flex-1 flex-col">
         <BackendDegradedBanner
           degraded={backendDegraded}
+          reason={appStatus?.backend_error ?? null}
           retrying={backendRetrying}
           onRetry={retryDegradedBackend}
         />
@@ -1926,7 +2118,16 @@ function App() {
             useWebSearch={useWebSearch}
             verifyRag={verifyRag}
             searchJob={searchJob.job}
+            chatJob={chatJob.job && isActiveSearchState(chatJob.job.state) ? chatJob.job : null}
+            awaitingJob={awaitingJob}
+            outcomeCheck={outcomeCheck ? { checking: outcomeCheck.checking } : null}
+            onCheckOutcome={() => {
+              if (outcomeCheck && !outcomeCheck.checking && !busy) void reconcileChatTurn(outcomeCheck.turn);
+            }}
+            onRetryTurn={(message) => void retryChatTurn(message)}
+            onCopyTurn={(message) => setDraft(message.content)}
             onCancelSearch={() => void searchJob.cancel()}
+            onCancelChat={() => void chatJob.cancel()}
             onDeleteSession={deleteSession}
             onRetry={bootstrap}
             onSend={sendMessage}
@@ -2118,10 +2319,17 @@ function ChatWorkspace(props: {
   useWebSearch: boolean;
   verifyRag: boolean;
   searchJob: JobRecord | null;
+  chatJob: JobRecord | null;
+  awaitingJob: boolean;
+  outcomeCheck: { checking: boolean } | null;
+  onCheckOutcome: () => void;
+  onRetryTurn: (message: Message) => void;
+  onCopyTurn: (message: Message) => void;
   onAddExistingSource: (source: SourceSummary) => void;
   onAttachFiles: () => void;
   onCaptureScreen: () => void;
   onCancelSearch: () => void;
+  onCancelChat: () => void;
   onDeleteSession: (sessionId: string) => void;
   onPasteImage: () => void;
   onPromoteSource: (source: SourceSummary, index: boolean) => void;
@@ -2192,7 +2400,7 @@ function ChatWorkspace(props: {
       ) : (
         <>
           <div className="scrollbar-thin flex-1 overflow-auto px-5 py-5">
-            {props.messages.length === 0 && !props.pendingUserContent && !props.busy ? (
+            {props.messages.length === 0 && !props.pendingUserContent && !props.busy && !props.outcomeCheck ? (
               <div className="flex h-full items-center justify-center text-center">
                 <div>
                   <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-md bg-gold/20 text-gold">
@@ -2209,6 +2417,15 @@ function ChatWorkspace(props: {
                 {props.messages.map((message) => (
                   <div className="flex flex-col gap-2" key={message.id}>
                     <MessageBubble message={message} />
+                    {message.role === "user" && message.turn && (
+                      <TurnStatus
+                        busy={props.busy}
+                        message={message}
+                        onCopy={() => props.onCopyTurn(message)}
+                        onRetry={() => props.onRetryTurn(message)}
+                      />
+                    )}
+                    {message.role === "assistant" && <VerificationNotice message={message} />}
                     {message.role === "assistant" && message.metadata?.operation_trace && (
                       <OperationTrace
                         answer={message.content}
@@ -2250,11 +2467,15 @@ function ChatWorkspace(props: {
                 {props.searchJob && isActiveSearchState(props.searchJob.state) && (
                   <SearchJobStatus job={props.searchJob} onCancel={props.onCancelSearch} />
                 )}
+                {props.outcomeCheck && <OutcomeCheckCard checking={props.outcomeCheck.checking} onCheck={props.onCheckOutcome} />}
                 {shouldShowChatProgress(props.busy, props.searchJob?.state) && (
                   <ChatProgressBar
                     event={props.progressEvent}
                     fallbackLabel={props.progressFallbackLabel}
                     now={props.progressNow}
+                    job={props.chatJob}
+                    awaitingJob={props.awaitingJob}
+                    onCancel={props.onCancelChat}
                   />
                 )}
               </div>
@@ -4410,6 +4631,97 @@ function MessageBubble({ message }: { message: Message }) {
   );
 }
 
+// A tracked question's outcome. Prior attempts stay inspectable; Retry and Copy are
+// offered only when the backend says they are allowed.
+function TurnStatus({ message, busy, onRetry, onCopy }: {
+  message: Message;
+  busy: boolean;
+  onRetry: () => void;
+  onCopy: () => void;
+}) {
+  const turn = message.turn;
+  if (!turn || turn.latest_state === "pending" || turn.latest_state === "running") return null;
+  const label = chatTurnStatusLabel(turn);
+  if (!label && turn.attempts.length < 2) return null;
+  return (
+    <div className="flex justify-end" data-testid="turn-status">
+      <div className="max-w-[82%] text-right text-xs text-ink/60">
+        {label && <span className="text-clay">{label}</span>}
+        {turn.can_retry && (
+          <button
+            className="ml-2 rounded border border-moss/30 px-2 py-0.5 font-medium text-moss hover:bg-moss/10 disabled:opacity-50"
+            disabled={busy}
+            onClick={onRetry}
+            type="button"
+          >
+            Retry
+          </button>
+        )}
+        {turn.can_copy && (
+          <button
+            className="ml-2 rounded border border-ink/20 px-2 py-0.5 font-medium text-ink/70 hover:bg-ink/5"
+            onClick={onCopy}
+            type="button"
+          >
+            Copy to new message
+          </button>
+        )}
+        <details className="mt-1">
+          <summary className="cursor-pointer">Attempts ({turn.attempts.length})</summary>
+          <ol className="mt-1 space-y-0.5">
+            {turn.attempts.map((attempt) => (
+              <li key={attempt.attempt_id}>
+                Attempt {attempt.number}: {chatAttemptLabel(attempt)}
+                {attempt.started_at && attempt.finished_at
+                  ? ` · ${Math.max(0, Math.round((attempt.finished_at - attempt.started_at) / 1000))}s`
+                  : ""}
+              </li>
+            ))}
+          </ol>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+function VerificationNotice({ message }: { message: Message }) {
+  const notice = message.metadata?.verification_notice as { label?: unknown; reason?: unknown } | undefined;
+  if (!notice || typeof notice.label !== "string") return null;
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[82%] rounded border border-gold/40 bg-gold/10 px-2 py-1 text-xs text-ink/75">
+        {notice.label}{typeof notice.reason === "string" ? ` — ${notice.reason}` : ""}
+      </div>
+    </div>
+  );
+}
+
+function OutcomeCheckCard({ checking, onCheck }: { checking: boolean; onCheck: () => void }) {
+  return (
+    <div aria-live="polite" className="flex justify-start" data-testid="outcome-check" role="status">
+      <div className="flex max-w-[82%] items-center gap-2 rounded-md border border-clay/25 bg-[#fff3ee] px-3 py-2 text-sm text-clay">
+        {checking ? (
+          <>
+            <span aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-clay/25 border-t-clay" />
+            <span>{CHECKING_OUTCOME_LABEL}</span>
+          </>
+        ) : (
+          <>
+            <span>Outcome unknown — the app lost contact before it could confirm whether an answer was saved. Nothing was resent.</span>
+            <button
+              className="ml-2 shrink-0 rounded border border-clay/40 px-2.5 py-1 text-xs font-medium hover:bg-clay/10"
+              onClick={onCheck}
+              type="button"
+            >
+              Check status
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function IconButton(props: {
   children: React.ReactNode;
   className?: string;
@@ -4432,10 +4744,11 @@ function IconButton(props: {
 
 function BackendDegradedBanner(props: {
   degraded: boolean;
+  reason: string | null;
   retrying: boolean;
   onRetry: () => void;
 }) {
-  const banner = backendBannerState(props.degraded, props.retrying);
+  const banner = backendBannerState(props.degraded, props.retrying, props.reason);
   if (!banner.visible) return null;
   return (
     <div
@@ -4766,6 +5079,14 @@ function artifactToSource(artifact: ArtifactRecord): SourceSummary {
 function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
+
+type ChatTurnRequest = {
+  message: string;
+  attachedSources: SourceSummary[];
+  modelLabel: string;
+  operationKey: string;
+  retry: boolean;
+};
 
 function makeRequestId(prefix: string): string {
   const random = typeof crypto !== "undefined" && "randomUUID" in crypto

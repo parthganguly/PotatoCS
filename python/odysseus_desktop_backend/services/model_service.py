@@ -2,21 +2,40 @@ from __future__ import annotations
 
 import json
 import base64
+import errno
+import http.client
+import os
 import re
+import select
 import shutil
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from odysseus_desktop_backend.cancellation import (
+    JobCancelledError,
+    TurnDeadlineExceeded,
+    active_cancel_event,
+    active_deadline,
+)
 from odysseus_desktop_backend.logging_config import get_logger
 from odysseus_desktop_backend.storage import Database, utc_ms
 
 
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 INTERACTIVE_CHAT_TIMEOUT_SECONDS = 120
+# Waiting for/loading the model is bounded separately from answer generation.
+MODEL_PREPARE_TIMEOUT_SECONDS = INTERACTIVE_CHAT_TIMEOUT_SECONDS
+# Owner-approved interactive text/document turn contract: preparation 120 s and
+# generation 120 s (above), optional verification + correction 60 s combined, and
+# 300 s for the whole turn from accepted Send. Every operation gets the lesser of
+# its stage allowance and what remains of the turn.
+INTERACTIVE_TURN_SECONDS = 300
+INTERACTIVE_VERIFICATION_SECONDS = 60
 VISION_CHAT_TIMEOUT_SECONDS = 240
 MAX_VISION_IMAGES = 4
 MAX_VISION_IMAGE_BYTES = 8 * 1024 * 1024
@@ -51,6 +70,16 @@ class ModelMalformedResponseError(ModelServiceError):
 
 class ModelEmptyResponseError(ModelServiceError):
     category = "empty_response"
+
+
+class ModelPreparationError(ModelServiceError):
+    """The selected model could not be made ready; no generation was attempted."""
+
+    category = "preparation_failure"
+
+
+class ModelPreparationTimeoutError(ModelPreparationError, ModelTimeoutError):
+    category = "preparation_timeout"
 
 
 class ModelService:
@@ -174,6 +203,37 @@ class ModelService:
             "family": str(details.get("family") or ""),
             "parameter_size": str(details.get("parameter_size") or ""),
             "quantization_level": str(details.get("quantization_level") or ""),
+        }
+
+    def prepare(
+        self,
+        model: str,
+        *,
+        options: dict[str, Any] | None = None,
+        timeout: float = MODEL_PREPARE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Wait for Ollama to load `model` (an empty-messages chat request), bounded on its own.
+
+        Sends the same options as the following generation request so Ollama does
+        not reload the runner for it. Returns immediately when the model is warm.
+        """
+        if not model:
+            raise ValueError("model is required")
+        payload: dict[str, Any] = {"model": model, "messages": [], "stream": False}
+        if options:
+            payload["options"] = dict(options)
+        started = time.perf_counter()
+        try:
+            data = self._post_json(f"{OLLAMA_ENDPOINT}/api/chat", payload, timeout=timeout)
+        except ModelTimeoutError as exc:
+            raise ModelPreparationTimeoutError(f"timeout: model preparation exceeded {timeout:g}s") from exc
+        except ModelServiceError as exc:
+            raise ModelPreparationError(f"model preparation failed: {exc}") from exc
+        load_duration_ns = int(data.get("load_duration") or 0) if isinstance(data, dict) else 0
+        return {
+            "model": model,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "load_duration_ns": load_duration_ns,
         }
 
     def chat(
@@ -438,15 +498,70 @@ class ModelService:
         return json.loads(raw)
 
     def _post_json(self, url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
+        """POST on the calling thread, bounded by an absolute deadline of `timeout` seconds.
+
+        The socket timeout alone is an inactivity limit: a trickling response
+        would extend it forever. A watchdog shuts the request's sockets down at
+        the deadline or when the active job is cancelled. The request never runs
+        on another thread, so when this returns or raises, the client operation
+        has stopped and nothing can be sent later.
+        """
+        cancel_event = active_cancel_event()
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError("model request cancelled")
+        turn = active_deadline()
+        if turn is not None:
+            # Inside an interactive turn no request may outlive the turn, and once
+            # it has expired no further inference is admitted at all.
+            try:
+                timeout = turn.allow(timeout)
+            except TurnDeadlineExceeded as exc:
+                raise ModelTimeoutError("timeout: interactive turn deadline reached") from exc
+        transfer = _OwnedTransfer()
+        watchdog = threading.Thread(
+            target=transfer.watch,
+            args=(cancel_event, time.monotonic() + timeout),
+            daemon=True,
+            name="odysseus-model-deadline",
+        )
+        watchdog.start()
+        data: dict[str, Any] | None = None
+        error: BaseException | None = None
+        try:
+            data = self._request_json(transfer.opener().open, url, payload, timeout)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below, after classification
+            error = exc
+        reason = transfer.finish()
+        watchdog.join()
+        if reason == "cancelled":
+            raise JobCancelledError("model request cancelled") from error
+        if reason == "deadline":
+            raise ModelTimeoutError(f"timeout: Ollama request exceeded {timeout:g}s") from error
+        if error is not None:
+            raise error
+        assert data is not None
+        return data
+
+    def get_json_bounded(self, url: str, timeout: float) -> dict[str, Any]:
+        """GET through the same absolute, cancellable, turn-clipped transport as _post_json."""
+        return self._post_json(url, None, timeout)  # type: ignore[arg-type]
+
+    def _request_json(
+        self,
+        open_url: Callable[..., Any],
+        url: str,
+        payload: dict[str, Any] | None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        # payload None is a GET (get_json_bounded); everything else is a JSON POST.
         req = urllib.request.Request(
             url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            data=None if payload is None else json.dumps(payload).encode("utf-8"),
+            headers={} if payload is None else {"Content-Type": "application/json"},
+            method="GET" if payload is None else "POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with open_url(req, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
         except TimeoutError as exc:
             raise ModelTimeoutError(f"timeout: Ollama request exceeded {timeout:g}s") from exc
@@ -468,6 +583,102 @@ class ModelService:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ModelMalformedResponseError(f"malformed response: {exc}") from exc
+
+
+_CONNECT_PENDING = {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN, getattr(errno, "WSAEWOULDBLOCK", errno.EWOULDBLOCK)}
+
+
+class _TransferAborted(OSError):
+    """The request was cancelled or hit its deadline; its sockets are shut."""
+
+
+class _OwnedTransfer:
+    """The sockets of one HTTP request. After abort() none of them can send or receive.
+
+    Sockets are registered before they connect, so there is no window in which
+    a connecting socket is invisible to abort().
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sockets: list[socket.socket] = []
+        self._finished = threading.Event()
+        self.reason = ""  # "", "cancelled" or "deadline"
+
+    def watch(self, cancel_event: threading.Event | None, deadline: float) -> None:
+        # ponytail: 50 ms polling; a cancel or deadline is acted on within that.
+        while not self._finished.wait(min(max(deadline - time.monotonic(), 0), 0.05)):
+            if cancel_event is not None and cancel_event.is_set():
+                self.abort("cancelled")
+            elif time.monotonic() >= deadline:
+                self.abort("deadline")
+            if self.reason:
+                return
+
+    def abort(self, reason: str) -> None:
+        with self._lock:
+            if self._finished.is_set() or self.reason:
+                return
+            self.reason = reason
+            for sock in self._sockets:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:  # not connected yet; check() stops it
+                    pass
+
+    def check(self) -> None:
+        if self.reason:
+            raise _TransferAborted(f"model request aborted: {self.reason}")
+
+    def finish(self) -> str:
+        with self._lock:
+            self._finished.set()
+            for sock in self._sockets:
+                sock.close()
+            return self.reason
+
+    def connect(self, host: str, port: int, timeout: float) -> socket.socket:
+        last_error: OSError | None = None
+        for family, kind, proto, _, address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+            sock = socket.socket(family, kind, proto)
+            with self._lock:
+                self._sockets.append(sock)
+            try:
+                self.check()
+                sock.setblocking(False)
+                status = sock.connect_ex(address)
+                while status in _CONNECT_PENDING:
+                    self.check()
+                    _, writable, failed = select.select([], [sock], [sock], 0.05)
+                    if writable or failed:
+                        status = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if status:
+                    raise OSError(status, os.strerror(status))
+                self.check()
+                sock.settimeout(timeout)  # inactivity limit, inside the absolute deadline
+                return sock
+            except _TransferAborted:
+                raise
+            except OSError as exc:
+                last_error = exc
+        raise last_error or OSError(f"could not resolve {host}")
+
+    def opener(self) -> urllib.request.OpenerDirector:
+        transfer = self
+
+        class Connection(http.client.HTTPConnection):
+            def connect(self) -> None:
+                self.sock = transfer.connect(self.host, self.port, self.timeout)
+
+            def send(self, data: Any) -> None:
+                transfer.check()
+                super().send(data)
+
+        class Handler(urllib.request.HTTPHandler):
+            def http_open(self, req: urllib.request.Request) -> Any:
+                return self.do_open(Connection, req)
+
+        return urllib.request.build_opener(Handler)
 
 
 def normalize_thinking_mode(value: str | None) -> str:

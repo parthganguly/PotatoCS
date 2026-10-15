@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
+  carriesOverToNewOperation,
   createProgressSubscription,
   fallbackProgressLabel,
   isOperationProgressEvent
@@ -24,7 +25,7 @@ export function useChatProgress(active: boolean) {
       return;
     }
     const pending = pendingEventRef.current;
-    setCurrent(pending && Date.now() - pending.receivedAt <= 2_000 ? pending.event : null);
+    setCurrent(pending && carriesOverToNewOperation(pending.event, Date.now() - pending.receivedAt) ? pending.event : null);
     pendingEventRef.current = null;
     setOperationStartedAt(Date.now());
     setNow(Date.now());

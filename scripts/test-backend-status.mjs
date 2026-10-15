@@ -48,6 +48,22 @@ assert.equal(retrying.message, degraded.message);
 const recovered = module.backendBannerState(false, false);
 assert.equal(recovered.visible, false);
 
+// Profile owned by another window: fixed, specific copy; never "crashed", never a model failure.
+const inUse = module.backendBannerState(true, false, "profile_in_use");
+assert.equal(inUse.visible, true);
+assert.match(inUse.message, /^Profile already open\./);
+assert.match(inUse.message, /Close that window, then choose Retry backend\./);
+assert.equal(/crash|model|Ollama|unavailable/i.test(inUse.message), false);
+assert.equal(inUse.retryLabel, "Retry backend");
+const unconfirmed = module.backendBannerState(true, false, "backend_stop_unconfirmed");
+assert.match(unconfirmed.message, /could not be confirmed stopped, so a new one was not started/);
+assert.equal(module.backendBannerState(true, false, "anything else").message, degraded.message);
+for (const copy of [inUse.message, unconfirmed.message]) {
+  for (const fragment of ["\\", "/", "{", "}", "Traceback", "C:", "jsonrpc"]) {
+    assert.equal(copy.includes(fragment), false, `banner copy must not contain "${fragment}"`);
+  }
+}
+
 // Event guard accepts only the fixed-shape shell event.
 assert.equal(
   module.isBackendDegradedEvent({ __odysseus_backend_degraded__: true, degraded: true }),

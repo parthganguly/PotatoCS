@@ -11,7 +11,7 @@ from typing import Iterable, Protocol
 
 import numpy as np
 
-from odysseus_desktop_backend.cancellation import JobCancelledError, check_cancelled
+from odysseus_desktop_backend.cancellation import JobCancelledError, active_deadline, check_cancelled
 from odysseus_desktop_backend.logging_config import get_logger
 from odysseus_desktop_backend.storage import Database, utc_ms
 
@@ -135,11 +135,24 @@ class OllamaEmbeddingProvider:
         self.model_key = f"ollama:{self.model_name}"
 
     def installed(self) -> bool:
-        if not self._tcp_reachable("127.0.0.1", 11434):
+        # Inside an interactive turn the probe obeys the turn: none starts after its
+        # deadline, and its connect and tags request are clipped to what remains (the
+        # request absolute and cancellable). Out of a turn nothing here changes.
+        turn = active_deadline()  # allow() below refuses to start once it has expired
+        if not self._tcp_reachable("127.0.0.1", 11434, timeout=0.5 if turn is None else turn.allow(0.5)):
             return False
         try:
-            tags = self._get_json(f"{self.endpoint}/api/tags", timeout=3)
+            if turn is None:
+                tags = self._get_json(f"{self.endpoint}/api/tags", timeout=3)
+            else:
+                from odysseus_desktop_backend.services.model_service import ModelService
+
+                tags = ModelService(None).get_json_bounded(f"{self.endpoint}/api/tags", 3)  # type: ignore[arg-type]
+        except JobCancelledError:
+            raise
         except Exception:
+            if turn is not None:
+                turn.check()  # cut off by the deadline: the turn ends, no lexical fallback
             return False
         names = {
             str(item.get("name") or "")
@@ -171,9 +184,9 @@ class OllamaEmbeddingProvider:
             vectors.append(vector.astype(np.float32))
         return vectors
 
-    def _tcp_reachable(self, host: str, port: int) -> bool:
+    def _tcp_reachable(self, host: str, port: int, timeout: float = 0.5) -> bool:
         try:
-            with socket.create_connection((host, port), timeout=0.5):
+            with socket.create_connection((host, port), timeout=timeout):
                 return True
         except OSError:
             return False
@@ -185,6 +198,15 @@ class OllamaEmbeddingProvider:
         return json.loads(raw)
 
     def _post_json(self, url: str, payload: dict, timeout: float) -> dict:
+        if active_deadline() is not None:
+            # Interactive turn: the absolute, cancellable generation transport, clipped
+            # to the turn. Imports and indexing keep the transport below unchanged.
+            from odysseus_desktop_backend.services.model_service import ModelService, ModelServiceError
+
+            try:
+                return ModelService(None)._post_json(url, payload, timeout)  # type: ignore[arg-type]
+            except ModelServiceError as exc:
+                raise RuntimeError(f"Ollama embeddings are not reachable at {self.endpoint}") from exc
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -238,6 +260,8 @@ class EmbeddingService:
             vector = provider.embed([query])[0]
             self._set_status(self._provider_status(provider, vector.shape[0]))
             return QueryEmbedding(provider.model_key, vector, provider.backend)
+        except JobCancelledError:
+            raise
         except Exception as exc:
             if provider.backend == "lexical":
                 raise

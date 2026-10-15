@@ -267,8 +267,8 @@ def test_fts5_available_and_v11_profile_migrates(tmp_path: Path) -> None:
     legacy.close()
     migrated = Database(profile)
     try:
-        assert SCHEMA_VERSION == 14
-        assert migrated.conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0] == "14"
+        assert SCHEMA_VERSION == 15
+        assert migrated.conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0] == "15"
         assert LocalSearchIndex(migrated).fts5_available()
     finally:
         migrated.close()

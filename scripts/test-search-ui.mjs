@@ -113,7 +113,7 @@ const submitResult = (job) => ({ job, session: { id: "session-1", title: "New ch
   let gets = 0;
   let busy = true;
   const settled = [];
-  const controller = new model.SearchJobController({
+  const controller = new model.JobPollController({
     submit: async () => submitResult(snapshot("running")),
     get: async () => {
       gets += 1;
@@ -143,7 +143,7 @@ const submitResult = (job) => ({ job, session: { id: "session-1", title: "New ch
   let gets = 0;
   let busy = true;
   let latest = null;
-  const controller = new model.SearchJobController({
+  const controller = new model.JobPollController({
     submit: async () => submitResult(snapshot("running")),
     get: async () => { gets += 1; throw new Error("persistent private RPC failure"); },
     cancel: async () => snapshot("cancel_requested")
@@ -276,5 +276,9 @@ const submitResult = (job) => ({ job, session: { id: "session-1", title: "New ch
   assert.equal(cardSource.includes("resultsOnlyPassages(results)"), true);
   assert.equal(model.resultsOnlyPassages({ outcome: "results_only", passages: [null, valid] }).length, 1);
 }
+
+// Shared settlement races (terminal/stale cancel, stale poll, duplicate submit).
+const { checkJobPollRaces } = await import("./job-poll-races.mjs");
+await checkJobPollRaces(model.JobPollController, "search", "search_poll_unavailable");
 
 console.log("search-ui-tests-ok");
