@@ -45,6 +45,11 @@ SNAPSHOT_KEYS = {
     "finished_at",
     "elapsed_ms",
     "queue_position",
+    # Chat turn contract: the attempt a chat job executes, and whether its
+    # backend deadline has passed while work is still stopping. Both empty/false
+    # for other kinds.
+    "attempt_id",
+    "deadline_reached",
 }
 
 

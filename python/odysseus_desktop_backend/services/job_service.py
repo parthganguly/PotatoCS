@@ -9,6 +9,7 @@ from typing import Any, Callable, Protocol
 
 from odysseus_desktop_backend.cancellation import (
     JobCancelledError,
+    TurnDeadline,
     cancellation_scope,
 )
 from odysseus_desktop_backend.logging_config import get_logger
@@ -55,6 +56,11 @@ JOB_MESSAGE_CODES = {
     "search_budget_exhausted",
     "model_unavailable",
     "search_failed",
+    "model_prepare_timeout",
+    "model_prepare_failed",
+    "model_generation_timeout",
+    "model_generation_failed",
+    "chat_turn_timeout",
 }
 
 
@@ -80,6 +86,10 @@ class JobRecord:
     query: str = ""  # private input; never serialized into snapshots or logs
     model: str = ""  # private input; snapshots expose no model routing before completion
     second_round_enabled: bool = True
+    attempt_id: str = ""  # chat: the tracked attempt this job executes
+    turn_message_id: str = ""  # chat: the logical user message; its text stays in the database
+    deadline: TurnDeadline | None = None  # chat: the turn's absolute deadline, from accepted Send
+    chat_result: dict[str, Any] | None = None  # private output; only via chat_result()
     state: str = "queued"
     message_code: str = ""
     created_at: int = 0
@@ -204,6 +214,58 @@ class JobService:
             snapshot = self._snapshot_locked(job)
         logger.info("jobs submitted kind=search count=1")
         return snapshot
+
+    def ensure_capacity(self) -> None:
+        """Refuse before anything is persisted when a new job could not be queued."""
+        with self._lock:
+            self._require_capacity_locked(1)
+
+    def submit_chat(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        attempt_id: str,
+        deadline: TurnDeadline,
+    ) -> dict[str, Any]:
+        """Queue one accepted chat attempt so it can be observed and cancelled while it runs."""
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id or not message_id or not attempt_id:
+            raise ValueError("session_id, message_id and attempt_id are required")
+        with self._condition:
+            self._require_capacity_locked(1)
+            job = JobRecord(
+                id=str(uuid.uuid4()),
+                kind="chat",
+                scope="chat",
+                session_id=clean_session_id,
+                attempt_id=attempt_id,
+                turn_message_id=message_id,
+                deadline=deadline,
+                created_at=utc_ms(),
+            )
+            self._register_locked(job)
+            self._condition.notify_all()
+            snapshot = self._snapshot_locked(job)
+        logger.info("jobs submitted kind=chat count=1")
+        return snapshot
+
+    def chat_result(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(str(job_id))
+            if job is None:
+                raise KeyError(f"job not found: {job_id}")
+            if job.kind != "chat" or job.state != "completed" or job.chat_result is None:
+                raise ValueError("chat result is not available")
+            return job.chat_result
+
+    def find_chat_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        """The job executing `attempt_id` in this process, if it is still registered."""
+        with self._lock:
+            for job in self._jobs.values():
+                if job.kind == "chat" and job.attempt_id == attempt_id:
+                    return self._snapshot_locked(job)
+        return None
 
     def get(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -419,6 +481,12 @@ class JobService:
             "finished_at": job.finished_at,
             "elapsed_ms": elapsed_ms,
             "queue_position": queue_position,
+            "attempt_id": job.attempt_id,
+            # The backend's own clock says the turn's time is up but work is still
+            # being stopped; the frontend shows this, it never times turns itself.
+            "deadline_reached": bool(
+                job.deadline is not None and job.state not in TERMINAL_JOB_STATES and job.deadline.expired()
+            ),
         }
 
 
@@ -445,6 +513,8 @@ class DocumentJobExecutor:
             self._run_ocr(job, on_running)
         elif job.kind == "search":
             self._run_search(job, on_running)
+        elif job.kind == "chat":
+            self._run_chat(job, on_running)
         else:
             raise JobFailure("job_failed")
 
@@ -580,6 +650,68 @@ class DocumentJobExecutor:
         job.message_id = str(result.get("assistant_message_id") or "")
         job.run_id = str(result.get("run_id") or "")
 
+    def _run_chat(self, job: JobRecord, on_running: Callable[[], None]) -> None:
+        """Run one tracked attempt. Its durable outcome is settled before the job is.
+
+        The attempt is settled here, in the worker, after every request of this
+        attempt has stopped (the model transport runs on this thread), so the job
+        never turns terminal while this worker could still send or save.
+        """
+        from odysseus_desktop_backend.cancellation import check_cancelled, deadline_scope
+        from odysseus_desktop_backend.services.chat_service import ChatService
+        from odysseus_desktop_backend.services.chat_turns import AttemptRetired, ChatTurnStore
+        from odysseus_desktop_backend.services.settings_service import SettingsService
+
+        turns = ChatTurnStore(self.db)
+        check_cancelled()
+        try:
+            turns.start(job.attempt_id)  # a cancel recorded while queued stops it here
+        except AttemptRetired as exc:
+            raise JobFailure("job_failed") from exc
+        on_running()
+        # No vision/OCR services: image turns stay on chat.send (Florence is not
+        # wired into the job worker); jobs.submit_chat refuses them up front.
+        chat = ChatService(
+            self.services.sessions,
+            SettingsService(self.db),
+            self.services.models,
+            rag=self.services.rag,
+            artifacts=self.services.artifacts,
+            documents=self.services.documents,
+            sources=self.services.sources,
+            turns=turns,
+        )
+        try:
+            with deadline_scope(job.deadline):
+                if job.deadline is not None:
+                    job.deadline.check()  # queue time counts against the turn
+                session_id, content, attachments, request = turns.request(job.turn_message_id)
+                result = chat.send(
+                    session_id=session_id,
+                    message=content,
+                    attachment_document_ids=attachments,
+                    attempt_id=job.attempt_id,
+                    user_message_id=job.turn_message_id,
+                    **request,
+                )
+        except Exception as exc:  # noqa: BLE001 - every outcome is classified below
+            if turns.state(job.attempt_id) == "completed":
+                # The answer was committed; only building the result failed. The job
+                # still completes so the saved answer is shown, never re-requested.
+                job.chat_result = None
+                return
+            if isinstance(exc, JobCancelledError):
+                turns.finish(job.attempt_id, "cancelled", "cancelled_by_user")
+                raise
+            code = chat_failure_code(exc, job.deadline)
+            turns.finish(job.attempt_id, "timed_out" if code == "chat_turn_timeout" else "failed", code)
+            if code == "job_failed":
+                raise  # JobService logs the unexpected error type
+            raise JobFailure(code) from exc
+        assistant = result.get("assistant_message") or {}
+        job.message_id = str(assistant.get("id") or "")
+        job.chat_result = result
+
     def _build_services(self) -> Any:
         from types import SimpleNamespace
 
@@ -618,3 +750,28 @@ class DocumentJobExecutor:
             models=models,
             sessions=sessions,
         )
+
+
+def chat_failure_code(exc: BaseException, deadline: TurnDeadline | None) -> str:
+    """Fixed outcome code for a chat attempt that saved no answer."""
+    from odysseus_desktop_backend.cancellation import TurnDeadlineExceeded
+    from odysseus_desktop_backend.services.model_service import (
+        ModelPreparationError,
+        ModelPreparationTimeoutError,
+        ModelServiceError,
+        ModelTimeoutError,
+    )
+
+    if isinstance(exc, TurnDeadlineExceeded) or (
+        isinstance(exc, ModelTimeoutError) and deadline is not None and deadline.expired()
+    ):
+        return "chat_turn_timeout"
+    if isinstance(exc, ModelPreparationTimeoutError):
+        return "model_prepare_timeout"
+    if isinstance(exc, ModelPreparationError):
+        return "model_prepare_failed"
+    if isinstance(exc, ModelTimeoutError):
+        return "model_generation_timeout"
+    if isinstance(exc, ModelServiceError):
+        return "model_generation_failed"
+    return "job_failed"

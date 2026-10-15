@@ -49,6 +49,12 @@ export function createProgressSubscription(
   };
 }
 
+// An event received just before an operation began may be its first event; a
+// terminal one never is (it belongs to an earlier operation), so it is not carried over.
+export function carriesOverToNewOperation(event: OperationProgressEvent, ageMs: number): boolean {
+  return ageMs <= 2_000 && event.status === "running" && event.stage !== "done";
+}
+
 export function progressElapsedMs(event: OperationProgressEvent, now: number): number {
   return Math.max(event.elapsed_ms, now - event.started_at, 0);
 }

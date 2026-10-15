@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
 
+from odysseus_desktop_backend.cancellation import JobCancelledError
 
 PROGRESS_DISCRIMINATOR = "__odysseus_progress__"
 STRICT_TRACE_ENV_VAR = "ODYSSEUS_STRICT_TRACE"
@@ -27,7 +28,9 @@ _TRACE_UUID_RE = re.compile(
 )
 _FIXED_LABELS = {
     "operation_failed": "Operation failed.",
+    "operation_cancelled": "Cancelled.",
     "done": "Done",
+    "model_prepare": "Preparing local model...",
     "model_capability_check": "Checking model capabilities...",
     "image_prepare": "Preparing image...",
     "ocr_run": "Running OCR...",
@@ -190,6 +193,9 @@ def progress_operation(**context: object) -> Iterator[ProgressEmitter]:
     token = _CURRENT_EMITTER.set(emitter)
     try:
         yield emitter
+    except JobCancelledError:
+        emitter.emit("operation_cancelled", status="error")
+        raise
     except Exception:
         emitter.emit("operation_failed", status="error")
         raise

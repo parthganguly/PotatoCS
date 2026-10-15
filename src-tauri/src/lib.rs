@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -118,12 +118,25 @@ fn write_shutdown_request<W: Write>(writer: &mut W, request_id: u64) -> Result<(
     writer.flush().map_err(|err| err.to_string())
 }
 
+/// Exit code and fixed copy shared with `python/odysseus_desktop_backend/profile_ownership.py`:
+/// a sidecar that finds its profile owned by another live backend exits with this
+/// code before touching the profile. It is never treated as a crash to restart.
+const PROFILE_IN_USE_EXIT_CODE: i32 = 3;
+const PROFILE_IN_USE_MESSAGE: &str =
+    "Profile already open: another PotatoCS window is using this profile.";
+const STOP_UNCONFIRMED_MESSAGE: &str =
+    "The previous backend could not be confirmed stopped, so a new one was not started. Close and reopen PotatoCS.";
+const BLOCKED_PROFILE_IN_USE: &str = "profile_in_use";
+const BLOCKED_STOP_UNCONFIRMED: &str = "backend_stop_unconfirmed";
+
 #[derive(Serialize)]
 struct AppStatus {
     profile_id: String,
     profile_dir: String,
     backend_ready: bool,
     backend_degraded: bool,
+    /// Fixed reason the backend cannot run, when it is not an ordinary crash.
+    backend_error: Option<&'static str>,
 }
 
 struct AppState {
@@ -175,6 +188,9 @@ struct BackendClient {
     /// True once spawn/restart recovery is exhausted (restart failed, or the
     /// one safe retry died again), until a later restart succeeds.
     degraded: bool,
+    /// Set when the backend cannot run for a fixed, non-crash reason
+    /// (`BLOCKED_*`); automatic restart and retry never apply then.
+    blocked: Option<&'static str>,
 }
 
 struct BackendCallError {
@@ -204,9 +220,13 @@ impl BackendCallError {
 impl BackendClient {
     fn spawn(app: &AppHandle, profile_dir: &Path) -> Result<Self, String> {
         let mut client = Self::spawn_process(app, profile_dir)?;
-        client
-            .call_once("health.ping", json!({}))
-            .map_err(|err| err.message)?;
+        if let Err(err) = client.call_once("health.ping", json!({})) {
+            // Never leave an unhealthy child running behind a failed spawn.
+            if client.shutdown(profile_dir).is_err() {
+                return Err(STOP_UNCONFIRMED_MESSAGE.to_string());
+            }
+            return Err(err.message);
+        }
         Ok(client)
     }
 
@@ -297,6 +317,7 @@ impl BackendClient {
             next_id: 1,
             is_shutdown: false,
             degraded: false,
+            blocked: None,
         };
 
         Ok(client)
@@ -327,6 +348,15 @@ impl BackendClient {
             Ok(_) => return Ok(()),
             Err(err) => err,
         };
+        if client.blocked.is_some() {
+            // Profile owned by another live backend: report it, never respawn.
+            client.degraded = true;
+            append_shell_log(
+                profile_dir,
+                "sidecar lifecycle phase=startup result=profile_in_use context=startup_health",
+            );
+            return Ok(());
+        }
 
         append_shell_log(
             profile_dir,
@@ -339,6 +369,16 @@ impl BackendClient {
             profile_dir,
             "sidecar lifecycle phase=restart result=attempted context=startup_health",
         );
+        // A replacement starts only once the previous child is confirmed gone.
+        if client.shutdown(profile_dir).is_err() {
+            client.degraded = true;
+            client.blocked = Some(BLOCKED_STOP_UNCONFIRMED);
+            append_shell_log(
+                profile_dir,
+                "sidecar lifecycle phase=restart result=refused_unconfirmed_stop context=startup_health",
+            );
+            return Ok(());
+        }
 
         match respawn() {
             Ok(mut replacement) => {
@@ -429,7 +469,7 @@ impl BackendClient {
                         profile_dir,
                         "sidecar lifecycle phase=restart result=failed",
                     );
-                    return Err("Python sidecar restart failed".to_string());
+                    return Err(self.restart_failure_message());
                 }
                 append_shell_log(
                     profile_dir,
@@ -462,6 +502,11 @@ impl BackendClient {
     }
 
     fn call_once(&mut self, method: &str, params: Value) -> Result<Value, BackendCallError> {
+        // Blocked for a fixed reason: report it on every call; only a user Retry
+        // (restart) may try again, never an automatic restart.
+        if self.blocked.is_some() {
+            return Err(BackendCallError::final_error(self.restart_failure_message()));
+        }
         if self.is_shutdown {
             return Err(BackendCallError::restartable(
                 "Python sidecar is not running".to_string(),
@@ -472,6 +517,9 @@ impl BackendClient {
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 self.is_shutdown = true;
+                if let Some(blocked) = self.blocked_by_exit(Some(status)) {
+                    return Err(blocked);
+                }
                 return Err(BackendCallError::restartable(
                     format!("Python sidecar exited before handling {method} (status: {status})"),
                     "child_exited",
@@ -497,6 +545,9 @@ impl BackendClient {
 
         if let Err(err) = writeln!(self.stdin, "{}", request) {
             self.is_shutdown = true;
+            if let Some(blocked) = self.blocked_by_exit(None) {
+                return Err(blocked);
+            }
             return Err(BackendCallError::restartable(
                 format!("Python sidecar pipe closed while sending {method}: {err}"),
                 "stdin_closed",
@@ -505,6 +556,9 @@ impl BackendClient {
 
         if let Err(err) = self.stdin.flush() {
             self.is_shutdown = true;
+            if let Some(blocked) = self.blocked_by_exit(None) {
+                return Err(blocked);
+            }
             return Err(BackendCallError::restartable(
                 format!("Python sidecar pipe closed while flushing {method}: {err}"),
                 "stdin_closed",
@@ -520,6 +574,9 @@ impl BackendClient {
             Some(response) => response,
             None => {
                 self.is_shutdown = true;
+                if let Some(blocked) = self.blocked_by_exit(None) {
+                    return Err(blocked);
+                }
                 let message = format!("Python sidecar exited before responding to {method}");
                 return Err(BackendCallError::restartable(message, "stdout_closed"));
             }
@@ -537,10 +594,80 @@ impl BackendClient {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// A sidecar that exited with the profile-in-use code is reported as such,
+    /// not as a crash. With `status` unknown (stdout closed first), the exit is
+    /// awaited briefly; a child still running is an ordinary failure.
+    fn blocked_by_exit(&mut self, status: Option<ExitStatus>) -> Option<BackendCallError> {
+        let mut status = status;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while status.is_none() && Instant::now() < deadline {
+            status = self.child.try_wait().ok().flatten();
+            if status.is_none() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if status?.code() != Some(PROFILE_IN_USE_EXIT_CODE) {
+            return None;
+        }
+        self.blocked = Some(BLOCKED_PROFILE_IN_USE);
+        Some(BackendCallError {
+            message: PROFILE_IN_USE_MESSAGE.to_string(),
+            restartable: false,
+            lifecycle_event: Some(BLOCKED_PROFILE_IN_USE),
+        })
+    }
+
     fn restart(&mut self, app: &AppHandle, profile_dir: &Path) -> Result<(), String> {
-        let _ = self.shutdown(profile_dir);
-        *self = Self::spawn(app, profile_dir)?;
-        Ok(())
+        self.replace_after_confirmed_stop(
+            profile_dir,
+            |client| client.shutdown(profile_dir),
+            || Self::spawn(app, profile_dir),
+        )
+    }
+
+    /// A replacement backend starts only after the previous child is positively
+    /// confirmed terminated; otherwise this fails closed and spawns nothing.
+    fn replace_after_confirmed_stop<S, F>(
+        &mut self,
+        profile_dir: &Path,
+        stop: S,
+        spawn: F,
+    ) -> Result<(), String>
+    where
+        S: FnOnce(&mut Self) -> Result<(), String>,
+        F: FnOnce() -> Result<Self, String>,
+    {
+        if stop(self).is_err() {
+            self.blocked = Some(BLOCKED_STOP_UNCONFIRMED);
+            append_shell_log(
+                profile_dir,
+                "sidecar lifecycle phase=restart result=refused_unconfirmed_stop",
+            );
+            return Err(STOP_UNCONFIRMED_MESSAGE.to_string());
+        }
+        match spawn() {
+            Ok(client) => {
+                *self = client;
+                Ok(())
+            }
+            Err(err) => {
+                if err == PROFILE_IN_USE_MESSAGE {
+                    self.blocked = Some(BLOCKED_PROFILE_IN_USE);
+                } else if err == STOP_UNCONFIRMED_MESSAGE {
+                    self.blocked = Some(BLOCKED_STOP_UNCONFIRMED);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Fixed copy only: a blocked reason, or the generic restart failure.
+    fn restart_failure_message(&self) -> String {
+        match self.blocked {
+            Some(BLOCKED_PROFILE_IN_USE) => PROFILE_IN_USE_MESSAGE.to_string(),
+            Some(_) => STOP_UNCONFIRMED_MESSAGE.to_string(),
+            None => "Python sidecar restart failed".to_string(),
+        }
     }
 
     /// User-initiated retry from the degraded-state UI. Reuses the existing
@@ -573,7 +700,7 @@ impl BackendClient {
                     profile_dir,
                     "sidecar lifecycle phase=restart result=failed context=user_retry",
                 );
-                Err("Python sidecar restart failed".to_string())
+                Err(self.restart_failure_message())
             }
         }
     }
@@ -686,6 +813,8 @@ fn can_restart_and_retry(method: &str) -> bool {
             | "campaigns.report_data"
             | "jobs.get"
             | "jobs.list"
+            // Reads a chat turn's durable outcome; never starts inference.
+            | "jobs.chat_status"
     )
 }
 
@@ -818,17 +947,18 @@ fn read_profile_artifact_file(state: tauri::State<AppState>, path: String) -> Re
 
 #[tauri::command]
 fn app_status(state: tauri::State<AppState>) -> AppStatus {
-    let (backend_ready, backend_degraded) = state
+    let (backend_ready, backend_degraded, backend_error) = state
         .backend
         .lock()
-        .map(|mut backend| (backend.is_ready(), backend.degraded))
-        .unwrap_or((false, true));
+        .map(|mut backend| (backend.is_ready(), backend.degraded, backend.blocked))
+        .unwrap_or((false, true, None));
 
     AppStatus {
         profile_id: state.profile_id.clone(),
         profile_dir: state.profile_dir.display().to_string(),
         backend_ready,
         backend_degraded,
+        backend_error,
     }
 }
 
@@ -1155,6 +1285,7 @@ mod tests {
             next_id: 1,
             is_shutdown: false,
             degraded: false,
+            blocked: None,
         }
     }
 
@@ -1488,6 +1619,10 @@ mod tests {
         assert!(can_restart_and_retry("jobs.list"));
         assert!(!can_restart_and_retry("jobs.submit_import"));
         assert!(!can_restart_and_retry("jobs.submit_search"));
+        assert!(!can_restart_and_retry("jobs.submit_chat"));
+        assert!(!can_restart_and_retry("jobs.chat_result"));
+        assert!(!can_restart_and_retry("jobs.retry_chat"));
+        assert!(can_restart_and_retry("jobs.chat_status"));
         assert!(!can_restart_and_retry("jobs.cancel"));
         let log = fs::read_to_string(profile_dir.join("logs").join("backend.log"))
             .expect("lifecycle log");
@@ -1708,6 +1843,131 @@ mod tests {
             .expect("shutdown request");
         let request: Value = serde_json::from_str(request.trim()).expect("valid shutdown request");
         assert_eq!(request["method"], "app.shutdown");
+    }
+
+    #[test]
+    fn profile_in_use_exit_is_reported_and_never_restarted_or_retried() {
+        let profile_dir = lifecycle_test_profile("profile-in-use");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_profile_in_use_fixture");
+        let mut respawns = 0;
+
+        let result = BackendClient::verify_health_with_startup_recovery(&mut backend, &profile_dir, || {
+            respawns += 1;
+            Ok(spawn_lifecycle_backend("tests::lifecycle_single_rpc_response_fixture"))
+        });
+
+        assert!(result.is_ok(), "the host must survive and report, not abort setup");
+        assert_eq!(respawns, 0, "a profile owned elsewhere is never respawned at startup");
+        assert!(backend.degraded);
+        assert_eq!(backend.blocked, Some(BLOCKED_PROFILE_IN_USE));
+
+        let mut restarts = 0;
+        let err = backend
+            .call_with_recovery_using(&profile_dir, "diagnostics.get", json!({}), |_| {
+                restarts += 1;
+                Ok(())
+            })
+            .expect_err("a blocked backend answers with the fixed error");
+        assert_eq!(err, PROFILE_IN_USE_MESSAGE);
+        assert_eq!(restarts, 0, "no automatic restart while the profile is owned elsewhere");
+
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log")).expect("lifecycle log");
+        assert!(log.contains("sidecar lifecycle phase=startup result=profile_in_use context=startup_health"));
+        assert!(!log.contains("phase=restart result=attempted context=startup_health"));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn restart_never_spawns_when_the_previous_child_is_not_confirmed_stopped() {
+        let profile_dir = lifecycle_test_profile("restart-unconfirmed-stop");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        let mut spawned = false;
+
+        let result = backend.replace_after_confirmed_stop(
+            &profile_dir,
+            |_| Err("could not reap the previous child".to_string()),
+            || {
+                spawned = true;
+                Ok(spawn_lifecycle_backend("tests::lifecycle_single_rpc_response_fixture"))
+            },
+        );
+
+        assert_eq!(result.expect_err("fails closed"), STOP_UNCONFIRMED_MESSAGE);
+        assert!(!spawned, "no replacement may start while the old child may be alive");
+        assert_eq!(backend.blocked, Some(BLOCKED_STOP_UNCONFIRMED));
+        let mut restarts = 0;
+        let err = backend
+            .call_with_recovery_using(&profile_dir, "diagnostics.get", json!({}), |_| {
+                restarts += 1;
+                Ok(())
+            })
+            .expect_err("still blocked");
+        assert_eq!(err, STOP_UNCONFIRMED_MESSAGE);
+        assert_eq!(restarts, 0);
+        let log = fs::read_to_string(profile_dir.join("logs").join("backend.log")).expect("lifecycle log");
+        assert!(log.contains("sidecar lifecycle phase=restart result=refused_unconfirmed_stop"));
+        kill_lifecycle_child(&mut backend);
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn restart_spawns_only_after_the_previous_child_is_confirmed_stopped() {
+        let profile_dir = lifecycle_test_profile("restart-confirmed-stop");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_sleeping_child_fixture");
+        let order = std::cell::RefCell::new(Vec::new());
+
+        backend
+            .replace_after_confirmed_stop(
+                &profile_dir,
+                |client| {
+                    let stopped = client.shutdown_with_grace_period(&profile_dir, Duration::from_millis(200));
+                    // Confirmed: the old child has been waited for and is gone.
+                    assert!(matches!(client.child.try_wait(), Ok(Some(_))));
+                    order.borrow_mut().push("stopped");
+                    stopped
+                },
+                || {
+                    order.borrow_mut().push("spawned");
+                    Ok(spawn_lifecycle_backend("tests::lifecycle_single_rpc_response_fixture"))
+                },
+            )
+            .expect("replacement after a confirmed stop");
+
+        assert_eq!(*order.borrow(), vec!["stopped", "spawned"]);
+        assert_eq!(backend.blocked, None);
+        let value = backend.call_once("diagnostics.get", json!({})).ok().expect("replacement answers");
+        assert_eq!(value["recovered"], true);
+        let _ = backend.shutdown(&profile_dir);
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    fn user_retry_reports_a_profile_still_owned_elsewhere() {
+        let profile_dir = lifecycle_test_profile("user-retry-profile-in-use");
+        let mut backend = spawn_lifecycle_backend("tests::lifecycle_already_exited_fixture");
+        backend.child.wait().expect("fixture exits");
+
+        let err = backend
+            .user_retry_using(&profile_dir, |client| {
+                let dir = profile_dir.clone();
+                client.replace_after_confirmed_stop(
+                    &profile_dir,
+                    move |old| old.shutdown(&dir),
+                    || Err(PROFILE_IN_USE_MESSAGE.to_string()),
+                )
+            })
+            .expect_err("still owned elsewhere");
+
+        assert_eq!(err, PROFILE_IN_USE_MESSAGE);
+        assert!(backend.degraded);
+        assert_eq!(backend.blocked, Some(BLOCKED_PROFILE_IN_USE));
+        let _ = fs::remove_dir_all(profile_dir);
+    }
+
+    #[test]
+    #[ignore = "helper process spawned by the profile-in-use test"]
+    fn lifecycle_profile_in_use_fixture() {
+        std::process::exit(PROFILE_IN_USE_EXIT_CODE);
     }
 
     #[test]

@@ -14,6 +14,16 @@ if str(PYTHON_DIR) not in sys.path:
 
 os.environ["ODYSSEUS_STRICT_TRACE"] = "1"
 
+# Offline boundary for this process and every Python child it starts: no test
+# can reach a loopback service (such as the developer's Ollama) it did not open.
+import offline_network  # noqa: E402
+
+offline_network.install()
+_OFFLINE_SITE = str(Path(__file__).resolve().parent / "offline_site")
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    [_OFFLINE_SITE, *[p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]]
+)
+
 
 class EgressBlockedError(RuntimeError):
     """Raised when a test attempts a socket connection to a non-loopback host."""

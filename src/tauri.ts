@@ -5,6 +5,8 @@ export type AppStatus = {
   profile_dir: string;
   backend_ready: boolean;
   backend_degraded: boolean;
+  // Fixed reason the backend cannot run that is not a crash (set by the host).
+  backend_error?: "profile_in_use" | "backend_stop_unconfirmed" | null;
 };
 
 export type Settings = {
@@ -34,7 +36,40 @@ export type JobRecord = {
   finished_at: number | null;
   elapsed_ms: number;
   queue_position: number | null;
+  // Chat jobs: the attempt this job executes, and whether the backend's turn
+  // deadline has passed while work is still being stopped.
+  attempt_id?: string;
+  deadline_reached?: boolean;
 };
+
+export type ChatAttempt = {
+  attempt_id: string;
+  number: number;
+  state: "pending" | "running" | "completed" | "failed" | "cancelled" | "timed_out" | "interrupted";
+  outcome_code: string;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+};
+
+// One logical user message and its tracked attempts (job chat turns only).
+export type ChatTurn = {
+  message_id: string;
+  session_id: string;
+  answered: boolean;
+  answer_message_id: string | null;
+  current_attempt_id: string;
+  latest_state: ChatAttempt["state"];
+  latest_outcome_code: string;
+  attempt_count: number;
+  attempts: ChatAttempt[];
+  is_latest_turn: boolean;
+  can_retry: boolean;
+  can_copy: boolean;
+};
+
+export type SubmitChatJobResult = { job: JobRecord | null; session: Session; turn: ChatTurn };
+export type ChatStatusResult = { found: boolean; turn: ChatTurn | null; job: JobRecord | null };
 
 export type SubmitImportJobsResult = { jobs: JobRecord[] };
 export type SubmitSearchJobResult = { job: JobRecord; session: Session };
@@ -169,6 +204,7 @@ export type Message = {
   documents?: DocumentRecord[];
   artifacts?: ArtifactRecord[];
   attachments?: MessageAttachment[];
+  turn?: ChatTurn;
 };
 
 export type OllamaStatus = {
@@ -1260,6 +1296,27 @@ export async function submitSearchJob(params: {
     model: params.model,
     second_round_enabled: params.secondRoundEnabled ?? true
   });
+}
+
+// Same params as chat.send minus image fields, plus operation_key; image turns stay on
+// chat.send. With retry_message_id it is an explicit retry of that unanswered turn.
+export async function submitChatJob(params: Record<string, unknown>): Promise<SubmitChatJobResult> {
+  if (typeof params.retry_message_id === "string") {
+    return rpc<SubmitChatJobResult>("jobs.retry_chat", {
+      message_id: params.retry_message_id,
+      operation_key: params.operation_key
+    });
+  }
+  return rpc<SubmitChatJobResult>("jobs.submit_chat", params);
+}
+
+// Authoritative turn outcome by operation key or message id; never starts work.
+export async function getChatStatus(params: { operation_key?: string; message_id?: string }): Promise<ChatStatusResult> {
+  return rpc<ChatStatusResult>("jobs.chat_status", params);
+}
+
+export async function getChatJobResult(jobId: string): Promise<ChatResult> {
+  return rpc<ChatResult>("jobs.chat_result", { job_id: jobId });
 }
 
 export async function getJob(jobId: string): Promise<JobRecord> {

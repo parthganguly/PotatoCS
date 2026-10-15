@@ -51,4 +51,10 @@ handler(event);
 dispose();
 assert.equal(unsubscribeCount, 1);
 
+// Only a running event can be a new operation's first event; an earlier "Done" never carries over.
+assert.equal(module.carriesOverToNewOperation(event, 500), true);
+assert.equal(module.carriesOverToNewOperation(event, 2_500), false);
+assert.equal(module.carriesOverToNewOperation({ ...event, stage: "done", status: "completed" }, 10), false);
+assert.equal(module.carriesOverToNewOperation({ ...event, stage: "operation_failed", status: "error" }, 10), false);
+
 console.log("chat-progress-tests-ok");

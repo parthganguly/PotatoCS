@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def utc_ms() -> int:
@@ -465,6 +465,47 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_conversation_attachments_active
                 ON conversation_attachments(session_id, removed_at, created_at);
+
+            -- One logical user message (an accepted job chat turn), its tracked
+            -- attempts and at most one committed answer. Legacy messages have no
+            -- row here and are never given invented outcomes.
+            CREATE TABLE IF NOT EXISTS chat_turns (
+                message_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                request_json TEXT NOT NULL DEFAULT '{}',
+                current_attempt_id TEXT NOT NULL,
+                answer_message_id TEXT UNIQUE,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_attempts (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                operation_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN (
+                    'pending', 'running', 'completed', 'failed', 'cancelled', 'timed_out', 'interrupted'
+                )),
+                outcome_code TEXT NOT NULL DEFAULT '',
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                answer_message_id TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                UNIQUE (message_id, attempt_number),
+                CHECK ((state = 'completed') = (answer_message_id IS NOT NULL)),
+                FOREIGN KEY (message_id) REFERENCES chat_turns(message_id) ON DELETE CASCADE
+            );
+
+            -- At most one attempt per conversation may be queued or running, and
+            -- at most one attempt per logical message may hold an answer.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_attempts_one_active_per_session
+                ON chat_attempts(session_id) WHERE state IN ('pending', 'running');
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_attempts_one_answer
+                ON chat_attempts(message_id) WHERE state = 'completed';
 
             CREATE TABLE IF NOT EXISTS artifact_analysis_runs (
                 id TEXT PRIMARY KEY,

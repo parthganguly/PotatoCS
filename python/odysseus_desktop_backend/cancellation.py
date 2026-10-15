@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 class JobCancelledError(Exception):
@@ -44,6 +45,64 @@ def check_cancelled() -> None:
 def cancellation_requested() -> bool:
     event = _CANCEL_EVENT.get()
     return event is not None and event.is_set()
+
+
+def active_cancel_event() -> threading.Event | None:
+    """The active job's cancel token, or None outside a cancellation scope."""
+    return _CANCEL_EVENT.get()
+
+
+class TurnDeadlineExceeded(Exception):
+    """The interactive turn's absolute deadline has passed; start no more work.
+
+    Like JobCancelledError, deliberately not a RuntimeError/ValueError.
+    """
+
+
+class TurnDeadline:
+    """An absolute monotonic deadline. Progress or stage changes never move it."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float] = time.monotonic):
+        self.clock = clock
+        self.expires_at = clock() + seconds
+
+    def remaining(self) -> float:
+        return self.expires_at - self.clock()
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+    def check(self) -> None:
+        if self.expired():
+            raise TurnDeadlineExceeded("interactive turn deadline reached")
+
+    def allow(self, stage_seconds: float) -> float:
+        """The lesser of a stage allowance and what remains; raises when nothing remains."""
+        self.check()
+        return min(float(stage_seconds), self.remaining())
+
+    def budget(self, seconds: float) -> "TurnDeadline":
+        """A shared sub-budget starting now that never outlives this deadline."""
+        sub = TurnDeadline(0, self.clock)
+        sub.expires_at = min(self.clock() + seconds, self.expires_at)
+        return sub
+
+
+_TURN_DEADLINE: ContextVar[TurnDeadline | None] = ContextVar("odysseus_turn_deadline", default=None)
+
+
+@contextmanager
+def deadline_scope(deadline: TurnDeadline | None) -> Iterator[TurnDeadline | None]:
+    token = _TURN_DEADLINE.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _TURN_DEADLINE.reset(token)
+
+
+def active_deadline() -> TurnDeadline | None:
+    """The interactive turn's overall deadline, or None outside a chat turn."""
+    return _TURN_DEADLINE.get()
 
 
 @contextmanager

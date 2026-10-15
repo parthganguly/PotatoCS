@@ -1,0 +1,81 @@
+name: Windows CI
+
+# Offline regression checks only: no Ollama, no model downloads, no live inference.
+# The Python suite's conftest installs the offline network guard itself.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: TypeScript, Vite build, UI scripts
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+      - run: npm ci
+      - name: TypeScript
+        run: npx --no-install tsc --noEmit
+      - name: Vite build
+        run: npx --no-install vite build
+      - name: UI scripts (all six)
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($script in Get-ChildItem scripts/test-*.mjs | Sort-Object Name) {
+            Write-Host "::group::$($script.Name)"
+            node $script.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $script.Name }
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count) { Write-Error "Failed: $($failed -join ', ')"; exit 1 }
+
+  python:
+    name: Python suite (offline guard active)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install -r python/requirements.txt pytest psutil -c .github/ci/python-constraints.txt
+      - name: Full Python suite (includes the IPC contract tests)
+        working-directory: python
+        run: python -m pytest -q -p no:cacheprovider -rfEs tests
+
+  rust:
+    name: Rust host library tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+      # tauri::generate_context! embeds ../dist, so the frontend is built first.
+      - run: npm ci
+      - run: npx --no-install vite build
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Rust host library tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
