@@ -145,7 +145,8 @@ assert.match(inspector, /aria-modal="true"/);
 assert.match(inspector, /event\.key === "Escape"/);
 assert.match(inspector, /whitespace-pre-wrap/);
 assert.match(inspector, /readImportedSource\(\{/);
-const sourcesApi = readFileSync("src/api/sources.ts", "utf8");
+// Windows checkouts use CRLF; the multi-line match below is written with LF.
+const sourcesApi = readFileSync("src/api/sources.ts", "utf8").replace(/\r\n/g, "\n");
 assert.match(sourcesApi, /rpc<SourceReadResult>\("documents\.read_source", \{\n    document_id: params\.documentId,/);
 
 // Each answer renders its own saved evidence; the transient latest-turn panel steps aside.
