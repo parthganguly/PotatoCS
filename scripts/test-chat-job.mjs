@@ -84,6 +84,19 @@ assert.equal(chat.chatAttemptLabel({ state: "failed", outcome_code: sentinel }),
 assert.equal(chat.chatTurnStatusLabel({ answered: false, latest_state: "running", latest_outcome_code: "" }), null);
 assert.equal(chat.chatTurnStatusLabel({ answered: true, latest_state: "completed", latest_outcome_code: "" }), null);
 assert.equal(chat.chatTurnStatusLabel({ answered: false, latest_state: "cancelled", latest_outcome_code: "cancelled_by_user" }), "Not answered. Cancelled.");
+// A private-runtime identity failure is a confirmed outcome that keeps the backend's bounded reason.
+const identityDetail = "Experimental model q loaded at the private runtime http://127.0.0.1:5 has digest f, expected e. No answer was kept and no other model was used; stop and re-verify the private model store before retrying.";
+assert.equal(chat.isConfirmedChatOutcome("model_identity_mismatch"), true);
+assert.equal(
+  chat.chatAttemptLabel({ state: "failed", outcome_code: "model_identity_mismatch", outcome_detail: identityDetail }),
+  `Failed — the private runtime's model identity did not match. ${identityDetail}`
+);
+assert.equal(
+  chat.chatTurnStatusLabel({ answered: false, latest_state: "failed", latest_outcome_code: "model_identity_mismatch", latest_outcome_detail: identityDetail }),
+  `Not answered. Failed — the private runtime's model identity did not match. ${identityDetail}`
+);
+assert.equal(chat.chatTurnStatusLabel({ answered: false, latest_state: "failed", latest_outcome_code: "model_prepare_failed", latest_outcome_detail: "" }), "Not answered. Failed — the model could not be prepared.");
+assert.equal(chat.chatJobFailureCopy("model_prepare_failed", "m", ""), chat.chatJobFailureCopy("model_prepare_failed", "m"));
 for (const state of ["queued", "preflighting", "running"]) assert.equal(chat.canCancelChatJob(state), true);
 for (const state of ["cancel_requested", "completed", "failed", "cancelled"]) assert.equal(chat.canCancelChatJob(state), false);
 
@@ -262,6 +275,15 @@ function settleWith(overrides) {
   assert.match(calls.find(([name]) => name === "error")[1], /stays in this conversation/);
   assert.deepEqual(calls.slice(-1), [["busy", false]]);
   assert.equal(deps.sendingRef.current, false);
+}
+{
+  // An identity failure shows its reason instead of the generic "is Ollama running" advice.
+  const { calls, settle } = settleWith({});
+  await settle(job("failed", { message_code: "model_identity_mismatch", message_detail: identityDetail }));
+  const error = calls.find(([name]) => name === "error")[1];
+  assert.ok(error.includes(identityDetail) && error.includes("identity check"), error);
+  assert.doesNotMatch(error, /Ollama is running/);
+  assert.equal(calls.some(([name]) => name === "reconcile"), false);
 }
 for (const code of [chat.CHAT_POLL_FAILURE_CODE, "job_failed"]) {
   // Lost polling or an unexpected failure: reconcile by operation key, never resend.

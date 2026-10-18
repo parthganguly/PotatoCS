@@ -21,15 +21,17 @@ const FAILURE_COPY: Record<string, (model: string) => string> = {
   model_prepare_failed: (model) => `${model} could not be prepared. Check that Ollama is running and the model is installed. ${NOT_SAVED}`,
   model_generation_timeout: (model) => `${model} loaded but did not finish the answer within the generation limit. ${NOT_SAVED}`,
   model_generation_failed: (model) => `${model} failed while generating the answer. ${NOT_SAVED}`,
+  model_identity_mismatch: (model) => `${model} failed the private runtime's model identity check. ${NOT_SAVED}`,
   chat_turn_timeout: () => `The 5-minute limit for this question was reached before an answer was ready. ${NOT_SAVED}`,
   cancelled_by_user: () => `Cancelled. ${NOT_SAVED}`,
   [CHAT_POLL_FAILURE_CODE]: () => `Lost contact with the backend while answering. ${UNKNOWN}`,
   job_failed: () => `The answer could not be completed because of an unexpected error. ${UNKNOWN}`
 };
 
-export function chatJobFailureCopy(code: unknown, modelLabel: string): string {
+// `detail` is the backend's bounded, content-free identity explanation, when it sent one.
+export function chatJobFailureCopy(code: unknown, modelLabel: string, detail?: string): string {
   const copy = typeof code === "string" && code in FAILURE_COPY ? FAILURE_COPY[code] : FAILURE_COPY.job_failed;
-  return copy(modelLabel);
+  return detail ? `${copy(modelLabel)} ${detail}` : copy(modelLabel);
 }
 
 // The backend settled these itself before reporting them; anything else needs a status check.
@@ -72,13 +74,14 @@ const ATTEMPT_REASON: Record<string, string> = {
   model_prepare_failed: "the model could not be prepared",
   model_generation_timeout: "the answer was not finished within 120 s",
   model_generation_failed: "the model failed while answering",
+  model_identity_mismatch: "the private runtime's model identity did not match",
   chat_turn_timeout: "the 5-minute limit was reached",
   backend_restarted: "the backend stopped before an answer was saved",
   outcome_reconciled: "stopped before an answer was saved"
 };
 
 // Fixed, inspectable copy for one attempt's outcome.
-export function chatAttemptLabel(attempt: Pick<ChatAttempt, "state" | "outcome_code">): string {
+export function chatAttemptLabel(attempt: Pick<ChatAttempt, "state" | "outcome_code" | "outcome_detail">): string {
   if (attempt.state === "completed") return "Answered";
   if (attempt.state === "pending") return "Queued";
   if (attempt.state === "running") return "In progress";
@@ -86,11 +89,17 @@ export function chatAttemptLabel(attempt: Pick<ChatAttempt, "state" | "outcome_c
   const reason = ATTEMPT_REASON[attempt.outcome_code];
   if (attempt.state === "timed_out") return `Timed out — ${reason ?? "the time limit was reached"}`;
   if (attempt.state === "interrupted") return `Stopped — ${reason ?? "the backend stopped before an answer was saved"}`;
-  return `Failed — ${reason ?? "an unexpected error"}`;
+  const detail = attempt.outcome_detail ? `. ${attempt.outcome_detail}` : "";
+  return `Failed — ${reason ?? "an unexpected error"}${detail}`;
 }
 
 // The line under an unanswered question; null while an attempt is still active.
 export function chatTurnStatusLabel(turn: ChatTurn): string | null {
   if (turn.answered || turn.latest_state === "pending" || turn.latest_state === "running") return null;
-  return `Not answered. ${chatAttemptLabel({ state: turn.latest_state, outcome_code: turn.latest_outcome_code })}.`;
+  const label = chatAttemptLabel({
+    state: turn.latest_state,
+    outcome_code: turn.latest_outcome_code,
+    outcome_detail: turn.latest_outcome_detail
+  });
+  return `Not answered. ${label}${label.endsWith(".") ? "" : "."}`;
 }

@@ -273,16 +273,19 @@ class ChatTurnStore:
             "created_at": now,
         }
 
-    def finish(self, attempt_id: str, state: str, outcome_code: str) -> bool:
-        """Settle an attempt that did not commit. A settled attempt is never changed."""
+    def finish(self, attempt_id: str, state: str, outcome_code: str, outcome_detail: str = "") -> bool:
+        """Settle an attempt that did not commit. A settled attempt is never changed.
+
+        `outcome_detail` is a bounded, content-free explanation (model identity failures only).
+        """
         with self._write() as conn:
             return bool(
                 conn.execute(
                     """
-                    UPDATE chat_attempts SET state = ?, outcome_code = ?, finished_at = ?
+                    UPDATE chat_attempts SET state = ?, outcome_code = ?, outcome_detail = ?, finished_at = ?
                     WHERE id = ? AND state IN ('pending', 'running')
                     """,
-                    (state, outcome_code, utc_ms(), attempt_id),
+                    (state, outcome_code, outcome_detail, utc_ms(), attempt_id),
                 ).rowcount
             )
 
@@ -345,6 +348,7 @@ class ChatTurnStore:
                 "operation_key": row["operation_key"],
                 "state": row["state"],
                 "outcome_code": row["outcome_code"],
+                "outcome_detail": row["outcome_detail"],
                 "created_at": row["created_at"],
                 "started_at": row["started_at"],
                 "finished_at": row["finished_at"],
@@ -372,6 +376,7 @@ class ChatTurnStore:
             "current_attempt_id": turn["current_attempt_id"],
             "latest_state": latest["state"],
             "latest_outcome_code": latest["outcome_code"],
+            "latest_outcome_detail": latest["outcome_detail"],
             "attempt_count": len(attempts),
             "attempts": attempts,
             "is_latest_turn": is_latest,

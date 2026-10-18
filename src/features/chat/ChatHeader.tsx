@@ -4,12 +4,19 @@ import type {
   DocumentRecord,
   ModelCapability,
   MultimodalMode,
+  OllamaStatus,
   RagPreset,
   Session,
   Settings,
   VisionBackend
 } from "../../tauri";
-import { installedModelTag, isInstalledModelTag, readableModelLabel } from "../../api/models";
+import {
+  installedModelTag,
+  isExperimentalModel,
+  isInstalledModelTag,
+  privateRuntimeLabel,
+  readableModelLabel
+} from "../../api/models";
 import { SEARCH_PRIVACY_DISCLOSURE } from "../search/searchModel";
 
 const ANSWER_STYLE_OPTIONS: Array<{ value: AnswerStyle; label: string }> = [
@@ -37,6 +44,7 @@ export function ChatHeader(props: {
   visionModel: string;
   visionModels: ModelCapability[];
   ragPreset: RagPreset;
+  privateRuntime: OllamaStatus["private_runtime"] | null;
   onDeleteSession: (sessionId: string) => void;
   onSetAnswerStyle: (value: AnswerStyle) => void;
   onSetRagPreset: (value: RagPreset) => void;
@@ -71,10 +79,19 @@ export function ChatHeader(props: {
             )}
             {props.modelChoices.map((model) => (
               <option key={model} title={model} value={model}>
-                {readableModelLabel(model)}
+                {`${readableModelLabel(model)}${isExperimentalModel(model, props.privateRuntime) ? " · experimental" : ""}`}
               </option>
             ))}
           </select>
+          {props.privateRuntime && (
+            <span
+              className="max-w-[520px] rounded-md border border-gold/40 bg-gold/10 px-2 py-1 text-ink/75"
+              data-testid="private-runtime"
+              title={`Expected digest ${props.privateRuntime.expected_digest}`}
+            >
+              {privateRuntimeLabel(props.privateRuntime, activeModel)}
+            </span>
+          )}
           {props.showVision && (
             <span className="rounded-md border border-ink/10 bg-white px-2 py-1">
               Vision: {visionBackendLabel(props.visionBackend)}

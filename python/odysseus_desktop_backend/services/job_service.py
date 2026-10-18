@@ -61,15 +61,20 @@ JOB_MESSAGE_CODES = {
     "model_generation_timeout",
     "model_generation_failed",
     "chat_turn_timeout",
+    "model_identity_mismatch",
 }
 
 
 class JobFailure(Exception):
-    """Fail the current job with a fixed message code (never raw error text)."""
+    """Fail the current job with a fixed message code (never raw error text).
 
-    def __init__(self, code: str):
+    `detail` is set only from ModelIdentityError, whose text is bounded and content-free.
+    """
+
+    def __init__(self, code: str, detail: str = ""):
         super().__init__(code)
         self.code = code if code in JOB_MESSAGE_CODES else "job_failed"
+        self.detail = detail
 
 
 @dataclass
@@ -92,6 +97,7 @@ class JobRecord:
     chat_result: dict[str, Any] | None = None  # private output; only via chat_result()
     state: str = "queued"
     message_code: str = ""
+    message_detail: str = ""  # model identity failures only; bounded and content-free
     created_at: int = 0
     started_at: int | None = None
     finished_at: int | None = None
@@ -386,7 +392,7 @@ class JobService:
                 self._finalize(job, "cancelled", "cancelled_by_user")
             except JobFailure as failure:
                 self._rollback(executor, job)
-                self._finalize(job, "failed", failure.code)
+                self._finalize(job, "failed", failure.code, failure.detail)
             except Exception as exc:  # noqa: BLE001 - job errors become fixed-code failures
                 self._rollback(executor, job)
                 logger.warning(
@@ -430,12 +436,13 @@ class JobService:
             raise ValueError(f"illegal job transition: {job.state} -> {state}")
         job.state = state
 
-    def _finalize(self, job: JobRecord, state: str, message_code: str) -> None:
+    def _finalize(self, job: JobRecord, state: str, message_code: str, detail: str = "") -> None:
         with self._lock:
             if job.state in TERMINAL_JOB_STATES:
                 return
             self._set_state_locked(job, state)
             job.message_code = message_code if message_code in JOB_MESSAGE_CODES else "job_failed"
+            job.message_detail = detail
             job.finished_at = utc_ms()
             self._prune_locked()
         logger.info(
@@ -470,6 +477,7 @@ class JobService:
             "kind": job.kind,
             "state": job.state,
             "message_code": job.message_code,
+            "message_detail": job.message_detail,
             "scope": job.scope,
             "document_id": job.document_id,
             "artifact_id": job.artifact_id,
@@ -704,10 +712,11 @@ class DocumentJobExecutor:
                 turns.finish(job.attempt_id, "cancelled", "cancelled_by_user")
                 raise
             code = chat_failure_code(exc, job.deadline)
-            turns.finish(job.attempt_id, "timed_out" if code == "chat_turn_timeout" else "failed", code)
+            detail = getattr(exc, "detail", "") if code == "model_identity_mismatch" else ""
+            turns.finish(job.attempt_id, "timed_out" if code == "chat_turn_timeout" else "failed", code, detail)
             if code == "job_failed":
                 raise  # JobService logs the unexpected error type
-            raise JobFailure(code) from exc
+            raise JobFailure(code, detail) from exc
         assistant = result.get("assistant_message") or {}
         job.message_id = str(assistant.get("id") or "")
         job.chat_result = result
@@ -756,6 +765,7 @@ def chat_failure_code(exc: BaseException, deadline: TurnDeadline | None) -> str:
     """Fixed outcome code for a chat attempt that saved no answer."""
     from odysseus_desktop_backend.cancellation import TurnDeadlineExceeded
     from odysseus_desktop_backend.services.model_service import (
+        ModelIdentityError,
         ModelPreparationError,
         ModelPreparationTimeoutError,
         ModelServiceError,
@@ -766,6 +776,8 @@ def chat_failure_code(exc: BaseException, deadline: TurnDeadline | None) -> str:
         isinstance(exc, ModelTimeoutError) and deadline is not None and deadline.expired()
     ):
         return "chat_turn_timeout"
+    if isinstance(exc, ModelIdentityError):
+        return "model_identity_mismatch"
     if isinstance(exc, ModelPreparationTimeoutError):
         return "model_prepare_timeout"
     if isinstance(exc, ModelPreparationError):

@@ -25,6 +25,8 @@ export type JobRecord = {
   kind: string;
   state: string;
   message_code: string;
+  // Bounded, content-free explanation; set only for model identity failures.
+  message_detail?: string;
   scope: JobScope | "chat";
   document_id: string;
   artifact_id: string;
@@ -47,6 +49,7 @@ export type ChatAttempt = {
   number: number;
   state: "pending" | "running" | "completed" | "failed" | "cancelled" | "timed_out" | "interrupted";
   outcome_code: string;
+  outcome_detail?: string;
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
@@ -61,6 +64,7 @@ export type ChatTurn = {
   current_attempt_id: string;
   latest_state: ChatAttempt["state"];
   latest_outcome_code: string;
+  latest_outcome_detail?: string;
   attempt_count: number;
   attempts: ChatAttempt[];
   is_latest_turn: boolean;
@@ -284,6 +288,14 @@ export type OllamaStatus = {
   conversation_models?: ConversationModelCatalogItem[];
   error: string;
   updated_at: number;
+  // Only when launched against a private runtime (ODYSSEUS_PRIVATE_OLLAMA_ENDPOINT).
+  private_runtime?: {
+    endpoint: string;
+    experimental_model: string;
+    expected_digest: string;
+    installed_digest: string;
+    state: "ready" | "missing" | "digest_mismatch" | "unreachable";
+  };
 };
 
 export type ConversationModelCatalogItem = {
