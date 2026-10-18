@@ -110,6 +110,7 @@ import {
   listModelCapabilities,
   readableModelLabel,
   refreshModelCapabilities,
+  selectInstalledModelOrFallback,
   visionCapableModels
 } from "./api/models";
 import { conversationSources, deleteSource, importSources, listSources, promoteSource, removeConversationSource } from "./api/sources";
@@ -339,7 +340,7 @@ function App() {
           await loadMessages(job.session_id);
         }
         // The question stays in the conversation with its own Retry; the composer is not refilled.
-        setError(chatJobFailureCopy(job.message_code, turn?.modelLabel ?? "The selected model"));
+        setError(chatJobFailureCopy(job.message_code, turn?.modelLabel ?? "The selected model", job.message_detail));
       } catch (err) {
         if (job.session_id) await loadMessages(job.session_id);
         setError(readError(err));
@@ -531,7 +532,7 @@ function App() {
       setSettings(nextSettings);
       const bootModelChoices = buildConversationModelOptions(nextOllama, nextCapabilities).map((option) => option.tag);
       const bootDefaultModel = String(nextSettings.default_model ?? "llama3.2");
-      setModelDraft(selectInstalledModelOrFallback(bootDefaultModel, bootModelChoices));
+      setModelDraft(selectInstalledModelOrFallback(bootDefaultModel, bootModelChoices, Boolean(nextOllama.private_runtime)));
       setVisionBackendDraft(normalizeVisionBackend(nextSettings.vision_backend));
       setSessions(nextSessions);
       setOllama(nextOllama);
@@ -677,7 +678,7 @@ function App() {
       const refreshedChoices = buildConversationModelOptions(nextOllama, nextCapabilities).map((option) => option.tag);
       setOllama(nextOllama);
       setModelCapabilities(nextCapabilities);
-      setModelDraft((current) => selectInstalledModelOrFallback(current, refreshedChoices));
+      setModelDraft((current) => selectInstalledModelOrFallback(current, refreshedChoices, Boolean(nextOllama.private_runtime)));
     } catch (err) {
       setError(readError(err));
     }
@@ -735,7 +736,9 @@ function App() {
         nextDiagnostics.ollama,
         nextDiagnostics.image_vision?.model_capabilities ?? []
       ).map((option) => option.tag);
-      setModelDraft((current) => selectInstalledModelOrFallback(current, diagnosticModelChoices));
+      setModelDraft((current) =>
+        selectInstalledModelOrFallback(current, diagnosticModelChoices, Boolean(nextDiagnostics.ollama.private_runtime))
+      );
       const defaultVision = visionCapableModels(nextDiagnostics.image_vision?.model_capabilities ?? [])[0]?.model ?? "";
       setChatVisionModel((current) => current || defaultVision);
       setImageVisionModel((current) => current || defaultVision);
@@ -743,7 +746,9 @@ function App() {
       setBenchmarkModel((current) =>
         nextDiagnostics.ollama.models.includes(current)
           ? current
-          : nextDiagnostics.ollama.models[0] || ""
+          : nextDiagnostics.ollama.private_runtime
+            ? "" // private runtime: a benchmark model is only ever the operator's explicit choice
+            : nextDiagnostics.ollama.models[0] || ""
       );
     } catch (err) {
       setError(readError(err));
@@ -1128,7 +1133,7 @@ function App() {
         }
       });
       setSettings(next);
-      setModelDraft(selectInstalledModelOrFallback(String(next.default_model ?? "llama3.2"), modelChoices));
+      setModelDraft(selectInstalledModelOrFallback(String(next.default_model ?? "llama3.2"), modelChoices, Boolean(ollama?.private_runtime)));
       setVisionBackendDraft(normalizeVisionBackend(next.vision_backend));
     } catch (err) {
       setError(readError(err));
@@ -1144,7 +1149,7 @@ function App() {
     }
     const requestedModel = modelDraft.trim() || String(settings.default_model || "llama3.2");
     const sessionModel = modelChoices.length > 0
-      ? selectInstalledModelOrFallback(requestedModel, modelChoices)
+      ? selectInstalledModelOrFallback(requestedModel, modelChoices, Boolean(ollama?.private_runtime))
       : requestedModel;
     setBusy(true);
     setError(null);
@@ -2094,6 +2099,7 @@ function App() {
             draft={draft}
             error={error}
             hasRuntime={hasRuntime}
+            privateRuntime={ollama?.private_runtime ?? null}
             loadState={loadState}
             documents={documents}
             messages={messages}
@@ -2298,6 +2304,7 @@ function ChatWorkspace(props: {
   draft: string;
   error: string | null;
   hasRuntime: boolean;
+  privateRuntime: OllamaStatus["private_runtime"] | null;
   loadState: LoadState;
   documents: DocumentRecord[];
   messages: Message[];
@@ -2389,6 +2396,7 @@ function ChatWorkspace(props: {
         onSetRagPreset={props.onSetRagPreset}
         onSetSelectedRagDocumentId={props.onSetSelectedRagDocumentId}
         onSetSessionModel={props.onSetSessionModel}
+        privateRuntime={props.privateRuntime}
         onSetUseRag={props.onSetUseRag}
         onSetWebSearch={props.onSetWebSearch}
         onSetVerifyRag={props.onSetVerifyRag}
@@ -3070,6 +3078,9 @@ function DiagnosticsWorkspace(props: {
                   onChange={(event) => props.onSetBenchmarkModel(event.target.value)}
                   value={props.benchmarkModel}
                 >
+                  {props.diagnostics?.ollama.private_runtime && models.length > 0 && (
+                    <option value="">Choose a model (private runtime: none is selected automatically)</option>
+                  )}
                   {models.length === 0 ? (
                     <option value="">No installed Ollama models</option>
                   ) : (
@@ -3158,7 +3169,7 @@ function DiagnosticsWorkspace(props: {
                 Retrieval-only measures ranking without a chat model. Oracle generation bypasses retrieval. Verifier applies only to end-to-end runs.
               </p>
               {!props.diagnostics?.ollama.reachable && (
-                <p className="mt-3 text-xs text-clay">Ollama is not reachable at 127.0.0.1:11434.</p>
+                <p className="mt-3 text-xs text-clay">Ollama is not reachable at {props.diagnostics?.ollama.endpoint}.</p>
               )}
               {props.copyStatus && <p className="mt-3 text-xs text-moss">{props.copyStatus}</p>}
             </div>
@@ -5109,15 +5120,6 @@ function dedupeStrings(values: string[]): string[] {
     result.push(clean);
   }
   return result;
-}
-
-function selectInstalledModelOrFallback(model: string, installedTags: string[]): string {
-  const requested = String(model || "").trim();
-  if (installedTags.length === 0) return requested;
-  if (requested && isInstalledModelTag(requested, installedTags)) {
-    return installedModelTag(requested, installedTags);
-  }
-  return installedTags[0] ?? requested;
 }
 
 function isSupportedImagePath(path: string): boolean {

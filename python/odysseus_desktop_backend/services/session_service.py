@@ -4,6 +4,7 @@ import json
 import uuid
 from typing import Any
 
+from odysseus_desktop_backend.services.model_service import EXPERIMENTAL_MODEL, is_experimental_model
 from odysseus_desktop_backend.storage import Database, utc_ms
 
 
@@ -26,6 +27,12 @@ class SessionService:
         session_id = str(uuid.uuid4())
         session_title = (title or "New chat").strip() or "New chat"
         session_model = (model or self.db.get_setting("default_model", "") or "").strip()
+        if is_experimental_model(session_model):
+            # Only the conversation's own model selector (update) may choose it.
+            raise ValueError(
+                f"{EXPERIMENTAL_MODEL} is experimental and is never assigned when a conversation is created; "
+                "select it in the conversation's model selector."
+            )
         self.db.conn.execute(
             """
             INSERT INTO sessions(id, title, model, created_at, updated_at, last_message_at)

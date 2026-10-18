@@ -31,7 +31,14 @@ from odysseus_desktop_backend.services.florence2_service import Florence2Backend
 from odysseus_desktop_backend.services.image_eval_service import ImageEvalService
 from odysseus_desktop_backend.services.job_service import TERMINAL_JOB_STATES, JobService
 from odysseus_desktop_backend.services.legacy_import_service import LegacyImportService
-from odysseus_desktop_backend.services.model_service import INTERACTIVE_TURN_SECONDS, ModelService
+from odysseus_desktop_backend.services.model_service import (
+    INTERACTIVE_TURN_SECONDS,
+    ModelService,
+    ModelServiceError,
+    experimental_selection_error,
+    is_experimental_model,
+    private_endpoint,
+)
 from odysseus_desktop_backend.services.ocr_service import LocalVLMTextExtractor, OCRService
 from odysseus_desktop_backend.services.rag_service import RAGService
 from odysseus_desktop_backend.services.session_service import SessionService
@@ -534,8 +541,26 @@ class SidecarApp:
         scope = optional_str(params, "scope") or "library"
         return {"jobs": self.jobs.submit_import(paths, scope=scope)}
 
+    def _require_explicit_model(self, model: str, session_id: str | None) -> None:
+        """Private runtime only: refuse before acceptance, with an actionable reason.
+
+        The experimental candidate must be this conversation's explicitly selected model
+        and must be installed with its pinned digest; nothing else is substituted.
+        """
+        if not private_endpoint():
+            return
+        error = experimental_selection_error(model, self.sessions.get(session_id)["model"] if session_id else None)
+        if error:
+            raise RpcError(-32602, error)
+        if is_experimental_model(model):
+            try:
+                self.models.verify_experimental_identity(model, loaded=False)
+            except ModelServiceError as exc:
+                raise RpcError(-32000, str(exc)) from exc
+
     def jobs_submit_search(self, params: JsonDict) -> JsonDict:
         model = require_str(params, "model")
+        self._require_explicit_model(model, optional_str(params, "session_id"))
         session = self.sessions.ensure(optional_str(params, "session_id"), model=model)
         job = self.jobs.submit_search(
             require_str(params, "query"),
@@ -564,6 +589,7 @@ class SidecarApp:
         existing = self.turns.status(operation_key=operation_key)
         if existing is not None:
             return self._chat_operation(existing)
+        self._require_explicit_model(model, optional_str(params, "session_id"))
         session = self.sessions.ensure(optional_str(params, "session_id"), model=model)
         self._require_text_conversation(str(session["id"]))
         self.jobs.ensure_capacity()
@@ -587,6 +613,10 @@ class SidecarApp:
         current = self.turns.status(message_id=message_id)
         if current is None:
             raise RpcError(-32602, "only a tracked chat question can be retried")
+        if private_endpoint():
+            self._require_explicit_model(
+                str(self.turns.request(message_id)[3].get("model") or ""), str(current["session_id"])
+            )
         self._require_text_conversation(str(current["session_id"]))
         self.jobs.ensure_capacity()
         turn, created = self.turns.retry(message_id, operation_key)

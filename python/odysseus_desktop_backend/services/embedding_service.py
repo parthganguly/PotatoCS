@@ -13,6 +13,7 @@ import numpy as np
 
 from odysseus_desktop_backend.cancellation import JobCancelledError, active_deadline, check_cancelled
 from odysseus_desktop_backend.logging_config import get_logger
+from odysseus_desktop_backend.services.model_service import endpoint_port, ollama_endpoint, private_endpoint
 from odysseus_desktop_backend.storage import Database, utc_ms
 
 
@@ -22,7 +23,6 @@ DEFAULT_DIMENSIONS = 384
 # Structural safety ceiling — NOT a measured Potato Mode default; Issue
 # #14/#20 own tuning.
 EMBEDDING_BATCH_SIZE = 16
-OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_\-']*", re.IGNORECASE)
 STOPWORDS = {
     "a",
@@ -126,11 +126,11 @@ class OllamaEmbeddingProvider:
         self,
         model_name: str = DEFAULT_EMBEDDING_MODEL,
         *,
-        endpoint: str = OLLAMA_ENDPOINT,
+        endpoint: str | None = None,
         timeout: float = 60,
     ):
         self.model_name = model_name
-        self.endpoint = endpoint.rstrip("/")
+        self.endpoint = (endpoint or ollama_endpoint()).rstrip("/")
         self.timeout = timeout
         self.model_key = f"ollama:{self.model_name}"
 
@@ -139,7 +139,8 @@ class OllamaEmbeddingProvider:
         # deadline, and its connect and tags request are clipped to what remains (the
         # request absolute and cancellable). Out of a turn nothing here changes.
         turn = active_deadline()  # allow() below refuses to start once it has expired
-        if not self._tcp_reachable("127.0.0.1", 11434, timeout=0.5 if turn is None else turn.allow(0.5)):
+        port = endpoint_port(self.endpoint)
+        if not self._tcp_reachable("127.0.0.1", port, timeout=0.5 if turn is None else turn.allow(0.5)):
             return False
         try:
             if turn is None:
@@ -245,7 +246,7 @@ class EmbeddingService:
         except JobCancelledError:
             raise
         except Exception as exc:
-            if provider.backend == "lexical":
+            if provider.backend == "lexical" or private_endpoint():
                 raise
             logger.warning("semantic embedding failed; falling back to lexical error=%s", exc)
             results = self._embed_texts_with_provider(items, self.fallback_provider)
@@ -263,7 +264,7 @@ class EmbeddingService:
         except JobCancelledError:
             raise
         except Exception as exc:
-            if provider.backend == "lexical":
+            if provider.backend == "lexical" or private_endpoint():
                 raise
             logger.warning("semantic query embedding failed; falling back to lexical error=%s", exc)
             vector = self.fallback_provider.embed([query])[0]
@@ -372,6 +373,18 @@ class EmbeddingService:
             return self.fallback_provider
 
         semantic = OllamaEmbeddingProvider(requested_model or DEFAULT_EMBEDDING_MODEL)
+        if private_endpoint():
+            # No lexical fallback in the private runtime: a missing embedding model makes
+            # indexing and retrieval fail at the private endpoint, visibly.
+            status = self._provider_status(semantic, None)
+            if not semantic.installed():
+                status["semantic"] = False
+                status["message"] = (
+                    f"Embedding model {semantic.model_name} is not installed at the private runtime "
+                    f"{semantic.endpoint}. Lexical fallback is disabled there, so indexing and retrieval will fail."
+                )
+            self._set_status(status)
+            return semantic
         if requested_backend in {"auto", "ollama", "semantic"} and semantic.installed():
             self._set_status(self._provider_status(semantic, None))
             return semantic

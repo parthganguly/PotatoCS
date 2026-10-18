@@ -92,6 +92,35 @@ export function installedModelTag(model: string, installedTags: string[]): strin
   return installedTags.find((tag) => canonicalModelTag(tag) === canonical) ?? model;
 }
 
+// Ordinary launch: an unavailable model falls back to the first installed one. Under a
+// private runtime nothing is substituted; the operator picks a model per conversation.
+export function selectInstalledModelOrFallback(model: string, installedTags: string[], privateRuntime = false): string {
+  const requested = String(model || "").trim();
+  if (installedTags.length === 0) return requested;
+  if (requested && isInstalledModelTag(requested, installedTags)) {
+    return installedModelTag(requested, installedTags);
+  }
+  if (privateRuntime) return requested;
+  return installedTags[0] ?? requested;
+}
+
+export function isExperimentalModel(model: string, runtime: OllamaStatus["private_runtime"] | null | undefined): boolean {
+  return Boolean(runtime && canonicalModelTag(model) === canonicalModelTag(runtime.experimental_model));
+}
+
+export function privateRuntimeLabel(runtime: NonNullable<OllamaStatus["private_runtime"]>, activeModel: string): string {
+  if (!isExperimentalModel(activeModel, runtime)) {
+    return `Private runtime ${runtime.endpoint}: choose ${runtime.experimental_model} in this conversation to use the experimental model.`;
+  }
+  const state = {
+    ready: "installed digest matches",
+    missing: "not installed in the private runtime; sending will fail and no other model is used",
+    digest_mismatch: `installed digest ${runtime.installed_digest.slice(0, 12)}… does not match; sending will fail and no other model is used`,
+    unreachable: "private runtime not reachable"
+  }[runtime.state];
+  return `Experimental model ${runtime.experimental_model} · expected digest ${runtime.expected_digest.slice(0, 12)}… · ${state} · ${runtime.endpoint}`;
+}
+
 export function readableModelLabel(model: string, options: { installed?: boolean } = {}): string {
   const clean = String(model || "").trim();
   if (!clean) return "No model";

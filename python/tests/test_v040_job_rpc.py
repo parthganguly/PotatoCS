@@ -50,6 +50,8 @@ SNAPSHOT_KEYS = {
     # for other kinds.
     "attempt_id",
     "deadline_reached",
+    # Bounded, content-free explanation; set only for a private-runtime model identity failure.
+    "message_detail",
 }
 
 

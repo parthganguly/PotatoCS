@@ -33,7 +33,9 @@ from odysseus_desktop_backend.services.model_service import (
     VISION_CHAT_TIMEOUT_SECONDS,
     ModelService,
     ModelTimeoutError,
+    experimental_selection_error,
     normalize_thinking_mode,
+    private_endpoint,
 )
 from odysseus_desktop_backend.services.florence2_service import FLORENCE_MODEL_ID
 from odysseus_desktop_backend.services.perception_types import (
@@ -201,6 +203,12 @@ class ChatService:
             )
             if recovered:
                 return recovered
+        if private_endpoint():
+            selection_error = experimental_selection_error(
+                selected_model, self.sessions.get(session_id).get("model") if session_id else None
+            )
+            if selection_error:
+                raise ValueError(selection_error)
         session = self.sessions.ensure(session_id, model=selected_model)
 
         if not session.get("model"):
@@ -693,6 +701,9 @@ class ChatService:
         models = _compact_trace_fields(
             {
                 "final_answer_model": final_answer_model,
+                # Private runtime only: the loaded digest checked against the pinned one.
+                "final_answer_model_digest": _safe_trace_identifier(response.get("model_digest")),
+                "runtime_endpoint": _safe_trace_label(response.get("runtime_endpoint")),
                 "vision_backend": _safe_trace_label(
                     analysis_data.get("actual_vision_backend") or provenance.get("vision_backend")
                 ),

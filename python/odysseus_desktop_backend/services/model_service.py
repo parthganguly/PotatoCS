@@ -12,6 +12,7 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,14 @@ from odysseus_desktop_backend.storage import Database, utc_ms
 
 
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
+# Launch-scoped private runtime: set only in the sidecar's launch environment, never
+# persisted. Every Ollama request (discovery, capabilities, preparation, generation,
+# loaded-model inspection and embeddings) then goes to it, with no fallback.
+PRIVATE_ENDPOINT_ENV = "ODYSSEUS_PRIVATE_OLLAMA_ENDPOINT"
+# The one candidate the private runtime is for (Astra brief, 2026-10-17). Experimental:
+# never a default, never selected automatically, refused on any other digest.
+EXPERIMENTAL_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
+EXPERIMENTAL_MODEL_DIGEST = "0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0"
 INTERACTIVE_CHAT_TIMEOUT_SECONDS = 120
 # Waiting for/loading the model is bounded separately from answer generation.
 MODEL_PREPARE_TIMEOUT_SECONDS = INTERACTIVE_CHAT_TIMEOUT_SECONDS
@@ -82,13 +91,89 @@ class ModelPreparationTimeoutError(ModelPreparationError, ModelTimeoutError):
     category = "preparation_timeout"
 
 
+IDENTITY_ACTION = (
+    "No answer was kept and no other model was used; stop and re-verify the private model store before retrying."
+)
+
+
+class ModelIdentityError(ModelInvalidModelError):
+    """The private runtime did not establish the pinned candidate's identity.
+
+    `detail` is bounded and content-free (endpoint, identities and the corrective action
+    only), so it may be kept with the attempt and shown to the operator.
+    """
+
+    def __init__(self, detail: str):
+        self.detail = detail[:600]
+        super().__init__(f"invalid model: {self.detail}")
+
+
+def reported_identity(value: Any) -> str:
+    """A tag or digest reported by the runtime, reduced to a short printable token."""
+    return re.sub(r"[^A-Za-z0-9._:/@+-]", "?", str(value or "").strip())[:80] or "none"
+
+
+def private_endpoint() -> str:
+    """The launch-scoped private Ollama endpoint, or "" for an ordinary launch.
+
+    Only http://127.0.0.1:<port> is accepted, on any port but the ordinary 11434; a bad
+    value fails every request rather than reaching the ordinary runtime.
+    """
+    raw = os.environ.get(PRIVATE_ENDPOINT_ENV, "").strip()
+    if not raw:
+        return ""
+    parts = urllib.parse.urlsplit(raw)
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if (parts.scheme, parts.hostname, parts.path.strip("/"), parts.query, parts.fragment, parts.username) != (
+        "http", "127.0.0.1", "", "", "", None
+    ) or port in (None, 11434):
+        raise ModelConnectionError(
+            f"connection failure: {PRIVATE_ENDPOINT_ENV} must be http://127.0.0.1:<port> on a port other "
+            "than 11434; no request was sent to any runtime"
+        )
+    return f"http://127.0.0.1:{port}"
+
+
+def ollama_endpoint() -> str:
+    return private_endpoint() or OLLAMA_ENDPOINT
+
+
+def endpoint_port(endpoint: str) -> int:
+    return urllib.parse.urlsplit(endpoint).port or 80
+
+
+def is_experimental_model(model: str | None) -> bool:
+    return bool(private_endpoint()) and canonical_model_tag(model or "") == canonical_model_tag(EXPERIMENTAL_MODEL)
+
+
+def experimental_selection_error(requested: str | None, conversation_model: str | None) -> str:
+    """Why `requested` may not be used in this conversation, or "".
+
+    In the private runtime the experimental candidate is used only after the operator
+    chose it in this conversation's model selector, so the request must name exactly
+    the conversation's saved model. `conversation_model` is None for a new conversation.
+    """
+    if not (is_experimental_model(requested) or is_experimental_model(conversation_model)):
+        return ""
+    if conversation_model is not None and canonical_model_tag(requested or "") == canonical_model_tag(conversation_model):
+        return ""
+    return (
+        f"Select {EXPERIMENTAL_MODEL} explicitly in this conversation's model selector before sending. "
+        "The experimental model is never chosen automatically, and a request must use the conversation's selected model."
+    )
+
+
 class ModelService:
     def __init__(self, db: Database):
         self.db = db
 
     def detect_ollama(self) -> dict[str, Any]:
         installed = shutil.which("ollama") is not None
-        reachable = self._tcp_reachable("127.0.0.1", 11434)
+        endpoint = ollama_endpoint()
+        reachable = self._tcp_reachable("127.0.0.1", endpoint_port(endpoint))
         models: list[str] = []
         model_details: list[dict[str, Any]] = []
         version = ""
@@ -96,7 +181,7 @@ class ModelService:
 
         if reachable:
             try:
-                tags = self._get_json(f"{OLLAMA_ENDPOINT}/api/tags", timeout=3)
+                tags = self._get_json(f"{endpoint}/api/tags", timeout=3)
                 for item in tags.get("models", []):
                     if not isinstance(item, dict) or not item.get("name"):
                         continue
@@ -105,7 +190,7 @@ class ModelService:
             except Exception as exc:  # noqa: BLE001 - surfaced in runtime status
                 error = str(exc)
             try:
-                version_data = self._get_json(f"{OLLAMA_ENDPOINT}/api/version", timeout=2)
+                version_data = self._get_json(f"{endpoint}/api/version", timeout=2)
                 version = str(version_data.get("version", ""))
             except Exception:
                 pass
@@ -114,7 +199,7 @@ class ModelService:
             "name": "ollama",
             "installed": installed,
             "reachable": reachable,
-            "endpoint": OLLAMA_ENDPOINT,
+            "endpoint": endpoint,
             "version": version,
             "models": models,
             "model_details": model_details,
@@ -126,12 +211,26 @@ class ModelService:
             "error": error,
             "updated_at": utc_ms(),
         }
+        if endpoint != OLLAMA_ENDPOINT:
+            digests = [
+                item["digest"]
+                for item in model_details
+                if canonical_model_tag(item["name"]) == canonical_model_tag(EXPERIMENTAL_MODEL)
+            ]
+            status["private_runtime"] = {
+                "endpoint": endpoint,
+                "experimental_model": EXPERIMENTAL_MODEL,
+                "expected_digest": EXPERIMENTAL_MODEL_DIGEST,
+                "installed_digest": digests[0] if digests else "",
+                "state": "unreachable" if not reachable or error else "missing" if not digests
+                else "ready" if digests[0] == EXPERIMENTAL_MODEL_DIGEST else "digest_mismatch",
+            }
         self._store_runtime_status(status)
         logger.info(
             "ollama detection installed=%s reachable=%s endpoint=%s models=%s error=%s",
             installed,
             reachable,
-            OLLAMA_ENDPOINT,
+            endpoint,
             len(models),
             error,
         )
@@ -156,7 +255,7 @@ class ModelService:
         clean_model = (model or "").strip()
         if not clean_model:
             raise ValueError("model is required")
-        data = self._post_json(f"{OLLAMA_ENDPOINT}/api/show", {"model": clean_model}, timeout=10)
+        data = self._post_json(f"{ollama_endpoint()}/api/show", {"model": clean_model}, timeout=10)
         details = data.get("details") if isinstance(data.get("details"), dict) else {}
         model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
         capabilities = [str(item).lower() for item in data.get("capabilities") or [] if isinstance(item, str)]
@@ -224,9 +323,13 @@ class ModelService:
             payload["options"] = dict(options)
         started = time.perf_counter()
         try:
-            data = self._post_json(f"{OLLAMA_ENDPOINT}/api/chat", payload, timeout=timeout)
+            self.verify_experimental_identity(model, loaded=False)
+            data = self._post_json(f"{ollama_endpoint()}/api/chat", payload, timeout=timeout)
+            self.verify_experimental_identity(model, loaded=True)
         except ModelTimeoutError as exc:
             raise ModelPreparationTimeoutError(f"timeout: model preparation exceeded {timeout:g}s") from exc
+        except ModelIdentityError:
+            raise  # its own outcome: the operator needs the identities, not "could not be prepared"
         except ModelServiceError as exc:
             raise ModelPreparationError(f"model preparation failed: {exc}") from exc
         load_duration_ns = int(data.get("load_duration") or 0) if isinstance(data, dict) else 0
@@ -282,8 +385,9 @@ class ModelService:
         if response_format:
             payload["format"] = response_format
 
+        self.verify_experimental_identity(model, loaded=False)
         started = time.perf_counter()
-        data = self._post_json(f"{OLLAMA_ENDPOINT}/api/chat", payload, timeout=timeout)
+        data = self._post_json(f"{ollama_endpoint()}/api/chat", payload, timeout=timeout)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         if not isinstance(data, dict):
             raise ModelMalformedResponseError("malformed response: Ollama response was not an object")
@@ -297,14 +401,58 @@ class ModelService:
             if isinstance(content, str):
                 if not content and not thinking_text:
                     raise ModelEmptyResponseError("empty response: Ollama returned no assistant content")
-                return structured_chat_response(
+                result = structured_chat_response(
                     model=model,
                     content=content,
                     thinking=thinking_text,
                     data=data,
                     elapsed_ms=elapsed_ms,
                 )
+                if is_experimental_model(model):
+                    # Selected tag = request tag (checked before acceptance), response tag
+                    # and loaded digest must all agree, or the answer is not kept. The tag
+                    # is the runtime's own report: a missing one is never filled from the request.
+                    reported = data.get("model")
+                    reported = reported.strip() if isinstance(reported, str) else ""
+                    if canonical_model_tag(reported) != canonical_model_tag(model):
+                        seen = f"answered as {reported_identity(reported)}" if reported else "reported no model identity"
+                        raise ModelIdentityError(
+                            f"Requested {EXPERIMENTAL_MODEL} at the private runtime {ollama_endpoint()}, "
+                            f"but the runtime {seen}. {IDENTITY_ACTION}"
+                        )
+                    result["model_digest"] = self.verify_experimental_identity(model, loaded=True)
+                    result["runtime_endpoint"] = ollama_endpoint()
+                return result
         raise ModelMalformedResponseError("malformed response: Ollama returned no assistant message")
+
+    def verify_experimental_identity(self, model: str, *, loaded: bool) -> str:
+        """The experimental candidate's digest as installed (or loaded), if it is the pinned one.
+
+        Anything else is an explicit failure; no other model is substituted. Returns ""
+        without a request for every model other than the candidate in a private runtime.
+        """
+        if not is_experimental_model(model):
+            return ""
+        endpoint = ollama_endpoint()
+        listing = self.get_json_bounded(f"{endpoint}/api/{'ps' if loaded else 'tags'}", 3)
+        digests = [
+            str(item.get("digest") or "")
+            for item in listing.get("models") or []
+            if isinstance(item, dict)
+            and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == canonical_model_tag(model)
+        ]
+        state = "loaded" if loaded else "installed"
+        if not digests:
+            raise ModelIdentityError(
+                f"Experimental model {EXPERIMENTAL_MODEL} is not {state} at the private runtime {endpoint} "
+                f"(expected digest {EXPERIMENTAL_MODEL_DIGEST}). {IDENTITY_ACTION}"
+            )
+        if digests[0] != EXPERIMENTAL_MODEL_DIGEST:
+            raise ModelIdentityError(
+                f"Experimental model {EXPERIMENTAL_MODEL} {state} at the private runtime {endpoint} has digest "
+                f"{reported_identity(digests[0])}, expected {EXPERIMENTAL_MODEL_DIGEST}. {IDENTITY_ACTION}"
+            )
+        return digests[0]
 
     def chat_vision_detailed(
         self,
@@ -370,10 +518,11 @@ class ModelService:
         )
 
     def ps(self) -> dict[str, Any]:
-        if not self._tcp_reachable("127.0.0.1", 11434):
-            return {"models": [], "reachable": False, "error": "Ollama is not reachable"}
+        endpoint = ollama_endpoint()
+        if not self._tcp_reachable("127.0.0.1", endpoint_port(endpoint)):
+            return {"models": [], "reachable": False, "error": f"Ollama is not reachable at {endpoint}"}
         try:
-            data = self._get_json(f"{OLLAMA_ENDPOINT}/api/ps", timeout=3)
+            data = self._get_json(f"{endpoint}/api/ps", timeout=3)
         except Exception as exc:  # noqa: BLE001 - surfaced as diagnostics
             return {"models": [], "reachable": True, "error": str(exc)}
         models = []
@@ -576,7 +725,10 @@ class ModelService:
             reason = getattr(exc, "reason", exc)
             if isinstance(reason, TimeoutError):
                 raise ModelTimeoutError(f"timeout: Ollama request exceeded {timeout:g}s") from exc
-            raise ModelConnectionError(f"connection failure: Ollama is not reachable at {OLLAMA_ENDPOINT}: {reason}") from exc
+            parts = urllib.parse.urlsplit(url)
+            raise ModelConnectionError(
+                f"connection failure: Ollama is not reachable at {parts.scheme}://{parts.netloc}: {reason}"
+            ) from exc
         if not raw.strip():
             raise ModelEmptyResponseError("empty response: Ollama returned an empty body")
         try:
