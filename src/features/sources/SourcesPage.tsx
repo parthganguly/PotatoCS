@@ -1,6 +1,7 @@
 import { FileText, Image, Library, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 import { SourceBackendKind, SourceSummary } from "../../tauri";
 import { LocalArtifactImage, sourceAttachmentStatusLabel } from "../attachments/ComposerAttachments";
+import type { SourceInspectorTarget } from "./SourceInspector";
 
 const FILTERS = [
   { value: "all", label: "All" },
@@ -21,6 +22,7 @@ export function SourcesPage(props: {
   onFilter: (filter: string) => void;
   onPromote: (source: SourceSummary, index: boolean) => void;
   onRefresh: () => void;
+  onOpenSource: (target: SourceInspectorTarget) => void;
 }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -96,6 +98,7 @@ export function SourcesPage(props: {
                 busy={props.busy}
                 key={`${source.backend_kind}-${source.id}`}
                 onDelete={() => props.onDelete(source)}
+                onOpenSource={props.onOpenSource}
                 onPromote={(index) => props.onPromote(source, index)}
                 source={source}
               />
@@ -110,6 +113,7 @@ export function SourcesPage(props: {
 function SourceRow(props: {
   busy: boolean;
   onDelete: () => void;
+  onOpenSource: (target: SourceInspectorTarget) => void;
   onPromote: (index: boolean) => void;
   source: SourceSummary;
 }) {
@@ -167,6 +171,19 @@ function SourceRow(props: {
         </div>
       </div>
       <div className="mt-3 flex flex-wrap justify-end gap-2">
+        {canOpenSource(source) && (
+          <button
+            className="rounded-md border border-tide/25 bg-white px-3 py-2 text-xs font-medium text-tide hover:bg-[#eef8f8]"
+            onClick={() => props.onOpenSource({
+              documentId: source.id,
+              title: source.display_name,
+              expectedContentHash: source.document?.content_hash || undefined
+            })}
+            type="button"
+          >
+            Open source
+          </button>
+        )}
         {isSession && (
           <>
             <button
@@ -224,6 +241,11 @@ function MiniMetric({ label, value }: { label: string; value: number | string })
       <p className="text-ink/50">{label}</p>
     </div>
   );
+}
+
+// Imported Markdown only; web captures and other formats have no original to show here.
+export function canOpenSource(source: SourceSummary): boolean {
+  return source.backend_kind === "document" && source.source_type === "markdown" && (source.source_origin ?? "local") === "local";
 }
 
 function formatSourceType(source: SourceSummary): string {

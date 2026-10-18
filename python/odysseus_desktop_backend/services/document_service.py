@@ -16,6 +16,8 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 LOW_TEXT_MIN_CHARS = 80
 PAGE_OCR_TEXT_MIN_CHARS = 20
 SOURCE_SCOPES = {"library", "session"}
+SOURCE_READ_PAGE_CHARS = 20_000
+SOURCE_READ_MAX_BYTES = 20 * 1024 * 1024
 logger = get_logger("documents")
 
 
@@ -722,6 +724,79 @@ class DocumentService:
             item["documents"] = grouped.get(str(message["id"]), [])
             hydrated.append(item)
         return hydrated
+
+    def read_imported_source(
+        self,
+        document_id: str,
+        *,
+        offset: int = 0,
+        max_chars: int = SOURCE_READ_PAGE_CHARS,
+        expected_content_hash: str = "",
+    ) -> dict[str, Any]:
+        """One bounded page of the profile-owned copy of an imported Markdown document.
+
+        Reads only `stored_path` inside the profile documents directory, never the
+        external original. Missing, deleted, unsupported or changed sources return an
+        explicit `state` and no text.
+        """
+        result: dict[str, Any] = {"document_id": document_id, "text": "", "offset": 0, "next_offset": None}
+        try:
+            document = self.get(document_id)
+        except KeyError:
+            return {**result, "state": "not_found"}
+        result.update(
+            title=str(document.get("title") or ""),
+            file_name=str(document.get("file_name") or ""),
+            file_type=str(document.get("file_type") or ""),
+            content_hash=str(document.get("content_hash") or ""),
+        )
+        if document["is_deleted"]:
+            return {**result, "state": "deleted"}
+        if (
+            document["is_staging"]
+            or document["is_internal"]
+            or document["source_origin"] != "local"
+            or document["file_type"] != "md"
+        ):
+            return {**result, "state": "unsupported"}
+        path = self._owned_file(str(document.get("stored_path") or ""))
+        if path is None:
+            return {**result, "state": "missing"}
+        if path.stat().st_size > SOURCE_READ_MAX_BYTES:
+            return {**result, "state": "too_large"}
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != result["content_hash"] or (
+            expected_content_hash and expected_content_hash != result["content_hash"]
+        ):
+            return {**result, "state": "changed"}
+        text = content.decode("utf-8", errors="replace").replace("\r\n", "\n")
+        start = min(max(0, int(offset)), len(text))
+        end = min(len(text), start + max(1, min(int(max_chars), SOURCE_READ_PAGE_CHARS)))
+        return {
+            **result,
+            "state": "available",
+            "text": text[start:end],
+            "offset": start,
+            "next_offset": end if end < len(text) else None,
+            "total_chars": len(text),
+            "line_start": text.count("\n", 0, start) + 1,
+        }
+
+    def _owned_file(self, stored_path: str) -> Path | None:
+        """The resolved app-owned copy, or None if absent or outside the documents dir."""
+        if not stored_path:
+            return None
+        candidate = Path(stored_path)
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                return None
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != self.documents_dir.resolve(strict=True):
+                return None
+        except OSError:
+            return None
+        return resolved
 
     def needs_ocr(self, document_id: str) -> bool:
         document = self.get(document_id)

@@ -323,16 +323,40 @@ class RAGService:
         limit: int = 4,
         document_ids: list[str] | None = None,
         max_snippets: int = MAX_EVIDENCE_SNIPPETS,
+        complete_markdown: bool = False,
     ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+        """Evidence packet for one answer.
+
+        With `complete_markdown` (Standard RAG), a retrieved set from one small imported
+        Markdown document is supplied verbatim, page by page; anything else falls back to
+        bounded excerpts. Each snippet records its `coverage`.
+        """
         results = self.search(query, limit=limit, document_ids=document_ids)
         if not results:
             return "", [], []
         results = self._expand_focused_document_results(query, results, limit=limit)
+        complete = (
+            self.complete_markdown_snippets(results, max_snippets=max_snippets)
+            if complete_markdown
+            else []
+        )
+        if complete:
+            return "\n\n".join(complete_document_block(snippet) for snippet in complete), results, complete
         snippets = self.extract_evidence_snippets(
             query,
             results,
             max_snippets=max_snippets,
         )
+        hashes: dict[str, str] = {}
+        for snippet in snippets:
+            document_id = str(snippet.get("document_id") or "")
+            if document_id not in hashes:
+                try:
+                    hashes[document_id] = str(self.documents.get(document_id).get("content_hash") or "")
+                except KeyError:
+                    hashes[document_id] = ""
+            snippet["coverage"] = "excerpt"
+            snippet["document_content_hash"] = hashes[document_id]
         blocks = []
         query_tokens = important_tokens(query)
         for snippet in snippets:
@@ -363,6 +387,80 @@ class RAGService:
                 f"{quoted_sentences}"
             )
         return "\n\n".join(blocks), results, snippets
+
+    def complete_markdown_snippets(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        max_snippets: int = MAX_EVIDENCE_SNIPPETS,
+    ) -> list[dict[str, Any]]:
+        """Whole stored pages of the one imported Markdown document the results came from.
+
+        Empty unless every result belongs to the same live, locally imported, non-OCR `.md`
+        document whose complete page text fits the aggregate excerpt allowance.
+        """
+        budget = max(0, max_snippets) * MAX_EVIDENCE_SNIPPET_CHARS
+        document_ids = {str(result.get("document_id") or "") for result in results}
+        if budget <= 0 or len(document_ids) != 1:
+            return []
+        if any(
+            isinstance(result.get("metadata"), dict) and result["metadata"].get("ocr")
+            for result in results
+        ):
+            return []
+        document_id = next(iter(document_ids))
+        try:
+            document = self.documents.get(document_id)
+            pages = self.documents.pages(document_id)
+        except KeyError:
+            return []
+        if (
+            document.get("is_deleted")
+            or document.get("is_staging")
+            or document.get("file_type") != "md"
+            or document.get("source_origin") != "local"
+        ):
+            return []
+        texts = [str(page.get("text") or "") for page in pages]
+        if not any(text.strip() for text in texts) or sum(len(text) for text in texts) > budget:
+            return []
+        title = str(document.get("title") or document.get("file_name") or "Document")
+        score = max(float(result.get("score") or 0.0) for result in results)
+        snippets: list[dict[str, Any]] = []
+        for page, text in zip(pages, texts):
+            if not text.strip():
+                continue
+            page_number = page.get("page_number")
+            snippets.append(
+                {
+                    "snippet_id": f"S{len(snippets) + 1}",
+                    # The text is the whole page, not any one retrieved chunk.
+                    "chunk_id": "",
+                    "retrieved_chunk_ids": [
+                        str(result["chunk_id"])
+                        for result in results
+                        if result.get("chunk_id") and result.get("page_start") in (None, page_number)
+                    ],
+                    "document_id": document_id,
+                    "source": title,
+                    "text": text,
+                    "score": score,
+                    "page_start": page_number,
+                    "page_end": page_number,
+                    "metadata": {
+                        "document_id": document_id,
+                        "title": document.get("title") or "",
+                        "file_name": document.get("file_name") or "",
+                        "file_type": "md",
+                        "page_start": page_number,
+                        "page_end": page_number,
+                    },
+                    "coverage": "complete_document",
+                    "document_content_hash": str(document.get("content_hash") or ""),
+                    "page_text_hash": str(page.get("text_hash") or ""),
+                }
+            )
+        return snippets
 
     def extract_evidence_snippets(
         self,
@@ -1246,6 +1344,19 @@ def ocr_match_prompt_note(snippet: dict[str, Any]) -> str:
         parts.extend(context_notes)
     parts.append("Answer only from this OCR/document evidence and do not import external facts.")
     return "\n".join(parts) + "\n"
+
+
+def complete_document_block(snippet: dict[str, Any]) -> str:
+    """One whole Markdown page, verbatim, between explicit markers (layout preserved)."""
+    snippet_id = snippet["snippet_id"]
+    page = snippet.get("page_start")
+    location = f", page {page}" if page else ""
+    return (
+        f"[{snippet_id}] {snippet['source']}{location} (complete imported Markdown document)\n"
+        f"----- begin {snippet_id} -----\n"
+        f"{snippet['text']}\n"
+        f"----- end {snippet_id} -----"
+    )
 
 
 def ocr_line_window(text: str, query_tokens: set[str], *, max_chars: int) -> str:

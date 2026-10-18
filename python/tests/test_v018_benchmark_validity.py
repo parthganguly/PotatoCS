@@ -317,7 +317,7 @@ class CapturingOllamaService(ModelService):
 
 
 class SimpleRAG:
-    def build_quote_context(self, query: str, *, limit: int, document_ids: list[str] | None = None):
+    def build_quote_context(self, query: str, *, limit: int, document_ids: list[str] | None = None, **_options):
         snippet = {
             "snippet_id": "S1",
             "chunk_id": "chunk-alpha",

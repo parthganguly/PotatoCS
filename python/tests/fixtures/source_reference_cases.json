@@ -1,0 +1,129 @@
+{
+  "description": "Shared scope of source-reference parsing. Read by python/tests/test_answer_evidence.py (backend review) and scripts/test-answer-evidence.mjs (UI rendering and warnings); both must produce these exact results. A syntax diagnostic only: it never judges support or completeness.",
+  "evidence_ids": ["S1", "S2"],
+  "cases": [
+    {
+      "name": "valid ID in this answer's map",
+      "text": "Reservations use set IDs [S1].",
+      "cited": ["S1"], "valid": ["S1"], "unknown": [], "malformed": [],
+      "warnings": []
+    },
+    {
+      "name": "mixed known and unknown IDs in one valid group resolve per ID",
+      "text": "Fix A [S1, S9]. Fix B [S2; S1].",
+      "cited": ["S1", "S9", "S2"], "valid": ["S1", "S2"], "unknown": ["S9"], "malformed": [],
+      "warnings": ["The answer cites evidence IDs that were not supplied: S9."]
+    },
+    {
+      "name": "unknown ID only",
+      "text": "The pilot ends in May [S99].",
+      "cited": ["S99"], "valid": [], "unknown": ["S99"], "malformed": [],
+      "warnings": [
+        "No valid source references resolve.",
+        "The answer cites evidence IDs that were not supplied: S99."
+      ]
+    },
+    {
+      "name": "dotted ID is malformed",
+      "text": "No pilot end date is established [S.1].",
+      "cited": [], "valid": [], "unknown": [], "malformed": ["[S.1]"],
+      "warnings": [
+        "No valid source references resolve: the answer's only source references are malformed.",
+        "Malformed source reference, not linked to any source: [S.1]."
+      ]
+    },
+    {
+      "name": "spaced ID is malformed",
+      "text": "Refunds need a signed inspection [S 1].",
+      "cited": [], "valid": [], "unknown": [], "malformed": ["[S 1]"],
+      "warnings": [
+        "No valid source references resolve: the answer's only source references are malformed.",
+        "Malformed source reference, not linked to any source: [S 1]."
+      ]
+    },
+    {
+      "name": "a malformed group stays whole; no valid-looking ID is salvaged",
+      "text": "Both rules apply [S1, S.2].",
+      "cited": [], "valid": [], "unknown": [], "malformed": ["[S1, S.2]"],
+      "warnings": [
+        "No valid source references resolve: the answer's only source references are malformed.",
+        "Malformed source reference, not linked to any source: [S1, S.2]."
+      ]
+    },
+    {
+      "name": "valid and malformed references in one answer",
+      "text": "Returns go to inspection [S1]. No end date is set [S.1].",
+      "cited": ["S1"], "valid": ["S1"], "unknown": [], "malformed": ["[S.1]"],
+      "warnings": ["Malformed source reference, not linked to any source: [S.1]."]
+    },
+    {
+      "name": "total absence of source references",
+      "text": "The memo changes three procedures.",
+      "cited": [], "valid": [], "unknown": [], "malformed": [],
+      "warnings": ["No valid source references resolve: the answer contains no source references."]
+    },
+    {
+      "name": "ordinary bracketed prose and numeric footnotes are not source references",
+      "text": "See [note], [1], [Section 2], [S3 bucket], [S], [x] and [Source 1].",
+      "cited": [], "valid": [], "unknown": [], "malformed": [],
+      "warnings": ["No valid source references resolve: the answer contains no source references."]
+    },
+    {
+      "name": "lowercase, padded, range, trailing separator and missing separator are malformed",
+      "text": "A [s1] B [ S1 ] C [S1-S3] D [S1,] E [S1 S2] F [S#2]",
+      "cited": [], "valid": [], "unknown": [], "malformed": ["[s1]", "[ S1 ]", "[S1-S3]", "[S1,]", "[S1 S2]", "[S#2]"],
+      "warnings": [
+        "No valid source references resolve: the answer's only source references are malformed.",
+        "Malformed source references, not linked to any source: [s1], [ S1 ], [S1-S3], [S1,], [S1 S2], [S#2]."
+      ]
+    },
+    {
+      "name": "code and quoted literals are not exempt; ordinary index brackets are not references",
+      "text": "Type `[S.1]` exactly; `arr[i]` and \"[S2]\" are literal.",
+      "cited": ["S2"], "valid": ["S2"], "unknown": [], "malformed": ["[S.1]"],
+      "warnings": ["Malformed source reference, not linked to any source: [S.1]."]
+    },
+    {
+      "name": "adjacent groups and a malformed token nested in brackets",
+      "text": "Facts [S1][S2] and [[S.1]].",
+      "cited": ["S1", "S2"], "valid": ["S1", "S2"], "unknown": [], "malformed": ["[S.1]"],
+      "warnings": ["Malformed source reference, not linked to any source: [S.1]."]
+    },
+    {
+      "name": "no-break space inside a valid group",
+      "text": "Both apply [S1,\u00a0S2].",
+      "cited": ["S1", "S2"], "valid": ["S1", "S2"], "unknown": [], "malformed": [],
+      "warnings": []
+    },
+    {
+      "name": "valid group split across a line break",
+      "text": "Both apply [S1,\nS2].",
+      "cited": ["S1", "S2"], "valid": ["S1", "S2"], "unknown": [], "malformed": [],
+      "warnings": []
+    },
+    {
+      "name": "existing behavior: a Markdown-link-shaped [S1] still resolves",
+      "text": "See [S1](https://example.invalid).",
+      "cited": ["S1"], "valid": ["S1"], "unknown": [], "malformed": [],
+      "warnings": []
+    },
+    {
+      "name": "limit: non-ASCII digits are neither IDs nor detected",
+      "text": "Arabic-Indic digit [S\u0661].",
+      "cited": [], "valid": [], "unknown": [], "malformed": [],
+      "warnings": ["No valid source references resolve: the answer contains no source references."]
+    },
+    {
+      "name": "limit: full-width brackets and bare IDs are not detected",
+      "text": "Full-width \u3010S1\u3011 and bare S1.",
+      "cited": [], "valid": [], "unknown": [], "malformed": [],
+      "warnings": ["No valid source references resolve: the answer contains no source references."]
+    },
+    {
+      "name": "limit: bracket contents longer than 40 characters are not scanned",
+      "text": "[S.1 1111111111 2222222222 3333333333 44444]",
+      "cited": [], "valid": [], "unknown": [], "malformed": [],
+      "warnings": ["No valid source references resolve: the answer contains no source references."]
+    }
+  ]
+}

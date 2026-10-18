@@ -197,6 +197,7 @@ export type Message = {
   created_at: number;
   metadata?: {
     operation_trace?: OperationTrace;
+    answer_evidence?: AnswerEvidence;
     search_evidence?: SearchEvidence[];
     search_results?: SearchResultsOnly;
     [key: string]: unknown;
@@ -205,6 +206,71 @@ export type Message = {
   artifacts?: ArtifactRecord[];
   attachments?: MessageAttachment[];
   turn?: ChatTurn;
+};
+
+// Saved with each document-grounded answer: exactly what the model was given and the
+// deterministic structural review. Nothing here certifies support or completeness.
+export type AnswerEvidenceEntry = {
+  id: string;
+  document_id: string;
+  source: string;
+  file_type: string;
+  page_start: number | null;
+  page_end: number | null;
+  coverage: "complete_document" | "excerpt";
+  ocr: boolean;
+  text: string;
+  text_truncated: boolean;
+  document_content_hash: string;
+  page_text_hash: string;
+  retrieved_chunk_ids: string[];
+};
+
+export type AnswerEvidence = {
+  schema_version: number;
+  rag_preset: string;
+  coverage: "complete_markdown" | "excerpts";
+  request_spans: string[];
+  sections_requested: boolean;
+  evidence: AnswerEvidenceEntry[];
+  review: {
+    completeness: "not_verified";
+    completeness_label: string;
+    expected_sections: number;
+    observed_sections: string[];
+    missing_sections: string[];
+    cited_ids: string[];
+    valid_ids: string[];
+    unknown_ids: string[];
+    citations_absent: boolean;
+    // Absent on answers saved before schema 2: "not checked", never "none found".
+    // Offsets are code-point positions in the saved answer text.
+    malformed_references?: { text: string; start: number; end: number; line: number }[];
+    malformed_reference_count?: number;
+    warnings: string[];
+  };
+  verifier: {
+    enabled: boolean;
+    status: string;
+    unsupported_claims: string[];
+    contradicted_claims: string[];
+  };
+};
+
+export type SourceReadState = "available" | "not_found" | "deleted" | "unsupported" | "missing" | "too_large" | "changed";
+
+export type SourceReadResult = {
+  state: SourceReadState;
+  document_id: string;
+  title?: string;
+  file_name?: string;
+  file_type?: string;
+  content_hash?: string;
+  text: string;
+  offset: number;
+  next_offset: number | null;
+  total_chars?: number;
+  line_start?: number;
 };
 
 export type OllamaStatus = {

@@ -1,4 +1,4 @@
-import { SourceBackendKind, SourceImportResult, SourceScope, SourceSummary, rpc } from "../tauri";
+import { SourceBackendKind, SourceImportResult, SourceReadResult, SourceScope, SourceSummary, rpc } from "../tauri";
 
 export async function listSources(params: {
   scope?: SourceScope;
@@ -76,5 +76,18 @@ export async function removeConversationSource(params: {
     session_id: params.sessionId,
     backend_kind: params.backendKind,
     source_id: params.sourceId
+  });
+}
+
+// Read-only page of the profile-owned imported copy, addressed by document ID only.
+export async function readImportedSource(params: {
+  documentId: string;
+  offset?: number;
+  expectedContentHash?: string;
+}): Promise<SourceReadResult> {
+  return rpc<SourceReadResult>("documents.read_source", {
+    document_id: params.documentId,
+    offset: params.offset ?? 0,
+    expected_content_hash: params.expectedContentHash ?? ""
   });
 }
