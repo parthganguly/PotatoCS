@@ -430,6 +430,7 @@ class FakeRAG:
         *,
         limit: int,
         document_ids: list[str] | None = None,
+        **_options,
     ):
         self.limits.append(limit)
         return (

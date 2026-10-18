@@ -73,6 +73,7 @@ import {
   OCRResult,
   OCRStatus,
   OllamaStatus,
+  AnswerEvidence,
   RAGGroundingReport,
   RAGHealth,
   RAGIndexResult,
@@ -139,6 +140,9 @@ import { firstRunReadinessNeeded, readinessRows } from "./features/readiness/rea
 import { AppSidebar } from "./features/shell/AppSidebar";
 import { backendBannerState, isBackendDegradedEvent } from "./features/shell/backendStatus";
 import { SourcesPage } from "./features/sources/SourcesPage";
+import { SourceInspector, type SourceInspectorTarget } from "./features/sources/SourceInspector";
+import { AnswerEvidenceCard, inspectorTargetForEntry } from "./features/chat/AnswerEvidenceCard";
+import { citationSegments, isAnswerEvidence, malformedReferencesChecked } from "./features/chat/answerEvidence";
 import { ImageVisionDiagnostics } from "./features/vision-diagnostics/ImageVisionDiagnostics";
 import { SearchEvidenceCard } from "./features/search/SearchEvidenceCard";
 import { SearchResultsOnlyCard } from "./features/search/SearchResultsOnlyCard";
@@ -212,6 +216,7 @@ function App() {
   const [retrievedSnippets, setRetrievedSnippets] = useState<RAGSnippet[]>([]);
   const [documentEvidence, setDocumentEvidence] = useState<DocumentEvidenceDiagnostic[]>([]);
   const [grounding, setGrounding] = useState<RAGGroundingReport | null>(null);
+  const [inspectorTarget, setInspectorTarget] = useState<SourceInspectorTarget | null>(null);
   const [useRag, setUseRag] = useState(false);
   const [useWebSearch, setUseWebSearch] = useState(false);
   const [verifyRag, setVerifyRag] = useState(false);
@@ -2158,6 +2163,7 @@ function App() {
               if (value) setUseRag(false);
             }}
             onSetVerifyRag={setVerifyRag}
+            onOpenSource={setInspectorTarget}
           />
         ) : activeView === "sources" ? (
           <SourcesPage
@@ -2173,6 +2179,7 @@ function App() {
             }}
             onPromote={promotePendingSource}
             onRefresh={() => refreshSources()}
+            onOpenSource={setInspectorTarget}
           />
         ) : (
           <DiagnosticsWorkspace
@@ -2274,6 +2281,7 @@ function App() {
           />
         )}
       </section>
+      {inspectorTarget && <SourceInspector target={inspectorTarget} onClose={() => setInspectorTarget(null)} />}
       <div
         aria-hidden="true"
         className="pointer-events-none fixed left-[-12000px] top-0 w-[1040px] bg-white"
@@ -2347,6 +2355,7 @@ function ChatWorkspace(props: {
   onSetWebSearch: (value: boolean) => void;
   onSetVerifyRag: (value: boolean) => void;
   onSetVisionModel: (value: string) => void;
+  onOpenSource: (target: SourceInspectorTarget) => void;
 }) {
   const latestAssistantMessageId = [...props.messages]
     .reverse()
@@ -2414,9 +2423,18 @@ function ChatWorkspace(props: {
               </div>
             ) : (
               <div className="mx-auto flex max-w-3xl flex-col gap-3">
-                {props.messages.map((message) => (
+                {props.messages.map((message) => {
+                  // Each answer shows its own saved evidence, never the latest turn's state.
+                  const answerEvidence = message.role === "assistant" && isAnswerEvidence(message.metadata?.answer_evidence)
+                    ? message.metadata.answer_evidence
+                    : null;
+                  return (
                   <div className="flex flex-col gap-2" key={message.id}>
-                    <MessageBubble message={message} />
+                    <MessageBubble
+                      message={message}
+                      evidence={answerEvidence}
+                      onOpenSource={props.onOpenSource}
+                    />
                     {message.role === "user" && message.turn && (
                       <TurnStatus
                         busy={props.busy}
@@ -2426,6 +2444,9 @@ function ChatWorkspace(props: {
                       />
                     )}
                     {message.role === "assistant" && <VerificationNotice message={message} />}
+                    {answerEvidence && (
+                      <AnswerEvidenceCard answerText={message.content} evidence={answerEvidence} onOpenSource={props.onOpenSource} />
+                    )}
                     {message.role === "assistant" && message.metadata?.operation_trace && (
                       <OperationTrace
                         answer={message.content}
@@ -2441,7 +2462,7 @@ function ChatWorkspace(props: {
                     {message.role === "assistant" && message.metadata?.search_results && (
                       <SearchResultsOnlyCard results={message.metadata.search_results} />
                     )}
-                    {message.id === latestAssistantMessageId && props.retrievedChunks.length > 0 && (
+                    {message.id === latestAssistantMessageId && !answerEvidence && props.retrievedChunks.length > 0 && (
                       <RetrievedSources
                         chunks={props.retrievedChunks}
                         grounding={props.grounding}
@@ -2456,7 +2477,8 @@ function ChatWorkspace(props: {
                       <ArtifactAnalysisCard analysis={props.artifactAnalysis} />
                     )}
                   </div>
-                ))}
+                  );
+                })}
                 {props.pendingUserContent && (
                   <div className="flex justify-end">
                     <div className="max-w-[82%] whitespace-pre-wrap rounded-md bg-moss px-3 py-2 text-sm leading-6 text-white">
@@ -4615,7 +4637,15 @@ function ScanIcon() {
   return <Search size={14} aria-hidden="true" />;
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({
+  message,
+  evidence = null,
+  onOpenSource
+}: {
+  message: Message;
+  evidence?: AnswerEvidence | null;
+  onOpenSource?: (target: SourceInspectorTarget) => void;
+}) {
   const isUser = message.role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
@@ -4624,7 +4654,11 @@ function MessageBubble({ message }: { message: Message }) {
           isUser ? "bg-moss text-white" : "border border-ink/15 bg-white text-ink"
         }`}
       >
-        {message.content || ((message.artifacts?.length || message.documents?.length) ? "Attachment" : "")}
+        {evidence && onOpenSource ? (
+          <CitedAnswerText evidence={evidence} onOpenSource={onOpenSource} text={message.content} />
+        ) : (
+          message.content || ((message.artifacts?.length || message.documents?.length) ? "Attachment" : "")
+        )}
         <MessageAttachments message={message} />
       </div>
     </div>
@@ -4681,6 +4715,67 @@ function TurnStatus({ message, busy, onRetry, onCopy }: {
         </details>
       </div>
     </div>
+  );
+}
+
+// The generated text exactly as saved; only [S<n>] tokens that resolve to this answer's
+// own evidence become buttons. Unknown IDs and malformed references keep their literal
+// text and get a visible, non-copyable marker. Nothing is added, repaired or inferred.
+function CitedAnswerText({
+  evidence,
+  onOpenSource,
+  text
+}: {
+  evidence: AnswerEvidence;
+  onOpenSource: (target: SourceInspectorTarget) => void;
+  text: string;
+}) {
+  const entries = new Map(evidence.evidence.map((entry) => [entry.id, entry]));
+  const malformedLabel = malformedReferencesChecked(evidence)
+    ? "Malformed source reference"
+    : "Malformed source reference (read-time check)";
+  const marker = (label: string) => (
+    <span className="ml-0.5 select-none rounded border border-clay/30 bg-[#fff7f2] px-1 text-[11px] font-medium text-clay">
+      {label}
+    </span>
+  );
+  return (
+    <>
+      {citationSegments(text, [...entries.keys()]).map((segment, index) => {
+        if (segment.kind === "text") return <Fragment key={index}>{segment.text}</Fragment>;
+        if (segment.kind === "malformed") {
+          return (
+            <span data-reference="malformed" key={index}>
+              {segment.text}
+              {marker(malformedLabel)}
+            </span>
+          );
+        }
+        const entry = segment.valid ? entries.get(segment.id) : undefined;
+        if (!entry) {
+          return (
+            <span data-reference="unknown" key={index}>
+              {segment.id}
+              {marker("Unknown source ID")}
+            </span>
+          );
+        }
+        const label = `Open evidence ${entry.id}: ${entry.source}. Resolves to evidence supplied to this answer; support is not verified.`;
+        return (
+          <button
+            aria-label={label}
+            className="mx-0.5 rounded px-0.5 font-medium text-tide underline decoration-tide/40 underline-offset-2 hover:bg-tide/10"
+            data-reference="resolving"
+            key={index}
+            onClick={() => onOpenSource(inspectorTargetForEntry(entry))}
+            title={label}
+            type="button"
+          >
+            {segment.id}
+          </button>
+        );
+      })}
+    </>
   );
 }
 

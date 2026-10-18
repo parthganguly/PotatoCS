@@ -24,7 +24,7 @@ from odysseus_desktop_backend.services.artifact_service import ArtifactService
 from odysseus_desktop_backend.services.campaign_service import CampaignService
 from odysseus_desktop_backend.services.chat_service import ChatService
 from odysseus_desktop_backend.services.chat_turns import ACTIVE_STATES, ChatTurnStore
-from odysseus_desktop_backend.services.document_service import DocumentService
+from odysseus_desktop_backend.services.document_service import SOURCE_READ_PAGE_CHARS, DocumentService
 from odysseus_desktop_backend.services.embedding_service import EmbeddingService
 from odysseus_desktop_backend.services.eval_service import EvalService
 from odysseus_desktop_backend.services.florence2_service import Florence2Backend
@@ -197,6 +197,7 @@ class SidecarApp:
             "documents.chunks": self.documents_chunks,
             "documents.ocr": self.documents_ocr,
             "documents.ocr_pages": self.documents_ocr_pages,
+            "documents.read_source": self.documents_read_source,
             "ocr.status": self.ocr_status,
             "jobs.submit_import": self.jobs_submit_import,
             "jobs.submit_search": self.jobs_submit_search,
@@ -509,6 +510,19 @@ class SidecarApp:
 
     def documents_ocr_pages(self, params: JsonDict) -> list[JsonDict]:
         return self.documents.ocr_pages(require_str(params, "document_id"))
+
+    def documents_read_source(self, params: JsonDict) -> JsonDict:
+        # Document ID only: the frontend never names a filesystem path.
+        offset = optional_int(params, "offset", 0)
+        max_chars = optional_int(params, "max_chars", SOURCE_READ_PAGE_CHARS)
+        if offset < 0 or max_chars < 1:
+            raise RpcError(-32602, "offset must be >= 0 and max_chars >= 1")
+        return self.documents.read_imported_source(
+            require_str(params, "document_id"),
+            offset=offset,
+            max_chars=max_chars,
+            expected_content_hash=optional_str(params, "expected_content_hash") or "",
+        )
 
     def ocr_status(self, _params: JsonDict) -> JsonDict:
         return self.ocr.status()
