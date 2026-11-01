@@ -37,6 +37,7 @@ from odysseus_desktop_backend.services.model_service import (
     normalize_thinking_mode,
     private_endpoint,
 )
+from odysseus_desktop_backend.services import time_conversion
 from odysseus_desktop_backend.services.florence2_service import FLORENCE_MODEL_ID
 from odysseus_desktop_backend.services.perception_types import (
     VISION_BACKEND_AUTOMATIC,
@@ -445,7 +446,19 @@ class ChatService:
                 selected_vision_backend,
                 image_context_ids[0],
             )
-        if not image_context_ids and self._should_answer_no_active_image_context(question_for_models, history):
+        # Plain text chat only: no RAG, verification, attachments or active sources.
+        time_conversion_eligible = bool(content) and not (
+            document_context_enabled or verify_rag or clean_artifact_ids or image_context_ids or multimodal_route
+        )
+        conversion = (
+            self._time_conversion_turn(content, session["id"], user_message["id"]) if time_conversion_eligible else None
+        )
+        if conversion is not None:
+            # Deterministic local reply: no model preparation, generation or verification.
+            outcome, conversion_elapsed_ms = conversion
+            reply = outcome.reply
+            reply_response = {"content": reply, "elapsed_ms": conversion_elapsed_ms}
+        elif not image_context_ids and self._should_answer_no_active_image_context(question_for_models, history):
             reply = NO_ACTIVE_IMAGE_CONTEXT_MESSAGE
             reply_response = self._local_reply_response(selected_model, reply)
         elif image_context_ids:
@@ -584,8 +597,15 @@ class ChatService:
             answer_style=selected_answer_style,
             embedding_model=str(current_settings.get("embedding_model") or ""),
             embedding_backend=str(current_settings.get("embedding_backend") or ""),
+            local_engine=(
+                {"outcome": conversion[0].status, "time_zone_data": conversion[0].time_zone_data}
+                if conversion is not None
+                else None
+            ),
         )
         answer_metadata: dict[str, Any] = {"operation_trace": operation_trace}
+        if conversion is not None:
+            answer_metadata[time_conversion.METADATA_KEY] = conversion[0].state
         if rag_context and retrieved_snippets:
             # This answer's own evidence and review; source text never enters the trace.
             answer_metadata["answer_evidence"] = build_answer_evidence(
@@ -653,8 +673,13 @@ class ChatService:
         answer_style: str,
         embedding_model: str = "",
         embedding_backend: str = "",
+        local_engine: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build a deliberately allow-listed, local-only summary of a completed answer."""
+        """Build a deliberately allow-listed, local-only summary of a completed answer.
+
+        `local_engine` marks a reply from the deterministic time-conversion engine:
+        no model answered it, so no answer model, style or thinking mode is recorded.
+        """
 
         response = model_response if isinstance(model_response, dict) else {}
         analysis_data = analysis if isinstance(analysis, dict) else {}
@@ -695,7 +720,7 @@ class ChatService:
             }
         )
 
-        final_answer_model = _safe_trace_label(
+        final_answer_model = None if local_engine is not None else _safe_trace_label(
             response.get("model") or provenance.get("final_answer_model") or selected_model
         )
         models = _compact_trace_fields(
@@ -730,8 +755,8 @@ class ChatService:
                 "vision_rerun": vision_rerun,
                 "context_evidence_action": context_evidence_action,
                 "deterministic_visual_answer": _trace_bool(provenance.get("deterministic_visual_answer")),
-                "answer_style": _safe_trace_label(answer_style),
-                "thinking_mode": _safe_trace_label(selected_thinking_mode),
+                "answer_style": None if local_engine is not None else _safe_trace_label(answer_style),
+                "thinking_mode": None if local_engine is not None else _safe_trace_label(selected_thinking_mode),
                 "done_reason": _safe_trace_label(response.get("done_reason")),
             }
         )
@@ -797,7 +822,7 @@ class ChatService:
             "thinking_truncated": False,
         }
 
-        return {
+        trace = {
             "schema_version": 1,
             "timing": timing,
             "models": models,
@@ -811,6 +836,18 @@ class ChatService:
             "warnings": warnings,
             "model_trace": model_trace,
         }
+        if local_engine is not None:
+            # Fixed labels only: never the user's dates, times or zones.
+            outcome = str(local_engine.get("outcome") or "")
+            trace["capability"] = _compact_trace_fields(
+                {
+                    "name": time_conversion.CAPABILITY,
+                    "engine": time_conversion.ENGINE,
+                    "outcome": outcome if outcome in time_conversion.OUTCOMES else None,
+                    "time_zone_data": _safe_trace_label(local_engine.get("time_zone_data")),
+                }
+            )
+        return trace
 
     def _recover_multimodal_turn(
         self,
@@ -1744,6 +1781,32 @@ class ChatService:
             return False
         historical = self.artifacts.attachments_for_messages(message_ids)
         return any(historical.get(message_id) for message_id in message_ids)
+
+    def _time_conversion_turn(
+        self, content: str, session_id: str, user_message_id: str
+    ) -> tuple[time_conversion.Outcome, int] | None:
+        """The local conversion outcome for this message, or None for ordinary chat.
+
+        Pending state comes only from the message stored immediately before this
+        one: a committed clarification. An unanswered or failed turn in between is
+        a boundary, so it never revives older state.
+        """
+        check_cancelled()
+        _turn_check()
+        started = time.perf_counter()
+        previous = self.sessions.preceding_message(session_id, user_message_id)
+        pending = (
+            time_conversion.pending_from_metadata(previous["metadata"])
+            if previous is not None and previous["role"] == "assistant"
+            else None
+        )
+        outcome = time_conversion.respond(content, pending, message_id=user_message_id)
+        if outcome is None:
+            return None
+        # A calculation that outlived the turn or its cancel is never committed.
+        check_cancelled()
+        _turn_check()
+        return outcome, int((time.perf_counter() - started) * 1000)
 
     def _local_reply_response(self, model: str, content: str) -> dict[str, Any]:
         return {

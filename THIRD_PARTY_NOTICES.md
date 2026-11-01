@@ -27,6 +27,8 @@ The MVP also uses these major third-party components:
 - chardet, 0BSD license (character encoding detection used by readability-lxml).
 - ReportLab, BSD-style license.
 - Pillow, HPND-style license.
+- tzdata (Python packaging of the IANA time zone database, used for local time
+  conversion), Apache License 2.0; the IANA tz data itself is in the public domain.
 - arboard Rust crate, MIT or Apache-2.0 license.
 - image Rust crate, MIT or Apache-2.0 license.
 - screenshots Rust crate, MIT license.
