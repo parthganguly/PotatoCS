@@ -389,6 +389,63 @@ class BlockingEngine(GuardrailEngine):
             time.sleep(0.005)
 
 
+def _emit_pr49_ci_timeout_diagnostic(service: JobService, job_id: str, gate: str) -> None:
+    """Read-only, content-free diagnostic after an existing timing assertion fails.
+
+    Diagnostic-only branch. Do not change production behavior, wait durations, or oracles.
+    """
+    import sys
+    import traceback
+
+    details = {"gate": gate, "job_state": "unknown", "lock_contended": None}
+    lock = getattr(service, "_lock", None)
+    acquired = bool(lock is not None and lock.acquire(blocking=False))
+    details["lock_contended"] = not acquired
+    if acquired:
+        try:
+            record = service._jobs.get(str(job_id))
+            details["job_state"] = getattr(record, "state", "not_found")
+            details["job_kind"] = getattr(record, "kind", "not_found")
+            details["job_started_at"] = getattr(record, "started_at", None)
+            details["queue_length"] = len(service._queue)
+            details["job_count"] = len(service._jobs)
+        finally:
+            lock.release()
+
+    target = getattr(service, "_worker", None)
+    details["target_worker_alive"] = target.is_alive() if target is not None else False
+    details["total_threads"] = threading.active_count()
+    print("PR49_CI_TIMEOUT_STATE " + repr(details), file=sys.stderr, flush=True)
+    frames = sys._current_frames()
+    live_workers = [t for t in threading.enumerate() if t.name == "odysseus-job-worker"]
+    print("PR49_CI_TIMEOUT_WORKERS " + str(len(live_workers)), file=sys.stderr, flush=True)
+    for worker in live_workers[:20]:
+        frame = frames.get(worker.ident)
+        frames_info = (
+            [(Path(item.filename).name, item.name, item.lineno)
+             for item in traceback.extract_stack(frame)[-24:]]
+            if frame is not None else []
+        )
+        print(
+            "PR49_CI_TIMEOUT_STACK "
+            + repr({"target": worker is target, "alive": worker.is_alive(), "frames": frames_info}),
+            file=sys.stderr, flush=True,
+        )
+    try:
+        import psutil
+        proc = psutil.Process()
+        memory = proc.memory_info()
+        print(
+            "PR49_CI_TIMEOUT_PROCESS "
+            + repr({"rss_bytes": memory.rss, "vms_bytes": memory.vms,
+                    "num_threads": proc.num_threads(), "cpu_times": tuple(proc.cpu_times()[:2])}),
+            file=sys.stderr, flush=True,
+        )
+    except Exception as exc:
+        print("PR49_CI_TIMEOUT_PROCESS_UNAVAILABLE " + type(exc).__name__,
+              file=sys.stderr, flush=True)
+
+
 def wait_terminal(service: JobService, job_id: str, timeout: float = 5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -396,6 +453,7 @@ def wait_terminal(service: JobService, job_id: str, timeout: float = 5.0):
         if snapshot["state"] in {"completed", "cancelled", "failed"}:
             return snapshot
         time.sleep(0.005)
+    _emit_pr49_ci_timeout_diagnostic(service, job_id, "terminal_5s")
     raise AssertionError("job did not reach a terminal state")
 
 
@@ -482,7 +540,11 @@ def test_ocr_heavy_staged_import_stays_invisible_then_cancel_purges_rows_and_cop
     jobs = JobService(profile, executor_factory(profile, BlockingEngine(entered)))
     try:
         submitted = jobs.submit_import([str(pdf)])[0]
-        assert entered.wait(3)
+        try:
+            assert entered.wait(3)
+        except AssertionError:
+            _emit_pr49_ci_timeout_diagnostic(jobs, submitted["job_id"], "entry_3s")
+            raise
         observer = Database(profile)
         try:
             documents = DocumentService(observer)
@@ -541,7 +603,11 @@ def test_cancel_at_commit_staging_boundary_resolves_completed_and_visible(tmp_pa
     )
     try:
         submitted = jobs.submit_import([str(fixture)])[0]
-        assert entered.wait(3)
+        try:
+            assert entered.wait(3)
+        except AssertionError:
+            _emit_pr49_ci_timeout_diagnostic(jobs, submitted["job_id"], "entry_3s")
+            raise
         assert jobs.cancel(submitted["job_id"])["state"] == "cancel_requested"
         release.set()
         final = wait_terminal(jobs, submitted["job_id"])
