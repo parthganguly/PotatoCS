@@ -932,3 +932,433 @@ def test_in_turn_availability_probe_obeys_the_turn_deadline(monkeypatch: pytest.
     assert time.monotonic() - started < 1.5
     assert hung_up.wait(3)
     server.close()
+
+
+# ------------------------------------------- E. local time conversion turns
+
+from odysseus_desktop_backend.services import chat_turns as chat_turns_module  # noqa: E402
+from odysseus_desktop_backend.services import session_service as session_service_module  # noqa: E402
+from odysseus_desktop_backend.services import time_conversion  # noqa: E402
+
+D2 = "Convert “9:00 tomorrow” to UTC. That is all the information I have given you."
+FOLLOW_UP = "2026-11-02 America/New_York"
+MODEL_ENTRY_POINTS = (
+    "prepare", "chat", "chat_detailed", "chat_vision_detailed", "chat_vision_history_detailed",
+    "inspect", "ps", "verify_experimental_identity", "_get_json", "_post_json", "_tcp_reachable",
+)
+
+
+class ModelGuard:
+    """Every model/runtime entry point; a call while forbidden fails the turn and the test."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[str] = []
+        self.forbid = True
+        for name in MODEL_ENTRY_POINTS:
+            monkeypatch.setattr(ModelService, name, self._wrap(name, getattr(ModelService, name)))
+
+    def _wrap(self, name: str, real: Callable[..., Any]) -> Callable[..., Any]:
+        guard = self
+
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            guard.calls.append(name)
+            if guard.forbid:
+                raise AssertionError(f"model entry point used by a local conversion: {name}")
+            return real(*args, **kwargs)
+
+        return guarded
+
+
+@pytest.fixture()
+def guard(monkeypatch: pytest.MonkeyPatch) -> ModelGuard:
+    return ModelGuard(monkeypatch)
+
+
+def chat_job(
+    app: SidecarApp, message: str, session_id: str | None = None, **extra: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    params: dict[str, Any] = {"message": message, "model": MODEL, **extra}
+    if session_id:
+        params["session_id"] = session_id
+    submitted = app.dispatch("jobs.submit_chat", params)
+    return submitted, wait_terminal(app, submitted["job"]["job_id"])
+
+
+def answers(app: SidecarApp, session_id: str) -> list[dict[str, Any]]:
+    return [m for m in app.dispatch("sessions.messages", {"session_id": session_id}) if m["role"] == "assistant"]
+
+
+def assert_local(message: dict[str, Any], outcome: str) -> dict[str, Any]:
+    trace = message["metadata"]["operation_trace"]
+    assert trace["capability"]["engine"] == "local_time_conversion"
+    assert trace["capability"]["outcome"] == outcome
+    assert "final_answer_model" not in trace["models"]
+    assert trace["tokens"] == {} and trace["sources"]["retrieved_chunk_ids"] == []
+    assert "thinking_mode" not in trace["pipeline"] and "answer_style" not in trace["pipeline"]
+    encoded = json.dumps(trace)
+    for raw in ("09:00", "tomorrow", "America/New_York", "2026-11-02", "14:00"):
+        assert raw not in encoded  # no user dates, times or zones in the trace
+    return message["metadata"]["time_conversion"]
+
+
+def test_job_turns_clarify_then_convert_with_no_model_call(app: SidecarApp, ollama: FakeOllama, guard: ModelGuard) -> None:
+    first, done = chat_job(app, D2, operation_key="tc-1")
+    session_id = first["session"]["id"]
+    assert done["state"] == "completed", done
+    clarification = answers(app, session_id)[-1]
+    assert "calendar date" in clarification["content"] and "source time zone" in clarification["content"]
+    state = assert_local(clarification, "clarified")
+    question_id = first["turn"]["message_id"]
+    assert state["needs"] == ["date", "source"] and state["refs"] == {"time": question_id, "target": question_id}
+
+    second, done = chat_job(app, FOLLOW_UP, session_id, operation_key="tc-2")
+    assert done["state"] == "completed", done
+    converted = answers(app, session_id)[-1]
+    assert "14:00 in UTC" in converted["content"] and "America/New_York (UTC-05:00)" in converted["content"]
+    state = assert_local(converted, "converted")
+    assert state["refs"]["date"] == second["turn"]["message_id"]
+    assert converted["metadata"]["operation_trace"]["capability"]["time_zone_data"]
+    assert roles(app, session_id) == ["user", "assistant", "user", "assistant"]
+    assert app.sessions.get(session_id)["model"] == MODEL  # the selected model is unchanged
+    assert guard.calls == [] and ollama.requests == []
+    assert "America/New_York" not in json.dumps(done)  # the job snapshot stays content-free
+
+
+def test_synchronous_chat_send_has_the_same_semantics(app: SidecarApp, ollama: FakeOllama, guard: ModelGuard) -> None:
+    first = app.dispatch("chat.send", {"message": D2, "model": MODEL})
+    assert first["assistant_message"]["metadata"]["time_conversion"]["status"] == "clarified"
+    second = app.dispatch("chat.send", {"message": FOLLOW_UP, "model": MODEL, "session_id": first["session"]["id"]})
+    assert_local(second["assistant_message"], "converted")
+    assert "14:00 in UTC" in second["assistant_message"]["content"]
+    assert guard.calls == [] and ollama.requests == []
+
+
+def test_reload_resumes_a_committed_clarification_but_other_sessions_do_not(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard
+) -> None:
+    first, _ = chat_job(app, D2)
+    session_id = first["session"]["id"]
+    app.close()  # a backend restart: only the committed messages survive (close is idempotent)
+    reloaded = SidecarApp(app.profile_dir)
+    try:
+        _, done = chat_job(reloaded, FOLLOW_UP, session_id)
+        assert done["state"] == "completed"
+        assert_local(answers(reloaded, session_id)[-1], "converted")
+        assert guard.calls == []
+
+        guard.forbid = False  # an independent session has no pending state: ordinary chat
+        other, done = chat_job(reloaded, FOLLOW_UP)
+        assert done["state"] == "completed"
+        answer = answers(reloaded, other["session"]["id"])[-1]
+        assert answer["content"] == ANSWER and "time_conversion" not in answer["metadata"]
+        assert answer["metadata"]["operation_trace"]["models"]["final_answer_model"] == MODEL
+    finally:
+        reloaded.close()
+
+
+def test_topic_change_ends_the_chain_and_reaches_the_model_unchanged(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard
+) -> None:
+    first, _ = chat_job(app, D2)
+    session_id = first["session"]["id"]
+    guard.forbid = False
+    _, done = chat_job(app, "What is the capital of France?", session_id)
+    assert done["state"] == "completed"
+    history = generation_history(ollama)[-1]
+    assert history[0] == ("user", D2) and history[-1] == ("user", "What is the capital of France?")
+    assert history[1][0] == "assistant" and history[1][1].startswith("To finish this time conversion")
+    assert "time_conversion" not in answers(app, session_id)[-1]["metadata"]
+    # The chain has ended: the field-shaped reply is now ordinary chat too.
+    chat_job(app, FOLLOW_UP, session_id)
+    assert generation_history(ollama)[-1][-1] == ("user", FOLLOW_UP)
+    assert "time_conversion" not in answers(app, session_id)[-1]["metadata"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Translate 'Convert 9:00 from UTC to Asia/Tokyo' into French",
+        "```python\nconvert('9:00', 'UTC')\n```",
+        "Convert 2026-01-01 09:00 from UTC to Asia/Tokyo and also write a poem",
+        "Why do some time zones use 30-minute offsets?",
+    ],
+)
+def test_non_conversion_messages_take_the_unchanged_model_path(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard, message: str
+) -> None:
+    guard.forbid = False
+    submitted, done = chat_job(app, message)
+    assert done["state"] == "completed"
+    body = [item for item in ollama.bodies if item.get("messages")][-1]
+    assert body["messages"][0]["role"] == "system" and body["messages"][0]["content"].startswith("You are PotatoCs")
+    assert body["messages"][-1] == {"role": "user", "content": message}
+    answer = answers(app, submitted["session"]["id"])[-1]
+    assert answer["content"] == ANSWER and "capability" not in answer["metadata"]["operation_trace"]
+
+
+def test_document_turns_keep_their_pipeline(app: SidecarApp, ollama: FakeOllama, guard: ModelGuard) -> None:
+    guard.forbid = False
+    submitted = submit(app, message=D2)
+    assert wait_terminal(app, submitted["job"]["job_id"])["state"] == "completed"
+    answer = answers(app, submitted["session"]["id"])[-1]
+    assert "time_conversion" not in answer["metadata"]
+    assert answer["metadata"]["operation_trace"]["pipeline"]["rag_enabled"]
+    assert ollama.count("generate") >= 1
+
+
+def test_duplicate_submission_answers_once(app: SidecarApp, ollama: FakeOllama, guard: ModelGuard) -> None:
+    first, _ = chat_job(app, D2, operation_key="tc-dup")
+    again = app.dispatch("jobs.submit_chat", {"message": D2, "model": MODEL, "operation_key": "tc-dup"})
+    assert again["turn"]["message_id"] == first["turn"]["message_id"]
+    assert roles(app, first["session"]["id"]) == ["user", "assistant"]
+    assert guard.calls == []
+
+
+def accept_text_turn(app: SidecarApp, session_id: str, content: str, key: str) -> dict[str, Any]:
+    turn, _ = app.turns.accept(
+        session_id=session_id, content=content, attachment_document_ids=[], request={"model": MODEL}, operation_key=key
+    )
+    return turn
+
+
+def send_attempt(app: SidecarApp, session_id: str, turn: dict[str, Any]) -> dict[str, Any]:
+    chat = ChatService(app.sessions, app.settings, app.models, turns=app.turns)
+    return chat.send(
+        message=D2,
+        session_id=session_id,
+        model=MODEL,
+        attempt_id=turn["current_attempt_id"],
+        user_message_id=turn["message_id"],
+    )
+
+
+def test_cancel_before_commit_saves_nothing(app: SidecarApp, monkeypatch: pytest.MonkeyPatch, guard: ModelGuard) -> None:
+    session = app.sessions.create(model=MODEL)
+    turn = accept_text_turn(app, session["id"], D2, "tc-c")
+    real = time_conversion.respond
+
+    def cancelled_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        store_for(app).request_cancel(turn["current_attempt_id"])  # the user's cancel lands mid-turn
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(time_conversion, "respond", cancelled_meanwhile)
+    app.turns.start(turn["current_attempt_id"])
+    with pytest.raises(JobCancelledError):
+        send_attempt(app, session["id"], turn)
+    assert roles(app, session["id"]) == ["user"]
+    assert not app.turns.status(message_id=turn["message_id"])["answered"]
+
+
+def test_retired_attempt_cannot_commit_a_conversion(app: SidecarApp, guard: ModelGuard) -> None:
+    session = app.sessions.create(model=MODEL)
+    turn = accept_text_turn(app, session["id"], D2, "tc-r")
+    app.turns.start(turn["current_attempt_id"])
+    assert app.turns.finish(turn["current_attempt_id"], "interrupted", "backend_restarted")
+    with pytest.raises(AttemptRetired):
+        send_attempt(app, session["id"], turn)
+    assert roles(app, session["id"]) == ["user"]
+
+
+def test_cancel_after_commit_keeps_the_completed_answer(app: SidecarApp, guard: ModelGuard) -> None:
+    first, _ = chat_job(app, D2)
+    app.dispatch("jobs.cancel", {"job_id": first["job"]["job_id"]})
+    assert app.dispatch("jobs.get", {"job_id": first["job"]["job_id"]})["state"] == "completed"
+    assert roles(app, first["session"]["id"]) == ["user", "assistant"]
+
+
+def fail_next_conversion(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = time_conversion.respond
+    pending = {"fail": True}
+
+    def once(*args: Any, **kwargs: Any) -> Any:
+        if pending.pop("fail", False):
+            raise RuntimeError("simulated failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(time_conversion, "respond", once)
+
+
+def test_retrying_a_failed_clarification_reply_uses_its_original_predecessor(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _ = chat_job(app, D2)
+    session_id = first["session"]["id"]
+    fail_next_conversion(monkeypatch)
+    failed, done = chat_job(app, FOLLOW_UP, session_id, operation_key="tc-f")
+    assert done["state"] == "failed"
+    retried = app.dispatch("jobs.retry_chat", {"message_id": failed["turn"]["message_id"], "operation_key": "tc-f2"})
+    assert wait_terminal(app, retried["job"]["job_id"])["state"] == "completed"
+    state = assert_local(answers(app, session_id)[-1], "converted")
+    assert state["refs"]["date"] == failed["turn"]["message_id"]
+    status = app.dispatch("jobs.chat_status", {"message_id": failed["turn"]["message_id"]})["turn"]
+    assert [a["state"] for a in status["attempts"]] == ["failed", "completed"]
+    assert roles(app, session_id) == ["user", "assistant", "user", "assistant"]
+    assert guard.calls == []
+
+
+def test_new_message_after_a_failed_reply_starts_without_stale_state(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _ = chat_job(app, D2)
+    session_id = first["session"]["id"]
+    fail_next_conversion(monkeypatch)
+    _, done = chat_job(app, FOLLOW_UP, session_id)
+    assert done["state"] == "failed"
+    guard.forbid = False
+    _, done = chat_job(app, FOLLOW_UP, session_id)
+    assert done["state"] == "completed"
+    answer = answers(app, session_id)[-1]
+    assert answer["content"] == ANSWER and "time_conversion" not in answer["metadata"]
+
+
+def test_tied_timestamps_and_a_cancelled_intervening_turn(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for module in (chat_turns_module, session_service_module):
+        monkeypatch.setattr(module, "utc_ms", lambda: 1_000)
+    first = app.dispatch("chat.send", {"message": D2, "model": MODEL})
+    session_id = first["session"]["id"]
+    second = app.dispatch("chat.send", {"message": FOLLOW_UP, "model": MODEL, "session_id": session_id})
+    assert_local(second["assistant_message"], "converted")  # predecessor found despite equal timestamps
+
+    again = app.dispatch("chat.send", {"message": D2, "model": MODEL, "session_id": session_id})
+    assert again["assistant_message"]["metadata"]["time_conversion"]["status"] == "clarified"
+    turn = accept_text_turn(app, session_id, FOLLOW_UP, "tc-x")
+    app.turns.request_cancel(turn["current_attempt_id"])  # cancelled while queued: no answer
+    guard.forbid = False
+    _, done = chat_job(app, FOLLOW_UP, session_id)
+    assert done["state"] == "completed"
+    answer = answers(app, session_id)[-1]
+    assert answer["content"] == ANSWER and "time_conversion" not in answer["metadata"]
+
+
+def test_missing_zone_data_is_an_honest_local_answer(
+    app: SidecarApp, ollama: FakeOllama, guard: ModelGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(time_conversion, "_zone_index", lambda: {})
+    submitted, done = chat_job(app, "Convert 2026-11-02 09:00 from America/New_York to UTC")
+    assert done["state"] == "completed"
+    answer = answers(app, submitted["session"]["id"])[-1]
+    assert answer["metadata"]["operation_trace"]["capability"]["outcome"] == "unavailable"
+    assert "time-zone database could not be loaded" in answer["content"] and "14:00" not in answer["content"]
+    assert guard.calls == []
+
+
+def test_cancel_conversion_is_local_and_ends_the_chain(app: SidecarApp, ollama: FakeOllama, guard: ModelGuard) -> None:
+    first, _ = chat_job(app, D2)
+    session_id = first["session"]["id"]
+    _, done = chat_job(app, "cancel conversion", session_id)
+    assert done["state"] == "completed"
+    assert_local(answers(app, session_id)[-1], "cancelled")
+    guard.forbid = False
+    chat_job(app, FOLLOW_UP, session_id)
+    assert "time_conversion" not in answers(app, session_id)[-1]["metadata"]
+
+
+def test_backend_log_carries_no_conversion_inputs(app: SidecarApp, ollama: FakeOllama, guard: ModelGuard) -> None:
+    first, _ = chat_job(app, D2)
+    chat_job(app, FOLLOW_UP, first["session"]["id"])
+    log = Path(app.profile_dir) / "logs" / "backend.log"
+    text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+    assert "America/New_York" not in text and "tomorrow" not in text
+
+
+# ------------------- E2. correction: local work honours the turn deadline/cancel
+
+
+def slow_conversion(monkeypatch: pytest.MonkeyPatch, clock: Clock, seconds: float) -> None:
+    """The real calculation, with the controlled clock advanced while it runs."""
+    real = time_conversion.respond
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        outcome = real(*args, **kwargs)
+        clock.now += seconds
+        return outcome
+
+    monkeypatch.setattr(time_conversion, "respond", slow)
+
+
+def controlled_job_deadlines(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    clock = Clock()
+    monkeypatch.setattr(rpc_server, "TurnDeadline", lambda seconds: TurnDeadline(seconds, clock))
+    return clock
+
+
+def test_local_conversion_past_the_deadline_commits_nothing(
+    app: SidecarApp, monkeypatch: pytest.MonkeyPatch, guard: ModelGuard
+) -> None:
+    clock = Clock()
+    deadline = TurnDeadline(300, clock)
+    slow_conversion(monkeypatch, clock, 301)
+    session = app.sessions.create(model=MODEL)
+    turn = accept_text_turn(app, session["id"], D2, "tc-d")
+    app.turns.start(turn["current_attempt_id"])
+    with deadline_scope(deadline), pytest.raises(TurnDeadlineExceeded) as raised:
+        send_attempt(app, session["id"], turn)
+    assert chat_failure_code(raised.value, deadline) == "chat_turn_timeout"
+    assert roles(app, session["id"]) == ["user"]
+    assert not app.turns.status(message_id=turn["message_id"])["answered"]
+    assert guard.calls == []
+
+
+def test_job_local_conversion_past_the_deadline_times_out(
+    app: SidecarApp, ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, guard: ModelGuard
+) -> None:
+    clock = controlled_job_deadlines(monkeypatch)
+    slow_conversion(monkeypatch, clock, 301)
+    submitted, final = chat_job(app, D2, operation_key="tc-jd")
+    assert (final["state"], final["message_code"]) == ("failed", "chat_turn_timeout")
+    turn = app.dispatch("jobs.chat_status", {"operation_key": "tc-jd"})["turn"]
+    assert (turn["latest_state"], turn["latest_outcome_code"]) == ("timed_out", "chat_turn_timeout")
+    assert roles(app, submitted["session"]["id"]) == ["user"]
+    assert guard.calls == [] and ollama.requests == []
+
+
+def test_job_local_conversion_within_the_deadline_still_answers(
+    app: SidecarApp, ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, guard: ModelGuard
+) -> None:
+    clock = controlled_job_deadlines(monkeypatch)
+    slow_conversion(monkeypatch, clock, 299)
+    submitted, final = chat_job(app, D2)
+    assert final["state"] == "completed"
+    assert assert_local(answers(app, submitted["session"]["id"])[-1], "clarified")["status"] == "clarified"
+    assert guard.calls == []
+
+
+def test_job_cancel_during_local_conversion_saves_nothing(
+    app: SidecarApp, ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, guard: ModelGuard
+) -> None:
+    real = time_conversion.respond
+    arrived, cancelled = threading.Event(), threading.Event()
+
+    def blocked(*args: Any, **kwargs: Any) -> Any:
+        arrived.set()
+        assert cancelled.wait(5)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(time_conversion, "respond", blocked)
+    submitted = app.dispatch("jobs.submit_chat", {"message": D2, "model": MODEL, "operation_key": "tc-jc"})
+    assert arrived.wait(5)
+    app.dispatch("jobs.cancel", {"job_id": submitted["job"]["job_id"]})
+    cancelled.set()
+    final = wait_terminal(app, submitted["job"]["job_id"])
+    assert final["state"] == "cancelled"
+    assert roles(app, submitted["session"]["id"]) == ["user"]
+    assert not app.dispatch("jobs.chat_status", {"operation_key": "tc-jc"})["turn"]["answered"]
+    assert guard.calls == []
+
+
+def test_queued_local_conversion_past_its_deadline_commits_nothing(
+    app: SidecarApp, ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, guard: ModelGuard
+) -> None:
+    guard.forbid = False  # the first, ordinary turn holds the worker on the model
+    ollama.prepare_delay = 1.0
+    first = submit(app)
+    assert ollama.arrived["prepare"].wait(5)
+    monkeypatch.setattr(rpc_server, "INTERACTIVE_TURN_SECONDS", 0.3)
+    second = app.dispatch("jobs.submit_chat", {"message": D2, "model": MODEL, "operation_key": "tc-q"})
+    final = wait_terminal(app, second["job"]["job_id"])
+    assert (final["state"], final["message_code"]) == ("failed", "chat_turn_timeout")
+    assert wait_terminal(app, first["job"]["job_id"])["state"] == "completed"
+    assert ollama.requests == ["prepare", "generate"]  # only the first turn
+    assert roles(app, second["session"]["id"]) == ["user"]

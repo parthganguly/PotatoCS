@@ -144,6 +144,27 @@ class SessionService:
             message["metadata"] = parse_message_metadata(message.pop("metadata_json", "{}"))
         return messages
 
+    def preceding_message(self, session_id: str, message_id: str) -> dict[str, Any] | None:
+        """The message stored immediately before `message_id` in this session, if any.
+
+        Raw storage order (created_at, then insertion order), so an unanswered turn
+        is a boundary and equal timestamps never make the predecessor ambiguous.
+        """
+        row = self.db.conn.execute(
+            """
+            SELECT p.id, p.role, p.metadata_json FROM messages m
+            JOIN messages p ON p.session_id = m.session_id
+                AND (p.created_at < m.created_at OR (p.created_at = m.created_at AND p.rowid < m.rowid))
+            WHERE m.id = ? AND m.session_id = ?
+            ORDER BY p.created_at DESC, p.rowid DESC
+            LIMIT 1
+            """,
+            (message_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"id": row["id"], "role": row["role"], "metadata": parse_message_metadata(row["metadata_json"])}
+
 
 def parse_message_metadata(raw: Any) -> dict[str, Any]:
     try:

@@ -3,3 +3,4 @@ pypdf
 readability-lxml
 reportlab
 pillow
+tzdata==2026.2

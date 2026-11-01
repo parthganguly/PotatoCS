@@ -59,7 +59,7 @@ export function OperationTrace({
             />
             <TraceSection
               rows={[
-                ["Final answer", valueOrMissing(trace.models.final_answer_model)],
+                ["Final answer", finalAnswerLabel(trace)],
                 ["Vision backend", valueOrMissing(trace.models.vision_backend)],
                 ["Vision model", valueOrMissing(trace.models.vision_model)],
                 ["OCR engine", valueOrMissing(trace.models.ocr_engine)],
@@ -111,6 +111,9 @@ export function OperationTrace({
               rows={[["Warnings", trace.warnings.length ? trace.warnings.join(" · ") : MISSING_VALUE]]}
               title="Warnings"
             />
+            {trace.capability && (
+              <TraceSection rows={capabilityRows(trace.capability)} title="Local engine" />
+            )}
             {trace.search && (
               <>
                 <TraceSection
@@ -178,6 +181,25 @@ export function OperationTrace({
       </div>
     </div>
   );
+}
+
+const LOCAL_ENGINES: Record<string, string> = {
+  local_time_conversion: "Local time conversion (no model)"
+};
+
+/** The model that answered, or the local engine for deterministic replies (no model ran). */
+export function finalAnswerLabel(trace: OperationTraceData): string {
+  const engine = trace.capability?.engine;
+  if (engine) return LOCAL_ENGINES[engine] ?? `Local engine: ${engine}`;
+  return valueOrMissing(trace.models.final_answer_model);
+}
+
+export function capabilityRows(capability: NonNullable<OperationTraceData["capability"]>): Array<[string, string]> {
+  return [
+    ["Engine", LOCAL_ENGINES[capability.engine] ?? valueOrMissing(capability.engine)],
+    ["Outcome", valueOrMissing(capability.outcome)],
+    ["Time-zone data", valueOrMissing(capability.time_zone_data)]
+  ];
 }
 
 function TraceSection({ rows, title }: { rows: Array<[string, string]>; title: string }) {

@@ -142,6 +142,13 @@ export type OperationTrace = {
     thinking_char_count: number;
     thinking_truncated: boolean;
   };
+  /** Present only when a local deterministic engine, not a model, produced the reply. */
+  capability?: {
+    name: string;
+    engine: string;
+    outcome?: string;
+    time_zone_data?: string;
+  };
   search?: {
     provider: string;
     metrics: Record<string, number | boolean | null>;

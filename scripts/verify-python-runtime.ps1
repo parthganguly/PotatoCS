@@ -33,6 +33,34 @@ import sys
 sys.path.insert(0, os.environ["ODYSSEUS_BACKEND_PATH"])
 for module in ("json", "sqlite3", "numpy", "pypdf", "reportlab", "PIL", "lxml", "readability", "rpc_server", "odysseus_desktop_backend"):
     importlib.import_module(module)
+
+# Local time conversion: the pinned tz database must load and resolve DST gaps/folds.
+import importlib.metadata
+import zoneinfo
+from datetime import datetime
+from odysseus_desktop_backend.services import time_conversion as tc
+tz_version = importlib.metadata.version("tzdata")
+if tz_version != "2026.2":
+    raise SystemExit("tzdata " + tz_version + " is not the pinned 2026.2")
+for key in ("UTC", "America/New_York", "Asia/Kolkata", "Australia/Lord_Howe"):
+    zoneinfo.ZoneInfo(key)
+def offsets(key, wall):
+    return [str(item.utcoffset()) for item in tc._candidates(datetime.fromisoformat(wall), zoneinfo.ZoneInfo(key))]
+expected = {
+    ("America/New_York", "2026-03-08T02:30"): [],
+    ("America/New_York", "2026-11-01T01:30"): ["-1 day, 20:00:00", "-1 day, 19:00:00"],
+    ("Australia/Lord_Howe", "2026-10-04T02:15"): [],
+    ("Australia/Lord_Howe", "2026-04-05T01:45"): ["11:00:00", "10:30:00"],
+    ("Asia/Kolkata", "2026-06-01T12:00"): ["5:30:00"],
+}
+for (key, wall), want in expected.items():
+    got = offsets(key, wall)
+    if got != want:
+        raise SystemExit("DST round trip failed for " + key + " " + wall + ": " + repr(got))
+answer = tc.respond("Convert 2026-11-02 09:00 from America/New_York to UTC", None, message_id="verify")
+if answer is None or answer.status != "converted" or "14:00 in UTC" not in answer.reply:
+    raise SystemExit("time conversion self-check failed")
+print("tzdata-ok " + tz_version + " (" + tc.time_zone_data_label() + ")")
 print("runtime-ok")
 "@
 
