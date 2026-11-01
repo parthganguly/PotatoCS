@@ -1007,6 +1007,9 @@ class RAGService:
         *,
         limit: int,
     ) -> list[dict[str, Any]]:
+        """Focus on the top document: its ranked hits first, unchanged and in rank order, then
+        their nearest neighboring chunks up to `max(limit, 8)` results. A short document fits
+        whole; a long one keeps the passages search found rather than its opening chunks."""
         if any(
             isinstance(result.get("metadata"), dict) and result["metadata"].get("ocr_lexical_match")
             for result in results
@@ -1015,25 +1018,36 @@ class RAGService:
         if not self._should_focus_on_top_document(query, results):
             return results
 
-        top = results[0]
-        chunks = self.documents.chunks(top["document_id"])
+        top_document_id = results[0]["document_id"]
+        chunks = self.documents.chunks(top_document_id)
         if not chunks:
             return results
 
-        score_by_id = {result["chunk_id"]: float(result["score"]) for result in results}
-        focused: list[dict[str, Any]] = []
-        for chunk in chunks[: max(limit, 8)]:
-            focused.append(
-                {
-                    "chunk_id": chunk["id"],
-                    "document_id": chunk["document_id"],
-                    "content": chunk["content"],
-                    "score": score_by_id.get(chunk["id"], 0.0),
-                    "page_start": chunk["page_start"],
-                    "page_end": chunk["page_end"],
-                    "metadata": chunk["metadata"],
-                }
-            )
+        budget = max(limit, 8)
+        focused = [result for result in results if result["document_id"] == top_document_id]
+        position = {chunk["id"]: index for index, chunk in enumerate(chunks)}
+        anchors = [position[hit["chunk_id"]] for hit in focused if hit["chunk_id"] in position]
+        taken = set(anchors)
+        for distance in range(1, budget + 1):
+            for anchor in anchors:
+                # The following chunk first: a section usually continues past its hit.
+                for index in (anchor + distance, anchor - distance):
+                    if len(focused) < budget and 0 <= index < len(chunks) and index not in taken:
+                        taken.add(index)
+                        chunk = chunks[index]
+                        focused.append(
+                            {
+                                "chunk_id": chunk["id"],
+                                "document_id": chunk["document_id"],
+                                "content": chunk["content"],
+                                "score": 0.0,
+                                "page_start": chunk["page_start"],
+                                "page_end": chunk["page_end"],
+                                "metadata": chunk["metadata"],
+                                # Context around a ranked hit, not itself a search result.
+                                "neighbor_of": chunks[anchor]["id"],
+                            }
+                        )
         return focused
 
     def _should_focus_on_top_document(self, query: str, results: list[dict[str, Any]]) -> bool:
