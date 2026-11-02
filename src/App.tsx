@@ -107,7 +107,6 @@ import {
   buildConversationModelOptions,
   installedModelTag,
   isInstalledModelTag,
-  listModelCapabilities,
   readableModelLabel,
   refreshModelCapabilities,
   selectInstalledModelOrFallback,
@@ -523,7 +522,9 @@ function App() {
           listSources({ filter: sourceFilter }),
           rpc<RAGHealth>("rag.health"),
           rpc<OCRStatus>("ocr.status"),
-          listModelCapabilities(false),
+          // Fresh inspection so a model replaced under the same tag is
+          // reflected on the next boot.
+          refreshModelCapabilities(),
           listImageEvalSuite(),
           listImageEvalHistory(20)
         ]);
@@ -561,6 +562,7 @@ function App() {
             checking: false,
             backendDegraded: Boolean(status.backend_degraded),
             ollama: nextOllama,
+            modelCapabilities: nextCapabilities,
             ragHealth: nextHealth,
             ocrStatus: nextOcr
           })
@@ -599,20 +601,40 @@ function App() {
   async function recheckReadiness() {
     setReadinessChecking(true);
     try {
-      const status = await getAppStatus();
-      setAppStatus(status);
-      setBackendDegraded(Boolean(status.backend_degraded));
-      const [nextOllama, nextHealth, nextOcr] = await Promise.all([
-        rpc<OllamaStatus>("models.detect_ollama"),
-        rpc<RAGHealth>("rag.health"),
-        rpc<OCRStatus>("ocr.status")
+      // Every check resolves on its own, so one failure only marks its own
+      // rows with fixed retry copy instead of leaving an old "ready" behind.
+      const [status, health, ocr] = await Promise.all([
+        getAppStatus().catch(() => null),
+        rpc<RAGHealth>("rag.health").catch(() => null),
+        rpc<OCRStatus>("ocr.status").catch(() => null)
       ]);
-      setOllama(nextOllama);
-      setRagHealth(nextHealth);
-      setOcrStatus(nextOcr);
-    } catch {
-      // Rows keep rendering fixed copy from the last known statuses; raw
-      // re-check errors never reach the readiness UI.
+      let modelResult: { capabilities: ModelCapability[]; ollama: OllamaStatus } | null = null;
+      try {
+        // Fresh inspection first so detect_ollama rebuilds its catalog from it;
+        // readiness rows re-use that same fresh metadata.
+        const capabilities = await refreshModelCapabilities();
+        modelResult = { capabilities, ollama: await rpc<OllamaStatus>("models.detect_ollama") };
+      } catch {
+        modelResult = null;
+      }
+      if (status) {
+        setAppStatus(status);
+        setBackendDegraded(Boolean(status.backend_degraded));
+      } else {
+        // A failed engine status must not keep the old engine-ready row.
+        setBackendDegraded(true);
+      }
+      setRagHealth(health);
+      setOcrStatus(ocr);
+      if (modelResult) {
+        setModelCapabilities(modelResult.capabilities);
+        setOllama(modelResult.ollama);
+      } else {
+        // A failed model check clears the model result; the rows then render
+        // fixed "check did not finish" copy instead of stale readiness.
+        setModelCapabilities([]);
+        setOllama(null);
+      }
     } finally {
       setReadinessChecking(false);
     }
@@ -674,7 +696,9 @@ function App() {
     setError(null);
     try {
       const nextOllama = await rpc<OllamaStatus>("models.detect_ollama");
-      const nextCapabilities = await listModelCapabilities(false);
+      // Fresh inspection so a model replaced under the same tag, or a
+      // retried-then-changed one, is reflected immediately.
+      const nextCapabilities = await refreshModelCapabilities();
       const refreshedChoices = buildConversationModelOptions(nextOllama, nextCapabilities).map((option) => option.tag);
       setOllama(nextOllama);
       setModelCapabilities(nextCapabilities);
@@ -2086,6 +2110,7 @@ function App() {
               checking: readinessChecking,
               backendDegraded,
               ollama,
+              modelCapabilities,
               ragHealth,
               ocrStatus
             })}

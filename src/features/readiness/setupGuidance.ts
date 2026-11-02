@@ -74,6 +74,27 @@ export const EMBEDDING_MODEL_GUIDANCE: SetupGuidance = {
   command: { label: "Install the embedding model", text: "ollama pull nomic-embed-text" }
 };
 
+/**
+ * Private-runtime variants of the runtime rows. They deliberately carry no
+ * command: `ollama serve` and the Ollama installer target the ambient runtime,
+ * which is not the configured endpoint here.
+ */
+export const PRIVATE_RUNTIME_START_GUIDANCE: SetupGuidance = {
+  steps: [
+    "This app is using its own private AI runtime instead of the regular Ollama installation.",
+    "Start that private runtime, or check that its configured address is running, then click Re-check.",
+    "Do not start or install the regular Ollama service for this."
+  ]
+};
+
+export const PRIVATE_RUNTIME_CHAT_GUIDANCE: SetupGuidance = {
+  steps: [
+    "This app is using its own private AI runtime, so chat models must be installed there.",
+    "Add a chat model to that private runtime using its own setup, then click Re-check.",
+    "It does not need to be added to the regular Ollama installation."
+  ]
+};
+
 /** OCR dependencies are missing. Basic pointer only — no install wizard yet. */
 export const OCR_BASIC_GUIDANCE: SetupGuidance = {
   steps: [

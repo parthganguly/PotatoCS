@@ -1,10 +1,14 @@
-import type { OCRStatus, OllamaStatus, RAGHealth } from "../../tauri";
+import type { ModelCapability, OCRStatus, OllamaStatus, RAGHealth } from "../../tauri";
+import { buildConversationModelOptions, isExperimentalModel } from "../../api/models";
+import type { ConversationModelOption } from "../../api/models";
 import {
   CHAT_MODEL_GUIDANCE,
   EMBEDDING_MODEL_GUIDANCE,
   OCR_BASIC_GUIDANCE,
   OLLAMA_INSTALL_GUIDANCE,
   OLLAMA_START_GUIDANCE,
+  PRIVATE_RUNTIME_CHAT_GUIDANCE,
+  PRIVATE_RUNTIME_START_GUIDANCE,
   SetupGuidance,
   VISION_OPTIONAL_GUIDANCE
 } from "./setupGuidance";
@@ -51,6 +55,7 @@ export type ReadinessInputs = {
   checking: boolean;
   backendDegraded: boolean;
   ollama: OllamaStatus | null;
+  modelCapabilities: ModelCapability[];
   ragHealth: RAGHealth | null;
   ocrStatus: OCRStatus | null;
 };
@@ -84,6 +89,31 @@ function row(
   return guidance ? { ...base, guidance } : base;
 }
 
+/**
+ * Selectable conversation models come from the same catalog logic the model
+ * picker uses, so aliases and capability changes mean the same thing in both
+ * places. One pass classifies the installed ones: a model counts as "usable"
+ * only when its role is actually `chat` or `vision`, and `unknown` is neither
+ * confirmed usable nor confirmed absent. Stale or uninstalled catalog entries
+ * are ignored, and the experimental private-runtime candidate does not count
+ * while its digest is not admitted.
+ */
+function chatModelOptionCounts(inputs: ReadinessInputs): {
+  usable: ConversationModelOption[];
+  unconfirmed: ConversationModelOption[];
+} {
+  const runtime = inputs.ollama?.private_runtime;
+  const usable: ConversationModelOption[] = [];
+  const unconfirmed: ConversationModelOption[] = [];
+  for (const option of buildConversationModelOptions(inputs.ollama, inputs.modelCapabilities)) {
+    if (!option.installed || option.stale) continue;
+    if (runtime && runtime.state !== "ready" && isExperimentalModel(option.tag, runtime)) continue;
+    if (option.role === "chat" || option.role === "vision") usable.push(option);
+    else if (option.role === "unknown") unconfirmed.push(option);
+  }
+  return { usable, unconfirmed };
+}
+
 function installedModelCount(ollama: OllamaStatus, role: "chat" | "vision"): number {
   const catalog = ollama.conversation_models ?? [];
   if (catalog.length > 0) {
@@ -109,6 +139,16 @@ function ollamaRow(inputs: ReadinessInputs): ReadinessRow {
   }
   if (ollama.reachable) {
     return row("ollama", label, "ready", "The local AI runtime is running on this computer.");
+  }
+  if (ollama.private_runtime) {
+    return row(
+      "ollama",
+      label,
+      "missing",
+      "The private AI runtime is not running or not reachable.",
+      "Start the private runtime, then come back and click Re-check.",
+      PRIVATE_RUNTIME_START_GUIDANCE
+    );
   }
   if (ollama.installed) {
     return row(
@@ -137,7 +177,17 @@ function chatModelRow(inputs: ReadinessInputs): ReadinessRow {
   if (!ollama) {
     return row("chat_model", label, "error", "The model check did not finish.", "Click Re-check to try again.");
   }
+  const privateRuntime = ollama.private_runtime;
   if (!ollama.reachable) {
+    if (privateRuntime) {
+      return row(
+        "chat_model",
+        label,
+        "unavailable",
+        "Chat models need the private AI runtime first.",
+        "Start the private runtime above, then click Re-check."
+      );
+    }
     return row(
       "chat_model",
       label,
@@ -146,8 +196,92 @@ function chatModelRow(inputs: ReadinessInputs): ReadinessRow {
       "Set up the runtime above, then click Re-check."
     );
   }
-  if (installedModelCount(ollama, "chat") > 0) {
+  // Reachable, but /api/tags failed: the inventory is unknown, not empty.
+  // Never turn that into a download suggestion or an offline claim.
+  if (ollama.error) {
+    return row(
+      "chat_model",
+      label,
+      "error",
+      "The app could not read the installed model list.",
+      "Click Re-check to try again."
+    );
+  }
+  if (privateRuntime?.state === "unreachable") {
+    return row(
+      "chat_model",
+      label,
+      "unavailable",
+      "Chat models need the private AI runtime first.",
+      "Start the private runtime above, then click Re-check."
+    );
+  }
+  const { usable, unconfirmed } = chatModelOptionCounts(inputs);
+  if (usable.length > 0) {
     return row("chat_model", label, "ready", "A chat model is installed and ready to answer questions.");
+  }
+  // Digest-verified experimental candidate with no confirmed capabilities: not
+  // counted as ready. Point at the model picker's explicit per-conversation
+  // selection that already gates it.
+  if (
+    privateRuntime?.state === "ready" &&
+    unconfirmed.length > 0 &&
+    unconfirmed.every((option) => isExperimentalModel(option.tag, privateRuntime))
+  ) {
+    return row(
+      "chat_model",
+      label,
+      "degraded",
+      "The experimental chat model in the private runtime matches its expected version, but the app has not confirmed its abilities yet.",
+      "Select it in a conversation's model picker to use it, or click Re-check to confirm again."
+    );
+  }
+  // Installed models with unknown capabilities: neither confirmed usable nor
+  // confirmed absent. Show a non-blocking re-check, never a download.
+  if (unconfirmed.length > 0) {
+    return row(
+      "chat_model",
+      label,
+      "degraded",
+      "Installed models were found, but the app could not confirm which one can answer chat questions yet.",
+      "Click Re-check to inspect them again."
+    );
+  }
+  if (privateRuntime) {
+    if (privateRuntime.state === "digest_mismatch") {
+      return row(
+        "chat_model",
+        label,
+        "error",
+        "The experimental chat model in the private runtime does not match the expected version.",
+        "Reinstall the expected version in that private runtime, or add any other chat model to it, then click Re-check.",
+        PRIVATE_RUNTIME_CHAT_GUIDANCE
+      );
+    }
+    // Known compatible models are absent and unconfirmed ones are excluded:
+    // the private runtime simply has no usable chat model. Ask for a generic
+    // chat model there; nothing implies the experimental candidate is required.
+    return row(
+      "chat_model",
+      label,
+      "missing",
+      "The private runtime has no chat model installed that can answer chat questions.",
+      "Add a chat model to that private runtime using its own setup, then click Re-check.",
+      PRIVATE_RUNTIME_CHAT_GUIDANCE
+    );
+  }
+  const hasInstalledModels =
+    (ollama.models?.length ?? 0) > 0 ||
+    (ollama.conversation_models ?? []).some((model) => model.installed && !model.stale);
+  if (hasInstalledModels) {
+    return row(
+      "chat_model",
+      label,
+      "missing",
+      "Installed models cannot answer chat questions.",
+      "Install a chat model from your terminal, then click Re-check.",
+      CHAT_MODEL_GUIDANCE
+    );
   }
   return row(
     "chat_model",
